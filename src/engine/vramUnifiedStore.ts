@@ -15,7 +15,12 @@
  * restoring embedded prefixes instantaneously across threads and sessions.
  */
 
-import { OPFS_VRAM_DIR_NAME, sanitizeOpfsModelFileName, type SyncAccessHandleLike } from './vramBackingStore';
+import {
+  OPFS_VRAM_DIR_NAME,
+  openSyncAccessHandleWithRetry,
+  sanitizeOpfsModelFileName,
+  type SyncAccessHandleCapableFile,
+} from './vramBackingStore';
 import { VRAM_KV_PAGE_TOKENS } from './vramKvPager';
 import { compressUnifiedKvBytes, decompressUnifiedKvBytes } from './vramSwapPolicy';
 
@@ -441,11 +446,14 @@ export class VramUnifiedStore {
     const payload = this.serializeBlocks(ranked);
     const fileName = sanitizeUnifiedKvFileName(this.geometry.modelId);
     try {
-      const fh = (await dir.getFileHandle(fileName, { create: true })) as FileSystemFileHandle & {
-        createSyncAccessHandle?: () => Promise<SyncAccessHandleLike>;
-      };
+      const fh = (await dir.getFileHandle(fileName, { create: true })) as FileSystemFileHandle &
+        SyncAccessHandleCapableFile;
       if (typeof fh.createSyncAccessHandle !== 'function') return 0;
-      const sync = await fh.createSyncAccessHandle();
+      const sync = await openSyncAccessHandleWithRetry(fh, {
+        mode: 'readwrite',
+        modelId: this.geometry.modelId,
+        retryDelaysMs: [25, 50, 100],
+      });
       try {
         sync.truncate(0);
         let written = 0;
@@ -477,11 +485,14 @@ export class VramUnifiedStore {
 
     const fileName = sanitizeUnifiedKvFileName(this.geometry.modelId);
     try {
-      const fh = (await dir.getFileHandle(fileName, { create: false })) as FileSystemFileHandle & {
-        createSyncAccessHandle?: () => Promise<SyncAccessHandleLike>;
-      };
+      const fh = (await dir.getFileHandle(fileName, { create: false })) as FileSystemFileHandle &
+        SyncAccessHandleCapableFile;
       if (typeof fh.createSyncAccessHandle !== 'function') return 0;
-      const sync = await fh.createSyncAccessHandle();
+      const sync = await openSyncAccessHandleWithRetry(fh, {
+        mode: 'read-only',
+        modelId: this.geometry.modelId,
+        retryDelaysMs: [25, 50, 100],
+      });
       let raw: Uint8Array;
       try {
         const size = sync.getSize();

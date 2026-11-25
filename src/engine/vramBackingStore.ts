@@ -1303,6 +1303,130 @@ interface PartialDownloadMeta {
   updatedAt: number;
 }
 
+/** BroadcastChannel name coordinating cross-tab / reload OPFS SyncAccessHandle lease handover. */
+export const OPFS_HANDOVER_CHANNEL_NAME = 'verdant-ui-opfs-v1';
+
+/** Default bounded retry backoff schedule (~2.07s total) for transient OPFS reload locks. */
+const DEFAULT_OPFS_LOCK_RETRY_DELAYS_MS: readonly number[] = [25, 50, 100, 150, 250, 400, 500, 600];
+
+/** Typed error surfaced when an OPFS file remains exclusively locked after handover & retries. */
+export class OpfsLockError extends Error {
+  readonly modelId?: string;
+  constructor(message: string, modelId?: string) {
+    super(message);
+    this.name = 'OpfsLockError';
+    this.modelId = modelId;
+  }
+}
+
+/** Detects browser OPFS SyncAccessHandle / Writable lock contention errors across engines. */
+export function isOpfsLockError(err: unknown): boolean {
+  if (!err) return false;
+  if (err instanceof OpfsLockError) return true;
+  if (
+    err instanceof DOMException &&
+    (err.name === 'NoModificationAllowedError' || err.name === 'InvalidModificationError')
+  ) {
+    return true;
+  }
+  if (err instanceof Error && (err.name === 'NoModificationAllowedError' || err.name === 'InvalidModificationError')) {
+    return true;
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  return /access handles? cannot be created|no modification allowed|locked|another open access handle|writable stream/i.test(
+    msg,
+  );
+}
+
+/** Broadcasts a non-blocking handover nudge asking older/idle VerdantUI tabs or workers to close OPFS handles. */
+export function requestOpfsHandleRelease(modelId?: string, senderId?: string): void {
+  if (typeof BroadcastChannel !== 'function') return;
+  try {
+    const ch = new BroadcastChannel(OPFS_HANDOVER_CHANNEL_NAME);
+    ch.postMessage({
+      type: 'release-opfs',
+      modelId: modelId ?? null,
+      senderId: senderId ?? null,
+      ts: Date.now(),
+    });
+    ch.close();
+  } catch {
+    // Ignore restricted BroadcastChannel environments
+  }
+}
+
+export interface SyncAccessHandleCapableFile {
+  createSyncAccessHandle?: (options?: {
+    mode?: 'read-only' | 'readwrite' | 'readwrite-unsafe';
+  }) => Promise<SyncAccessHandleLike>;
+  getFile?: () => Promise<File>;
+}
+
+/**
+ * Acquires a `FileSystemSyncAccessHandle` with:
+ *  1. Lock-free `mode: 'read-only'` for immutable committed files (Chrome 121+ / WHATWG FS Access),
+ *     transparently falling back to 0-arg `createSyncAccessHandle()` on older browsers.
+ *  2. Cross-tab / page-reload `BroadcastChannel` lease handover + bounded exponential backoff
+ *     so reloading the page NEVER fails due to an old worker still tearing down its OPFS handle.
+ */
+export async function openSyncAccessHandleWithRetry(
+  fileHandle: SyncAccessHandleCapableFile,
+  options?: {
+    mode?: 'read-only' | 'readwrite';
+    modelId?: string;
+    senderId?: string;
+    signal?: AbortSignal;
+    retryDelaysMs?: readonly number[];
+  },
+): Promise<SyncAccessHandleLike> {
+  if (typeof fileHandle.createSyncAccessHandle !== 'function') {
+    throw new Error('OPFS FileSystemSyncAccessHandle is unavailable in this execution context.');
+  }
+  const mode = options?.mode ?? 'readwrite';
+  const delays = options?.retryDelaysMs ?? DEFAULT_OPFS_LOCK_RETRY_DELAYS_MS;
+
+  const tryOpenOnce = async (): Promise<SyncAccessHandleLike> => {
+    if (mode === 'read-only') {
+      try {
+        return await fileHandle.createSyncAccessHandle!({ mode: 'read-only' });
+      } catch (err) {
+        // Older browsers reject the options dictionary with TypeError -> retry 0-arg default mode
+        if (err instanceof TypeError) {
+          return await fileHandle.createSyncAccessHandle!();
+        }
+        throw err;
+      }
+    }
+    return await fileHandle.createSyncAccessHandle!();
+  };
+
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= delays.length; attempt++) {
+    if (options?.signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    try {
+      return await tryOpenOnce();
+    } catch (err) {
+      if (isAbortError(err)) throw err;
+      if (!isOpfsLockError(err)) throw err;
+      lastErr = err;
+      // Nudge any older reloading worker or idle tab to close its OPFS SyncAccessHandle
+      requestOpfsHandleRelease(options?.modelId, options?.senderId);
+      if (attempt < delays.length) {
+        await sleepWithAbort(delays[attempt], options?.signal);
+      }
+    }
+  }
+
+  const target = options?.modelId ? `"${options.modelId}"` : 'this model';
+  const rawDetail = lastErr instanceof Error ? lastErr.message : String(lastErr ?? 'file locked');
+  throw new OpfsLockError(
+    `Local OPFS storage for ${target} is currently locked by another active VerdantUI tab or pending reload (${rawDetail}). Close duplicate VerdantUI tabs and retry.`,
+    options?.modelId,
+  );
+}
+
 /** Per-model serialization queue preventing OPFS `NoModificationAllowedError` on rapid retry/cancel. */
 const opfsModelLocks = new Map<string, Promise<void>>();
 
@@ -1519,12 +1643,14 @@ async function writePartMeta(
   meta: PartialDownloadMeta,
 ): Promise<void> {
   try {
-    const h = (await dir.getFileHandle(metaName, { create: true })) as FileSystemFileHandle & {
-      createSyncAccessHandle?: () => Promise<SyncAccessHandleLike>;
-    };
+    const h = (await dir.getFileHandle(metaName, { create: true })) as FileSystemFileHandle &
+      SyncAccessHandleCapableFile;
     const encoded = new TextEncoder().encode(JSON.stringify(meta));
     if (typeof h.createSyncAccessHandle === 'function') {
-      const sync = await h.createSyncAccessHandle();
+      const sync = await openSyncAccessHandleWithRetry(h, {
+        mode: 'readwrite',
+        retryDelaysMs: [25, 50, 100],
+      });
       try {
         sync.truncate(0);
         writeAllSync(sync, encoded, 0);
@@ -1671,11 +1797,16 @@ async function reclaimInactiveOpfsModels(
   return freed;
 }
 
-/** Opens an already-ingested OPFS GGUF file synchronously for vRAM paging, auto-evicting corrupt files. */
+/**
+ * Opens an already-ingested OPFS GGUF file synchronously for vRAM paging, auto-evicting corrupt files.
+ * Uses lock-free `{ mode: 'read-only' }` + bounded reload-handover retry, with automatic zero-copy
+ * `LocalFileSyncBackingStore` (`FileReaderSync`) fallback if another tab holds an exclusive lock.
+ */
 export async function openOpfsModelBacking(
   modelId: string,
   dirOverride?: FileSystemDirectoryHandle,
-): Promise<OpfsSyncBackingStore | null> {
+  options?: { signal?: AbortSignal; retryDelaysMs?: readonly number[] },
+): Promise<VramBackingStore | null> {
   if (!dirOverride && !isOpfsSyncSupported()) return null;
   const dir = dirOverride ?? (await getOpfsVramDirectory(false));
   if (!dir) return null;
@@ -1684,11 +1815,21 @@ export async function openOpfsModelBacking(
   if (await hasOpfsEntry(dir, `${fileName}.incomplete`)) {
     return null;
   }
+  let fileHandle: FileSystemFileHandle & SyncAccessHandleCapableFile;
   try {
-    const fileHandle = (await dir.getFileHandle(fileName, { create: false })) as FileSystemFileHandle & {
-      createSyncAccessHandle: () => Promise<SyncAccessHandleLike>;
-    };
-    const syncHandle = await fileHandle.createSyncAccessHandle();
+    fileHandle = (await dir.getFileHandle(fileName, { create: false })) as FileSystemFileHandle &
+      SyncAccessHandleCapableFile;
+  } catch {
+    return null;
+  }
+
+  try {
+    const syncHandle = await openSyncAccessHandleWithRetry(fileHandle, {
+      mode: 'read-only',
+      modelId,
+      signal: options?.signal,
+      retryDelaysMs: options?.retryDelaysMs,
+    });
     const size = syncHandle.getSize();
     const check = validateSyncHandleGgufHeader(syncHandle);
     if (!check.valid) {
@@ -1698,7 +1839,28 @@ export async function openOpfsModelBacking(
       return null;
     }
     return new OpfsSyncBackingStore(modelId, syncHandle, size);
-  } catch {
+  } catch (err) {
+    if (isAbortError(err)) throw err;
+    if (isOpfsLockError(err)) {
+      // Fallback for older browsers without read-only SyncAccessHandle when another tab holds an exclusive lock:
+      // committed .gguf files are immutable, so FileReaderSync over getFile() reads lock-free with 0 re-download!
+      if (isFileReaderSyncSupported() && typeof fileHandle.getFile === 'function') {
+        try {
+          const blob = await fileHandle.getFile();
+          if (blob.size >= 24) {
+            const headBuf = new Uint8Array(await blob.slice(0, 24).arrayBuffer());
+            if (validateGgufMagicHeader(headBuf).valid) {
+              return new LocalFileSyncBackingStore(modelId, blob);
+            }
+          }
+        } catch {
+          // Fall through to surface typed OpfsLockError
+        }
+      }
+      throw err instanceof OpfsLockError
+        ? err
+        : new OpfsLockError(err instanceof Error ? err.message : String(err), modelId);
+    }
     return null;
   }
 }
@@ -1713,6 +1875,8 @@ export async function openOpfsDemandModelBacking(
     asyncRangeFetcher?: AsyncRangeFetcher;
     fetchFn?: typeof fetch;
     upgradeLegacyOversizedSlabs?: boolean;
+    signal?: AbortSignal;
+    retryDelaysMs?: readonly number[];
   },
 ): Promise<OpfsDemandVramBackingStore | null> {
   if (!options?.dirOverride && !isOpfsSyncSupported()) return null;
@@ -1737,19 +1901,33 @@ export async function openOpfsDemandModelBacking(
     return null;
   }
 
+  let cacheHandle: FileSystemFileHandle & SyncAccessHandleCapableFile;
+  let idxHandle: FileSystemFileHandle & SyncAccessHandleCapableFile;
   try {
-    const cacheHandle = (await dir.getFileHandle(cacheName, {
+    cacheHandle = (await dir.getFileHandle(cacheName, {
       create: false,
-    })) as FileSystemFileHandle & {
-      createSyncAccessHandle: () => Promise<SyncAccessHandleLike>;
-    };
-    const idxHandle = (await dir.getFileHandle(idxName, {
+    })) as FileSystemFileHandle & SyncAccessHandleCapableFile;
+    idxHandle = (await dir.getFileHandle(idxName, {
       create: true,
-    })) as FileSystemFileHandle & {
-      createSyncAccessHandle: () => Promise<SyncAccessHandleLike>;
-    };
-    const syncCache = await cacheHandle.createSyncAccessHandle();
-    const syncIdx = await idxHandle.createSyncAccessHandle();
+    })) as FileSystemFileHandle & SyncAccessHandleCapableFile;
+  } catch {
+    return null;
+  }
+
+  let syncCache: SyncAccessHandleLike | null = null;
+  try {
+    syncCache = await openSyncAccessHandleWithRetry(cacheHandle, {
+      mode: 'readwrite',
+      modelId,
+      signal: options?.signal,
+      retryDelaysMs: options?.retryDelaysMs,
+    });
+    const syncIdx = await openSyncAccessHandleWithRetry(idxHandle, {
+      mode: 'readwrite',
+      modelId,
+      signal: options?.signal,
+      retryDelaysMs: options?.retryDelaysMs,
+    });
     const store = new OpfsDemandVramBackingStore({
       modelId,
       url,
@@ -1775,7 +1953,21 @@ export async function openOpfsDemandModelBacking(
       }
     };
     return store;
-  } catch {
+  } catch (err) {
+    // Prevent leaking syncCache open when syncIdx acquisition fails or aborts!
+    if (syncCache) {
+      try {
+        syncCache.close();
+      } catch {
+        // Ignore duplicate close
+      }
+    }
+    if (isAbortError(err)) throw err;
+    if (isOpfsLockError(err)) {
+      throw err instanceof OpfsLockError
+        ? err
+        : new OpfsLockError(err instanceof Error ? err.message : String(err), modelId);
+    }
     return null;
   }
 }
@@ -1835,13 +2027,15 @@ export async function streamUrlToVramBacking(
 
     // 1. Fast path: already verified & persisted in OPFS (full file or demand slab cache)
     if (useOpfs) {
-      const existingFull = await openOpfsModelBacking(modelId, options?.opfsDirectoryOverride);
+      const existingFull = await openOpfsModelBacking(modelId, options?.opfsDirectoryOverride, {
+        signal: options?.signal,
+      });
       if (existingFull) {
         options?.onProgress?.({
           receivedBytes: existingFull.byteLength,
           totalBytes: existingFull.byteLength,
           percent: 100,
-          backingKind: 'opfs-sync',
+          backingKind: existingFull.kind,
           stage: 'cached',
         });
         return existingFull;
@@ -1852,6 +2046,7 @@ export async function streamUrlToVramBacking(
         syncRangeFetcher: options?.syncRangeFetcherOverride,
         fetchFn: fetchImpl,
         upgradeLegacyOversizedSlabs: options?.demandSlabBytesOverride === undefined,
+        signal: options?.signal,
       });
       if (existingDemand) {
         await existingDemand.prewarmHeader(fetchImpl, options?.signal, options?.onProgress);
@@ -1903,7 +2098,11 @@ export async function streamUrlToVramBacking(
         }
 
         const existingMeta = await readPartMeta(dir, metaName);
-        const syncHandle = await activeHandle.createSyncAccessHandle();
+        const syncHandle = await openSyncAccessHandleWithRetry(activeHandle, {
+          mode: 'readwrite',
+          modelId,
+          signal: options?.signal,
+        });
         const stageBuf = new Uint8Array(OPFS_STREAM_CHUNK_BYTES);
         let stageLen = 0;
         let writtenOffset = 0;
@@ -1961,16 +2160,30 @@ export async function streamUrlToVramBacking(
           const idxName = `${base}.vram.idx`;
           const cacheFileHandle = (await dir.getFileHandle(cacheName, {
             create: true,
-          })) as FileSystemFileHandle & {
-            createSyncAccessHandle: () => Promise<SyncAccessHandleLike>;
-          };
+          })) as FileSystemFileHandle & SyncAccessHandleCapableFile;
           const idxFileHandle = (await dir.getFileHandle(idxName, {
             create: true,
-          })) as FileSystemFileHandle & {
-            createSyncAccessHandle: () => Promise<SyncAccessHandleLike>;
-          };
-          const cacheSync = await cacheFileHandle.createSyncAccessHandle();
-          const idxSync = await idxFileHandle.createSyncAccessHandle();
+          })) as FileSystemFileHandle & SyncAccessHandleCapableFile;
+          const cacheSync = await openSyncAccessHandleWithRetry(cacheFileHandle, {
+            mode: 'readwrite',
+            modelId,
+            signal: options?.signal,
+          });
+          let idxSync: SyncAccessHandleLike;
+          try {
+            idxSync = await openSyncAccessHandleWithRetry(idxFileHandle, {
+              mode: 'readwrite',
+              modelId,
+              signal: options?.signal,
+            });
+          } catch (err) {
+            try {
+              cacheSync.close();
+            } catch {
+              // Ignore duplicate close
+            }
+            throw err;
+          }
 
           const demandStore = new OpfsDemandVramBackingStore({
             modelId,
@@ -2552,10 +2765,13 @@ export async function streamFileToVramBacking(
         const fileName = sanitizeOpfsModelFileName(modelId);
         const incompleteMarkerName = `${fileName}.incomplete`;
         await dir.getFileHandle(incompleteMarkerName, { create: true });
-        const targetHandle = (await dir.getFileHandle(fileName, { create: true })) as FileSystemFileHandle & {
-          createSyncAccessHandle: () => Promise<SyncAccessHandleLike>;
-        };
-        const syncHandle = await targetHandle.createSyncAccessHandle();
+        const targetHandle = (await dir.getFileHandle(fileName, { create: true })) as FileSystemFileHandle &
+          SyncAccessHandleCapableFile;
+        const syncHandle = await openSyncAccessHandleWithRetry(targetHandle, {
+          mode: 'readwrite',
+          modelId,
+          signal,
+        });
         let handleClosed = false;
         const closeSafe = () => {
           if (!handleClosed) {
@@ -2769,6 +2985,7 @@ export async function deleteOpfsModel(
   dirOverride?: FileSystemDirectoryHandle,
 ): Promise<boolean> {
   return withModelOpfsLock(modelId, async () => {
+    requestOpfsHandleRelease(modelId);
     const dir = dirOverride ?? (await getOpfsVramDirectory(false));
     if (!dir) return false;
     const stem = sanitizeOpfsBaseName(modelId);
@@ -2781,6 +2998,7 @@ export async function deleteOpfsModel(
       `${base}.incomplete`,
       `${stem}.vram.cache`,
       `${stem}.vram.idx`,
+      `${stem}.unified.kv`,
     ]) {
       try {
         await dir.removeEntry(candidate);

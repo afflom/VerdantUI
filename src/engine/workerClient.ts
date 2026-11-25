@@ -243,6 +243,18 @@ export class LlamaVTensorWorkerClient {
   >();
 
   private state: EngineState;
+  private disposed = false;
+  private readonly handlePageUnload = (): void => {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.clearSpeculativeTimers();
+    try {
+      this.worker.postMessage({ type: 'shutdown' } satisfies WorkerRequest);
+    } catch {
+      // Ignore closed worker
+    }
+    this.worker.terminate();
+  };
 
   constructor() {
     const saved = loadSavedPrefs();
@@ -294,6 +306,13 @@ export class LlamaVTensorWorkerClient {
       });
     };
 
+    if (typeof window !== 'undefined') {
+      // Synchronously release OPFS SyncAccessHandles on page reload/navigation so the reloaded
+      // document never hits NoModificationAllowedError racing the old worker's teardown!
+      window.addEventListener('pagehide', this.handlePageUnload);
+      window.addEventListener('beforeunload', this.handlePageUnload);
+    }
+
     if (saved.precisionMode !== 'q8-vnni') {
       void this.updatePrecisionMode(saved.precisionMode).catch(() => {});
     }
@@ -320,6 +339,25 @@ export class LlamaVTensorWorkerClient {
    * otherwise initializes the internal offline bootstrap checkpoint silently.
    */
   async bootInitialModel(): Promise<LoadedModelSummary> {
+    // Avoid racing OPFS handle creation when coi-serviceworker.js is negotiating a one-shot
+    // COOP/COEP reload on first visit (prevents transient OPFS lock during reload handover).
+    if (typeof window !== 'undefined') {
+      const coiWin = window as unknown as {
+        __VERDANT_COI_RELOADING?: boolean;
+        __VERDANT_COI_PENDING?: boolean;
+      };
+      if (coiWin.__VERDANT_COI_PENDING && !coiWin.__VERDANT_COI_RELOADING) {
+        const deadline = Date.now() + 450;
+        while (coiWin.__VERDANT_COI_PENDING && !coiWin.__VERDANT_COI_RELOADING && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      }
+      if (coiWin.__VERDANT_COI_RELOADING) {
+        // Page is reloading into cross-origin isolation right now — don't lock OPFS!
+        return new Promise<LoadedModelSummary>(() => {});
+      }
+    }
+
     const storage = await this.refreshOpfsStorage().catch(() => INITIAL_OPFS_STORAGE);
     const cachedIds = computeCachedIds(storage);
     const lastId = readLastModelId();
@@ -1007,8 +1045,18 @@ export class LlamaVTensorWorkerClient {
   }
 
   dispose(): void {
+    this.disposed = true;
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('pagehide', this.handlePageUnload);
+      window.removeEventListener('beforeunload', this.handlePageUnload);
+    }
     this.clearSpeculativeTimers();
     this.cancelDownload();
+    try {
+      this.worker.postMessage({ type: 'shutdown' } satisfies WorkerRequest);
+    } catch {
+      // Ignore closed worker
+    }
     this.worker.terminate();
     this.listeners.clear();
     this.pending.clear();

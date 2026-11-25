@@ -9,10 +9,14 @@ import {
   MemoryBackingStore,
   OPFS_DEMAND_SLAB_BYTES,
   OpfsDemandVramBackingStore,
+  OpfsLockError,
   OpfsSyncBackingStore,
   coalesceTensorExtents,
   inspectOpfsVramStorage,
+  isOpfsLockError,
   openOpfsDemandModelBacking,
+  openOpfsModelBacking,
+  openSyncAccessHandleWithRetry,
   parseContentRangeHeader,
   sanitizeOpfsModelFileName,
   streamUrlToVramBacking,
@@ -887,4 +891,148 @@ test('parseGgufFromBackingAsync and LlamaVTensorRuntime.loadFromBackingAsync + g
     rtMem.unload();
     rtDemand.unload();
   }
+});
+
+test('OPFS SyncAccessHandle reload lock recovery, read-only committed reads, and zero handle leaks', async () => {
+  const validGguf = makeFakeGgufPayload(4096);
+
+  // 1. Transient NoModificationAllowedError (simulated page reload teardown) recovers transparently
+  let attempts = 0;
+  let observedMode: string | undefined;
+  let closed = false;
+  const transientHandle = {
+    createSyncAccessHandle: async (opts?: { mode?: 'read-only' | 'readwrite' | 'readwrite-unsafe' }) => {
+      observedMode = opts?.mode;
+      attempts += 1;
+      if (attempts <= 2) {
+        throw new DOMException(
+          'Access Handles cannot be created if there is another open Access Handle',
+          'NoModificationAllowedError',
+        );
+      }
+      return {
+        getSize: () => validGguf.byteLength,
+        read: (buf: ArrayBufferView, o?: { at?: number }) => {
+          const at = o?.at ?? 0;
+          const dst = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+          const n = Math.min(dst.byteLength, Math.max(0, validGguf.byteLength - at));
+          dst.set(validGguf.subarray(at, at + n), 0);
+          return n;
+        },
+        write: () => 0,
+        truncate: () => {},
+        flush: () => {},
+        close: () => {
+          closed = true;
+        },
+      };
+    },
+  };
+
+  const sync = await openSyncAccessHandleWithRetry(transientHandle, {
+    mode: 'read-only',
+    modelId: 'reload-test-model',
+    retryDelaysMs: [5, 5, 5],
+  });
+  assert.equal(attempts, 3, 'Expected retry after 2 transient lock failures');
+  assert.equal(observedMode, 'read-only', 'Committed read-only open must request mode: read-only');
+  assert.equal(sync.getSize(), validGguf.byteLength);
+  sync.close();
+  assert.equal(closed, true);
+
+  // 2. Older browser rejecting options bag with TypeError falls back cleanly to 0-arg createSyncAccessHandle()
+  let zeroArgFallbackCalled = false;
+  const legacyDir = {
+    async getFileHandle(name: string) {
+      if (name.endsWith('.incomplete')) throw new DOMException('Not found', 'NotFoundError');
+      return {
+        async createSyncAccessHandle(opts?: unknown) {
+          if (opts !== undefined) {
+            throw new TypeError('Unexpected options argument');
+          }
+          zeroArgFallbackCalled = true;
+          return {
+            getSize: () => validGguf.byteLength,
+            read: (buf: ArrayBufferView, o?: { at?: number }) => {
+              const at = o?.at ?? 0;
+              const dst = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+              const n = Math.min(dst.byteLength, Math.max(0, validGguf.byteLength - at));
+              dst.set(validGguf.subarray(at, at + n), 0);
+              return n;
+            },
+            write: () => 0,
+            truncate: () => {},
+            flush: () => {},
+            close: () => {},
+          };
+        },
+      };
+    },
+  } as unknown as FileSystemDirectoryHandle;
+
+  const backing = await openOpfsModelBacking('legacy-model', legacyDir, { retryDelaysMs: [5] });
+  assert.ok(backing !== null);
+  assert.equal(zeroArgFallbackCalled, true);
+  backing.close();
+
+  // 3. openOpfsDemandModelBacking closes syncCache (zero handle leak!) and throws OpfsLockError if syncIdx is locked
+  let cacheHandleClosed = false;
+  const idxMetaJson = JSON.stringify({
+    version: 1,
+    url: 'https://example.test/model.gguf',
+    totalBytes: 4096,
+    slabBytes: 1024,
+    maxSlots: 4,
+    slots: [[0, 0]],
+    updatedAt: Date.now(),
+  });
+  const lockedDemandDir = {
+    async getFileHandle(name: string) {
+      if (name.endsWith('.vram.idx')) {
+        return {
+          async getFile() {
+            return new Blob([idxMetaJson]);
+          },
+          async createSyncAccessHandle() {
+            throw new DOMException('File is locked by another handle', 'NoModificationAllowedError');
+          },
+        };
+      }
+      if (name.endsWith('.vram.cache')) {
+        return {
+          async createSyncAccessHandle() {
+            return {
+              getSize: () => 4096,
+              read: () => 0,
+              write: () => 0,
+              truncate: () => {},
+              flush: () => {},
+              close: () => {
+                cacheHandleClosed = true;
+              },
+            };
+          },
+        };
+      }
+      throw new DOMException('Not found', 'NotFoundError');
+    },
+  } as unknown as FileSystemDirectoryHandle;
+
+  await assert.rejects(
+    () =>
+      openOpfsDemandModelBacking('locked-demand-model', 'https://example.test/model.gguf', {
+        dirOverride: lockedDemandDir,
+        retryDelaysMs: [5, 5],
+      }),
+    (err: unknown) => {
+      assert.ok(err instanceof OpfsLockError);
+      assert.equal(isOpfsLockError(err), true);
+      return true;
+    },
+  );
+  assert.equal(
+    cacheHandleClosed,
+    true,
+    'openOpfsDemandModelBacking MUST close syncCache when syncIdx fails to prevent permanent OPFS lock leak',
+  );
 });

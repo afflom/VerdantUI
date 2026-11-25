@@ -633,7 +633,7 @@ export class VTensorBackendRegistry {
         computeGops: probe.computeGops,
         ridgeIntensityOpsPerByte: probe.ridgeIntensityOpsPerByte,
         workerSyncLatencyUs: this.threadPool?.isActive
-          ? Math.max(1.5, Math.min(8, this.threadPool.barrierLatencyUs))
+          ? Math.max(0.4, Math.min(8, this.threadPool.barrierLatencyUs))
           : 0,
         memoryBudgetBytes,
         calibrationMs: probe.calibrationMs,

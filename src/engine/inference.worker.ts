@@ -10,6 +10,7 @@ import {
 import { formatBytes } from './modelCatalog';
 import type { PrecisionContractMode } from './performanceContract';
 import {
+  OPFS_HANDOVER_CHANNEL_NAME,
   clearAllOpfsModels,
   deleteOpfsModel,
   inspectOpfsVramStorage,
@@ -17,6 +18,7 @@ import {
   streamUrlToVramBacking,
   type OpfsQuotaSnapshot,
   type VramBackingKind,
+  type VramBackingStore,
 } from './vramBackingStore';
 import type { WeightResidencyPolicy } from './vramWeightPager';
 import {
@@ -105,6 +107,9 @@ export type WorkerRequest =
       type: 'count_tokens';
       requestId: string;
       prompt: string;
+    }
+  | {
+      type: 'shutdown';
     };
 
 export type WorkerResponse =
@@ -184,7 +189,67 @@ const threadPoolReadyPromise = runtime.initThreadPool().catch(() => undefined);
 const activeControllers = new Map<string, AbortController>();
 let activeSpeculativeController: AbortController | null = null;
 let activeSpeculativePromise: Promise<void> | null = null;
+let activeLoadController: AbortController | null = null;
+let activeLoadPromise: Promise<void> | null = null;
 let activeGenerationCount = 0;
+
+const workerInstanceId =
+  typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `w-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+// Cross-tab / reload OPFS lease handover channel: if a newer reloading tab/worker requests
+// an OPFS file held by an idle older worker, immediately close our SyncAccessHandle!
+let opfsHandoverChannel: BroadcastChannel | null = null;
+if (typeof BroadcastChannel === 'function') {
+  try {
+    opfsHandoverChannel = new BroadcastChannel(OPFS_HANDOVER_CHANNEL_NAME);
+    opfsHandoverChannel.onmessage = (ev: MessageEvent<{ type?: string; senderId?: string; modelId?: string | null }>) => {
+      const msg = ev.data;
+      if (!msg || msg.type !== 'release-opfs' || msg.senderId === workerInstanceId) {
+        return;
+      }
+      if (activeGenerationCount > 0 || activeLoadController !== null) {
+        return;
+      }
+      const loaded = runtime.getModelSummary();
+      const holdsOpfs =
+        loaded !== null &&
+        (loaded.backingKind === 'opfs-sync' || loaded.backingKind === 'opfs-demand');
+      if (holdsOpfs && (!msg.modelId || msg.modelId === loaded.id)) {
+        runtime.unload();
+        try {
+          opfsHandoverChannel?.postMessage({
+            type: 'released',
+            senderId: workerInstanceId,
+            modelId: loaded.id,
+          });
+        } catch {
+          // Ignore closed channel
+        }
+      }
+    };
+  } catch {
+    opfsHandoverChannel = null;
+  }
+}
+
+/**
+ * Serializes model loads so rapid model switches never overlap OPFS handles or race runtime state.
+ * Aborts any in-flight load and waits for its OPFS handles to close cleanly before starting the next.
+ */
+async function preemptActiveLoad(): Promise<void> {
+  if (activeLoadController) {
+    activeLoadController.abort();
+  }
+  if (activeLoadPromise) {
+    try {
+      await activeLoadPromise;
+    } catch {
+      // Previous load cleaned up
+    }
+  }
+}
 
 const workerScope = self as unknown as DedicatedWorkerGlobalScope;
 
@@ -269,8 +334,25 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
   const req = event.data;
 
   try {
+    if (req.type === 'shutdown') {
+      if (activeSpeculativeController) activeSpeculativeController.abort();
+      if (activeLoadController) activeLoadController.abort();
+      for (const ctrl of activeControllers.values()) ctrl.abort();
+      activeControllers.clear();
+      runtime.unload();
+      runtime.disposeThreadPool();
+      try {
+        opfsHandoverChannel?.close();
+      } catch {
+        // Ignore
+      }
+      opfsHandoverChannel = null;
+      return;
+    }
+
     if (req.type === 'load_buffer') {
       await preemptSpeculativePrefill();
+      await preemptActiveLoad();
       await threadPoolReadyPromise;
       const summary = runtime.loadFromBuffer(
         req.id,
@@ -293,10 +375,19 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
 
     if (req.type === 'load_url') {
       await preemptSpeculativePrefill();
+      await preemptActiveLoad();
       await threadPoolReadyPromise;
       const controller = new AbortController();
       activeControllers.set(req.requestId, controller);
+      activeLoadController = controller;
       let modelUnloaded = false;
+      let acquiredBacking: VramBackingStore | null = null;
+      let committedToRuntime = false;
+      let finishLoad!: () => void;
+      const loadDone = new Promise<void>((resolve) => {
+        finishLoad = resolve;
+      });
+      activeLoadPromise = loadDone;
       try {
         // Release existing SyncAccessHandle only when reloading the exact same model ID
         if (runtime.getModelSummary()?.id === req.id) {
@@ -320,6 +411,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
             });
           },
         });
+        acquiredBacking = backing;
 
         post({
           type: 'progress',
@@ -332,6 +424,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         });
 
         const preStorage = await inspectOpfsVramStorage();
+        committedToRuntime = true;
         const summary = await runtime.loadFromBackingAsync(
           req.id,
           req.displayName,
@@ -365,6 +458,13 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           opfsStorage,
         });
       } catch (err) {
+        if (acquiredBacking && !committedToRuntime) {
+          try {
+            acquiredBacking.close();
+          } catch {
+            // Ignore duplicate close
+          }
+        }
         const opfsStorage = await inspectOpfsVramStorage().catch(() => undefined);
         const isAbort =
           (err instanceof DOMException && err.name === 'AbortError') ||
@@ -382,16 +482,28 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         });
       } finally {
         activeControllers.delete(req.requestId);
+        if (activeLoadController === controller) activeLoadController = null;
+        if (activeLoadPromise === loadDone) activeLoadPromise = null;
+        finishLoad();
       }
       return;
     }
 
     if (req.type === 'load_file') {
       await preemptSpeculativePrefill();
+      await preemptActiveLoad();
       await threadPoolReadyPromise;
       const controller = new AbortController();
       activeControllers.set(req.requestId, controller);
+      activeLoadController = controller;
       let modelUnloaded = false;
+      let acquiredBacking: VramBackingStore | null = null;
+      let committedToRuntime = false;
+      let finishLoad!: () => void;
+      const loadDone = new Promise<void>((resolve) => {
+        finishLoad = resolve;
+      });
+      activeLoadPromise = loadDone;
       try {
         if (runtime.getModelSummary()?.id === req.id) {
           runtime.unload();
@@ -414,6 +526,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           },
           controller.signal,
         );
+        acquiredBacking = backing;
 
         post({
           type: 'progress',
@@ -425,6 +538,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           backingKind: backing.kind,
         });
 
+        committedToRuntime = true;
         const summary = await runtime.loadFromBackingAsync(
           req.id,
           req.displayName,
@@ -458,6 +572,13 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           opfsStorage,
         });
       } catch (err) {
+        if (acquiredBacking && !committedToRuntime) {
+          try {
+            acquiredBacking.close();
+          } catch {
+            // Ignore duplicate close
+          }
+        }
         const opfsStorage = await inspectOpfsVramStorage().catch(() => undefined);
         const isAbort =
           (err instanceof DOMException && err.name === 'AbortError') ||
@@ -475,6 +596,9 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         });
       } finally {
         activeControllers.delete(req.requestId);
+        if (activeLoadController === controller) activeLoadController = null;
+        if (activeLoadPromise === loadDone) activeLoadPromise = null;
+        finishLoad();
       }
       return;
     }
@@ -729,10 +853,12 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       }
     }
   } catch (err) {
-    post({
-      type: 'error',
-      requestId: req.requestId,
-      message: err instanceof Error ? err.message : String(err),
-    });
+    if ('requestId' in req) {
+      post({
+        type: 'error',
+        requestId: req.requestId,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 };

@@ -110,6 +110,17 @@
       : new URL('./coi-serviceworker.js', document.baseURI || window.location.href).href;
 
   const triggerReload = (nextAttempt) => {
+    window.__VERDANT_COI_RELOADING = true;
+    window.__VERDANT_COI_PENDING = false;
+    try {
+      if (typeof BroadcastChannel === 'function') {
+        const ch = new BroadcastChannel('verdant-ui-opfs-v1');
+        ch.postMessage({ type: 'release-opfs', senderId: 'coi-bootstrap', modelId: null, ts: Date.now() });
+        ch.close();
+      }
+    } catch {
+      // Ignore restricted BroadcastChannel
+    }
     try {
       window.sessionStorage.setItem(STORAGE_KEY, String(nextAttempt));
     } catch {
@@ -118,6 +129,8 @@
     window.location.reload();
   };
 
+  window.__VERDANT_COI_PENDING = true;
+
   navigator.serviceWorker
     .register(swUrl)
     .then((registration) => {
@@ -125,7 +138,10 @@
         attempts === 1 ? COEP_MODE_REQUIRE_CORP : COEP_MODE_CREDENTIALLESS;
 
       const activateAndReload = (worker) => {
-        if (!worker) return;
+        if (!worker) {
+          window.__VERDANT_COI_PENDING = false;
+          return;
+        }
         worker.postMessage({ type: 'verdant-coi-set-mode', mode: targetMode });
         triggerReload(attempts + 1);
       };
@@ -146,11 +162,16 @@
         installing.addEventListener('statechange', () => {
           if (installing.state === 'activated') {
             activateAndReload(installing);
+          } else if (installing.state === 'redundant') {
+            window.__VERDANT_COI_PENDING = false;
           }
         });
+      } else {
+        window.__VERDANT_COI_PENDING = false;
       }
     })
     .catch(() => {
       // Non-fatal: runtime degrades cleanly if browser policy forbids service workers.
+      window.__VERDANT_COI_PENDING = false;
     });
 })();
