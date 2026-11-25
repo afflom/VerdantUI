@@ -43,6 +43,7 @@ import {
 import { detectChatTemplate, formatMessagesForLlama } from '../engine/assistantAdapter';
 import { isInternalBootstrapModel } from '../engine/modelCatalog';
 import {
+  createVerdantClientTools,
   findTierForModelId,
   recommendVerdantTier,
   resolveTierCatalogModel,
@@ -105,6 +106,14 @@ const SpeculativePrefillDriver: FC<{
   return null;
 };
 
+const METER_CLIENT_TOOL_SCHEMAS = createVerdantClientTools(() => ({
+  model: null,
+  telemetry: {} as never,
+  opfsStorage: { supported: false, usageBytes: 0, quotaBytes: 0, storedModels: [], partialModels: [] },
+  lastTokensPerSec: 0,
+  harnessMode: 'agentic',
+}));
+
 const ComposerContextMeter: FC<{
   engineState: EngineState;
   modelReady: boolean;
@@ -117,9 +126,10 @@ const ComposerContextMeter: FC<{
   const model = engineState.model;
   const maxCtx = model?.maxContextWindow ?? 0;
   const isBootstrapUnbound = isInternalBootstrapModel(model?.id);
-  const systemMessage =
-    engineState.importedHarness?.system ?? VERDANT_HARNESS_MODES[engineState.harnessMode].system;
+  const modeSpec = VERDANT_HARNESS_MODES[engineState.harnessMode];
+  const systemMessage = engineState.importedHarness?.system ?? modeSpec.system;
   const effectivePromptMode = engineState.importedHarness?.promptMode ?? engineState.promptMode;
+  const activeTools = modeSpec.enableTools ? METER_CLIENT_TOOL_SCHEMAS : undefined;
 
   useEffect(() => {
     if (!modelReady || !model || isBootstrapUnbound || !onCountTokens) {
@@ -152,6 +162,10 @@ const ComposerContextMeter: FC<{
         model,
         effectivePromptMode,
         systemMessage,
+        {
+          thinkingMode: modeSpec.thinkingPolicy,
+          tools: activeTools,
+        },
       );
       void onCountTokens(formatted)
         .then((res) => {
@@ -174,6 +188,8 @@ const ComposerContextMeter: FC<{
     isBootstrapUnbound,
     effectivePromptMode,
     systemMessage,
+    modeSpec.thinkingPolicy,
+    activeTools,
     onCountTokens,
   ]);
 

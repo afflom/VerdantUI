@@ -722,19 +722,20 @@ export function createVerdantClientTools(
 
 /**
  * Builds the official `@assistant-ui/react` `ModelContext` for the active Verdant Harness mode,
- * seamlessly composing an optional user-imported custom harness override when present.
+ * seamlessly composing live user sampling adjustments and an optional imported custom harness override.
  */
 export function buildVerdantModelContext(
   mode: VerdantHarnessMode,
   clientTools: Record<string, Tool<any, any>>,
   importedHarness: ImportedHarnessSpec | null,
+  samplingOverride?: { readonly temperature?: number; readonly topP?: number },
 ): ModelContext {
   const spec = VERDANT_HARNESS_MODES[mode];
   const baseContext: ModelContext = {
     system: spec.system,
     callSettings: {
-      temperature: spec.callSettings.temperature,
-      topP: spec.callSettings.topP,
+      temperature: samplingOverride?.temperature ?? spec.callSettings.temperature,
+      topP: samplingOverride?.topP ?? spec.callSettings.topP,
     },
     config: {
       reasoningEffort: spec.reasoningEffort,

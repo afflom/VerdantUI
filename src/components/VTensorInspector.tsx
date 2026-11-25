@@ -3,6 +3,7 @@ import { CheckCircle2, Play, RotateCcw, ShieldCheck, X, XCircle } from 'lucide-r
 import { formatBytes } from '../engine/modelCatalog';
 import type { SamplingConfig } from '../engine/llamaRuntime';
 import type { PrecisionContractMode } from '../engine/performanceContract';
+import { VERDANT_HARNESS_MODES } from '../engine/verdantHarness';
 import type { WeightResidencyPolicy } from '../engine/vramWeightPager';
 import type { EngineState, PromptFormatMode } from '../engine/workerClient';
 import { VTENSOR_CONTRACT } from '../engine/vtensorProvider';
@@ -836,13 +837,14 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
                 </div>
               </div>
               <p className="mt-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+                <strong className="font-medium text-slate-700 dark:text-slate-300">
+                  {VERDANT_HARNESS_MODES[engineState.harnessMode].label} mode
+                </strong>
+                {' · '}
+                {VERDANT_HARNESS_MODES[engineState.harnessMode].description}
                 {engineState.importedHarness
-                  ? `${engineState.importedHarness.name}${
-                      engineState.importedHarness.system
-                        ? ' · sets system message'
-                        : ' · no system message'
-                    }`
-                  : 'No harness loaded. Model runs unmodified with no injected system prompt.'}
+                  ? ` Custom override: ${engineState.importedHarness.name}.`
+                  : ''}
               </p>
             </div>
 

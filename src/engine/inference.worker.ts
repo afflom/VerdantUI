@@ -240,17 +240,21 @@ if (typeof BroadcastChannel === 'function') {
 
 /**
  * Serializes model loads so rapid model switches never overlap OPFS handles or race runtime state.
- * Aborts any in-flight load and waits for its OPFS handles to close cleanly before starting the next.
+ * Loops until no in-flight load owns the slot so concurrent back-to-back callers cannot race.
  */
 async function preemptActiveLoad(): Promise<void> {
-  if (activeLoadController) {
-    activeLoadController.abort();
-  }
-  if (activeLoadPromise) {
-    try {
-      await activeLoadPromise;
-    } catch {
-      // Previous load cleaned up
+  while (activeLoadController || activeLoadPromise) {
+    const ctrl = activeLoadController;
+    const pending = activeLoadPromise;
+    if (ctrl) ctrl.abort();
+    if (pending) {
+      try {
+        await pending;
+      } catch {
+        // Previous load cleaned up
+      }
+    } else {
+      break;
     }
   }
 }
@@ -267,14 +271,18 @@ function post(msg: WorkerResponse): void {
  * in the live vRAM KV pager and Unified Virtual Store!
  */
 async function preemptSpeculativePrefill(): Promise<void> {
-  if (activeSpeculativeController) {
-    activeSpeculativeController.abort();
-  }
-  if (activeSpeculativePromise) {
-    try {
-      await activeSpeculativePromise;
-    } catch {
-      // Ignore speculative abort/cancellation errors
+  while (activeSpeculativeController || activeSpeculativePromise) {
+    const ctrl = activeSpeculativeController;
+    const pending = activeSpeculativePromise;
+    if (ctrl) ctrl.abort();
+    if (pending) {
+      try {
+        await pending;
+      } catch {
+        // Ignore speculative abort/cancellation errors
+      }
+    } else {
+      break;
     }
   }
 }
@@ -284,14 +292,18 @@ async function preemptSpeculativePrefill(): Promise<void> {
  * NEVER interleaves two generators over the shared `kvPager` / `cachedTokens` / `scratch` state!
  */
 async function preemptActiveGeneration(): Promise<void> {
-  if (activeGenerationController) {
-    activeGenerationController.abort();
-  }
-  if (activeGenerationPromise) {
-    try {
-      await activeGenerationPromise;
-    } catch {
-      // Previous generation cleaned up
+  while (activeGenerationController || activeGenerationPromise) {
+    const ctrl = activeGenerationController;
+    const pending = activeGenerationPromise;
+    if (ctrl) ctrl.abort();
+    if (pending) {
+      try {
+        await pending;
+      } catch {
+        // Previous generation cleaned up
+      }
+    } else {
+      break;
     }
   }
 }
@@ -357,6 +369,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
   try {
     if (req.type === 'shutdown') {
       if (activeSpeculativeController) activeSpeculativeController.abort();
+      if (activeGenerationController) activeGenerationController.abort();
       if (activeLoadController) activeLoadController.abort();
       for (const ctrl of activeControllers.values()) ctrl.abort();
       activeControllers.clear();

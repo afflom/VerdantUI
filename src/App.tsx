@@ -23,6 +23,7 @@ const ModelManagerModal = lazy(() =>
 const VTensorInspector = lazy(() =>
   import('./components/VTensorInspector').then((m) => ({ default: m.VTensorInspector })),
 );
+import type { SamplingConfig } from './engine/llamaRuntime';
 import {
   buildVerdantModelContext,
   createVerdantClientTools,
@@ -56,8 +57,9 @@ function readInitialDarkMode(): boolean {
 const VerdantHarnessBridge: FC<{
   harnessMode: VerdantHarnessMode;
   importedHarness: ImportedHarnessSpec | null;
+  sampling: SamplingConfig;
   workerClient: LlamaVTensorWorkerClient;
-}> = ({ harnessMode, importedHarness, workerClient }) => {
+}> = ({ harnessMode, importedHarness, sampling, workerClient }) => {
   const aui = useAui();
   const clientTools = useMemo(
     () =>
@@ -75,11 +77,14 @@ const VerdantHarnessBridge: FC<{
   );
 
   useEffect(() => {
-    const context = buildVerdantModelContext(harnessMode, clientTools, importedHarness);
+    const context = buildVerdantModelContext(harnessMode, clientTools, importedHarness, {
+      temperature: sampling.temperature,
+      topP: sampling.topP,
+    });
     return aui.modelContext.register({
       getModelContext: () => context,
     });
-  }, [aui, harnessMode, clientTools, importedHarness]);
+  }, [aui, harnessMode, clientTools, importedHarness, sampling.temperature, sampling.topP]);
 
   return null;
 };
@@ -168,61 +173,116 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [mobileSidebarOpen, inspectorOpen]);
 
-  const openModelsModal = (tab: ModalViewTab = 'managed') => {
+  const openModelsModal = useCallback((tab: ModalViewTab = 'managed') => {
     setModelsModalTab(tab);
     setModelsModalOpen(true);
-  };
+  }, []);
 
-  const handleSelectCatalogModel = async (model: CatalogModel) => {
-    await workerClient.loadCatalogModel(model);
-  };
+  const handleOpenManagedModels = useCallback(() => {
+    openModelsModal('managed');
+  }, [openModelsModal]);
 
-  const handleSelectManagedTier = async (tierId: VerdantRuntimeTierId) => {
-    await workerClient.loadManagedTier(tierId);
-  };
+  const handleSelectCatalogModel = useCallback(
+    async (model: CatalogModel) => {
+      await workerClient.loadCatalogModel(model);
+    },
+    [workerClient],
+  );
 
-  const handleSelectHarnessMode = (mode: VerdantHarnessMode) => {
-    workerClient.setHarnessMode(mode);
-  };
+  const handleSelectManagedTier = useCallback(
+    (tierId: VerdantRuntimeTierId) => {
+      void workerClient.loadManagedTier(tierId).catch(() => {});
+    },
+    [workerClient],
+  );
 
-  const handleUploadLocalFile = async (file: File) => {
-    await workerClient.loadFromFile(file);
-  };
+  const handleSelectHarnessMode = useCallback(
+    (mode: VerdantHarnessMode) => {
+      workerClient.setHarnessMode(mode);
+    },
+    [workerClient],
+  );
 
-  const handleLoadCustomUrl = async (url: string) => {
-    const fileName = url.split('/').pop()?.replace(/\.gguf$/i, '') || 'Custom GGUF';
-    await workerClient.loadFromUrl(`custom-${Date.now()}`, fileName, url, false);
-  };
+  const handleUploadLocalFile = useCallback(
+    async (file: File) => {
+      await workerClient.loadFromFile(file);
+    },
+    [workerClient],
+  );
 
-  const handleImportHarness = (harness: ImportedHarnessSpec) => {
-    workerClient.setImportedHarness(harness);
-  };
+  const handleLoadCustomUrl = useCallback(
+    async (url: string) => {
+      const fileName = url.split('/').pop()?.replace(/\.gguf$/i, '') || 'Custom GGUF';
+      await workerClient.loadFromUrl(`custom-${Date.now()}`, fileName, url, false);
+    },
+    [workerClient],
+  );
 
-  const handleClearHarness = () => {
+  const handleImportHarness = useCallback(
+    (harness: ImportedHarnessSpec) => {
+      workerClient.setImportedHarness(harness);
+    },
+    [workerClient],
+  );
+
+  const handleClearHarness = useCallback(() => {
     workerClient.setImportedHarness(null);
-  };
+  }, [workerClient]);
 
-  const handleCancelDownload = () => {
+  const handleCancelDownload = useCallback(() => {
     workerClient.cancelDownload();
-  };
+  }, [workerClient]);
 
-  const handleDeleteCachedModel = async (modelId: string) => {
-    await workerClient.deleteCachedModel(modelId);
-  };
+  const handleRetryLoad = useCallback(() => {
+    void workerClient.retryLastLoad().catch(() => {});
+  }, [workerClient]);
 
-  const handleClearCache = async () => {
+  const handleDismissError = useCallback(() => {
+    workerClient.clearError();
+  }, [workerClient]);
+
+  const handleToggleInspector = useCallback(() => {
+    setInspectorOpen((prev) => !prev);
+  }, []);
+
+  const handleSpeculativeDraftChange = useCallback(
+    (
+      messages: Parameters<LlamaVTensorWorkerClient['scheduleSpeculativePrefill']>[0],
+      draft: string,
+      system?: string,
+      threadId?: string,
+    ) => {
+      workerClient.scheduleSpeculativePrefill(messages, draft, system, threadId);
+    },
+    [workerClient],
+  );
+
+  const handleCountTokens = useCallback(
+    (prompt: string) => workerClient.countTokens(prompt),
+    [workerClient],
+  );
+
+  const handleDeleteCachedModel = useCallback(
+    async (modelId: string) => {
+      await workerClient.deleteCachedModel(modelId);
+    },
+    [workerClient],
+  );
+
+  const handleClearCache = useCallback(async () => {
     await workerClient.clearModelCache();
-  };
+  }, [workerClient]);
 
-  const handleRunConformance = async () => {
+  const handleRunConformance = useCallback(async () => {
     await workerClient.runConformanceCheck();
-  };
+  }, [workerClient]);
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <VerdantHarnessBridge
         harnessMode={engineState.harnessMode}
         importedHarness={engineState.importedHarness}
+        sampling={engineState.sampling}
         workerClient={workerClient}
       />
       <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#F8F9FA] text-slate-900 dark:bg-[#0B0F14] dark:text-slate-100">
@@ -291,17 +351,15 @@ export default function App() {
           <main className="min-w-0 flex-1 overflow-hidden">
             <ThreadView
               engineState={engineState}
-              onOpenModels={() => openModelsModal('managed')}
+              onOpenModels={handleOpenManagedModels}
               onSelectHarnessMode={handleSelectHarnessMode}
-              onLoadManagedTier={(tierId) => void handleSelectManagedTier(tierId).catch(() => {})}
+              onLoadManagedTier={handleSelectManagedTier}
               onCancelDownload={handleCancelDownload}
-              onRetryLoad={() => void workerClient.retryLastLoad().catch(() => {})}
-              onDismissError={() => workerClient.clearError()}
-              onToggleInspector={() => setInspectorOpen((prev) => !prev)}
-              onSpeculativeDraftChange={(messages, draft, system, threadId) =>
-                workerClient.scheduleSpeculativePrefill(messages, draft, system, threadId)
-              }
-              onCountTokens={(prompt) => workerClient.countTokens(prompt)}
+              onRetryLoad={handleRetryLoad}
+              onDismissError={handleDismissError}
+              onToggleInspector={handleToggleInspector}
+              onSpeculativeDraftChange={handleSpeculativeDraftChange}
+              onCountTokens={handleCountTokens}
             />
           </main>
 

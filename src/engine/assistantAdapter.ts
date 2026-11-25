@@ -862,8 +862,11 @@ export function createLlamaVTensorAdapter(
       const systemMessage = context?.system;
       const baseWithHarness = {
         ...state.sampling,
-        topK: state.importedHarness?.topK ?? harnessSpec.topK,
-        repeatPenalty: state.importedHarness?.repeatPenalty ?? harnessSpec.repeatPenalty,
+        topK: state.importedHarness?.topK ?? state.sampling.topK ?? harnessSpec.topK,
+        repeatPenalty:
+          state.importedHarness?.repeatPenalty ??
+          state.sampling.repeatPenalty ??
+          harnessSpec.repeatPenalty,
       };
       const effectiveSampling = applyCallSettingsToSampling(
         baseWithHarness,
@@ -907,6 +910,7 @@ export function createLlamaVTensorAdapter(
       let firstTokenTime: number | undefined;
       let totalChunks = 0;
       let latestText = '';
+      let lastPromptTokens = 0;
       let lastGeneratedTokens = 0;
       let lastTokensPerSecond = 0;
 
@@ -922,6 +926,7 @@ export function createLlamaVTensorAdapter(
           }
           totalChunks += 1;
           latestText = event.accumulatedText;
+          lastPromptTokens = event.promptTokens;
           lastGeneratedTokens = event.generatedTokens;
           lastTokensPerSecond = event.tokensPerSecond;
 
@@ -982,7 +987,7 @@ export function createLlamaVTensorAdapter(
             steps: [
               {
                 usage: {
-                  inputTokens: 0,
+                  inputTokens: lastPromptTokens,
                   outputTokens: lastGeneratedTokens,
                 },
               },

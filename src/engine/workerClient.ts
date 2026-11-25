@@ -6,6 +6,7 @@
  */
 
 import type { ThreadMessage } from '@assistant-ui/react';
+import type { Tool } from 'assistant-stream';
 import { formatSpeculativePrefixForLlama } from './assistantAdapter';
 import {
   loadSavedHarness,
@@ -28,6 +29,7 @@ import {
 } from './modelCatalog';
 import {
   VERDANT_HARNESS_MODES,
+  createVerdantClientTools,
   loadSavedHarnessMode,
   resolveTierCatalogModel,
   saveHarnessMode,
@@ -242,6 +244,8 @@ export class LlamaVTensorWorkerClient {
   private speculativeTailTimer: ReturnType<typeof setTimeout> | null = null;
   private lastSpeculativePrompt = '';
   private activeSpeculativeThreadId: string | null = null;
+  private lastTokenStatePatchMs = 0;
+  private readonly speculativeTools: Record<string, Tool<any, any>>;
   private readonly listeners = new Set<Listener>();
   private readonly pending = new Map<
     string,
@@ -296,14 +300,21 @@ export class LlamaVTensorWorkerClient {
       conformanceRunning: false,
     };
 
+    this.speculativeTools = createVerdantClientTools(() => ({
+      model: this.state.model,
+      telemetry: this.state.telemetry,
+      opfsStorage: this.state.opfsStorage,
+      lastTokensPerSec: this.state.lastTokensPerSec,
+      harnessMode: this.state.harnessMode,
+    }));
+
     this.worker = new Worker(new URL('./inference.worker.ts', import.meta.url), {
       type: 'module',
     });
     this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
       this.handleWorkerMessage(event.data);
     };
-    this.worker.onerror = (err) => {
-      const errorMsg = err.message || 'Web Worker runtime error.';
+    const handleWorkerFailure = (errorMsg: string) => {
       this.activeLoadRequestId = null;
       for (const [, pendingEntry] of this.pending) {
         pendingEntry.reject(new Error(errorMsg));
@@ -317,6 +328,12 @@ export class LlamaVTensorWorkerClient {
         errorMessage: errorMsg,
         statusDetail: 'Worker error',
       });
+    };
+    this.worker.onerror = (err) => {
+      handleWorkerFailure(err.message || 'Web Worker runtime error.');
+    };
+    this.worker.onmessageerror = () => {
+      handleWorkerFailure('Web Worker message serialization error.');
     };
 
     if (typeof window !== 'undefined') {
@@ -492,9 +509,17 @@ export class LlamaVTensorWorkerClient {
   }
 
   resetSampling(): void {
-    savePrefs(DEFAULT_SAMPLING_CONFIG, 'auto', 'q8-vnni', 'auto');
+    const spec = VERDANT_HARNESS_MODES[this.state.harnessMode];
+    const nextSampling: SamplingConfig = {
+      ...DEFAULT_SAMPLING_CONFIG,
+      temperature: spec.callSettings.temperature,
+      topP: spec.callSettings.topP,
+      topK: spec.topK,
+      repeatPenalty: spec.repeatPenalty,
+    };
+    savePrefs(nextSampling, 'auto', 'q8-vnni', 'auto');
     this.patchState({
-      sampling: DEFAULT_SAMPLING_CONFIG,
+      sampling: nextSampling,
       promptMode: 'auto',
       precisionMode: 'q8-vnni',
       weightResidencyPolicy: 'auto',
@@ -633,13 +658,37 @@ export class LlamaVTensorWorkerClient {
   setHarnessMode(mode: VerdantHarnessMode): void {
     if (this.state.harnessMode === mode) return;
     saveHarnessMode(mode);
+    const spec = VERDANT_HARNESS_MODES[mode];
+    const imported = this.state.importedHarness;
+    const nextSampling: SamplingConfig = {
+      ...this.state.sampling,
+      temperature: imported?.callSettings?.temperature ?? spec.callSettings.temperature,
+      topP: imported?.callSettings?.topP ?? spec.callSettings.topP,
+      topK: imported?.topK ?? spec.topK,
+      repeatPenalty: imported?.repeatPenalty ?? spec.repeatPenalty,
+    };
+    savePrefs(
+      nextSampling,
+      this.state.promptMode,
+      this.state.precisionMode,
+      this.state.weightResidencyPolicy,
+    );
     this.clearSpeculativeTimers();
     this.lastSpeculativePrompt = '';
-    this.patchState({ harnessMode: mode });
+    this.patchState({
+      harnessMode: mode,
+      sampling: nextSampling,
+    });
   }
 
   async loadManagedTier(tierId: VerdantRuntimeTierId): Promise<LoadedModelSummary> {
     return this.loadCatalogModel(resolveTierCatalogModel(tierId));
+  }
+
+  private getActiveSpeculativeTools(): Record<string, Tool<any, any>> | undefined {
+    return VERDANT_HARNESS_MODES[this.state.harnessMode].enableTools
+      ? this.speculativeTools
+      : undefined;
   }
 
   /**
@@ -664,6 +713,7 @@ export class LlamaVTensorWorkerClient {
       systemMessage ??
       this.state.importedHarness?.system ??
       VERDANT_HARNESS_MODES[this.state.harnessMode].system;
+    const activeTools = this.getActiveSpeculativeTools();
     const stableWordDraft = trimToStableSpeculativePrefix(draftText, false);
     const fullDraft = trimToStableSpeculativePrefix(draftText, true);
 
@@ -673,6 +723,7 @@ export class LlamaVTensorWorkerClient {
       model,
       mode,
       systemPrompt,
+      { tools: activeTools },
     );
     if (wordPrompt && (wordPrompt !== this.lastSpeculativePrompt || threadId !== this.activeSpeculativeThreadId)) {
       const delayMs = draftText.trim().length === 0 ? 60 : 160;
@@ -689,6 +740,7 @@ export class LlamaVTensorWorkerClient {
         model,
         mode,
         systemPrompt,
+        { tools: activeTools },
       );
       if (tailPrompt && (tailPrompt !== this.lastSpeculativePrompt || threadId !== this.activeSpeculativeThreadId)) {
         this.speculativeTailTimer = setTimeout(() => {
@@ -746,14 +798,18 @@ export class LlamaVTensorWorkerClient {
         opfsStorage: msg.opfsStorage,
         cachedModelIds: computeCachedIds(msg.opfsStorage),
       });
-      // Warm initial prompt prefix for local/resident models (skip on network demand-paged models)
+      // Warm initial prompt prefix (including active harness system + Agentic <tools>) for local/resident models
       if (msg.summary.backingKind !== 'opfs-demand') {
+        const bootSystem =
+          this.state.importedHarness?.system ??
+          VERDANT_HARNESS_MODES[this.state.harnessMode].system;
         const bootPrefix = formatSpeculativePrefixForLlama(
           [],
           '',
           msg.summary,
           this.state.importedHarness?.promptMode ?? this.state.promptMode,
-          this.state.importedHarness?.system,
+          bootSystem,
+          { tools: this.getActiveSpeculativeTools() },
         );
         if (bootPrefix) {
           this.dispatchSpeculativePrefill(bootPrefix);
@@ -781,16 +837,28 @@ export class LlamaVTensorWorkerClient {
     }
 
     if (msg.type === 'token') {
-      this.patchState({
-        prefillProgress: null,
-        statusDetail: 'Generating response',
-        lastTokensPerSec: msg.event.tokensPerSecond,
-        lastGeneratedTokens: msg.event.generatedTokens,
-        lastPromptTokens: msg.event.promptTokens,
-        lastPromptTruncatedTokens: msg.event.promptTruncatedTokens ?? 0,
-        ...(msg.telemetry ? { telemetry: msg.telemetry } : {}),
-      });
+      // Deliver every token immediately to Assistant-UI's stream consumer with zero latency.
       entry.onToken?.(msg.event);
+      // Throttle top-level React App engineState re-renders to ~120ms so fast decode (50-150 tok/s)
+      // never saturates the main thread with redundant full-tree React reconciliation.
+      const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      const shouldPatchUi =
+        this.state.prefillProgress !== null ||
+        msg.telemetry !== undefined ||
+        msg.event.finished ||
+        nowMs - this.lastTokenStatePatchMs >= 120;
+      if (shouldPatchUi) {
+        this.lastTokenStatePatchMs = nowMs;
+        this.patchState({
+          prefillProgress: null,
+          statusDetail: 'Generating response',
+          lastTokensPerSec: msg.event.tokensPerSecond,
+          lastGeneratedTokens: msg.event.generatedTokens,
+          lastPromptTokens: msg.event.promptTokens,
+          lastPromptTruncatedTokens: msg.event.promptTruncatedTokens ?? 0,
+          ...(msg.telemetry ? { telemetry: msg.telemetry } : {}),
+        });
+      }
       return;
     }
 
@@ -1016,7 +1084,14 @@ export class LlamaVTensorWorkerClient {
     const queue: TokenStreamEvent[] = [];
     let notifyNext: (() => void) | null = null;
     let done = false;
+    let cancelSent = false;
     let streamError: Error | null = null;
+
+    const sendCancelOnce = () => {
+      if (cancelSent) return;
+      cancelSent = true;
+      this.worker.postMessage({ type: 'cancel', requestId } satisfies WorkerRequest);
+    };
 
     const wake = () => {
       if (notifyNext) {
@@ -1027,7 +1102,7 @@ export class LlamaVTensorWorkerClient {
     };
 
     const onAbort = () => {
-      this.worker.postMessage({ type: 'cancel', requestId } satisfies WorkerRequest);
+      sendCancelOnce();
       done = true;
       wake();
     };
@@ -1039,6 +1114,7 @@ export class LlamaVTensorWorkerClient {
 
     this.clearSpeculativeTimers();
     this.lastSpeculativePrompt = '';
+    this.lastTokenStatePatchMs = 0;
 
     this.patchState({
       status: 'generating',
@@ -1089,12 +1165,12 @@ export class LlamaVTensorWorkerClient {
     } finally {
       signal?.removeEventListener('abort', onAbort);
       if (this.pending.has(requestId)) {
-        this.worker.postMessage({ type: 'cancel', requestId } satisfies WorkerRequest);
+        sendCancelOnce();
         this.pending.delete(requestId);
         this.patchState({
           status: 'ready',
           prefillProgress: null,
-          statusDetail: 'Generation cancelled',
+          statusDetail: `${this.state.model?.displayName ?? 'Model'} ready`,
         });
       }
     }

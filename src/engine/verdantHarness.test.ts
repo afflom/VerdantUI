@@ -5,6 +5,7 @@ import path from 'node:path';
 import type { ThreadMessage } from '@assistant-ui/react';
 import {
   formatMessagesForLlama,
+  formatSpeculativePrefixForLlama,
   hasCompleteToolCallTag,
   isThinkingCapableModel,
   parseAssistantStreamParts,
@@ -345,15 +346,77 @@ test('buildVerdantModelContext and VERDANT_RUNTIME_TIERS orchestrate curated tie
   const agenticCtx = buildVerdantModelContext('agentic', clientTools, null);
   assert.ok(agenticCtx.tools && Object.keys(agenticCtx.tools).length === 5);
 
-  const overriddenCtx = buildVerdantModelContext('agentic', clientTools, {
-    id: 'test-harness',
-    importedAt: 0,
-    name: 'Custom Override',
-    sourceLabel: 'test.json',
-    system: 'Custom system prompt',
-    callSettings: { temperature: 0.1 },
-  });
+  const overriddenCtx = buildVerdantModelContext(
+    'agentic',
+    clientTools,
+    {
+      id: 'test-harness',
+      importedAt: 0,
+      name: 'Custom Override',
+      sourceLabel: 'test.json',
+      system: 'Custom system prompt',
+      callSettings: { temperature: 0.1 },
+    },
+    { temperature: 0.42, topP: 0.88 },
+  );
   assert.equal(overriddenCtx.system, 'Custom system prompt');
   assert.equal(overriddenCtx.callSettings?.temperature, 0.1);
+  assert.equal(overriddenCtx.callSettings?.topP, 0.88);
   assert.ok(overriddenCtx.tools && Object.keys(overriddenCtx.tools).length === 5);
+
+  const manualSliderCtx = buildVerdantModelContext('thinking', clientTools, null, {
+    temperature: 0.35,
+    topP: 0.77,
+  });
+  assert.equal(manualSliderCtx.callSettings?.temperature, 0.35);
+  assert.equal(manualSliderCtx.callSettings?.topP, 0.77);
+});
+
+test('Speculative prefill maintains 100% byte-prefix parity across Fast, Thinking, and Agentic modes (including <tools>)', () => {
+  const clientTools = createVerdantClientTools(() => ({
+    model: QWEN3_4B_SUMMARY,
+    telemetry: {} as never,
+    opfsStorage: { supported: true, usageBytes: 0, quotaBytes: 0, storedModels: [], partialModels: [] },
+    lastTokensPerSec: 0,
+    harnessMode: 'agentic',
+  }));
+
+  const draft = 'Calculate (144 * 37) + ';
+  const finalUserText = `${draft}sqrt(625)`;
+
+  for (const modeId of ['fast', 'thinking', 'agentic'] as const) {
+    const spec = VERDANT_HARNESS_MODES[modeId];
+    const tools = spec.enableTools ? clientTools : undefined;
+
+    const bootSpec = formatSpeculativePrefixForLlama([], '', QWEN3_4B_SUMMARY, 'auto', spec.system, {
+      tools,
+    });
+    const draftSpec = formatSpeculativePrefixForLlama(
+      [],
+      draft,
+      QWEN3_4B_SUMMARY,
+      'auto',
+      spec.system,
+      { tools },
+    );
+    const finalPrompt = formatMessagesForLlama(
+      [makeUserMsg(finalUserText)],
+      QWEN3_4B_SUMMARY,
+      'auto',
+      spec.system,
+      { thinkingMode: spec.thinkingPolicy, tools },
+    );
+
+    assert.ok(
+      finalPrompt.startsWith(bootSpec),
+      `Boot speculative prefix must be a strict byte prefix of final prompt in ${modeId} mode`,
+    );
+    assert.ok(
+      finalPrompt.startsWith(draftSpec),
+      `Draft speculative prefix must be a strict byte prefix of final prompt in ${modeId} mode`,
+    );
+    if (modeId === 'agentic') {
+      assert.ok(bootSpec.includes('<tools>'), 'Agentic boot warmup must prefill <tools> schemas');
+    }
+  }
 });
