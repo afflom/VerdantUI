@@ -1484,3 +1484,169 @@ test('deriveOptimalPoolWorkers avoids SMT spin-convoy saturation and OP_MOE_EXPE
   }
 });
 
+test('OP_MOE_EXPERTS_BATCH4 matches sequential Batch-4 MoE across dense (0b1111) and sparse masks and scales', async () => {
+  if (!isVerdantSharedWasmSupported()) return;
+  const availCpus = Math.max(1, os.cpus().length);
+  const targetWorkers = Math.min(4, availCpus);
+  if (targetWorkers < 2) return;
+
+  const dim = 2048;
+  const expFfnDim = 768;
+  const uniqueCount = 8;
+  const wType = GgmlType.Q4_K;
+  const rng = makeRng(40404);
+  const gateBytes = (weightRowByteSize(wType, dim) * expFfnDim + 63) & ~63;
+  const downBytes = (weightRowByteSize(wType, expFfnDim) * dim + 63) & ~63;
+  const layout4 = computeMoeWorkerScratchLayout(dim, expFfnDim, 4);
+  const totalBytes =
+    (gateBytes * 2 + downBytes) * uniqueCount + layout4.strideBytes * targetWorkers + 4 * 1024 * 1024;
+  const arena = new VerdantWasmArena({ initialPages: Math.ceil(totalBytes / 65536), shared: true });
+  const pool = await VTensorThreadPool.create(arena, { maxWorkers: targetWorkers, parallelThresholdBytes: 32 * 1024 });
+  assert.ok(pool && pool.isActive);
+
+  try {
+    const wGate = arena.allocRegion(gateBytes * uniqueCount);
+    const wUp = arena.allocRegion(gateBytes * uniqueCount);
+    const wDown = arena.allocRegion(downBytes * uniqueCount);
+    const bXPtr = arena.allocRegion(4 * dim * 4);
+    const qkDimStride = (dim >>> 8) * Q8_K_ACT_BLOCK_BYTES;
+    const qkFfnStride = (expFfnDim >>> 8) * Q8_K_ACT_BLOCK_BYTES;
+    const bQkDimPtr = arena.allocRegion(4 * qkDimStride);
+    const outSeqPtr = arena.allocRegion(4 * dim * 4);
+    const outParPtr = arena.allocRegion(4 * dim * 4);
+    const gateTmp = arena.allocRegion(4 * expFfnDim * 4);
+    const upTmp = arena.allocRegion(4 * expFfnDim * 4);
+    const hidTmp = arena.allocRegion(4 * expFfnDim * 4);
+    const qkFfnTmp = arena.allocRegion(4 * qkFfnStride);
+    const projTmp = arena.allocRegion(4 * dim * 4);
+    const workerScratch = arena.allocRegion(layout4.strideBytes * targetWorkers);
+
+    const bytes = arena.bytes();
+    for (const [base, len] of [
+      [wGate, gateBytes * uniqueCount],
+      [wUp, gateBytes * uniqueCount],
+      [wDown, downBytes * uniqueCount],
+    ] as const) {
+      const u32 = new Uint32Array(bytes.buffer, base, len >>> 2);
+      for (let i = 0; i < u32.length; i++) u32[i] = ((rng() * 0xffffffff) >>> 0) & 0x3bff3bff;
+    }
+    const xArr = new Float32Array(arena.memory.buffer, bXPtr, 4 * dim);
+    for (let i = 0; i < xArr.length; i++) xArr[i] = (rng() - 0.5) * 0.8;
+    for (let t = 0; t < 4; t++) {
+      arena.quantizeActivationQ8K(bXPtr + t * dim * 4, bQkDimPtr + t * qkDimStride, dim);
+    }
+
+    const gatePtrs = new Int32Array(uniqueCount);
+    const upPtrs = new Int32Array(uniqueCount);
+    const downPtrs = new Int32Array(uniqueCount);
+    // Mix of full 4-token hits (0b1111) and sparse 1..3-token masks
+    const masks = new Uint8Array([0b1111, 0b1111, 0b0101, 0b1010, 0b1110, 0b0001, 0b1111, 0b0111]);
+    const weights = new Float32Array(uniqueCount * 4);
+    for (let u = 0; u < uniqueCount; u++) {
+      gatePtrs[u] = wGate + u * gateBytes;
+      upPtrs[u] = wUp + u * gateBytes;
+      downPtrs[u] = wDown + u * downBytes;
+      for (let t = 0; t < 4; t++) {
+        weights[u * 4 + t] = (masks[u] & (1 << t)) !== 0 ? 0.05 + rng() * 0.25 : 0;
+      }
+    }
+
+    const runSeq = () => {
+      arena.kernels.zero_bytes(outSeqPtr, 4 * dim * 4);
+      for (let u = 0; u < uniqueCount; u++) {
+        const mask = masks[u];
+        if (mask === 15) {
+          arena.mulMatBatchQ8K(wType, gatePtrs[u], bQkDimPtr, bXPtr, gateTmp, dim, expFfnDim, 4);
+          arena.mulMatBatchQ8K(wType, upPtrs[u], bQkDimPtr, bXPtr, upTmp, dim, expFfnDim, 4);
+          arena.kernels.swiglu_f32(gateTmp, upTmp, hidTmp, 4 * expFfnDim);
+          for (let t = 0; t < 4; t++) {
+            arena.quantizeActivationQ8K(hidTmp + t * expFfnDim * 4, qkFfnTmp + t * qkFfnStride, expFfnDim);
+          }
+          arena.mulMatBatchQ8K(wType, downPtrs[u], qkFfnTmp, hidTmp, projTmp, expFfnDim, dim, 4);
+          for (let t = 0; t < 4; t++) {
+            arena.kernels.axpy_f32(outSeqPtr + t * dim * 4, projTmp + t * dim * 4, weights[u * 4 + t], dim);
+          }
+        } else {
+          for (let t = 0; t < 4; t++) {
+            if ((mask & (1 << t)) === 0) continue;
+            const tx = bXPtr + t * dim * 4;
+            const tq = bQkDimPtr + t * qkDimStride;
+            arena.mulMatQ8K(wType, gatePtrs[u], tq, tx, gateTmp, dim, expFfnDim);
+            arena.mulMatQ8K(wType, upPtrs[u], tq, tx, upTmp, dim, expFfnDim);
+            arena.kernels.swiglu_f32(gateTmp, upTmp, hidTmp, expFfnDim);
+            arena.quantizeActivationQ8K(hidTmp, qkFfnTmp, expFfnDim);
+            arena.mulMatQ8K(wType, downPtrs[u], qkFfnTmp, hidTmp, projTmp, expFfnDim, dim);
+            arena.kernels.axpy_f32(outSeqPtr + t * dim * 4, projTmp, weights[u * 4 + t], dim);
+          }
+        }
+      }
+    };
+
+    arena.attachThreadPool(null);
+    runSeq();
+
+    arena.attachThreadPool(pool);
+    const runPar = () => {
+      const ok = arena.dispatchMoeExpertsBatch4Parallel({
+        uniqueCount,
+        dim,
+        expFfnDim,
+        gateUpBatchOp: ParallelMatOp.MUL_MAT_BATCH4_Q8K,
+        gateUpSingleOp: ParallelMatOp.MUL_MAT_Q8K,
+        downBatchOp: ParallelMatOp.MUL_MAT_BATCH4_Q8K,
+        downSingleOp: ParallelMatOp.MUL_MAT_Q8K,
+        gateType: wType,
+        upType: wType,
+        downType: wType,
+        bXOrQ8Ptr: bQkDimPtr,
+        bXF32Ptr: bXPtr,
+        xQ8StrideBytes: qkDimStride,
+        outPtr: outParPtr,
+        workerScratchBase: workerScratch,
+        layout: layout4,
+        gatePtrs,
+        upPtrs,
+        downPtrs,
+        masks,
+        weights,
+      });
+      assert.equal(ok, true);
+    };
+    runPar();
+
+    const seqOut = new Float32Array(arena.memory.buffer, outSeqPtr, 4 * dim);
+    const parOut = new Float32Array(arena.memory.buffer, outParPtr, 4 * dim);
+    let maxDiff = 0;
+    for (let i = 0; i < 4 * dim; i++) {
+      assert.ok(Number.isFinite(parOut[i]), `Non-finite Batch4 MoE output at idx ${i}`);
+      const d = Math.abs(parOut[i] - seqOut[i]);
+      if (d > maxDiff) maxDiff = d;
+    }
+    assert.ok(maxDiff < 1e-4, `OP_MOE_EXPERTS_BATCH4 parity drift: maxDiff=${maxDiff}`);
+
+    const iters = 4;
+    arena.attachThreadPool(null);
+    runSeq();
+    const t0 = performance.now();
+    for (let i = 0; i < iters; i++) runSeq();
+    const seqMs = (performance.now() - t0) / iters;
+
+    arena.attachThreadPool(pool);
+    runPar();
+    const t1 = performance.now();
+    for (let i = 0; i < iters; i++) runPar();
+    const parMs = (performance.now() - t1) / iters;
+
+    const speedup = seqMs / Math.max(0.01, parMs);
+    console.log(
+      `[OP_MOE_EXPERTS_BATCH4 P=${pool.workerCount} Q4_K 8×mixed] ${speedup.toFixed(2)}x (${seqMs.toFixed(2)}ms -> ${parMs.toFixed(2)}ms, maxDiff=${maxDiff.toExponential(1)})`,
+    );
+    if (process.env.CI !== 'true') {
+      assert.ok(speedup > 1.5, `Expected OP_MOE_EXPERTS_BATCH4 speedup > 1.5x (got ${speedup.toFixed(2)}x)`);
+    }
+  } finally {
+    arena.attachThreadPool(null);
+    await pool.disposeAsync();
+  }
+});
+

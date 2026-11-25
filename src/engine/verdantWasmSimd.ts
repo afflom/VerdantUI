@@ -57,6 +57,7 @@ const WASM_PAGE_BYTES = 65_536;
 
 // WASM value types
 const I32 = 0x7f;
+const I64 = 0x7e;
 const F32 = 0x7d;
 const F64 = 0x7c;
 const V128 = 0x7b;
@@ -165,6 +166,7 @@ class FuncBuilder {
 
   // Constants
   i32Const(v: number): this { return this.emit(0x41, ...sleb(v)); }
+  i64Const(v: number): this { return this.emit(0x42, ...sleb(v)); }
   f32Const(v: number): this { return this.emit(0x43, ...f32Bytes(v)); }
   f64Const(v: number): this { return this.emit(0x44, ...f64Bytes(v)); }
 
@@ -190,6 +192,11 @@ class FuncBuilder {
   i32Shl(): this { return this.emit(0x74); }
   i32ShrS(): this { return this.emit(0x75); }
   i32ShrU(): this { return this.emit(0x76); }
+  i64Or(): this { return this.emit(0x84); }
+  i64Shl(): this { return this.emit(0x86); }
+  i64ShrU(): this { return this.emit(0x88); }
+  i32WrapI64(): this { return this.emit(0xa7); }
+  i64ExtendI32U(): this { return this.emit(0xad); }
 
   // f32 & f64 arithmetic
   f32Eq(): this { return this.emit(0x5b); }
@@ -5324,14 +5331,11 @@ function buildMulMatQ4KQ8K(useRelaxed: boolean): FuncBuilder {
   const u0 = f.local(I32);
   const u1 = f.local(I32);
   const u2 = f.local(I32);
-  const sc03_0 = f.local(I32);
-  const sc47_0 = f.local(I32);
-  const sc03_1 = f.local(I32);
-  const sc47_1 = f.local(I32);
-  const sc03_2 = f.local(I32);
-  const sc47_2 = f.local(I32);
-  const sc03_3 = f.local(I32);
-  const sc47_3 = f.local(I32);
+  // Pack 8x u8 scales per row into ONE 64-bit GPR (4 I64 locals instead of 8 I32 -> frees 4 x86-64 GPRs!)
+  const sc_0 = f.local(I64);
+  const sc_1 = f.local(I64);
+  const sc_2 = f.local(I64);
+  const sc_3 = f.local(I64);
   const mn03 = f.local(I32);
   const mn47 = f.local(I32);
   const accS = f.local(F32);
@@ -5357,25 +5361,25 @@ function buildMulMatQ4KQ8K(useRelaxed: boolean): FuncBuilder {
   f.get(nSuper).i32Const(144).i32Mul().set(rowBytes);
   f.i32Const(0).set(r);
 
-  // SWAR unpack scales into (sc03Loc, sc47Loc) and compute minDotV = dot(mins[0..7], bsums32V) into dstMinLoc
+  // SWAR unpack scales into packed i64 `sc64Loc` and compute minDotV = dot(mins[0..7], bsums32V) into dstMinLoc
   const unpackScalesAndMinDot = (
     wpLoc: number,
-    sc03Loc: number,
-    sc47Loc: number,
+    sc64Loc: number,
     bsums32Loc: number,
     dstMinLoc: number,
   ) => {
     f.get(wpLoc).i32Load(4).set(u0);
     f.get(wpLoc).i32Load(8).set(u1);
     f.get(wpLoc).i32Load(12).set(u2);
-    // sc03 = u0 & 0x3f3f3f3f; mn03 = u1 & 0x3f3f3f3f
-    f.get(u0).i32Const(0x3f3f3f3f).i32And().set(sc03Loc);
-    f.get(u1).i32Const(0x3f3f3f3f).i32And().set(mn03);
-    // sc47 = (u2 & 0x0f0f0f0f) | ((u0 >>> 2) & 0x30303030)
-    f.get(u2).i32Const(0x0f0f0f0f).i32And()
+    // sc03 = u0 & 0x3f3f3f3f; sc47 = (u2 & 0x0f0f0f0f) | ((u0 >>> 2) & 0x30303030)
+    // Pack into single i64 GPR: sc03 | (sc47 << 32)
+    f.get(u0).i32Const(0x3f3f3f3f).i32And().i64ExtendI32U()
+      .get(u2).i32Const(0x0f0f0f0f).i32And()
       .get(u0).i32Const(2).i32ShrU().i32Const(0x30303030).i32And()
-      .i32Or().set(sc47Loc);
-    // mn47 = ((u2 >>> 4) & 0x0f0f0f0f) | ((u1 >>> 2) & 0x30303030)
+      .i32Or().i64ExtendI32U().i64Const(32).i64Shl()
+      .i64Or().set(sc64Loc);
+    // mn03 = u1 & 0x3f3f3f3f; mn47 = ((u2 >>> 4) & 0x0f0f0f0f) | ((u1 >>> 2) & 0x30303030)
+    f.get(u1).i32Const(0x3f3f3f3f).i32And().set(mn03);
     f.get(u2).i32Const(4).i32ShrU().i32Const(0x0f0f0f0f).i32And()
       .get(u1).i32Const(2).i32ShrU().i32Const(0x30303030).i32And()
       .i32Or().set(mn47);
@@ -5385,13 +5389,14 @@ function buildMulMatQ4KQ8K(useRelaxed: boolean): FuncBuilder {
       .get(bsums32Loc).i32x4DotI16x8S().set(dstMinLoc);
   };
 
-  // Extract byte `k` (0..3) from packed scale i32 local and splat into i16x8 (for 1-op pmaddwd!)
-  const emitScaleSplat16 = (scWordLoc: number, byteIdx: number) => {
-    f.get(scWordLoc);
+  // Extract byte `k` (0..7) from packed i64 scale local and splat into i16x8 (for 1-op pmaddwd!)
+  const emitScaleSplat16 = (sc64Loc: number, byteIdx: number) => {
+    f.get(sc64Loc);
     if (byteIdx > 0) {
-      f.i32Const(byteIdx * 8).i32ShrU();
+      f.i64Const(byteIdx * 8).i64ShrU();
     }
-    if (byteIdx < 3) {
+    f.i32WrapI64();
+    if (byteIdx < 7) {
       f.i32Const(0xff).i32And();
     }
     f.i16x8Splat();
@@ -5399,14 +5404,12 @@ function buildMulMatQ4KQ8K(useRelaxed: boolean): FuncBuilder {
 
   const emitChunkRow = (
     wpLoc: number,
-    sc03Loc: number,
-    sc47Loc: number,
+    sc64Loc: number,
     sumiLoc: number,
     c: number,
   ) => {
     const qsBase = 16 + c * 32;
-    const scWord = c < 2 ? sc03Loc : sc47Loc;
-    const scLoIdx = (c & 1) * 2;
+    const scLoIdx = c * 2;
     const scHiIdx = scLoIdx + 1;
 
     f.get(wpLoc).v128Load(qsBase).set(raw0);
@@ -5418,7 +5421,7 @@ function buildMulMatQ4KQ8K(useRelaxed: boolean): FuncBuilder {
     f.get(raw1).get(mask0f).v128And().set(nib);
     f.pushDotI8I7ToI16x8(xhi0, nib, useRelaxed);
     f.i16x8Add();
-    emitScaleSplat16(scWord, scLoIdx);
+    emitScaleSplat16(sc64Loc, scLoIdx);
     f.i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
 
     // Sub-block 2c+1 (high nibbles): 2x vpmaddubsw -> i16x8.add -> 1x vpmaddwd(sc)!
@@ -5427,7 +5430,7 @@ function buildMulMatQ4KQ8K(useRelaxed: boolean): FuncBuilder {
     f.get(raw1).i32Const(4).i8x16ShrU().set(nib);
     f.pushDotI8I7ToI16x8(xhi1, nib, useRelaxed);
     f.i16x8Add();
-    emitScaleSplat16(scWord, scHiIdx);
+    emitScaleSplat16(sc64Loc, scHiIdx);
     f.i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
   };
 
@@ -5448,10 +5451,10 @@ function buildMulMatQ4KQ8K(useRelaxed: boolean): FuncBuilder {
   f.get(qp).f32Load(0).set(dxS);
   // Load bsums32[0..7] into xlo0 temporarily and fold all 4 rows' min terms into acc4 up front
   f.get(qp).v128Load(48, 4).set(xlo0);
-  unpackScalesAndMinDot(wp0, sc03_0, sc47_0, xlo0, sumi0);
-  unpackScalesAndMinDot(wp1, sc03_1, sc47_1, xlo0, sumi1);
-  unpackScalesAndMinDot(wp2, sc03_2, sc47_2, xlo0, sumi2);
-  unpackScalesAndMinDot(wp3, sc03_3, sc47_3, xlo0, sumi3);
+  unpackScalesAndMinDot(wp0, sc_0, xlo0, sumi0);
+  unpackScalesAndMinDot(wp1, sc_1, xlo0, sumi1);
+  unpackScalesAndMinDot(wp2, sc_2, xlo0, sumi2);
+  unpackScalesAndMinDot(wp3, sc_3, xlo0, sumi3);
   f.hsum4RowsI32x4(sumi0, sumi1, sumi2, sumi3, raw0, raw1, dotV);
   // acc4 -= f32x4(minSums4) * dmin4 * dxS
   f.f32Const(0).f32x4Splat()
@@ -5474,10 +5477,10 @@ function buildMulMatQ4KQ8K(useRelaxed: boolean): FuncBuilder {
     f.get(qp).v128Load(xBase + 32, 4).set(xlo1);
     f.get(qp).v128Load(xBase + 48, 4).set(xhi1);
 
-    emitChunkRow(wp0, sc03_0, sc47_0, sumi0, c);
-    emitChunkRow(wp1, sc03_1, sc47_1, sumi1, c);
-    emitChunkRow(wp2, sc03_2, sc47_2, sumi2, c);
-    emitChunkRow(wp3, sc03_3, sc47_3, sumi3, c);
+    emitChunkRow(wp0, sc_0, sumi0, c);
+    emitChunkRow(wp1, sc_1, sumi1, c);
+    emitChunkRow(wp2, sc_2, sumi2, c);
+    emitChunkRow(wp3, sc_3, sumi3, c);
   }
 
   // Encode to float ONCE per 256-element super-block for all 4 rows simultaneously!
@@ -5518,7 +5521,7 @@ function buildMulMatQ4KQ8K(useRelaxed: boolean): FuncBuilder {
   f.get(sb).get(nSuper).i32GeS().brIf(1);
   f.get(qp).f32Load(0).set(dxS);
   f.get(qp).v128Load(48, 4).set(xlo0);
-  unpackScalesAndMinDot(wp0, sc03_0, sc47_0, xlo0, sumi1);
+  unpackScalesAndMinDot(wp0, sc_0, xlo0, sumi1);
   f.i32Const(0).i32x4Splat().set(sumi0);
   for (let c = 0; c < 4; c++) {
     const xBase = 64 + c * 64;
@@ -5526,7 +5529,7 @@ function buildMulMatQ4KQ8K(useRelaxed: boolean): FuncBuilder {
     f.get(qp).v128Load(xBase + 16, 4).set(xhi0);
     f.get(qp).v128Load(xBase + 32, 4).set(xlo1);
     f.get(qp).v128Load(xBase + 48, 4).set(xhi1);
-    emitChunkRow(wp0, sc03_0, sc47_0, sumi0, c);
+    emitChunkRow(wp0, sc_0, sumi0, c);
   }
   f.loadF16AsF32(wp0, 0).hsumI32x4(sumi0).f32ConvertI32S().f32Mul()
     .loadF16AsF32(wp0, 2).hsumI32x4(sumi1).f32ConvertI32S().f32Mul()
@@ -5594,11 +5597,11 @@ function buildMulMatQ4KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
   f.get(5).set(oStride);
   f.i32Const(0).set(r);
 
-  const emitScaleSplat16 = (scWordLoc: number, byteIdx: number) => {
-    f.get(scWordLoc);
-    if (byteIdx > 0) f.i32Const(byteIdx * 8).i32ShrU();
-    if (byteIdx < 3) f.i32Const(0xff).i32And();
-    f.i16x8Splat().set(scV);
+  // Broadcast i16 lane `k` (0..7) from XMM `dotV` (holding sc[0..7]) in 1 single VPSHUFB (zero GPR->XMM stalls!)
+  const emitScaleShuffle16 = (laneIdx: number) => {
+    const lo = laneIdx * 2;
+    const hi = lo + 1;
+    f.get(dotV).get(dotV).i8x16Shuffle([lo, hi, lo, hi, lo, hi, lo, hi, lo, hi, lo, hi, lo, hi, lo, hi]).set(scV);
   };
 
   const emitTokSub = (qpLoc: number, xOff: number, sumiLoc: number) => {
@@ -5653,21 +5656,22 @@ function buildMulMatQ4KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
     .loadF16AsF32(wp, 2).f32x4Splat().get(dx4).f32x4Mul().f32x4Mul()
     .f32x4Sub().set(acc4);
 
+  // Pack all 8 scales into XMM `dotV` (dead during chunk loop) as i16x8 -> frees sc03/sc47 GPRs!
+  f.i32Const(0).i32x4Splat().get(sc03).i32x4ReplaceLane(0).get(sc47).i32x4ReplaceLane(1)
+    .i16x8ExtendLowI8x16U().set(dotV);
+
   f.i32Const(0).i32x4Splat().tee(sumi0).tee(sumi1).tee(sumi2).set(sumi3);
 
   for (let c = 0; c < 4; c++) {
     const qsBase = 16 + c * 32;
     const xBase = 64 + c * 64;
-    const scWord = c < 2 ? sc03 : sc47;
-    const scLoIdx = (c & 1) * 2;
-    const scHiIdx = scLoIdx + 1;
 
     f.get(wp).v128Load(qsBase).set(raw0);
     f.get(wp).v128Load(qsBase + 16).set(raw1);
 
     f.get(raw0).get(mask0f).v128And().set(wlo0);
     f.get(raw1).get(mask0f).v128And().set(wlo1);
-    emitScaleSplat16(scWord, scLoIdx);
+    emitScaleShuffle16(c * 2);
     emitTokSub(qp0, xBase, sumi0);
     emitTokSub(qp1, xBase, sumi1);
     emitTokSub(qp2, xBase, sumi2);
@@ -5675,7 +5679,7 @@ function buildMulMatQ4KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
 
     f.get(raw0).i32Const(4).i8x16ShrU().set(wlo0);
     f.get(raw1).i32Const(4).i8x16ShrU().set(wlo1);
-    emitScaleSplat16(scWord, scHiIdx);
+    emitScaleShuffle16(c * 2 + 1);
     emitTokSub(qp0, xBase + 32, sumi0);
     emitTokSub(qp1, xBase + 32, sumi1);
     emitTokSub(qp2, xBase + 32, sumi2);
@@ -6422,8 +6426,12 @@ function buildMulMatQ6KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
   for (let h = 0; h < 2; h++) {
     const qlBase = h * 64;
     const qhBase = 128 + h * 32;
-    const scBase = 192 + h * 8;
     const xHalf = 64 + h * 128;
+
+    // Extend 8 signed i8 scales for this half into `dotV` (dead during h-loop) -> 1-op VPSHUFB per sub-block!
+    f.get(wp).v128Load(192);
+    if (h === 0) f.i16x8ExtendLowI8x16S().set(dotV);
+    else f.i16x8ExtendHighI8x16S().set(dotV);
 
     for (let s = 0; s < 2; s++) {
       const sOff = s * 16;
@@ -6431,10 +6439,12 @@ function buildMulMatQ6KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
       f.get(wp).v128Load(qlBase + 32 + sOff).set(qlb);
       f.get(wp).v128Load(qhBase + sOff).set(qhv);
 
-      const emitGroup4 = (xOff: number, scOff: number, buildQ6: () => void) => {
+      const emitGroup4 = (xOff: number, scLane: number, buildQ6: () => void) => {
+        const lo = scLane * 2;
+        const hi = lo + 1;
         buildQ6();
         f.set(q6v);
-        f.get(wp).i32Load8S(scBase + scOff).i16x8Splat().set(scV);
+        f.get(dotV).get(dotV).i8x16Shuffle([lo, hi, lo, hi, lo, hi, lo, hi, lo, hi, lo, hi, lo, hi, lo, hi]).set(scV);
         emitTokQ6(qp0, xOff, sumi0);
         emitTokQ6(qp1, xOff, sumi1);
         emitTokQ6(qp2, xOff, sumi2);
@@ -6511,7 +6521,6 @@ function buildMulMatQ2KQ8K(useRelaxed: boolean): FuncBuilder {
   const wp3 = f.local(I32);
   const qp = f.local(I32);
   const sb = f.local(I32);
-  const scW = f.local(I32);
   const accS = f.local(F32);
   const dxS = f.local(F32);
 
@@ -6542,43 +6551,42 @@ function buildMulMatQ2KQ8K(useRelaxed: boolean): FuncBuilder {
       .i32x4Add().set(dstLoc);
   };
 
-  // SWAR 4-scale extract from `scW = (i32Load(off) & 0x0f0f0f0f)` (4x fewer scalar memory loads!)
-  const emitScaleSplatFromWord = (byteIdx: number) => {
-    f.get(scW);
-    if (byteIdx > 0) f.i32Const(byteIdx * 8).i32ShrU();
-    if (byteIdx < 3) f.i32Const(0xff).i32And();
-    f.i16x8Splat();
+  // XMM-domain scale broadcast: 1 single VPSHUFB per sub-block (zero scalar loads, zero GPR->XMM stalls!)
+  const emitScaleShuffle = (scHalfLoc: number, laneIdx: number) => {
+    const lo = laneIdx * 2;
+    const hi = lo + 1;
+    f.get(scHalfLoc).get(scHalfLoc).i8x16Shuffle([lo, hi, lo, hi, lo, hi, lo, hi, lo, hi, lo, hi, lo, hi, lo, hi]);
   };
 
-  // Accumulate all 16 sub-blocks of one row `wpLoc` into `sumiLoc` with SWAR scale loads
+  // Accumulate all 16 sub-blocks of one row `wpLoc` into `sumiLoc` purely in XMM domain
   const emitRowQ2 = (wpLoc: number, sumiLoc: number) => {
+    // Load all 16 4-bit scales once into dotV (dead during emitRowQ2), extend low/high halves into x1
+    f.get(wpLoc).v128Load(0).v128Const([15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15]).v128And().set(dotV);
     for (let h = 0; h < 2; h++) {
+      if (h === 0) f.get(dotV).i16x8ExtendLowI8x16U().set(x1);
+      else f.get(dotV).i16x8ExtendHighI8x16U().set(x1);
       f.get(wpLoc).v128Load(16 + h * 32).set(q0);
       f.get(wpLoc).v128Load(32 + h * 32).set(q1);
-      for (let pair = 0; pair < 2; pair++) {
-        // Load 4 sub-block low-nibble scales in ONE 32-bit SWAR load
-        f.get(wpLoc).i32Load(h * 8 + pair * 4).i32Const(0x0f0f0f0f).i32And().set(scW);
-        for (let sub = 0; sub < 2; sub++) {
-          const s = pair * 2 + sub;
-          const shift = s * 2;
-          const xOff = 64 + h * 128 + s * 32;
-          const b0 = sub * 2;
-          f.get(qp).v128Load(xOff, 4).set(x0);
-          f.get(q0);
-          if (shift > 0) f.i32Const(shift).i8x16ShrU();
-          f.get(mask03).v128And().set(qv);
-          f.pushDotI8I7ToI16x8(x0, qv, useRelaxed);
-          emitScaleSplatFromWord(b0);
-          f.i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
+      for (let s = 0; s < 4; s++) {
+        const shift = s * 2;
+        const xOff = 64 + h * 128 + s * 32;
+        f.get(qp).v128Load(xOff, 4).set(x0);
+        f.get(q0);
+        if (shift > 0) f.i32Const(shift).i8x16ShrU();
+        if (s < 3) f.get(mask03).v128And();
+        f.set(qv);
+        f.pushDotI8I7ToI16x8(x0, qv, useRelaxed);
+        emitScaleShuffle(x1, s * 2);
+        f.i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
 
-          f.get(qp).v128Load(xOff + 16, 4).set(x1);
-          f.get(q1);
-          if (shift > 0) f.i32Const(shift).i8x16ShrU();
-          f.get(mask03).v128And().set(qv);
-          f.pushDotI8I7ToI16x8(x1, qv, useRelaxed);
-          emitScaleSplatFromWord(b0 + 1);
-          f.i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
-        }
+        f.get(qp).v128Load(xOff + 16, 4).set(x0);
+        f.get(q1);
+        if (shift > 0) f.i32Const(shift).i8x16ShrU();
+        if (s < 3) f.get(mask03).v128And();
+        f.set(qv);
+        f.pushDotI8I7ToI16x8(x0, qv, useRelaxed);
+        emitScaleShuffle(x1, s * 2 + 1);
+        f.i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
       }
     }
   };
@@ -6766,18 +6774,24 @@ function buildMulMatQ2KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
 
   f.i32Const(0).i32x4Splat().tee(sumi0).tee(sumi1).tee(sumi2).set(sumi3);
 
+  // XMM-domain scale broadcast: extend 8 scales per half into `dotV` once, then 1-op VPSHUFB per sub-block
   for (let h = 0; h < 2; h++) {
+    f.get(wp).v128Load(0).v128Const([15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15]).v128And();
+    if (h === 0) f.i16x8ExtendLowI8x16U().set(dotV);
+    else f.i16x8ExtendHighI8x16U().set(dotV);
     f.get(wp).v128Load(16 + h * 32).set(q0);
     f.get(wp).v128Load(32 + h * 32).set(q1);
     for (let s = 0; s < 4; s++) {
       const shift = s * 2;
       const xOff = 64 + h * 128 + s * 32;
-      const scIdx0 = h * 8 + s * 2;
+      const l0 = s * 4;
+      const l1 = l0 + 2;
 
       f.get(q0);
       if (shift > 0) f.i32Const(shift).i8x16ShrU();
-      f.get(mask03).v128And().set(qv);
-      f.get(wp).i32Load8U(scIdx0).i32Const(0x0f).i32And().i16x8Splat().set(scV);
+      if (s < 3) f.get(mask03).v128And();
+      f.set(qv);
+      f.get(dotV).get(dotV).i8x16Shuffle([l0, l0 + 1, l0, l0 + 1, l0, l0 + 1, l0, l0 + 1, l0, l0 + 1, l0, l0 + 1, l0, l0 + 1, l0, l0 + 1]).set(scV);
       emitTokSub(qp0, xOff, sumi0);
       emitTokSub(qp1, xOff, sumi1);
       emitTokSub(qp2, xOff, sumi2);
@@ -6785,8 +6799,9 @@ function buildMulMatQ2KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
 
       f.get(q1);
       if (shift > 0) f.i32Const(shift).i8x16ShrU();
-      f.get(mask03).v128And().set(qv);
-      f.get(wp).i32Load8U(scIdx0 + 1).i32Const(0x0f).i32And().i16x8Splat().set(scV);
+      if (s < 3) f.get(mask03).v128And();
+      f.set(qv);
+      f.get(dotV).get(dotV).i8x16Shuffle([l1, l1 + 1, l1, l1 + 1, l1, l1 + 1, l1, l1 + 1, l1, l1 + 1, l1, l1 + 1, l1, l1 + 1, l1, l1 + 1]).set(scV);
       emitTokSub(qp0, xOff + 16, sumi0);
       emitTokSub(qp1, xOff + 16, sumi1);
       emitTokSub(qp2, xOff + 16, sumi2);
@@ -7625,17 +7640,18 @@ export interface MoeWorkerScratchLayout {
 export function computeMoeWorkerScratchLayout(
   dim: number,
   expFfnDim: number,
+  batchSize = 1,
 ): MoeWorkerScratchLayout {
+  const b = Math.max(1, batchSize | 0);
   const align64 = (n: number) => (n + 63) & ~63;
-  const ffnBytes = align64(expFfnDim * 4);
-  const dimBytes = align64(dim * 4);
-  const q8Bytes = align64(
-    Math.max(
-      Math.ceil(expFfnDim / 256) * Q8_K_ACT_BLOCK_BYTES,
-      Math.ceil(expFfnDim / 32) * Q8_0_ACT_BLOCK_BYTES,
-      64,
-    ),
+  const ffnBytes = align64(b * expFfnDim * 4);
+  const dimBytes = align64(b * dim * 4);
+  const q8PerTok = Math.max(
+    Math.ceil(expFfnDim / 256) * Q8_K_ACT_BLOCK_BYTES,
+    Math.ceil(expFfnDim / 32) * Q8_0_ACT_BLOCK_BYTES,
+    64,
   );
+  const q8Bytes = align64(b * q8PerTok);
   const offGateOut = 0;
   const offUpOut = offGateOut + ffnBytes;
   const offHid = offUpOut + ffnBytes;
@@ -7663,6 +7679,30 @@ export interface MoeExpertParallelDispatch {
   readonly gatePtrs: Int32Array;
   readonly upPtrs: Int32Array;
   readonly downPtrs: Int32Array;
+  readonly weights: Float32Array;
+}
+
+export interface MoeExpertBatch4ParallelDispatch {
+  readonly uniqueCount: number;
+  readonly dim: number;
+  readonly expFfnDim: number;
+  readonly gateUpBatchOp: ParallelMatOp;
+  readonly gateUpSingleOp: ParallelMatOp;
+  readonly downBatchOp: ParallelMatOp;
+  readonly downSingleOp: ParallelMatOp;
+  readonly gateType: GgmlType;
+  readonly upType: GgmlType;
+  readonly downType: GgmlType;
+  readonly bXOrQ8Ptr: number;
+  readonly bXF32Ptr: number;
+  readonly xQ8StrideBytes: number;
+  readonly outPtr: number;
+  readonly workerScratchBase: number;
+  readonly layout: MoeWorkerScratchLayout;
+  readonly gatePtrs: Int32Array;
+  readonly upPtrs: Int32Array;
+  readonly downPtrs: Int32Array;
+  readonly masks: Uint8Array | Int32Array;
   readonly weights: Float32Array;
 }
 
@@ -7694,6 +7734,10 @@ export interface VTensorThreadPoolLike {
   ): void;
   dispatchParallelMoeExperts(
     params: MoeExpertParallelDispatch,
+    kernels: VerdantSimdExports,
+  ): void;
+  dispatchParallelMoeExpertsBatch4(
+    params: MoeExpertBatch4ParallelDispatch,
     kernels: VerdantSimdExports,
   ): void;
   dispatchParallelFlashAttn(
@@ -9010,6 +9054,21 @@ export class VerdantWasmArena {
       return false;
     }
     pool.dispatchParallelMoeExperts(params, this.kernels);
+    return true;
+  }
+
+  /**
+   * Single-barrier Expert-Parallel 4-token Prefill Sparse MoE dispatch (`OP_MOE_EXPERTS_BATCH4`):
+   * Distributes all `uniqueCount` routed experts across all `P` cores in ONE barrier — using
+   * Batch-4 contractions when all 4 tokens hit an expert (`mask === 0b1111`) and L1-hot per-token
+   * contractions for sparse masks (`popcount(mask) ∈ {1,2,3}`), with SIMD reduction across cores!
+   */
+  dispatchMoeExpertsBatch4Parallel(params: MoeExpertBatch4ParallelDispatch): boolean {
+    const pool = this.threadPool;
+    if (!pool || !pool.isActive || params.uniqueCount < 2) {
+      return false;
+    }
+    pool.dispatchParallelMoeExpertsBatch4(params, this.kernels);
     return true;
   }
 

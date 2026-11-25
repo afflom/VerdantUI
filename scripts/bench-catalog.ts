@@ -268,6 +268,13 @@ function runBatch4DenseOrMoeLayer(
     ffnProjB4: number;
     expStrideGate: number;
     expStrideDown: number;
+    moeWorkerScratch: number;
+    moeBatch4Layout: MoeWorkerScratchLayout | null;
+    moeGatePtrs: Int32Array;
+    moeUpPtrs: Int32Array;
+    moeDownPtrs: Int32Array;
+    moeMasksB4: Uint8Array;
+    moeWeightsB4: Float32Array;
   },
 ): number {
   const B = 4;
@@ -320,6 +327,36 @@ function runBatch4DenseOrMoeLayer(
     for (let t = 0; t < B; t++) {
       arena.quantizeActivation(ptrs.xB4 + t * dim * 4, ptrs.q8B4 + t * qDimStride, dim);
     }
+  }
+
+  if (isMoe) {
+    const dispatched =
+      ptrs.moeBatch4Layout !== null &&
+      ptrs.moeWorkerScratch >= 0 &&
+      arena.dispatchMoeExpertsBatch4Parallel({
+        uniqueCount: activeExperts,
+        dim,
+        expFfnDim: ffnDim,
+        gateUpBatchOp: useQ8K ? ParallelMatOp.MUL_MAT_BATCH4_Q8K : ParallelMatOp.MUL_MAT_BATCH4_Q8,
+        gateUpSingleOp: useQ8K ? ParallelMatOp.MUL_MAT_Q8K : ParallelMatOp.MUL_MAT_Q8,
+        downBatchOp: ffnUseQ8K ? ParallelMatOp.MUL_MAT_BATCH4_Q8K : ParallelMatOp.MUL_MAT_BATCH4_Q8,
+        downSingleOp: ffnUseQ8K ? ParallelMatOp.MUL_MAT_Q8K : ParallelMatOp.MUL_MAT_Q8,
+        gateType: wType,
+        upType: wType,
+        downType: wType,
+        bXOrQ8Ptr: useQ8K ? ptrs.q8kB4 : ptrs.q8B4,
+        bXF32Ptr: ptrs.xB4,
+        xQ8StrideBytes: useQ8K ? qkDimStride : qDimStride,
+        outPtr: ptrs.ffnProjB4,
+        workerScratchBase: ptrs.moeWorkerScratch,
+        layout: ptrs.moeBatch4Layout,
+        gatePtrs: ptrs.moeGatePtrs,
+        upPtrs: ptrs.moeUpPtrs,
+        downPtrs: ptrs.moeDownPtrs,
+        masks: ptrs.moeMasksB4,
+        weights: ptrs.moeWeightsB4,
+      });
+    if (dispatched) return performance.now() - t0;
   }
 
   const nPasses = isMoe ? activeExperts : 1;
@@ -577,18 +614,23 @@ async function benchmarkModel(model: CatalogModel, workers: number): Promise<Cat
     const ffnProj = arena.allocRegion(dim * 4);
     const expProj = arena.allocRegion(dim * 4);
     const logitsTile = arena.allocRegion(lmTileRows * 4);
-    const moeLayout = g.isMoe ? computeMoeWorkerScratchLayout(dim, ffnDim) : null;
+    const moeLayout = g.isMoe ? computeMoeWorkerScratchLayout(dim, ffnDim, 1) : null;
+    const moeBatch4Layout = g.isMoe ? computeMoeWorkerScratchLayout(dim, ffnDim, 4) : null;
     const moeWorkerScratch =
-      moeLayout !== null ? arena.allocRegion(moeLayout.strideBytes * Math.max(1, workers)) : -1;
+      moeBatch4Layout !== null ? arena.allocRegion(moeBatch4Layout.strideBytes * Math.max(1, workers)) : -1;
     const moeGatePtrs = new Int32Array(activeExperts);
     const moeUpPtrs = new Int32Array(activeExperts);
     const moeDownPtrs = new Int32Array(activeExperts);
     const moeWeights = new Float32Array(activeExperts);
+    const moeMasksB4 = new Uint8Array(activeExperts);
+    const moeWeightsB4 = new Float32Array(activeExperts * 4);
     for (let e = 0; e < activeExperts; e++) {
       moeGatePtrs[e] = wGate + e * expStrideGate;
       moeUpPtrs[e] = wUp + e * expStrideGate;
       moeDownPtrs[e] = wDown + e * expStrideDown;
       moeWeights[e] = 1 / activeExperts;
+      moeMasksB4[e] = 0b1111;
+      for (let t = 0; t < 4; t++) moeWeightsB4[e * 4 + t] = 1 / activeExperts;
     }
 
     const xB4 = arena.allocRegion(4 * dim * 4);
@@ -616,6 +658,7 @@ async function benchmarkModel(model: CatalogModel, workers: number): Promise<Cat
     const b4Ptrs = {
       wQ, wK, wV, wO, wGate, wUp, wDown, xB4, q8B4, q8kB4, qB4, kB4, vB4,
       attnProjB4, ffnGateB4, ffnUpB4, ffnHidB4, q8FfnB4, q8kFfnB4, ffnProjB4, expStrideGate, expStrideDown,
+      moeWorkerScratch, moeBatch4Layout, moeGatePtrs, moeUpPtrs, moeDownPtrs, moeMasksB4, moeWeightsB4,
     };
 
     // Warmup all hot kernels (single-token, batch-4, and LM-head) across workers so TurboFan tiers up before timing

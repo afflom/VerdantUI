@@ -244,6 +244,7 @@ interface ScratchTensors {
   readonly moeExpertProj: VTensorHandle | null;
   readonly moeWorkerScratch: VTensorHandle | null;
   readonly moeWorkerScratchLayout: MoeWorkerScratchLayout | null;
+  readonly moeBatch4WorkerScratchLayout: MoeWorkerScratchLayout | null;
   readonly moeWorkerScratchSlots: number;
   // Shared packed Q8_0_ACT & Q8_K_ACT scratch vectors (amortized across Q/K/V and gate/up!)
   readonly q8Dim: VTensorHandle | null;
@@ -1418,13 +1419,17 @@ export class LlamaVTensorRuntime {
     const q8kFfnBytes = canQuantizeQ8KFfn ? (ffnDim >>> 8) * Q8_K_ACT_BLOCK_BYTES : 0;
 
     const moeWorkerScratchLayout =
-      moeExpertCount > 0 ? computeMoeWorkerScratchLayout(dim, ffnDim) : null;
+      moeExpertCount > 0 ? computeMoeWorkerScratchLayout(dim, ffnDim, 1) : null;
+    const moeBatch4WorkerScratchLayout =
+      moeExpertCount > 0 ? computeMoeWorkerScratchLayout(dim, ffnDim, B) : null;
     const moeWorkerScratchSlots =
       moeExpertCount > 0
         ? Math.max(1, Math.min(16, this.backend.activeThreadPool?.workerCount ?? 1))
         : 0;
     const moeWorkerScratchBytes =
-      moeWorkerScratchLayout !== null ? moeWorkerScratchLayout.strideBytes * moeWorkerScratchSlots : 0;
+      moeBatch4WorkerScratchLayout !== null
+        ? moeBatch4WorkerScratchLayout.strideBytes * moeWorkerScratchSlots
+        : 0;
 
     const scratchCapacity =
       alignUp32(dim * 4) * 5 +
@@ -1477,6 +1482,7 @@ export class LlamaVTensorRuntime {
           ? computeBuffer.allocTensor('act.moe_worker_scratch', GgmlType.I8, [moeWorkerScratchBytes])
           : null,
       moeWorkerScratchLayout,
+      moeBatch4WorkerScratchLayout,
       moeWorkerScratchSlots,
       q8Dim: q8DimBytes > 0 ? computeBuffer.allocTensor('act.q8_dim', GgmlType.I8, [q8DimBytes]) : null,
       q8AttnOut:
@@ -1622,6 +1628,10 @@ export class LlamaVTensorRuntime {
     const moeBatchExpIds = new Int32Array(moeBatchMaxUnique);
     const moeBatchExpMask = new Uint8Array(moeBatchMaxUnique);
     const moeBatchExpWeights = new Float64Array(moeBatchMaxUnique * PREFILL_BATCH_SIZE);
+    const moeBatchGatePtrs = new Int32Array(moeBatchMaxUnique);
+    const moeBatchUpPtrs = new Int32Array(moeBatchMaxUnique);
+    const moeBatchDownPtrs = new Int32Array(moeBatchMaxUnique);
+    const moeBatchWeightsF32 = new Float32Array(moeBatchMaxUnique * PREFILL_BATCH_SIZE);
 
     const routeTopKFromLogits = (rLogits: Float32Array, nExperts: number, kUsed: number): void => {
       let maxL = Number.NEGATIVE_INFINITY;
@@ -2135,6 +2145,99 @@ export class LlamaVTensorRuntime {
 
       const bFfnProjPtr = useWasm && bs.ffnProj.buffer.isWasmBacked ? bs.ffnProj.buffer.wasmPtr(bs.ffnProj) : -1;
       const outAll = bs.ffnProj.buffer.f32View(bs.ffnProj);
+
+      // Fast path: Single-barrier Expert-Parallel Batch-4 Sparse MoE (`OP_MOE_EXPERTS_BATCH4`)
+      // Cuts 16-48 sequential barriers per MoE prefill layer down to ONE barrier!
+      const pool = b.activeThreadPool;
+      if (
+        useWasm &&
+        arena &&
+        bFfnProjPtr >= 0 &&
+        pool &&
+        pool.isActive &&
+        uniqueCount >= 2 &&
+        uniqueCount <= 32 &&
+        s.moeWorkerScratch &&
+        s.moeBatch4WorkerScratchLayout &&
+        s.moeWorkerScratch.buffer.isWasmBacked &&
+        s.moeWorkerScratchSlots >= Math.min(pool.workerCount, uniqueCount)
+      ) {
+        let allWasm = true;
+        let sameTypes = true;
+        let gType: GgmlType = expGateType;
+        let uType: GgmlType = expUpType;
+        let dType: GgmlType = expDownType;
+        for (let u = 0; u < uniqueCount; u++) {
+          const exp = wp.acquireExpertSlice(layerIdx, moeBatchExpIds[u]);
+          if (
+            !exp.gate.buffer.isWasmBacked ||
+            !exp.up.buffer.isWasmBacked ||
+            !exp.down.buffer.isWasmBacked
+          ) {
+            allWasm = false;
+            break;
+          }
+          if (u === 0) {
+            gType = exp.gate.type;
+            uType = exp.up.type;
+            dType = exp.down.type;
+          } else if (exp.gate.type !== gType || exp.up.type !== uType || exp.down.type !== dType) {
+            sameTypes = false;
+            break;
+          }
+          moeBatchGatePtrs[u] = exp.gate.buffer.wasmPtr(exp.gate);
+          moeBatchUpPtrs[u] = exp.up.buffer.wasmPtr(exp.up);
+          moeBatchDownPtrs[u] = exp.down.buffer.wasmPtr(exp.down);
+          const wBase = u * B4;
+          moeBatchWeightsF32[wBase + 0] = moeBatchExpWeights[wBase + 0];
+          moeBatchWeightsF32[wBase + 1] = moeBatchExpWeights[wBase + 1];
+          moeBatchWeightsF32[wBase + 2] = moeBatchExpWeights[wBase + 2];
+          moeBatchWeightsF32[wBase + 3] = moeBatchExpWeights[wBase + 3];
+        }
+        if (allWasm && sameTypes) {
+          const dispatched = arena.dispatchMoeExpertsBatch4Parallel({
+            uniqueCount,
+            dim,
+            expFfnDim,
+            gateUpBatchOp: expInQ8K
+              ? ParallelMatOp.MUL_MAT_BATCH4_Q8K
+              : expInQ8
+                ? ParallelMatOp.MUL_MAT_BATCH4_Q8
+                : ParallelMatOp.MUL_MAT_BATCH4,
+            gateUpSingleOp: expInQ8K
+              ? ParallelMatOp.MUL_MAT_Q8K
+              : expInQ8
+                ? ParallelMatOp.MUL_MAT_Q8
+                : ParallelMatOp.MUL_MAT,
+            downBatchOp: expDownQ8K
+              ? ParallelMatOp.MUL_MAT_BATCH4_Q8K
+              : expDownQ8
+                ? ParallelMatOp.MUL_MAT_BATCH4_Q8
+                : ParallelMatOp.MUL_MAT_BATCH4,
+            downSingleOp: expDownQ8K
+              ? ParallelMatOp.MUL_MAT_Q8K
+              : expDownQ8
+                ? ParallelMatOp.MUL_MAT_Q8
+                : ParallelMatOp.MUL_MAT,
+            gateType: gType,
+            upType: uType,
+            downType: dType,
+            bXOrQ8Ptr: expInQ8K ? bQkDimPtr : expInQ8 ? bQDimPtr : bXNormPtr,
+            bXF32Ptr: bXNormPtr,
+            xQ8StrideBytes: expInQ8K ? qkDimStride : expInQ8 ? qDimStride : xStrideBytes,
+            outPtr: bFfnProjPtr,
+            workerScratchBase: s.moeWorkerScratch.buffer.wasmPtr(s.moeWorkerScratch),
+            layout: s.moeBatch4WorkerScratchLayout,
+            gatePtrs: moeBatchGatePtrs,
+            upPtrs: moeBatchUpPtrs,
+            downPtrs: moeBatchDownPtrs,
+            masks: moeBatchExpMask,
+            weights: moeBatchWeightsF32,
+          });
+          if (dispatched) return;
+        }
+      }
+
       if (useWasm && arena && bFfnProjPtr >= 0) {
         arena.kernels.zero_bytes(bFfnProjPtr, B4 * dim * 4);
       } else {

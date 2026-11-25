@@ -18,11 +18,14 @@ import { GgmlType } from './gguf';
 import {
   executeWasmMatStripe,
   ParallelMatOp,
+  Q8_0_ACT_BLOCK_BYTES,
+  Q8_K_ACT_BLOCK_BYTES,
   VerdantWasmArena,
   WASM_ATTN_WORKER_SCRATCH_BASE,
   WASM_ATTN_WORKER_SCRATCH_STRIDE,
   weightRowByteSize,
   type MatGroupEntry,
+  type MoeExpertBatch4ParallelDispatch,
   type MoeExpertParallelDispatch,
   type VerdantSimdExports,
   type VTensorThreadPoolLike,
@@ -70,9 +73,11 @@ export const OP_GROUP_DISPATCH = 50;
 export const OP_PING = 51;
 export const OP_FLASH_ATTN_RANGE = 52;
 export const OP_MOE_EXPERTS = 53;
+export const OP_MOE_EXPERTS_BATCH4 = 54;
 export const OP_SHUTDOWN = 99;
 export const MAX_POOL_WORKERS = 32;
 export const MAX_MOE_ACTIVE_EXPERTS = 16;
+export const MAX_MOE_BATCH4_EXPERTS = 32;
 /** 26-int FlashAttention descriptor overlaid onto indices 16..41 (strictly < WORKER_SLOT_BASE = 48). */
 export const ATTN_DESC_BASE = GROUP_DESC_BASE;
 /** Dedicated single-barrier Expert-Parallel MoE descriptor placed cleanly after all worker slots. */
@@ -80,7 +85,14 @@ export const MOE_DESC_BASE = WORKER_SLOT_BASE + MAX_POOL_WORKERS * WORKER_SLOT_S
 export const MOE_HDR_COUNT = 19; // header ints at MOE_DESC_BASE + 0..18
 export const MOE_EXPERT_LIST_BASE = MOE_DESC_BASE + MOE_HDR_COUNT; // 579
 export const MOE_EXPERT_STRIDE = 4; // [gatePtr, upPtr, downPtr, weightF32Bits]
-export const CTRL_TOTAL_INTS = MOE_EXPERT_LIST_BASE + MAX_MOE_ACTIVE_EXPERTS * MOE_EXPERT_STRIDE + 16;
+export const MOE_B4_HDR_COUNT = 22; // header ints at MOE_DESC_BASE + 0..21
+export const MOE_B4_EXPERT_LIST_BASE = MOE_DESC_BASE + MOE_B4_HDR_COUNT; // 582
+export const MOE_B4_EXPERT_STRIDE = 8; // [gatePtr, upPtr, downPtr, mask, w0Bits, w1Bits, w2Bits, w3Bits]
+export const CTRL_TOTAL_INTS =
+  Math.max(
+    MOE_EXPERT_LIST_BASE + MAX_MOE_ACTIVE_EXPERTS * MOE_EXPERT_STRIDE,
+    MOE_B4_EXPERT_LIST_BASE + MAX_MOE_BATCH4_EXPERTS * MOE_B4_EXPERT_STRIDE,
+  ) + 16;
 
 const moeF32Buf = new ArrayBuffer(4);
 const moeF32View = new Float32Array(moeF32Buf);
@@ -172,6 +184,97 @@ function runMoeWorkerSlice(
   }
 }
 
+function runMoeBatch4WorkerSlice(
+  kernels: VerdantSimdExports,
+  ctrl: Int32Array,
+  threadId: number,
+): void {
+  const m = MOE_DESC_BASE;
+  const uniqueCount = ctrl[m + 0];
+  const activeThreads = ctrl[m + 21];
+  if (threadId >= uniqueCount || threadId >= activeThreads) return;
+
+  const dim = ctrl[m + 1];
+  const expFfnDim = ctrl[m + 2];
+  const gateUpBatchOp = ctrl[m + 3] as ParallelMatOp;
+  const gateUpSingleOp = ctrl[m + 4] as ParallelMatOp;
+  const downBatchOp = ctrl[m + 5] as ParallelMatOp;
+  const downSingleOp = ctrl[m + 6] as ParallelMatOp;
+  const gateType = ctrl[m + 7] as GgmlType;
+  const upType = ctrl[m + 8] as GgmlType;
+  const downType = ctrl[m + 9] as GgmlType;
+  const bXOrQ8Ptr = ctrl[m + 10] >>> 0;
+  const bXF32Ptr = ctrl[m + 11] >>> 0;
+  const xQ8Stride = ctrl[m + 12];
+  const scratchBase = (ctrl[m + 13] >>> 0) + threadId * ctrl[m + 14];
+  const gateOutPtr = scratchBase + ctrl[m + 15];
+  const upOutPtr = scratchBase + ctrl[m + 16];
+  const hidPtr = scratchBase + ctrl[m + 17];
+  const q8FfnPtr = scratchBase + ctrl[m + 18];
+  const expProjPtr = scratchBase + ctrl[m + 19];
+  const accumPtr = scratchBase + ctrl[m + 20];
+
+  const gateStride = expFfnDim * 4;
+  const dimStride = dim * 4;
+  const q8FfnStride =
+    downSingleOp === ParallelMatOp.MUL_MAT_Q8K
+      ? (expFfnDim >>> 8) * Q8_K_ACT_BLOCK_BYTES
+      : (expFfnDim >>> 5) * Q8_0_ACT_BLOCK_BYTES;
+
+  kernels.zero_bytes(accumPtr, 4 * dimStride);
+
+  for (let u = threadId; u < uniqueCount; u += activeThreads) {
+    const eBase = MOE_B4_EXPERT_LIST_BASE + u * MOE_B4_EXPERT_STRIDE;
+    const gateWPtr = ctrl[eBase + 0] >>> 0;
+    const upWPtr = ctrl[eBase + 1] >>> 0;
+    const downWPtr = ctrl[eBase + 2] >>> 0;
+    const mask = ctrl[eBase + 3];
+
+    if (mask === 15) {
+      executeWasmMatStripe(kernels, gateUpBatchOp, gateType, gateWPtr, bXOrQ8Ptr, bXF32Ptr, gateOutPtr, dim, expFfnDim, gateStride);
+      executeWasmMatStripe(kernels, gateUpBatchOp, upType, upWPtr, bXOrQ8Ptr, bXF32Ptr, upOutPtr, dim, expFfnDim, gateStride);
+      kernels.swiglu_f32(gateOutPtr, upOutPtr, hidPtr, 4 * expFfnDim);
+      if (downBatchOp === ParallelMatOp.MUL_MAT_BATCH4_Q8K) {
+        for (let t = 0; t < 4; t++) {
+          kernels.quantize_f32_to_q8_k(hidPtr + t * gateStride, q8FfnPtr + t * q8FfnStride, expFfnDim);
+        }
+        executeWasmMatStripe(kernels, downBatchOp, downType, downWPtr, q8FfnPtr, hidPtr, expProjPtr, expFfnDim, dim, dimStride);
+      } else if (downBatchOp === ParallelMatOp.MUL_MAT_BATCH4_Q8) {
+        for (let t = 0; t < 4; t++) {
+          kernels.quantize_f32_to_q8_0(hidPtr + t * gateStride, q8FfnPtr + t * q8FfnStride, expFfnDim);
+        }
+        executeWasmMatStripe(kernels, downBatchOp, downType, downWPtr, q8FfnPtr, hidPtr, expProjPtr, expFfnDim, dim, dimStride);
+      } else {
+        executeWasmMatStripe(kernels, downBatchOp, downType, downWPtr, hidPtr, hidPtr, expProjPtr, expFfnDim, dim, dimStride);
+      }
+      for (let t = 0; t < 4; t++) {
+        const w = i32BitsToF32(ctrl[eBase + 4 + t]);
+        kernels.axpy_f32(accumPtr + t * dimStride, expProjPtr + t * dimStride, w, dim);
+      }
+    } else {
+      for (let t = 0; t < 4; t++) {
+        if ((mask & (1 << t)) === 0) continue;
+        const w = i32BitsToF32(ctrl[eBase + 4 + t]);
+        const txF32 = bXF32Ptr + t * dimStride;
+        const txQ8 = gateUpSingleOp === ParallelMatOp.MUL_MAT ? txF32 : bXOrQ8Ptr + t * xQ8Stride;
+        executeWasmMatStripe(kernels, gateUpSingleOp, gateType, gateWPtr, txQ8, txF32, gateOutPtr, dim, expFfnDim, gateStride);
+        executeWasmMatStripe(kernels, gateUpSingleOp, upType, upWPtr, txQ8, txF32, upOutPtr, dim, expFfnDim, gateStride);
+        kernels.swiglu_f32(gateOutPtr, upOutPtr, hidPtr, expFfnDim);
+        if (downSingleOp === ParallelMatOp.MUL_MAT_Q8K) {
+          kernels.quantize_f32_to_q8_k(hidPtr, q8FfnPtr, expFfnDim);
+          executeWasmMatStripe(kernels, downSingleOp, downType, downWPtr, q8FfnPtr, hidPtr, expProjPtr, expFfnDim, dim, dimStride);
+        } else if (downSingleOp === ParallelMatOp.MUL_MAT_Q8) {
+          kernels.quantize_f32_to_q8_0(hidPtr, q8FfnPtr, expFfnDim);
+          executeWasmMatStripe(kernels, downSingleOp, downType, downWPtr, q8FfnPtr, hidPtr, expProjPtr, expFfnDim, dim, dimStride);
+        } else {
+          executeWasmMatStripe(kernels, downSingleOp, downType, downWPtr, hidPtr, hidPtr, expProjPtr, expFfnDim, dim, dimStride);
+        }
+        kernels.axpy_f32(accumPtr + t * dimStride, expProjPtr, w, dim);
+      }
+    }
+  }
+}
+
 /** Active spin window (~400–800 µs) keeps helper threads hot across attention/RMSNorm gaps without futex syscalls. */
 export const WORKER_ACTIVE_SPIN = 80_000;
 export const COORDINATOR_JOIN_SPIN = 80_000;
@@ -255,6 +358,15 @@ export function runComputeWorkerLoop(
 
     if (op === OP_MOE_EXPERTS) {
       runMoeWorkerSlice(kernels, ctrl, workerIndex + 1);
+      Atomics.store(ctrl, slotBase + SLOT_DONE_SEQ, seq);
+      if (Atomics.load(ctrl, CTRL_COORDINATOR_WAITING) !== 0) {
+        Atomics.notify(ctrl, slotBase + SLOT_DONE_SEQ, 1);
+      }
+      continue;
+    }
+
+    if (op === OP_MOE_EXPERTS_BATCH4) {
+      runMoeBatch4WorkerSlice(kernels, ctrl, workerIndex + 1);
       Atomics.store(ctrl, slotBase + SLOT_DONE_SEQ, seq);
       if (Atomics.load(ctrl, CTRL_COORDINATOR_WAITING) !== 0) {
         Atomics.notify(ctrl, slotBase + SLOT_DONE_SEQ, 1);
@@ -657,6 +769,95 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
                     runStripe(downOp, downType, dW, hidPtr, hidPtr, expProjPtr, expFfnDim, dim, dimStride);
                   }
                   k.axpy_f32(accumPtr, expProjPtr, weight, dim);
+                }
+              }
+              Atomics.store(ctrl, slotBase + ${SLOT_DONE_SEQ}, seq);
+              if (Atomics.load(ctrl, ${CTRL_COORDINATOR_WAITING}) !== 0) {
+                Atomics.notify(ctrl, slotBase + ${SLOT_DONE_SEQ}, 1);
+              }
+              continue;
+            }
+            if (op === ${OP_MOE_EXPERTS_BATCH4}) {
+              const m = ${MOE_DESC_BASE};
+              const uniqueCount = ctrl[m + 0];
+              const activeThreads = ctrl[m + 21];
+              const tid = workerIndex + 1;
+              if (tid < uniqueCount && tid < activeThreads) {
+                const dim = ctrl[m + 1];
+                const expFfnDim = ctrl[m + 2];
+                const gateUpBatchOp = ctrl[m + 3];
+                const gateUpSingleOp = ctrl[m + 4];
+                const downBatchOp = ctrl[m + 5];
+                const downSingleOp = ctrl[m + 6];
+                const gateType = ctrl[m + 7];
+                const upType = ctrl[m + 8];
+                const downType = ctrl[m + 9];
+                const bXOrQ8 = ctrl[m + 10] >>> 0;
+                const bXF32 = ctrl[m + 11] >>> 0;
+                const xQ8Stride = ctrl[m + 12];
+                const scratchBase = (ctrl[m + 13] >>> 0) + tid * ctrl[m + 14];
+                const gateOutPtr = scratchBase + ctrl[m + 15];
+                const upOutPtr = scratchBase + ctrl[m + 16];
+                const hidPtr = scratchBase + ctrl[m + 17];
+                const q8FfnPtr = scratchBase + ctrl[m + 18];
+                const expProjPtr = scratchBase + ctrl[m + 19];
+                const accumPtr = scratchBase + ctrl[m + 20];
+                const gateStride = expFfnDim * 4;
+                const dimStride = dim * 4;
+                const q8FfnStride =
+                  downSingleOp === ${ParallelMatOp.MUL_MAT_Q8K}
+                    ? (expFfnDim >>> 8) * ${Q8_K_ACT_BLOCK_BYTES}
+                    : (expFfnDim >>> 5) * ${Q8_0_ACT_BLOCK_BYTES};
+                k.zero_bytes(accumPtr, 4 * dimStride);
+                for (let u = tid; u < uniqueCount; u += activeThreads) {
+                  const eBase = ${MOE_B4_EXPERT_LIST_BASE} + u * ${MOE_B4_EXPERT_STRIDE};
+                  const gW = ctrl[eBase + 0] >>> 0;
+                  const uW = ctrl[eBase + 1] >>> 0;
+                  const dW = ctrl[eBase + 2] >>> 0;
+                  const mask = ctrl[eBase + 3];
+                  if (mask === 15) {
+                    runStripe(gateUpBatchOp, gateType, gW, bXOrQ8, bXF32, gateOutPtr, dim, expFfnDim, gateStride);
+                    runStripe(gateUpBatchOp, upType, uW, bXOrQ8, bXF32, upOutPtr, dim, expFfnDim, gateStride);
+                    k.swiglu_f32(gateOutPtr, upOutPtr, hidPtr, 4 * expFfnDim);
+                    if (downBatchOp === ${ParallelMatOp.MUL_MAT_BATCH4_Q8K}) {
+                      for (let t = 0; t < 4; t++) {
+                        k.quantize_f32_to_q8_k(hidPtr + t * gateStride, q8FfnPtr + t * q8FfnStride, expFfnDim);
+                      }
+                      runStripe(downBatchOp, downType, dW, q8FfnPtr, hidPtr, expProjPtr, expFfnDim, dim, dimStride);
+                    } else if (downBatchOp === ${ParallelMatOp.MUL_MAT_BATCH4_Q8}) {
+                      for (let t = 0; t < 4; t++) {
+                        k.quantize_f32_to_q8_0(hidPtr + t * gateStride, q8FfnPtr + t * q8FfnStride, expFfnDim);
+                      }
+                      runStripe(downBatchOp, downType, dW, q8FfnPtr, hidPtr, expProjPtr, expFfnDim, dim, dimStride);
+                    } else {
+                      runStripe(downBatchOp, downType, dW, hidPtr, hidPtr, expProjPtr, expFfnDim, dim, dimStride);
+                    }
+                    for (let t = 0; t < 4; t++) {
+                      i32View[0] = ctrl[eBase + 4 + t];
+                      k.axpy_f32(accumPtr + t * dimStride, expProjPtr + t * dimStride, f32View[0], dim);
+                    }
+                  } else {
+                    for (let t = 0; t < 4; t++) {
+                      if ((mask & (1 << t)) === 0) continue;
+                      i32View[0] = ctrl[eBase + 4 + t];
+                      const w = f32View[0];
+                      const txF32 = bXF32 + t * dimStride;
+                      const txQ8 = gateUpSingleOp === ${ParallelMatOp.MUL_MAT} ? txF32 : bXOrQ8 + t * xQ8Stride;
+                      runStripe(gateUpSingleOp, gateType, gW, txQ8, txF32, gateOutPtr, dim, expFfnDim, gateStride);
+                      runStripe(gateUpSingleOp, upType, uW, txQ8, txF32, upOutPtr, dim, expFfnDim, gateStride);
+                      k.swiglu_f32(gateOutPtr, upOutPtr, hidPtr, expFfnDim);
+                      if (downSingleOp === ${ParallelMatOp.MUL_MAT_Q8K}) {
+                        k.quantize_f32_to_q8_k(hidPtr, q8FfnPtr, expFfnDim);
+                        runStripe(downSingleOp, downType, dW, q8FfnPtr, hidPtr, expProjPtr, expFfnDim, dim, dimStride);
+                      } else if (downSingleOp === ${ParallelMatOp.MUL_MAT_Q8}) {
+                        k.quantize_f32_to_q8_0(hidPtr, q8FfnPtr, expFfnDim);
+                        runStripe(downSingleOp, downType, dW, q8FfnPtr, hidPtr, expProjPtr, expFfnDim, dim, dimStride);
+                      } else {
+                        runStripe(downSingleOp, downType, dW, hidPtr, hidPtr, expProjPtr, expFfnDim, dim, dimStride);
+                      }
+                      k.axpy_f32(accumPtr + t * dimStride, expProjPtr, w, dim);
+                    }
+                  }
                 }
               }
               Atomics.store(ctrl, slotBase + ${SLOT_DONE_SEQ}, seq);
@@ -1205,6 +1406,88 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
         params.workerScratchBase + t * stride + offAcc,
         params.outPtr,
         params.dim,
+      );
+    }
+  }
+
+  /**
+   * Single-barrier Expert-Parallel 4-token Prefill Sparse MoE dispatch (`OP_MOE_EXPERTS_BATCH4`):
+   * Cuts 16–48 sequential barriers per MoE prefill layer down to ONE barrier, running Batch-4
+   * weight-amortized contractions for 4-token hits (`mask === 15`) and L1-hot per-token paths for
+   * sparse hits (`popcount(mask) ∈ {1,2,3}`), all in private per-core scratch!
+   */
+  dispatchParallelMoeExpertsBatch4(
+    params: MoeExpertBatch4ParallelDispatch,
+    kernels: VerdantSimdExports,
+  ): void {
+    const count = Math.min(MAX_MOE_BATCH4_EXPERTS, params.uniqueCount);
+    const totalFloats = 4 * params.dim;
+    if (count <= 0) {
+      kernels.zero_bytes(params.outPtr, totalFloats * 4);
+      return;
+    }
+
+    const activeThreads = this.active && this.helperCount > 0 ? Math.min(this.workerCount, count) : 1;
+    const ctrl = this.ctrl;
+    const m = MOE_DESC_BASE;
+
+    ctrl[CTRL_OP_CODE] = OP_MOE_EXPERTS_BATCH4;
+    ctrl[m + 0] = count;
+    ctrl[m + 1] = params.dim;
+    ctrl[m + 2] = params.expFfnDim;
+    ctrl[m + 3] = params.gateUpBatchOp;
+    ctrl[m + 4] = params.gateUpSingleOp;
+    ctrl[m + 5] = params.downBatchOp;
+    ctrl[m + 6] = params.downSingleOp;
+    ctrl[m + 7] = params.gateType;
+    ctrl[m + 8] = params.upType;
+    ctrl[m + 9] = params.downType;
+    ctrl[m + 10] = params.bXOrQ8Ptr | 0;
+    ctrl[m + 11] = params.bXF32Ptr | 0;
+    ctrl[m + 12] = params.xQ8StrideBytes;
+    ctrl[m + 13] = params.workerScratchBase | 0;
+    ctrl[m + 14] = params.layout.strideBytes;
+    ctrl[m + 15] = params.layout.offGateOut;
+    ctrl[m + 16] = params.layout.offUpOut;
+    ctrl[m + 17] = params.layout.offHid;
+    ctrl[m + 18] = params.layout.offQ8Ffn;
+    ctrl[m + 19] = params.layout.offExpProj;
+    ctrl[m + 20] = params.layout.offAccum;
+    ctrl[m + 21] = activeThreads;
+
+    for (let u = 0; u < count; u++) {
+      const eBase = MOE_B4_EXPERT_LIST_BASE + u * MOE_B4_EXPERT_STRIDE;
+      ctrl[eBase + 0] = params.gatePtrs[u] | 0;
+      ctrl[eBase + 1] = params.upPtrs[u] | 0;
+      ctrl[eBase + 2] = params.downPtrs[u] | 0;
+      ctrl[eBase + 3] = params.masks[u] & 0x0f;
+      const wBase = u * 4;
+      ctrl[eBase + 4] = f32ToI32Bits(params.weights[wBase + 0]);
+      ctrl[eBase + 5] = f32ToI32Bits(params.weights[wBase + 1]);
+      ctrl[eBase + 6] = f32ToI32Bits(params.weights[wBase + 2]);
+      ctrl[eBase + 7] = f32ToI32Bits(params.weights[wBase + 3]);
+    }
+
+    if (activeThreads > 1) {
+      const nextSeq = (this.jobSeq + 1) | 0;
+      this.jobSeq = nextSeq;
+      this.publishJob(nextSeq);
+      runMoeBatch4WorkerSlice(kernels, ctrl, 0);
+      this.joinHelpers(nextSeq);
+      this.dispatches += 1;
+    } else {
+      runMoeBatch4WorkerSlice(kernels, ctrl, 0);
+    }
+
+    const stride = params.layout.strideBytes;
+    const offAcc = params.layout.offAccum;
+    kernels.copy_bytes(params.outPtr, params.workerScratchBase + offAcc, totalFloats * 4);
+    for (let t = 1; t < activeThreads; t++) {
+      kernels.add_f32(
+        params.outPtr,
+        params.workerScratchBase + t * stride + offAcc,
+        params.outPtr,
+        totalFloats,
       );
     }
   }
