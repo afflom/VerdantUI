@@ -1,0 +1,53 @@
+# VerdantUI Architectural & Performance Invariant Register (Verdant Studio model/ids.toml parity)
+# Every registered ID maps a non-negotiable client-side, engine, or performance invariant to its
+# primary implementation file and verification test. Audited by `npm run ratchet`.
+
+schema = "verdant-ui/ids/1"
+
+[[id]]
+code = "VUI-CLIENT-01"
+title = "100% client-side runtime with zero external server or backend API dependencies"
+owner = "scripts/ratchet-gate.ts"
+evidence = "model/verdant-ratchet.toml"
+
+[[id]]
+code = "VUI-ENGINE-01"
+title = "Exclusive afflom/verdant-engine vTensor WASM SIMD substrate (zero WebGPU/foreign processor APIs)"
+owner = "src/engine/vtensorProvider.ts"
+evidence = "model/engine-pin.json"
+
+[[id]]
+code = "VUI-MT-01"
+title = "Multi-threaded SharedArrayBuffer WASM SIMD pool with COOP/COEP isolation and saturation-safe worker sizing"
+owner = "src/engine/vtensorThreadPool.ts"
+evidence = "public/coi-serviceworker.js"
+
+[[id]]
+code = "VUI-OPFS-01"
+title = "Lock-free read-only OPFS model reads, pagehide teardown, BroadcastChannel lease handover, and zero handle leaks"
+owner = "src/engine/vramBackingStore.ts"
+evidence = "src/engine/vramBackingStore.test.ts"
+
+[[id]]
+code = "VUI-MOE-01"
+title = "Single-barrier Expert-Parallel Sparse MoE (OP_MOE_EXPERTS & hybrid OP_MOE_EXPERTS_BATCH4) with Theorem T3-MoE wave sizing"
+owner = "src/engine/llamaRuntime.ts"
+evidence = "src/engine/scalingBenchmarks.test.ts"
+
+[[id]]
+code = "VUI-SIMD-01"
+title = "Zero-spill XMM-domain scale shuffle and narrow-lane integer contractions across Q4_K, Q6_K, Q5_K, Q3_K, Q2_K, and Q4_0"
+owner = "src/engine/verdantWasmSimd.ts"
+evidence = "src/engine/verdantWasmSimd.test.ts"
+
+[[id]]
+code = "VUI-PREFETCH-01"
+title = "Double-buffered async OPFS layer and LM-head stripe prefetch pipelining with in-flight slab deduplication"
+owner = "src/engine/llamaRuntime.ts"
+evidence = "src/engine/vramBackingStore.ts"
+
+[[id]]
+code = "VUI-PAGES-01"
+title = "Subpath-safe GitHub Pages static bundle with commit-pinned fast CD workflow"
+owner = "scripts/assemble-pages.ts"
+evidence = ".github/workflows/pages.yml"

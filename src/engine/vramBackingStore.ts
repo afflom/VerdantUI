@@ -619,6 +619,8 @@ export class OpfsDemandVramBackingStore implements VramBackingStore {
   private slabEvictions = 0;
   private bytesFetched = 0;
   private dirtySincePersist = 0;
+  /** Deduplicates overlapping async double-buffered prefetchRanges calls sharing a boundary slab. */
+  private readonly inFlightSlabs = new Map<number, Promise<void>>();
 
   constructor(options: {
     modelId: string;
@@ -951,6 +953,7 @@ export class OpfsDemandVramBackingStore implements VramBackingStore {
 
     const missingSet = new Set<number>();
     const missingSlabs: number[] = [];
+    const waitInFlight: Promise<void>[] = [];
 
     for (let i = 0; i < ranges.length; i++) {
       const r = ranges[i];
@@ -964,6 +967,8 @@ export class OpfsDemandVramBackingStore implements VramBackingStore {
         const existingSlot = this.slabToSlot[s];
         if (existingSlot !== -1) {
           this.touchSlot(existingSlot);
+        } else if (this.inFlightSlabs.has(s)) {
+          waitInFlight.push(this.inFlightSlabs.get(s)!);
         } else if (!missingSet.has(s)) {
           missingSet.add(s);
           missingSlabs.push(s);
@@ -972,6 +977,9 @@ export class OpfsDemandVramBackingStore implements VramBackingStore {
     }
 
     if (missingSlabs.length === 0) {
+      if (waitInFlight.length > 0) {
+        await Promise.all(waitInFlight);
+      }
       return;
     }
 
@@ -996,25 +1004,41 @@ export class OpfsDemandVramBackingStore implements VramBackingStore {
           completed += 1;
           continue;
         }
+        const existingFlight = this.inFlightSlabs.get(slabId);
+        if (existingFlight) {
+          await existingFlight;
+          completed += 1;
+          continue;
+        }
         const slabLen = this.slabLength(slabId);
         const startByte = slabId * this.slabBytes;
         const endInclusive = startByte + slabLen - 1;
-        const data = await this.asyncFetcher(this.url, startByte, endInclusive, signal);
-        if (signal?.aborted) {
-          throw new DOMException('Aborted', 'AbortError');
+        const fetchTask = (async () => {
+          const data = await this.asyncFetcher(this.url, startByte, endInclusive, signal);
+          if (signal?.aborted) {
+            throw new DOMException('Aborted', 'AbortError');
+          }
+          if (!this.handle) {
+            return;
+          }
+          if (data.byteLength < slabLen) {
+            throw new Error(
+              `Demand slab ${slabId} truncated (${data.byteLength} < ${slabLen} bytes).`,
+            );
+          }
+          this.putSlab(slabId, data);
+          this.slabMisses += 1;
+          this.bytesFetched += slabLen;
+          fetchedInBatch += slabLen;
+        })();
+        this.inFlightSlabs.set(slabId, fetchTask);
+        try {
+          await fetchTask;
+        } finally {
+          if (this.inFlightSlabs.get(slabId) === fetchTask) {
+            this.inFlightSlabs.delete(slabId);
+          }
         }
-        if (!this.handle) {
-          return;
-        }
-        if (data.byteLength < slabLen) {
-          throw new Error(
-            `Demand slab ${slabId} truncated (${data.byteLength} < ${slabLen} bytes).`,
-          );
-        }
-        this.putSlab(slabId, data);
-        this.slabMisses += 1;
-        this.bytesFetched += slabLen;
-        fetchedInBatch += slabLen;
         completed += 1;
         options?.onProgress?.(completed, total, fetchedInBatch);
       }
@@ -1023,6 +1047,9 @@ export class OpfsDemandVramBackingStore implements VramBackingStore {
     const workers: Promise<void>[] = [];
     for (let w = 0; w < concurrency; w++) {
       workers.push(worker());
+    }
+    if (waitInFlight.length > 0) {
+      workers.push(...waitInFlight);
     }
     await Promise.all(workers);
 
@@ -1231,6 +1258,7 @@ export class OpfsDemandVramBackingStore implements VramBackingStore {
       }
       this.handle = null;
     }
+    this.inFlightSlabs.clear();
   }
 }
 

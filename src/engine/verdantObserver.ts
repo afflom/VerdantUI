@@ -369,15 +369,28 @@ export function observeCatalogScaling(
     partialModelCount: opfsPartials.length,
   };
 
+  // Assess every catalog model ONCE and reuse across active view + category summaries
+  const allCatalogModels = getModelsByCategory('all');
+  const assessedById = new Map<string, CatalogModelAssessment>();
+  for (let i = 0; i < allCatalogModels.length; i++) {
+    const m = allCatalogModels[i];
+    assessedById.set(m.id, assessCatalogModel(m, env, input));
+  }
+
   const categoryModels = getModelsByCategory(activeCategory.id);
-  const assessments = categoryModels.map((m) => assessCatalogModel(m, env, input));
+  const assessments = categoryModels.map(
+    (m) => assessedById.get(m.id) ?? assessCatalogModel(m, env, input),
+  );
 
   const categorySummaries: CategorySummaryObservation[] = MODEL_CATEGORIES.map((cat) => {
     const modelsInCat = getModelsByCategory(cat.id);
-    const assessed = modelsInCat.map((m) => assessCatalogModel(m, env, input));
-    const cachedCount = assessed.filter(
-      (a) => a.readiness === 'ready-cached' || a.readiness === 'active',
-    ).length;
+    let cachedCount = 0;
+    for (let i = 0; i < modelsInCat.length; i++) {
+      const a = assessedById.get(modelsInCat[i].id);
+      if (a && (a.readiness === 'ready-cached' || a.readiness === 'active')) {
+        cachedCount += 1;
+      }
+    }
     return {
       category: cat,
       activeInCategory: !bootstrapUnbound && modelsInCat.some((m) => m.id === input.activeModelId),

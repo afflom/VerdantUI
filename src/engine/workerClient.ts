@@ -244,6 +244,7 @@ export class LlamaVTensorWorkerClient {
 
   private state: EngineState;
   private disposed = false;
+  private lastRequestedCatalogModel: CatalogModel | null = null;
   private readonly handlePageUnload = (): void => {
     if (this.disposed) return;
     this.disposed = true;
@@ -845,7 +846,25 @@ export class LlamaVTensorWorkerClient {
   }
 
   async loadCatalogModel(model: CatalogModel): Promise<LoadedModelSummary> {
+    this.lastRequestedCatalogModel = model;
     return this.loadFromUrl(model.id, model.name, model.url, model.bundled);
+  }
+
+  /** Retries the most recently requested catalog model (or re-runs initial boot). */
+  async retryLastLoad(): Promise<LoadedModelSummary> {
+    if (this.lastRequestedCatalogModel) {
+      return this.loadCatalogModel(this.lastRequestedCatalogModel);
+    }
+    return this.bootInitialModel();
+  }
+
+  clearError(): void {
+    if (this.state.errorMessage !== null) {
+      this.patchState({
+        errorMessage: null,
+        status: this.state.model ? 'ready' : 'idle',
+      });
+    }
   }
 
   async loadFromUrl(

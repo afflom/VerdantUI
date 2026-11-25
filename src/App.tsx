@@ -261,6 +261,8 @@ export default function App() {
               onOpenModels={() => openModelsModal('all')}
               onOpenHarness={() => openModelsModal('harness')}
               onCancelDownload={handleCancelDownload}
+              onRetryLoad={() => void workerClient.retryLastLoad().catch(() => {})}
+              onDismissError={() => workerClient.clearError()}
               onToggleInspector={() => setInspectorOpen((prev) => !prev)}
               onSpeculativeDraftChange={(messages, draft, system) =>
                 workerClient.scheduleSpeculativePrefill(messages, draft, system)

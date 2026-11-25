@@ -1035,4 +1035,41 @@ test('OPFS SyncAccessHandle reload lock recovery, read-only committed reads, and
     true,
     'openOpfsDemandModelBacking MUST close syncCache when syncIdx fails to prevent permanent OPFS lock leak',
   );
+
+  // 4. Overlapping double-buffered prefetchRanges deduplicates shared boundary slabs into 1 HTTP Range fetch
+  const slabBytes = 16 * 1024;
+  const payload = makeFakeGgufPayload(slabBytes * 4);
+  const { dir: dedupDir } = createMockOpfsDir();
+  const dedupHandle = (await dedupDir.getFileHandle('dedup.vram.cache', {
+    create: true,
+  })) as FileSystemFileHandle & { createSyncAccessHandle: () => Promise<SyncAccessHandleLike> };
+  const dedupSync = await dedupHandle.createSyncAccessHandle();
+  let fetchCount = 0;
+  const store = new OpfsDemandVramBackingStore({
+    modelId: 'dedup-test',
+    url: 'https://example.test/dedup.gguf',
+    totalBytes: payload.byteLength,
+    handle: dedupSync,
+    maxCacheBytes: slabBytes * 4,
+    slabBytes,
+    asyncRangeFetcher: async (_u, start, end) => {
+      fetchCount += 1;
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      return payload.subarray(start, end + 1);
+    },
+  });
+  try {
+    // Two overlapping double-buffered calls both touching slab 1 (bytes 16384..32767)
+    await Promise.all([
+      store.prefetchRanges([{ fileOffset: 8192, byteLength: 16384 }]),
+      store.prefetchRanges([{ fileOffset: 24576, byteLength: 16384 }]),
+    ]);
+    // Slabs 0, 1, 2 -> exactly 3 fetches (NOT 4!)
+    assert.equal(fetchCount, 3, `Expected shared boundary slab 1 to be deduplicated (got ${fetchCount} fetches)`);
+    assert.equal(store.hasSlab(0), true);
+    assert.equal(store.hasSlab(1), true);
+    assert.equal(store.hasSlab(2), true);
+  } finally {
+    store.close();
+  }
 });

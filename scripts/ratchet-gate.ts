@@ -23,6 +23,7 @@ export interface RatchetViolation {
     | 'vtensor-provider-lock'
     | 'engine-pin-parity'
     | 'owner-decisions'
+    | 'ids-register'
     | 'policy-config';
   readonly path: string;
   readonly line?: number;
@@ -31,6 +32,7 @@ export interface RatchetViolation {
 
 export interface RatchetSnapshot {
   readonly policyToml: string;
+  readonly idsTomlRaw: string;
   readonly enginePinRaw: string;
   readonly ownerDecisionsRaw: string;
   readonly packageJsonRaw: string;
@@ -130,6 +132,7 @@ export function loadRatchetSnapshot(cwd = process.cwd()): RatchetSnapshot {
   const coiPath = join(root, 'public/coi-serviceworker.js');
   return {
     policyToml: readReq('model/verdant-ratchet.toml'),
+    idsTomlRaw: readReq('model/ids.toml'),
     enginePinRaw: readReq('model/engine-pin.json'),
     ownerDecisionsRaw: readReq('model/owner-decisions.json'),
     packageJsonRaw: readReq('package.json'),
@@ -373,6 +376,26 @@ export function evaluateVerdantRatchet(snapshot: RatchetSnapshot): RatchetReport
     });
   }
 
+  // 9. Verdant Studio invariant ID register (`model/ids.toml`)
+  const idsSchema = snapshot.idsTomlRaw.match(/^\s*schema\s*=\s*"([^"]+)"/m)?.[1];
+  const codeMatches = Array.from(snapshot.idsTomlRaw.matchAll(/^\s*code\s*=\s*"([^"]+)"/gm)).map((m) => m[1]);
+  const seenCodes = new Set<string>();
+  const dupCodes: string[] = [];
+  for (const code of codeMatches) {
+    if (seenCodes.has(code)) dupCodes.push(code);
+    seenCodes.add(code);
+  }
+  if (idsSchema !== 'verdant-ui/ids/1' || codeMatches.length < 6 || dupCodes.length > 0) {
+    violations.push({
+      category: 'ids-register',
+      path: 'model/ids.toml',
+      detail:
+        dupCodes.length > 0
+          ? `Duplicate invariant IDs in model/ids.toml: ${dupCodes.join(', ')}`
+          : `model/ids.toml must carry schema verdant-ui/ids/1 with >= 6 unique invariant IDs (found ${codeMatches.length})`,
+    });
+  }
+
   return {
     ok: violations.length === 0,
     schema,
@@ -470,6 +493,14 @@ export function verifyPlantedDefects(cleanSnapshot: RatchetSnapshot): {
       mutate: (s) => ({
         ...s,
         ownerDecisionsRaw: JSON.stringify({ schema: 'verdant-ui/owner-decisions/1', decisions: [] }),
+      }),
+    },
+    {
+      name: 'planted-duplicate-id-register',
+      expectedCategory: 'ids-register',
+      mutate: (s) => ({
+        ...s,
+        idsTomlRaw: `${s.idsTomlRaw}\n[[id]]\ncode = "VUI-CLIENT-01"\ntitle = "duplicate"\n`,
       }),
     },
   ];
