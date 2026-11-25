@@ -629,7 +629,7 @@ export class VTensorBackendRegistry {
     const sharedMemorySupported =
       (this.wasmArena?.isSharedMemory ?? false) || detectSharedMemorySupport();
     const effectiveWorkers = this.threadPool?.isActive ? this.threadPool.workerCount : 1;
-    const memoryBudgetBytes = deriveHostMemoryBudgetBytes();
+    const memoryBudgetBytes = deriveHostMemoryBudgetBytes(this.wasmArena?.maxCapacityBytes);
 
     if (this.wasmArena) {
       const probe = this.wasmArena.runCalibrationProbe();
@@ -2009,18 +2009,35 @@ export function runVTensorConformanceSuite(): ConformanceSuiteReport {
       dominantWeightType: GgmlType.Q4_K,
       quantizedWeightFraction: 1.0,
     };
-    const contract3B = derivePerformanceContract(env, spec3B, {
+    // Verify Theorem T4b keeps 3B (~2.0 GB) 100% resident when probed WASM budget permits (>= 2.4 GiB),
+    // and engages OPFS-paged weight residency cleanly when model exceeds physical budget (e.g. 1.5 GiB cap or 7B)!
+    const contract3BResident = derivePerformanceContract(env, spec3B, {
       backingKind: 'opfs-sync',
       requestedMaxContext: 2048,
     });
     if (
-      contract3B.weightResidencyMode !== 'opfs-paged' ||
-      !contract3B.streamLmHead ||
-      !contract3B.streamEmbeddings ||
-      contract3B.projectedTotalArenaBytes > env.memoryBudgetBytes
+      env.memoryBudgetBytes >= 2.4 * 1024 * 1024 * 1024 &&
+      contract3BResident.weightResidencyMode !== 'resident-all'
     ) {
       throw new Error(
-        `3B OPFS weight paging contract failed: mode=${contract3B.weightResidencyMode}, arena=${contract3B.projectedTotalArenaBytes} > ${env.memoryBudgetBytes}`,
+        `3B resident-all contract failed on ${Math.round(env.memoryBudgetBytes / (1024 * 1024))} MiB arena: mode=${contract3BResident.weightResidencyMode}`,
+      );
+    }
+
+    const constrainedBudget = Math.floor(1.5 * 1024 * 1024 * 1024);
+    const contract3BPaged = derivePerformanceContract(env, spec3B, {
+      backingKind: 'opfs-sync',
+      requestedMaxContext: 2048,
+      memoryBudgetBytesOverride: constrainedBudget,
+    });
+    if (
+      contract3BPaged.weightResidencyMode !== 'opfs-paged' ||
+      !contract3BPaged.streamLmHead ||
+      !contract3BPaged.streamEmbeddings ||
+      contract3BPaged.projectedTotalArenaBytes > constrainedBudget
+    ) {
+      throw new Error(
+        `3B OPFS weight paging contract failed: mode=${contract3BPaged.weightResidencyMode}, arena=${contract3BPaged.projectedTotalArenaBytes} > ${constrainedBudget}`,
       );
     }
 
@@ -2035,7 +2052,7 @@ export function runVTensorConformanceSuite(): ConformanceSuiteReport {
     }
     backing.close();
     reg.freeAllBuffers();
-    return `3B (1.88 GB) bounded to ${(contract3B.projectedResidentWeightBytes / 1048576).toFixed(0)} MB RAM · ${contract3B.weightLayerFrameSlots}/28L frames · 7→1 coalesced extent`;
+    return `3B (1.88 GB) ${contract3BResident.weightResidencyMode} on ${Math.round(env.memoryBudgetBytes / 1048576)} MiB · paged fallback ${(contract3BPaged.projectedResidentWeightBytes / 1048576).toFixed(0)} MB (${contract3BPaged.weightLayerFrameSlots}/28L) · 7→1 coalesced`;
   });
 
   // VT-64: Unified Virtual Store (Theorem T6 Global Space Allocation + Content-Addressed KV Prefix Restore)

@@ -68,6 +68,7 @@ import {
   type VramBackingStore,
 } from './vramBackingStore';
 import {
+  computeLmHeadStripeRows,
   VramWeightPager,
   type LayerTensorInfoGroup,
   type PagedLayerWeights,
@@ -250,6 +251,10 @@ function createRng(seed?: number): () => number {
 // Reusable scratch buffers for zero-allocation repeat-penalty restoration (max 64 unique tokens)
 const savedPenaltyIds = new Int32Array(64);
 const savedPenaltyVals = new Float32Array(64);
+// Reusable scratch buffers for zero-allocation Top-K sampling (k <= 1024)
+const samplerTopkIds = new Int32Array(1024);
+const samplerTopkVals = new Float32Array(1024);
+const samplerTopkProbs = new Float64Array(1024);
 
 /**
  * Zero-allocation token sampler: applies repeat penalty in-place to the <=64 unique recent token
@@ -306,26 +311,69 @@ export function sampleNextToken(
       return bestId;
     }
 
-    // Partial Top-K selection (100% in-Verdant WASM SIMD for k <= 1024, zero JS 152K scan)
+    // Partial Top-K selection (100% in-Verdant WASM SIMD for k <= 1024, zero JS allocations!)
     const k = Math.max(1, Math.min(config.topK, vocabSize));
-    let candidates: number[];
-    if (arena && logitsPtr >= 0 && k <= 1024) {
-      const effK = arena.kernels.topk_f32(
-        logitsPtr,
-        vocabSize,
-        k,
-        WASM_TOPK_IDS_OFFSET,
-        WASM_TOPK_VALS_OFFSET,
-      );
-      const idsView = new Int32Array(arena.memory.buffer, WASM_TOPK_IDS_OFFSET, effK);
-      candidates = new Array<number>(effK);
-      for (let i = 0; i < effK; i++) candidates[i] = idsView[i];
-      candidates.sort((a, b) => logits[b] - logits[a]);
+    let candIds: Int32Array;
+    let candCount: number;
+
+    if (k <= 1024) {
+      candIds = samplerTopkIds;
+      if (arena && logitsPtr >= 0) {
+        candCount = arena.kernels.topk_f32(
+          logitsPtr,
+          vocabSize,
+          k,
+          WASM_TOPK_IDS_OFFSET,
+          WASM_TOPK_VALS_OFFSET,
+        );
+        const idsView = new Int32Array(arena.memory.buffer, WASM_TOPK_IDS_OFFSET, candCount);
+        const valsView = new Float32Array(arena.memory.buffer, WASM_TOPK_VALS_OFFSET, candCount);
+        for (let i = 0; i < candCount; i++) {
+          samplerTopkIds[i] = idsView[i];
+          samplerTopkVals[i] = valsView[i];
+        }
+      } else {
+        candCount = k;
+        for (let i = 0; i < k; i++) {
+          samplerTopkIds[i] = 0;
+          samplerTopkVals[i] = -Infinity;
+        }
+        let minSlot = 0;
+        let minVal = -Infinity;
+        for (let i = 0; i < vocabSize; i++) {
+          const v = logits[i];
+          if (v > minVal) {
+            samplerTopkIds[minSlot] = i;
+            samplerTopkVals[minSlot] = v;
+            minVal = samplerTopkVals[0];
+            minSlot = 0;
+            for (let j = 1; j < k; j++) {
+              if (samplerTopkVals[j] < minVal) {
+                minVal = samplerTopkVals[j];
+                minSlot = j;
+              }
+            }
+          }
+        }
+      }
+
+      // In-place descending sort of candCount <= 1024 items (zero heap allocations)
+      for (let i = 1; i < candCount; i++) {
+        const keyId = samplerTopkIds[i];
+        const keyVal = samplerTopkVals[i];
+        let j = i - 1;
+        while (j >= 0 && samplerTopkVals[j] < keyVal) {
+          samplerTopkIds[j + 1] = samplerTopkIds[j];
+          samplerTopkVals[j + 1] = samplerTopkVals[j];
+          j--;
+        }
+        samplerTopkIds[j + 1] = keyId;
+        samplerTopkVals[j + 1] = keyVal;
+      }
     } else {
       const topIds = new Int32Array(k);
       const topVals = new Float32Array(k);
       topVals.fill(-Infinity);
-
       let minSlot = 0;
       let minVal = -Infinity;
       for (let i = 0; i < vocabSize; i++) {
@@ -343,28 +391,31 @@ export function sampleNextToken(
           }
         }
       }
-      candidates = Array.from(topIds).sort((a, b) => logits[b] - logits[a]);
+      const sorted = Array.from(topIds).sort((a, b) => logits[b] - logits[a]);
+      candIds = Int32Array.from(sorted);
+      candCount = sorted.length;
     }
 
     const invTemp = 1.0 / config.temperature;
-    const maxLogit = logits[candidates[0]] * invTemp;
+    const maxLogit = logits[candIds[0]] * invTemp;
 
-    const probs = new Float64Array(candidates.length);
+    const probs = candCount <= 1024 ? samplerTopkProbs : new Float64Array(candCount);
     let sumExp = 0;
-    for (let i = 0; i < candidates.length; i++) {
-      const p = Math.exp(logits[candidates[i]] * invTemp - maxLogit);
+    for (let i = 0; i < candCount; i++) {
+      const p = Math.exp(logits[candIds[i]] * invTemp - maxLogit);
       probs[i] = p;
       sumExp += p;
     }
-    for (let i = 0; i < candidates.length; i++) {
-      probs[i] /= sumExp;
+    const invSum = 1.0 / sumExp;
+    for (let i = 0; i < candCount; i++) {
+      probs[i] *= invSum;
     }
 
     // Top-P (nucleus) truncation
     const topP = Math.max(0.05, Math.min(1.0, config.topP));
     let cumProb = 0;
-    let cutoff = candidates.length;
-    for (let i = 0; i < candidates.length; i++) {
+    let cutoff = candCount;
+    for (let i = 0; i < candCount; i++) {
       cumProb += probs[i];
       if (cumProb >= topP) {
         cutoff = i + 1;
@@ -380,10 +431,10 @@ export function sampleNextToken(
     for (let i = 0; i < cutoff; i++) {
       running += probs[i];
       if (r <= running) {
-        return candidates[i];
+        return candIds[i];
       }
     }
-    return candidates[cutoff - 1];
+    return candIds[cutoff - 1];
   } finally {
     // Restore original logits so callers inspecting logits see unmutated values
     for (let i = 0; i < modifiedCount; i++) {
@@ -855,17 +906,24 @@ export class LlamaVTensorRuntime {
     const attempts: Array<{
       policy: WeightResidencyPolicy;
       maxLayerFrameSlotsCap?: number;
+      memoryBudgetBytesOverride?: number;
     }> = [
       { policy: this.weightResidencyPolicy },
-      { policy: 'paged', maxLayerFrameSlotsCap: 2 },
-      { policy: 'paged', maxLayerFrameSlotsCap: 1 },
+      { policy: 'paged', memoryBudgetBytesOverride: 1536 * 1024 * 1024 },
+      { policy: 'paged', memoryBudgetBytesOverride: 768 * 1024 * 1024, maxLayerFrameSlotsCap: 4 },
+      { policy: 'paged', memoryBudgetBytesOverride: 512 * 1024 * 1024, maxLayerFrameSlotsCap: 1 },
     ];
 
     let lastErr: unknown = null;
     for (let i = 0; i < attempts.length; i++) {
       const plan = attempts[i];
       try {
-        this.allocateWithPlan(plan.policy, plan.maxLayerFrameSlotsCap);
+        this.allocateWithPlan(
+          plan.policy,
+          plan.maxLayerFrameSlotsCap,
+          undefined,
+          plan.memoryBudgetBytesOverride,
+        );
         return;
       } catch (err) {
         lastErr = err;
@@ -887,6 +945,7 @@ export class LlamaVTensorRuntime {
     policy: WeightResidencyPolicy,
     maxLayerFrameSlotsCap?: number,
     maxContextOverride?: number,
+    memoryBudgetBytesOverride?: number,
   ): void {
     const backing = this.backingStore!;
     const parsed = this.parsedHeader!;
@@ -900,6 +959,10 @@ export class LlamaVTensorRuntime {
 
     // 0. Calibrate hardware & solve the formal Prism Performance Contract (Theorems T1–T4b)
     const env = this.backend.calibrateEnvironment();
+    const effectiveBudgetBytes =
+      memoryBudgetBytesOverride && memoryBudgetBytesOverride > 0
+        ? Math.min(env.memoryBudgetBytes, memoryBudgetBytesOverride)
+        : env.memoryBudgetBytes;
     const contract = derivePerformanceContract(env, modelSpec, {
       precisionMode: this.precisionMode,
       requestedMaxContext: maxContextOverride ?? this.requestedMaxContext,
@@ -908,6 +971,7 @@ export class LlamaVTensorRuntime {
       backingBandwidthMBs: this.calibratedBackingBandwidthMBs,
       backingQuotaBytes: this.backingQuotaBytes,
       maxLayerFrameSlotsCap,
+      memoryBudgetBytesOverride: effectiveBudgetBytes,
     });
     if (this.backend.activeThreadPool && Number.isFinite(contract.parallelThresholdBytes)) {
       this.backend.activeThreadPool.setParallelThresholdBytes(contract.parallelThresholdBytes);
@@ -922,7 +986,7 @@ export class LlamaVTensorRuntime {
     const kvPageBytesWarmQ8 = 2 * (q8BytesPerHalfPage + scaleFloatsPerHalfPage * 4);
 
     const unifiedPlan = deriveUnifiedStoreAllocation({
-      globalBudgetBytes: env.memoryBudgetBytes,
+      globalBudgetBytes: effectiveBudgetBytes,
       weightAndLiveKvBytes: contract.projectedTotalArenaBytes,
       embdRowBytes,
       streamEmbeddings: contract.streamEmbeddings,
@@ -944,6 +1008,7 @@ export class LlamaVTensorRuntime {
         layerFrameSlots: contract.weightLayerFrameSlots,
         streamEmbeddings: contract.streamEmbeddings,
         streamLmHead: contract.streamLmHead,
+        lmHeadStripeRows: computeLmHeadStripeRows(outWeightInfo, contract.lmHeadTileTargetBytes),
         hotEmbeddingCacheSlots: unifiedPlan.hotEmbeddingCacheSlots,
       },
       (bufId, usage, cap) => this.backend.allocBuffer(bufId, usage, cap),

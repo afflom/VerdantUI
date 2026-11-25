@@ -50,7 +50,6 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
   const vramWeights = telemetry.vramWeights;
   const unifiedStore = telemetry.unifiedStore;
   const frameBudget = telemetry.frameBudget;
-  const webgpu = telemetry.webgpu;
   const threadPool = telemetry.threadPool;
   const prism = telemetry.prism;
   const residencyToggleDisabled =
@@ -213,29 +212,6 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
                       {threadPool.active
                         ? `${threadPool.workerCount}T SIMD · ${threadPool.parallelDispatches.toLocaleString()} par`
                         : '1T SIMD (single)'}
-                    </dd>
-                  </div>
-                )}
-                {webgpu && (
-                  <div className="flex items-center justify-between gap-2 px-3 py-2">
-                    <dt className="whitespace-nowrap text-slate-500 dark:text-slate-400">
-                      vTensor WebGPU
-                    </dt>
-                    <dd
-                      title={webgpu.reason}
-                      className={`truncate text-right font-mono text-[11px] ${
-                        webgpu.status === 'hardware-active'
-                          ? 'text-emerald-800 dark:text-emerald-400'
-                          : 'text-slate-600 dark:text-slate-400'
-                      }`}
-                    >
-                      {webgpu.status === 'hardware-active'
-                        ? `HW GPU · ${webgpu.adapterLabel}`
-                        : webgpu.status === 'software-rejected'
-                          ? 'SW GPU rejected (SIMD)'
-                          : webgpu.status === 'pending'
-                            ? 'Probing…'
-                            : 'Unavailable (SIMD)'}
                     </dd>
                   </div>
                 )}
@@ -722,7 +698,7 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
                   Worker to verify exclusive provider lock, Prism NativeBackend &amp; CostSurface
                   certificates, Q8_K narrow-lane (Q4_K/Q6_K) &amp; uor-matmul tabulated kernels,
                   3-tier vRAM KV paging, OPFS Belady-cyclic weight paging, Unified Store (T6), and
-                  hardware-only WebGPU admission.
+                  strict Verdant-only execution (browser WebGPU disabled).
                 </p>
               )}
             </section>

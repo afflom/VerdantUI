@@ -712,30 +712,30 @@ export class VerdantWebGpuSubstrate {
   }
 
   /**
-   * Probes `navigator.gpu`, rejects software adapters, compiles workgroup-tiled WGSL compute
-   * shaders (F32, Q4_0, Q8_0, Q4_K), and validates numerical parity on live GPU silicon.
+   * Browser WebGPU (`navigator.gpu`) is strictly disabled under the pure-Verdant policy.
+   * All tensor execution runs exclusively on Verdant WASM SIMD / Relaxed-SIMD + Prism + vRAM.
    */
   async probeAndInit(): Promise<WebGpuSubstrateTelemetry> {
-    const navGpu =
-      typeof navigator !== 'undefined'
-        ? ((navigator as unknown as { gpu?: NavigatorGpuLike }).gpu ?? null)
-        : null;
+    this.telemetry = {
+      status: 'unavailable',
+      adapterLabel: 'Verdant-Only (Browser WebGPU Disabled)',
+      vendor: '',
+      architecture: '',
+      maxStorageBufferMB: 0,
+      shadersCompiled: 0,
+      selfTestMaxError: null,
+      persistentBuffers: 0,
+      persistentBytes: 0,
+      gpuDispatches: 0,
+      gpuDispatchedBytes: 0,
+      reason: 'Browser WebGPU is disabled; executing exclusively on Verdant WASM SIMD + Prism.',
+    };
+    return this.getTelemetry();
+  }
 
+  /** @internal Retained solely for structural typing; never invoked under Verdant-only policy. */
+  private async _disabledBrowserProbe(navGpu: NavigatorGpuLike | null): Promise<WebGpuSubstrateTelemetry> {
     if (!navGpu || typeof navGpu.requestAdapter !== 'function') {
-      this.telemetry = {
-        status: 'unavailable',
-        adapterLabel: 'No WebGPU API',
-        vendor: '',
-        architecture: '',
-        maxStorageBufferMB: 0,
-        shadersCompiled: 0,
-        selfTestMaxError: null,
-        persistentBuffers: 0,
-        persistentBytes: 0,
-        gpuDispatches: 0,
-        gpuDispatchedBytes: 0,
-        reason: 'WebGPU unavailable in this runtime; multi-core WASM SIMD VNNI active.',
-      };
       return this.getTelemetry();
     }
 

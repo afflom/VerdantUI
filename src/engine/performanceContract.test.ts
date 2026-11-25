@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { GgmlType } from './gguf';
 import {
   computeVramKvPageSizes,
+  deriveHostMemoryBudgetBytes,
   derivePerformanceContract,
   evaluateContractCompliance,
   partitionRowStripes,
@@ -11,6 +12,8 @@ import {
   type EnvironmentProfile,
   type ModelGeometrySpec,
 } from './performanceContract';
+import { probeMaxWasmMemoryPages, VerdantWasmArena } from './verdantWasmSimd';
+import { VRAM_LM_HEAD_TILE_MAX_BYTES, VRAM_LM_HEAD_TILE_TARGET_BYTES } from './vramWeightPager';
 
 const SAMPLE_ENV: EnvironmentProfile = {
   simdTier: 'relaxed-vnni',
@@ -213,7 +216,9 @@ test('Prism Theorem T4: 3-tier Hot/Warm/Cold-Q4 capacity law safely scales conte
   assert.ok(cTight.coldQ4RamLimit < cTight.totalKvPages);
   assert.ok(cTight.projectedTotalArenaBytes <= tightEnv.memoryBudgetBytes);
 
-  // Theorem T4b + Full Context: 3B 1.88 GB model at full 131,072 ctx engages OPFS weight paging + 4-tier KV swap!
+  // Theorem T4b + Full Context (3.25 GiB probed WASM32 ceiling):
+  // Llama-3.2-3B (~1.88 GiB Q4_K_M) stays 100% resident-all (0 ms OPFS weight I/O/token)
+  // while preserving FULL 131,072 context via 4-tier vRAM KV swap!
   const m3b = makeModelSpec({
     name: 'Llama-3.2-3B-Q4_K_M',
     layers: 28,
@@ -226,20 +231,79 @@ test('Prism Theorem T4: 3-tier Hot/Warm/Cold-Q4 capacity law safely scales conte
     ctx: 131072,
     type: GgmlType.Q4_K,
   });
-  const c3b = derivePerformanceContract(SAMPLE_ENV, m3b, {
+  const c3bResident = derivePerformanceContract(SAMPLE_ENV, m3b, {
     backingKind: 'opfs-sync',
     weightResidencyPolicy: 'auto',
     backingQuotaBytes: 16 * 1024 * 1024 * 1024,
   });
-  assert.equal(c3b.effectiveMaxContext, 131072);
-  assert.equal(c3b.swapQ4Enabled, true);
-  assert.equal(c3b.weightResidencyMode, 'opfs-paged');
-  assert.equal(c3b.streamEmbeddings, true);
-  assert.equal(c3b.streamLmHead, true);
-  assert.ok(c3b.weightLayerFrameSlots >= 1 && c3b.weightLayerFrameSlots < 28);
-  assert.ok(c3b.projectedResidentWeightBytes < m3b.totalWeightBufferBytes);
-  assert.ok(c3b.projectedTotalArenaBytes <= SAMPLE_ENV.memoryBudgetBytes);
-  assert.ok(c3b.opfsIoOverheadMsPerToken > 0);
+  assert.equal(c3bResident.effectiveMaxContext, 131072);
+  assert.equal(c3bResident.swapQ4Enabled, true);
+  assert.equal(c3bResident.weightResidencyMode, 'resident-all');
+  assert.equal(c3bResident.streamEmbeddings, false);
+  assert.equal(c3bResident.streamLmHead, false);
+  assert.equal(c3bResident.opfsIoOverheadMsPerToken, 0);
+  assert.ok(c3bResident.projectedTotalArenaBytes <= SAMPLE_ENV.memoryBudgetBytes);
+
+  // Under a constrained 1.5 GiB budget (e.g. mobile/OOM step-down), the same 3B model
+  // automatically engages OPFS weight paging + 4-tier KV swap without dropping context!
+  const constrainedEnv: EnvironmentProfile = {
+    ...SAMPLE_ENV,
+    memoryBudgetBytes: Math.floor(1.5 * 1024 * 1024 * 1024),
+  };
+  const c3bPaged = derivePerformanceContract(constrainedEnv, m3b, {
+    backingKind: 'opfs-sync',
+    weightResidencyPolicy: 'auto',
+    backingQuotaBytes: 16 * 1024 * 1024 * 1024,
+  });
+  assert.equal(c3bPaged.effectiveMaxContext, 131072);
+  assert.equal(c3bPaged.swapQ4Enabled, true);
+  assert.equal(c3bPaged.weightResidencyMode, 'opfs-paged');
+  assert.equal(c3bPaged.streamEmbeddings, true);
+  assert.equal(c3bPaged.streamLmHead, true);
+  assert.ok(c3bPaged.weightLayerFrameSlots >= 1 && c3bPaged.weightLayerFrameSlots < 28);
+  assert.ok(c3bPaged.projectedResidentWeightBytes < m3b.totalWeightBufferBytes);
+  assert.ok(c3bPaged.projectedTotalArenaBytes <= constrainedEnv.memoryBudgetBytes);
+  assert.ok(c3bPaged.opfsIoOverheadMsPerToken > 0);
+  assert.ok(
+    c3bPaged.lmHeadTileTargetBytes >= VRAM_LM_HEAD_TILE_TARGET_BYTES &&
+      c3bPaged.lmHeadTileTargetBytes <= VRAM_LM_HEAD_TILE_MAX_BYTES,
+  );
+
+  // 7B model (4.35 GB) on 3.25 GiB host engages OPFS weight paging with scaled 32 MiB LM-head tile!
+  const m7b = makeModelSpec({
+    name: 'Qwen2.5-7B-Q4_K_M',
+    layers: 28,
+    dim: 3584,
+    ffnDim: 18944,
+    heads: 28,
+    kvHeads: 4,
+    vocab: 152064,
+    weightMB: 4350,
+    ctx: 32768,
+    type: GgmlType.Q4_K,
+  });
+  const c7b = derivePerformanceContract(SAMPLE_ENV, m7b, {
+    backingKind: 'opfs-sync',
+    weightResidencyPolicy: 'auto',
+    backingQuotaBytes: 16 * 1024 * 1024 * 1024,
+  });
+  assert.equal(c7b.weightResidencyMode, 'opfs-paged');
+  assert.equal(c7b.lmHeadTileTargetBytes, VRAM_LM_HEAD_TILE_MAX_BYTES);
+  assert.ok(c7b.projectedTotalArenaBytes <= SAMPLE_ENV.memoryBudgetBytes);
+});
+
+test('Dynamic WASM32 ceiling probe unlocks > 2 GiB arena budget without contrived caps', () => {
+  const maxPages = probeMaxWasmMemoryPages(true);
+  assert.ok(maxPages >= 32768, `Expected probed WASM32 maxPages >= 32768, got ${maxPages}`);
+  const arena = new VerdantWasmArena({ initialPages: 32, shared: true });
+  assert.equal(arena.maxPages, maxPages);
+  assert.equal(arena.maxCapacityBytes, maxPages * 65536);
+
+  // Probed 3.75 GiB -> 3.25 GiB safe budget; probed 2.0 GiB -> 1.625 GiB safe budget
+  const budget375 = deriveHostMemoryBudgetBytes(61440 * 65536);
+  assert.equal(budget375, WASM32_SAFE_MEMORY_CAP_BYTES);
+  const budget200 = deriveHostMemoryBudgetBytes(32768 * 65536);
+  assert.equal(budget200, 32768 * 65536 - 384 * 1024 * 1024);
 });
 
 test('Prism Theorem T5: compliance evaluation distinguishes UPHELD, EXCEEDS_ESTIMATE, and BELOW_CONTRACT', () => {

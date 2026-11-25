@@ -184,4 +184,5 @@ test('VerdantWebGpuSubstrate strictly rejects software renderers and exposes val
   const res = await sub.probeAndInit();
   assert.equal(res.status, 'unavailable');
   assert.equal(sub.isHardwareActive, false);
+  assert.match(res.adapterLabel, /Verdant-Only/i);
 });

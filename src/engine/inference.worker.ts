@@ -24,7 +24,6 @@ import {
   runVTensorConformanceSuite,
   type VTensorTelemetrySnapshot,
 } from './vtensorProvider';
-import { VerdantWebGpuSubstrate } from './verdantWebGpu';
 
 export type WorkerRequest =
   | {
@@ -180,9 +179,6 @@ export type WorkerResponse =
     };
 
 const runtime = new LlamaVTensorRuntime();
-const webgpuSubstrate = new VerdantWebGpuSubstrate();
-runtime.attachWebGpuTelemetry(() => webgpuSubstrate.getTelemetry());
-void webgpuSubstrate.probeAndInit();
 const threadPoolReadyPromise = runtime.initThreadPool().catch(() => undefined);
 
 const activeControllers = new Map<string, AbortController>();

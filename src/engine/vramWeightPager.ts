@@ -145,10 +145,27 @@ function alignUp32(n: number): number {
 }
 
 export const VRAM_LM_HEAD_TILE_TARGET_BYTES = 8 * 1024 * 1024;
+export const VRAM_LM_HEAD_TILE_MAX_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Scales the LM-head streaming tile budget dynamically between 8 MiB and 32 MiB according to
+ * available physical weight RAM, cutting OPFS read syscalls and thread barriers up to 4× on 7B+ models.
+ */
+export function computeDynamicLmHeadTileBytes(
+  physicalWeightBudgetBytes: number,
+  lmHeadWeightBytes: number,
+): number {
+  const scaled = Math.floor(physicalWeightBudgetBytes * 0.12);
+  const clamped = Math.max(
+    VRAM_LM_HEAD_TILE_TARGET_BYTES,
+    Math.min(VRAM_LM_HEAD_TILE_MAX_BYTES, scaled),
+  );
+  return Math.max(64 * 1024, Math.min(lmHeadWeightBytes, clamped));
+}
 
 /**
  * Computes the optimal LM-head stripe height (rows per tile) so the streaming tile stays
- * bounded around ~8 MiB regardless of vocab size (32K, 49K, 128K, 152K, 256K).
+ * bounded cleanly around `targetTileBytes` regardless of vocab size (32K–256K).
  */
 export function computeLmHeadStripeRows(
   outWeightInfo: GgufTensorInfo,
@@ -213,6 +230,8 @@ export class VramWeightPager {
   private readonly lmHeadTileBuffer: VTensorBuffer | null;
   private readonly lmHeadStripeRows: number;
   private readonly lmHeadRowBytes: number;
+  private readonly lmHeadFullStripeView: VTensorHandle | null;
+  private readonly lmHeadTailStripeView: VTensorHandle | null;
 
   // Live telemetry counters
   private layerHits = 0;
@@ -425,7 +444,7 @@ export class VramWeightPager {
       this.slots = [];
       this.layerToSlot = new Int32Array(layerInfos.length);
       this.layerToSlot.fill(-1);
-      for (let i = 0; i < Math.min(64, layerInfos.length); i++) {
+      for (let i = 0; i < layerInfos.length; i++) {
         this.residentLayerBitset |= 1n << BigInt(i);
       }
       this.embdRowBuffer = null;
@@ -435,6 +454,8 @@ export class VramWeightPager {
       this.embdSlotLastTouch = new Uint32Array(0);
       this.lmHeadTileBuffer = null;
       this.lmHeadStripeRows = outWeightInfo.dims[1] ?? 1;
+      this.lmHeadFullStripeView = null;
+      this.lmHeadTailStripeView = null;
       this.residentWeightBytes = weightsBuf.capacityBytes;
       this.pinnedLayerCount = layerInfos.length;
       this.cachedStreamingPublications = [];
@@ -544,15 +565,30 @@ export class VramWeightPager {
 
     // 4. Row-striped LM-head streaming tile buffer if LM head is streamed from OPFS
     if (this.streamLmHead) {
+      const cols = outWeightInfo.dims[0] ?? 1;
+      const vocabRows = outWeightInfo.dims[1] ?? 1;
       this.lmHeadStripeRows =
         config.lmHeadStripeRows ?? computeLmHeadStripeRows(outWeightInfo);
       const tileBytes = alignUp32(this.lmHeadStripeRows * this.lmHeadRowBytes) + 32;
       const tileBuf = allocBuffer('vtensor.vram_lmhead_tile', 'weights', tileBytes);
       this.lmHeadTileBuffer = tileBuf;
+      this.lmHeadFullStripeView = tileBuf.createViewTensor(
+        'vram.lmhead_stripe',
+        outWeightInfo.type,
+        [cols, this.lmHeadStripeRows],
+        0,
+      );
+      const tailRows = vocabRows % this.lmHeadStripeRows;
+      this.lmHeadTailStripeView =
+        tailRows > 0
+          ? tileBuf.createViewTensor('vram.lmhead_tail', outWeightInfo.type, [cols, tailRows], 0)
+          : null;
       totalResident += tileBuf.capacityBytes;
     } else {
       this.lmHeadTileBuffer = null;
       this.lmHeadStripeRows = outWeightInfo.dims[1] ?? 1;
+      this.lmHeadFullStripeView = null;
+      this.lmHeadTailStripeView = null;
     }
 
     this.residentWeightBytes = totalResident;
@@ -587,9 +623,7 @@ export class VramWeightPager {
     if (targetSlot.layerIdx >= 0) {
       const evictedLayer = targetSlot.layerIdx;
       this.layerToSlot[evictedLayer] = -1;
-      if (evictedLayer < 64) {
-        this.residentLayerBitset &= ~(1n << BigInt(evictedLayer));
-      }
+      this.residentLayerBitset &= ~(1n << BigInt(evictedLayer));
       this.slotReclaims += 1;
     }
 
@@ -661,9 +695,7 @@ export class VramWeightPager {
     targetSlot.lastTouch = ++this.clock;
     targetSlot.publication = publication;
     this.layerToSlot[layerIdx] = targetSlot.slotIndex;
-    if (layerIdx < 64) {
-      this.residentLayerBitset |= 1n << BigInt(layerIdx);
-    }
+    this.residentLayerBitset |= 1n << BigInt(layerIdx);
     this.layerFaults += 1;
     return publication;
   }
@@ -759,12 +791,17 @@ export class VramWeightPager {
       this.coalescedReads += 1;
       this.bytesRestoredFromBacking += stripeBytes;
 
-      const view = tileBuf.createViewTensor(
-        `vram.lmhead_${rowStart}`,
-        this.outWeightInfo.type,
-        [cols, rowCount],
-        0,
-      );
+      const view =
+        rowCount === this.lmHeadStripeRows && this.lmHeadFullStripeView
+          ? this.lmHeadFullStripeView
+          : this.lmHeadTailStripeView && this.lmHeadTailStripeView.dims[1] === rowCount
+            ? this.lmHeadTailStripeView
+            : tileBuf.createViewTensor(
+                `vram.lmhead_${rowStart}`,
+                this.outWeightInfo.type,
+                [cols, rowCount],
+                0,
+              );
       callback(view, rowStart, rowCount);
     }
   }

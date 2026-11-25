@@ -30,6 +30,7 @@ import { GgmlType, getGgmlTypeTrait, type LlamaHyperParams } from './gguf';
 import { vramCapacityCeiling, type VramBackingKind } from './vramBackingStore';
 import { VRAM_KV_PAGE_TOKENS } from './vramKvPager';
 import {
+  computeDynamicLmHeadTileBytes,
   VRAM_LM_HEAD_TILE_TARGET_BYTES,
   type WeightResidencyMode,
   type WeightResidencyPolicy,
@@ -140,6 +141,7 @@ export interface PerformanceContract {
   readonly weightLayerFrameSlots: number;
   readonly streamEmbeddings: boolean;
   readonly streamLmHead: boolean;
+  readonly lmHeadTileTargetBytes: number;
   readonly projectedResidentWeightBytes: number;
   readonly vramLogicalCapacityCeilingBytes: number;
   readonly opfsIoOverheadMsPerToken: number;
@@ -157,11 +159,11 @@ export interface PerformanceContract {
  * (zero arbitrary heuristic magic numbers):
  * - WASM_V128_ARCH_REGISTERS = 16 (x86-64 XMM0..XMM15 / ARM64 V0..V15 baseline without spill).
  * - SPILL_FREE_BATCH_WIDTH   = 4  (2 wave weight regs + 4 accumulators + 2 act regs + 2 masks <= 16).
- * - WASM32_SAFE_MEMORY_CAP   = 1.5 GiB (leaves 512 MiB headroom below the 2 GiB JS/WASM32 limit).
+ * - WASM32_SAFE_MEMORY_CAP   = 3.25 GiB (leaves 512 MiB headroom below 3.75 GiB probed WASM32 ceiling).
  */
 export const WASM_V128_ARCH_REGISTERS = 16;
 export const SPILL_FREE_BATCH_WIDTH = 4;
-export const WASM32_SAFE_MEMORY_CAP_BYTES = Math.floor(1.5 * 1024 * 1024 * 1024);
+export const WASM32_SAFE_MEMORY_CAP_BYTES = Math.floor(3.25 * 1024 * 1024 * 1024);
 
 /**
  * Quantized GGML block formats whose weights are strictly in [0, 63] or signed i8,
@@ -181,7 +183,7 @@ export const INTEGER_DOT_COMPATIBLE_TYPES: ReadonlySet<GgmlType> = new Set<GgmlT
 /** Detects host logical CPU count across browsers, Web Workers, and Node.js. */
 export function detectHardwareConcurrency(): number {
   if (typeof navigator !== 'undefined' && typeof navigator.hardwareConcurrency === 'number') {
-    return Math.max(1, Math.min(32, Math.floor(navigator.hardwareConcurrency)));
+    return Math.max(1, Math.min(64, Math.floor(navigator.hardwareConcurrency)));
   }
   return 1;
 }
@@ -198,17 +200,28 @@ export function detectSharedMemorySupport(): boolean {
   }
 }
 
-/** Derives the safe WASM linear arena memory budget from host RAM (bounded by WASM32 1.5 GiB cap). */
-export function deriveHostMemoryBudgetBytes(): number {
+/**
+ * Derives the safe Verdant WASM linear arena budget from the host's dynamically probed
+ * `WebAssembly.Memory` ceiling and `navigator.deviceMemory`:
+ * - Reserves 384 MiB below the probed WASM ceiling for JS/DOM/worker headroom (up to 3.25 GiB).
+ * - Respects low-RAM devices (`deviceMemory < 8 GB`, e.g. 2–4 GB mobile) at 55% of RAM.
+ * - Does NOT artificially throttle `deviceMemory >= 8` hosts (browsers privacy-cap `deviceMemory`
+ *   at 8 even on 16–128 GB workstations), enabling 3B models (~2.0 GB) to run 100% resident!
+ */
+export function deriveHostMemoryBudgetBytes(probedWasmMaxBytes?: number): number {
+  const probedCap =
+    probedWasmMaxBytes && probedWasmMaxBytes > 512 * 1024 * 1024
+      ? Math.min(WASM32_SAFE_MEMORY_CAP_BYTES, probedWasmMaxBytes - 384 * 1024 * 1024)
+      : WASM32_SAFE_MEMORY_CAP_BYTES;
+
   const nav = typeof navigator !== 'undefined'
     ? (navigator as Navigator & { deviceMemory?: number })
     : undefined;
-  if (nav && typeof nav.deviceMemory === 'number' && nav.deviceMemory > 0) {
-    // Allow up to 45% of reported device memory, capped strictly at WASM32 safe limit (1.5 GiB)
-    const hostBudget = Math.floor(nav.deviceMemory * 1024 * 1024 * 1024 * 0.45);
-    return Math.max(256 * 1024 * 1024, Math.min(WASM32_SAFE_MEMORY_CAP_BYTES, hostBudget));
+  if (nav && typeof nav.deviceMemory === 'number' && nav.deviceMemory > 0 && nav.deviceMemory < 8) {
+    const lowRamBudget = Math.floor(nav.deviceMemory * 1024 * 1024 * 1024 * 0.55);
+    return Math.max(256 * 1024 * 1024, Math.min(probedCap, lowRamBudget));
   }
-  return WASM32_SAFE_MEMORY_CAP_BYTES;
+  return Math.max(256 * 1024 * 1024, probedCap);
 }
 
 /**
@@ -289,6 +302,7 @@ export function derivePerformanceContract(
     backingBandwidthMBs?: number;
     backingQuotaBytes?: number;
     maxLayerFrameSlotsCap?: number;
+    memoryBudgetBytesOverride?: number;
   },
 ): PerformanceContract {
   const hp = model.hparams;
@@ -412,16 +426,21 @@ export function derivePerformanceContract(
     Math.ceil((Math.max(dim, qDim, ffnDim) / 32) * 48) * (B + 2) +
     64 * 1024;
 
+  const effectiveMemoryBudgetBytes =
+    options?.memoryBudgetBytesOverride && options.memoryBudgetBytesOverride > 0
+      ? Math.min(env.memoryBudgetBytes, options.memoryBudgetBytesOverride)
+      : env.memoryBudgetBytes;
+
   // Minimum hot frames theorem: Page 0 (attention sink) + active prefill span + 2 working pages
   const minHotFrames = 1 + Math.ceil(B / VRAM_KV_PAGE_TOKENS) + 2; // = 4 pages minimum
   const minKvReserveBytes = minHotFrames * hotF32Bytes + 4 * warmQ8Bytes;
   const wasmHeadroomBytes = 64 * 1024 * 1024;
   const physicalWeightBudgetBytes = Math.max(
     16 * 1024 * 1024,
-    env.memoryBudgetBytes - minKvReserveBytes - estimatedScratchBytes - wasmHeadroomBytes,
+    effectiveMemoryBudgetBytes - minKvReserveBytes - estimatedScratchBytes - wasmHeadroomBytes,
   );
   const vramLogicalCapacityCeilingBytes = vramCapacityCeiling(
-    Math.max(env.memoryBudgetBytes, model.totalWeightBufferBytes),
+    Math.max(effectiveMemoryBudgetBytes, model.totalWeightBufferBytes),
     model.totalWeightBufferBytes,
     backingQuotaBytes,
   );
@@ -435,18 +454,23 @@ export function derivePerformanceContract(
   let weightLayerFrameSlots = hp.blockCount;
   let streamEmbeddings = false;
   let streamLmHead = false;
+  let lmHeadTileTargetBytes = VRAM_LM_HEAD_TILE_TARGET_BYTES;
   let projectedResidentWeightBytes = model.totalWeightBufferBytes;
   let opfsIoTimeSec = 0;
 
   if (weightResidencyMode === 'opfs-paged') {
     streamEmbeddings = true;
+    lmHeadTileTargetBytes = computeDynamicLmHeadTileBytes(
+      physicalWeightBudgetBytes,
+      model.lmHeadWeightBytes,
+    );
     streamLmHead =
       mustPageWeights ||
-      model.lmHeadWeightBytes > VRAM_LM_HEAD_TILE_TARGET_BYTES ||
+      model.lmHeadWeightBytes > lmHeadTileTargetBytes ||
       weightResidencyPolicy === 'paged';
     const hotNormsEstimate = hp.blockCount * dim * 12 + dim * 4;
     const lmTileEstimate = streamLmHead
-      ? Math.min(model.lmHeadWeightBytes, VRAM_LM_HEAD_TILE_TARGET_BYTES)
+      ? Math.min(model.lmHeadWeightBytes, lmHeadTileTargetBytes)
       : model.lmHeadWeightBytes;
     const frameBudgetBytes = mustPageWeights
       ? Math.max(avgLayerBytes, physicalWeightBudgetBytes - hotNormsEstimate - lmTileEstimate)
@@ -509,7 +533,7 @@ export function derivePerformanceContract(
 
   const availableForKvBytes = Math.max(
     minKvReserveBytes,
-    Math.floor((env.memoryBudgetBytes - projectedResidentWeightBytes - estimatedScratchBytes) * 0.65),
+    Math.floor((effectiveMemoryBudgetBytes - projectedResidentWeightBytes - estimatedScratchBytes) * 0.65),
   );
 
   // Target KV budget: never exceed 65% of remaining WASM budget OR 96 MiB soft cap for crisp browser responsiveness
@@ -592,7 +616,7 @@ export function derivePerformanceContract(
     projectedResidentWeightBytes + projectedKvContractBytes + estimatedScratchBytes;
   const memoryBudgetUtilization = Math.min(
     1,
-    projectedTotalArenaBytes / Math.max(1, env.memoryBudgetBytes),
+    projectedTotalArenaBytes / Math.max(1, effectiveMemoryBudgetBytes),
   );
 
   const summaryTheoremLine =
@@ -642,6 +666,7 @@ export function derivePerformanceContract(
     weightLayerFrameSlots,
     streamEmbeddings,
     streamLmHead,
+    lmHeadTileTargetBytes,
     projectedResidentWeightBytes,
     vramLogicalCapacityCeilingBytes,
     opfsIoOverheadMsPerToken: Number((opfsIoTimeSec * 1000).toFixed(2)),

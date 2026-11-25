@@ -5222,26 +5222,26 @@ function buildMulMatQ6KQ8K(useRelaxed: boolean): FuncBuilder {
   const qp = f.local(I32);
   const sb = f.local(I32);
   const h = f.local(I32);
-  const qlp0 = f.local(I32);
-  const qhp0 = f.local(I32);
-  const scp0 = f.local(I32);
-  const qlp1 = f.local(I32);
-  const qhp1 = f.local(I32);
-  const scp1 = f.local(I32);
-  const xHalfPtr = f.local(I32);
+  const ql0 = f.local(I32);
+  const qh0 = f.local(I32);
+  const sc0 = f.local(I32);
+  const ql1 = f.local(I32);
+  const qh1 = f.local(I32);
+  const sc1 = f.local(I32);
+  const xBase = f.local(I32);
   const acc0 = f.local(F32);
   const acc1 = f.local(F32);
   const dxS = f.local(F32);
 
-  // Strictly 12 V128 locals -> 0 XMM spills on x86-64 AND 0 qhv reloads!
+  // Strictly 12 V128 locals -> 4 free XMM scratch registers on x86-64 (0 spills!)
   const mask0f = f.local(V128);
   const mask03 = f.local(V128);
+  const sumi0 = f.local(V128);
+  const sumi1 = f.local(V128);
   const x0 = f.local(V128);
   const x1 = f.local(V128);
   const x2 = f.local(V128);
   const x3 = f.local(V128);
-  const sumi0 = f.local(V128);
-  const sumi1 = f.local(V128);
   const qla = f.local(V128);
   const qlb = f.local(V128);
   const qhv = f.local(V128);
@@ -5263,24 +5263,24 @@ function buildMulMatQ6KQ8K(useRelaxed: boolean): FuncBuilder {
       .i32x4Sub().set(sumiLoc);
   };
 
-  // Emit all 4 groups of slice `s` (0 or 1) for one row with fused vpmaddubsw + vpmaddwd(sc)
+  // Emit all 4 groups of slice `s` (0 or 1) using current half pointers `(qlLoc, qhLoc, scLoc)`
   const emitSliceRow = (
-    qlpLoc: number,
-    qhpLoc: number,
-    scpLoc: number,
+    qlLoc: number,
+    qhLoc: number,
+    scLoc: number,
     sumiLoc: number,
     s: number,
   ) => {
     const sOff = s * 16;
-    f.get(qlpLoc).v128Load(sOff).set(qla);
-    f.get(qlpLoc).v128Load(32 + sOff).set(qlb);
-    f.get(qhpLoc).v128Load(sOff).set(qhv);
+    f.get(qlLoc).v128Load(sOff).set(qla);
+    f.get(qlLoc).v128Load(32 + sOff).set(qlb);
+    f.get(qhLoc).v128Load(sOff).set(qhv);
 
     const emitGroup = (xLoc: number, scOff: number, buildQ6: () => void) => {
       buildQ6();
       f.set(q6v);
       f.pushDotI8I7ToI16x8(xLoc, q6v, useRelaxed);
-      f.get(scpLoc).i32Load8S(scOff).i16x8Splat()
+      f.get(scLoc).i32Load8S(scOff).i16x8Splat()
         .i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
     };
 
@@ -5302,7 +5302,7 @@ function buildMulMatQ6KQ8K(useRelaxed: boolean): FuncBuilder {
     });
   };
 
-  // 2-row register-blocked loop (fits 100% in uop cache + zero XMM spills!)
+  // 2-row zero-spill main loop with compact rolled h-loop (fits 100% in x86-64 DSB uop cache)
   f.block().loop();
   f.get(r).i32Const(1).i32Add().get(4).i32GeS().brIf(1);
   f.get(0).get(r).get(rowBytes).i32Mul().i32Add().tee(wp0).get(rowBytes).i32Add().set(wp1);
@@ -5319,34 +5319,33 @@ function buildMulMatQ6KQ8K(useRelaxed: boolean): FuncBuilder {
   initRowOffset(wp0, sumi0);
   initRowOffset(wp1, sumi1);
 
-  // Rolled 2-half loop (h = 0, 1) keeps inner body tiny and 100% inside x86 uop cache!
-  f.get(wp0).set(qlp0);
-  f.get(wp0).i32Const(128).i32Add().set(qhp0);
-  f.get(wp0).i32Const(192).i32Add().set(scp0);
-  f.get(wp1).set(qlp1);
-  f.get(wp1).i32Const(128).i32Add().set(qhp1);
-  f.get(wp1).i32Const(192).i32Add().set(scp1);
-  f.get(qp).i32Const(64).i32Add().set(xHalfPtr);
+  f.get(wp0).set(ql0);
+  f.get(wp0).i32Const(128).i32Add().set(qh0);
+  f.get(wp0).i32Const(192).i32Add().set(sc0);
+  f.get(wp1).set(ql1);
+  f.get(wp1).i32Const(128).i32Add().set(qh1);
+  f.get(wp1).i32Const(192).i32Add().set(sc1);
+  f.get(qp).i32Const(64).i32Add().set(xBase);
   f.i32Const(0).set(h);
 
   f.block().loop();
   f.get(h).i32Const(2).i32GeS().brIf(1);
   for (let s = 0; s < 2; s++) {
     const sOff = s * 16;
-    f.get(xHalfPtr).v128Load(0 + sOff, 4).set(x0);
-    f.get(xHalfPtr).v128Load(32 + sOff, 4).set(x1);
-    f.get(xHalfPtr).v128Load(64 + sOff, 4).set(x2);
-    f.get(xHalfPtr).v128Load(96 + sOff, 4).set(x3);
-    emitSliceRow(qlp0, qhp0, scp0, sumi0, s);
-    emitSliceRow(qlp1, qhp1, scp1, sumi1, s);
+    f.get(xBase).v128Load(0 + sOff, 4).set(x0);
+    f.get(xBase).v128Load(32 + sOff, 4).set(x1);
+    f.get(xBase).v128Load(64 + sOff, 4).set(x2);
+    f.get(xBase).v128Load(96 + sOff, 4).set(x3);
+    emitSliceRow(ql0, qh0, sc0, sumi0, s);
+    emitSliceRow(ql1, qh1, sc1, sumi1, s);
   }
-  f.get(qlp0).i32Const(64).i32Add().set(qlp0);
-  f.get(qhp0).i32Const(32).i32Add().set(qhp0);
-  f.get(scp0).i32Const(8).i32Add().set(scp0);
-  f.get(qlp1).i32Const(64).i32Add().set(qlp1);
-  f.get(qhp1).i32Const(32).i32Add().set(qhp1);
-  f.get(scp1).i32Const(8).i32Add().set(scp1);
-  f.get(xHalfPtr).i32Const(128).i32Add().set(xHalfPtr);
+  f.get(ql0).i32Const(64).i32Add().set(ql0);
+  f.get(qh0).i32Const(32).i32Add().set(qh0);
+  f.get(sc0).i32Const(8).i32Add().set(sc0);
+  f.get(ql1).i32Const(64).i32Add().set(ql1);
+  f.get(qh1).i32Const(32).i32Add().set(qh1);
+  f.get(sc1).i32Const(8).i32Add().set(sc1);
+  f.get(xBase).i32Const(128).i32Add().set(xBase);
   f.get(h).i32Const(1).i32Add().set(h);
   f.br(0).end().end();
 
@@ -5361,13 +5360,14 @@ function buildMulMatQ6KQ8K(useRelaxed: boolean): FuncBuilder {
   f.get(sb).i32Const(1).i32Add().set(sb);
   f.br(0).end().end();
 
-  f.get(2).get(r).i32Const(2).i32Shl().i32Add().tee(qlp0).get(acc0).f32Store(0);
-  f.get(qlp0).get(acc1).f32Store(4);
+  f.get(2).get(r).i32Const(2).i32Shl().i32Add().get(acc0).f32Store(0);
+  f.get(2).get(r).i32Const(2).i32Shl().i32Add().get(acc1).f32Store(4);
   f.get(r).i32Const(2).i32Add().set(r);
   f.br(0).end().end();
 
-  // Odd remainder row (0 or 1)
-  f.get(r).get(4).i32LtS().if_();
+  // Odd trailing row (0..1)
+  f.block();
+  f.get(r).get(4).i32GeS().brIf(0);
   f.get(0).get(r).get(rowBytes).i32Mul().i32Add().set(wp0);
   f.get(1).set(qp);
   f.f32Const(0).set(acc0);
@@ -5380,26 +5380,26 @@ function buildMulMatQ6KQ8K(useRelaxed: boolean): FuncBuilder {
   f.get(qp).v128Load(32, 4).set(x1);
   initRowOffset(wp0, sumi0);
 
-  f.get(wp0).set(qlp0);
-  f.get(wp0).i32Const(128).i32Add().set(qhp0);
-  f.get(wp0).i32Const(192).i32Add().set(scp0);
-  f.get(qp).i32Const(64).i32Add().set(xHalfPtr);
+  f.get(wp0).set(ql0);
+  f.get(wp0).i32Const(128).i32Add().set(qh0);
+  f.get(wp0).i32Const(192).i32Add().set(sc0);
+  f.get(qp).i32Const(64).i32Add().set(xBase);
   f.i32Const(0).set(h);
 
   f.block().loop();
   f.get(h).i32Const(2).i32GeS().brIf(1);
   for (let s = 0; s < 2; s++) {
     const sOff = s * 16;
-    f.get(xHalfPtr).v128Load(0 + sOff, 4).set(x0);
-    f.get(xHalfPtr).v128Load(32 + sOff, 4).set(x1);
-    f.get(xHalfPtr).v128Load(64 + sOff, 4).set(x2);
-    f.get(xHalfPtr).v128Load(96 + sOff, 4).set(x3);
-    emitSliceRow(qlp0, qhp0, scp0, sumi0, s);
+    f.get(xBase).v128Load(0 + sOff, 4).set(x0);
+    f.get(xBase).v128Load(32 + sOff, 4).set(x1);
+    f.get(xBase).v128Load(64 + sOff, 4).set(x2);
+    f.get(xBase).v128Load(96 + sOff, 4).set(x3);
+    emitSliceRow(ql0, qh0, sc0, sumi0, s);
   }
-  f.get(qlp0).i32Const(64).i32Add().set(qlp0);
-  f.get(qhp0).i32Const(32).i32Add().set(qhp0);
-  f.get(scp0).i32Const(8).i32Add().set(scp0);
-  f.get(xHalfPtr).i32Const(128).i32Add().set(xHalfPtr);
+  f.get(ql0).i32Const(64).i32Add().set(ql0);
+  f.get(qh0).i32Const(32).i32Add().set(qh0);
+  f.get(sc0).i32Const(8).i32Add().set(sc0);
+  f.get(xBase).i32Const(128).i32Add().set(xBase);
   f.get(h).i32Const(1).i32Add().set(h);
   f.br(0).end().end();
 
@@ -5796,7 +5796,7 @@ export function buildVerdantSimdModuleBytes(
     funcTypeIndices.push(idx);
   }
 
-  // Import section: env.memory (min 16 pages = 1 MiB, max 32768 pages = 2 GiB; 0x03 = shared)
+  // Import section: env.memory (min 16 pages = 1 MiB, max 65536 pages = 4 GiB WASM32 architectural ceiling; 0x03 = shared)
   const importBody = [
     0x01,
     ...utf8('env'),
@@ -5804,7 +5804,7 @@ export function buildVerdantSimdModuleBytes(
     0x02,
     sharedMemory ? 0x03 : 0x01,
     ...uleb(16),
-    ...uleb(32768),
+    ...uleb(65536),
   ];
 
   // Function section
@@ -6205,6 +6205,42 @@ function alignUp32(n: number): number {
   return rem === 0 ? n : n + (32 - rem);
 }
 
+const cachedProbedMaxPages: { shared: number | null; unshared: number | null } = {
+  shared: null,
+  unshared: null,
+};
+
+/**
+ * Dynamically probes the host engine's true maximum `WebAssembly.Memory` page ceiling
+ * (up to 3.75 GiB = 61,440 pages on 64-bit V8/SpiderMonkey/JSC, gracefully stepping down on
+ * constrained browsers/devices) with zero physical RAM commit (`initial: 1`).
+ */
+export function probeMaxWasmMemoryPages(shared: boolean): number {
+  const key = shared ? 'shared' : 'unshared';
+  const cached = cachedProbedMaxPages[key];
+  if (cached !== null) return cached;
+
+  // Candidate ceilings in 64 KiB pages: 3.75 GiB -> 3.5 GiB -> 3.0 GiB -> 2.5 GiB -> 2.0 GiB -> 1.5 GiB -> 1.0 GiB
+  const candidates = [61440, 57344, 49152, 40960, 32768, 24576, 16384];
+  for (const maxPages of candidates) {
+    try {
+      const probe = new WebAssembly.Memory({
+        initial: 1,
+        maximum: maxPages,
+        ...(shared ? { shared: true } : {}),
+      });
+      if (probe.buffer.byteLength >= 65536) {
+        cachedProbedMaxPages[key] = maxPages;
+        return maxPages;
+      }
+    } catch {
+      // Try next lower ceiling
+    }
+  }
+  cachedProbedMaxPages[key] = 16384;
+  return 16384;
+}
+
 /**
  * Unified WASM linear memory arena + SIMD128/Relaxed-SIMD kernel dispatcher owned by each
  * VTensorBackendRegistry. Supports both single-core and zero-copy SharedArrayBuffer multi-core
@@ -6217,6 +6253,8 @@ export class VerdantWasmArena {
   readonly moduleByteSize: number;
   readonly relaxedSimdActive: boolean;
   readonly isSharedMemory: boolean;
+  readonly maxPages: number;
+  readonly maxCapacityBytes: number;
 
   private cursor = WASM_DYNAMIC_ARENA_START;
   private gen = 1;
@@ -6224,7 +6262,7 @@ export class VerdantWasmArena {
   private cachedCalibration: ArenaCalibrationResult | null = null;
   private threadPool: VTensorThreadPoolLike | null = null;
 
-  constructor(optionsOrPages: number | { initialPages?: number; shared?: boolean } = 64) {
+  constructor(optionsOrPages: number | { initialPages?: number; shared?: boolean; maxPages?: number } = 64) {
     if (!isVerdantWasmSimdSupported() || !cachedCompiledModule) {
       throw new Error('WebAssembly SIMD128 is not supported in this runtime.');
     }
@@ -6232,15 +6270,26 @@ export class VerdantWasmArena {
       typeof optionsOrPages === 'number' ? optionsOrPages : (optionsOrPages.initialPages ?? 64);
     const wantShared =
       typeof optionsOrPages === 'number' ? false : (optionsOrPages.shared ?? false);
+    const requestedMaxPages =
+      typeof optionsOrPages === 'number' ? undefined : optionsOrPages.maxPages;
 
     this.relaxedSimdActive = isVerdantRelaxedSimdSupported();
     const useShared = wantShared && isVerdantSharedWasmSupported() && cachedSharedCompiledModule !== null;
     this.isSharedMemory = useShared;
     this.compiledModule = useShared ? cachedSharedCompiledModule! : cachedCompiledModule;
     this.moduleByteSize = useShared ? cachedSharedModuleByteLength : cachedModuleByteLength;
+
+    const probedMax = probeMaxWasmMemoryPages(useShared);
+    const maxPages = Math.max(
+      Math.max(16, initialPages),
+      Math.min(probedMax, requestedMaxPages ?? probedMax),
+    );
+    this.maxPages = maxPages;
+    this.maxCapacityBytes = maxPages * 65536;
+
     this.memory = new WebAssembly.Memory({
       initial: Math.max(16, initialPages),
-      maximum: 32768,
+      maximum: maxPages,
       ...(useShared ? { shared: true } : {}),
     });
     const instance = new WebAssembly.Instance(this.compiledModule, {

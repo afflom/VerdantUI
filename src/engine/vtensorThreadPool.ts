@@ -15,7 +15,6 @@
  */
 
 import { GgmlType } from './gguf';
-import { partitionRowStripes } from './performanceContract';
 import {
   executeWasmMatStripe,
   ParallelMatOp,
@@ -40,6 +39,8 @@ export const CTRL_O_STRIDE_BYTES = 10;
 export const CTRL_READY_COUNT = 11;
 export const CTRL_GROUP_OP = 12;
 export const CTRL_GROUP_COUNT = 13;
+export const CTRL_SLEEPING_HELPERS = 14;
+export const CTRL_COORDINATOR_WAITING = 15;
 
 // Fused multi-projection group descriptor block (3 entries × 8 ints = 24 ints, padded to 32 ints)
 export const GROUP_DESC_BASE = 16; // byte offset 64 (cache-line aligned)
@@ -65,11 +66,11 @@ export const SLOT_G2_ROW_COUNT = 6;
 export const OP_GROUP_DISPATCH = 50;
 export const OP_PING = 51;
 export const OP_SHUTDOWN = 99;
-export const MAX_POOL_WORKERS = 8;
+export const MAX_POOL_WORKERS = 32;
 
-/** Active spin window (~150–250 µs) keeps helper threads hot across back-to-back transformer layers. */
-export const WORKER_ACTIVE_SPIN = 24_000;
-export const COORDINATOR_JOIN_SPIN = 40_000;
+/** Active spin window (~400–800 µs) keeps helper threads hot across attention/RMSNorm gaps without futex syscalls. */
+export const WORKER_ACTIVE_SPIN = 80_000;
+export const COORDINATOR_JOIN_SPIN = 80_000;
 
 /** Default Theorem T3 parallel dispatch floor (48 KiB): unlocks multi-core across 135M–3B models. */
 export const DEFAULT_PARALLEL_THRESHOLD_BYTES = 48 * 1024;
@@ -106,29 +107,38 @@ export function runComputeWorkerLoop(
       seq = Atomics.load(ctrl, CTRL_JOB_SEQ);
     }
     while (seq === lastSeq) {
-      Atomics.wait(ctrl, CTRL_JOB_SEQ, lastSeq, 25);
+      Atomics.add(ctrl, CTRL_SLEEPING_HELPERS, 1);
       seq = Atomics.load(ctrl, CTRL_JOB_SEQ);
+      if (seq === lastSeq) {
+        Atomics.wait(ctrl, CTRL_JOB_SEQ, lastSeq, 25);
+        seq = Atomics.load(ctrl, CTRL_JOB_SEQ);
+      }
+      Atomics.sub(ctrl, CTRL_SLEEPING_HELPERS, 1);
     }
     lastSeq = seq;
 
     const op = Atomics.load(ctrl, CTRL_OP_CODE);
     if (op === OP_SHUTDOWN) {
       Atomics.store(ctrl, slotBase + SLOT_DONE_SEQ, seq);
-      Atomics.notify(ctrl, slotBase + SLOT_DONE_SEQ, 1);
+      if (Atomics.load(ctrl, CTRL_COORDINATOR_WAITING) !== 0) {
+        Atomics.notify(ctrl, slotBase + SLOT_DONE_SEQ, 1);
+      }
       break;
     }
 
     if (op === OP_PING) {
       Atomics.store(ctrl, slotBase + SLOT_DONE_SEQ, seq);
-      Atomics.notify(ctrl, slotBase + SLOT_DONE_SEQ, 1);
+      if (Atomics.load(ctrl, CTRL_COORDINATOR_WAITING) !== 0) {
+        Atomics.notify(ctrl, slotBase + SLOT_DONE_SEQ, 1);
+      }
       continue;
     }
 
     if (op === OP_GROUP_DISPATCH) {
       const groupOp = Atomics.load(ctrl, CTRL_GROUP_OP) as ParallelMatOp;
       const groupCount = Atomics.load(ctrl, CTRL_GROUP_COUNT);
-      const xOrQ8Ptr = Atomics.load(ctrl, CTRL_X_OR_Q8_PTR);
-      const xF32Ptr = Atomics.load(ctrl, CTRL_X_F32_PTR);
+      const xOrQ8Ptr = Atomics.load(ctrl, CTRL_X_OR_Q8_PTR) >>> 0;
+      const xF32Ptr = Atomics.load(ctrl, CTRL_X_F32_PTR) >>> 0;
       const cols = Atomics.load(ctrl, CTRL_COLS);
 
       for (let g = 0; g < groupCount; g++) {
@@ -139,8 +149,8 @@ export function runComputeWorkerLoop(
           const rowStart = Atomics.load(ctrl, slotBase + startOff);
           const dBase = GROUP_DESC_BASE + g * GROUP_DESC_STRIDE;
           const weightType = Atomics.load(ctrl, dBase + GDESC_WEIGHT_TYPE) as GgmlType;
-          const wPtr = Atomics.load(ctrl, dBase + GDESC_W_PTR);
-          const outPtr = Atomics.load(ctrl, dBase + GDESC_OUT_PTR);
+          const wPtr = Atomics.load(ctrl, dBase + GDESC_W_PTR) >>> 0;
+          const outPtr = Atomics.load(ctrl, dBase + GDESC_OUT_PTR) >>> 0;
           const rowBytes = Atomics.load(ctrl, dBase + GDESC_ROW_BYTES);
           const oStrideBytes = Atomics.load(ctrl, dBase + GDESC_O_STRIDE_BYTES);
 
@@ -160,7 +170,9 @@ export function runComputeWorkerLoop(
       }
 
       Atomics.store(ctrl, slotBase + SLOT_DONE_SEQ, seq);
-      Atomics.notify(ctrl, slotBase + SLOT_DONE_SEQ, 1);
+      if (Atomics.load(ctrl, CTRL_COORDINATOR_WAITING) !== 0) {
+        Atomics.notify(ctrl, slotBase + SLOT_DONE_SEQ, 1);
+      }
       continue;
     }
 
@@ -168,10 +180,10 @@ export function runComputeWorkerLoop(
     if (rowCount > 0) {
       const rowStart = Atomics.load(ctrl, slotBase + SLOT_ROW_START);
       const weightType = Atomics.load(ctrl, CTRL_WEIGHT_TYPE) as GgmlType;
-      const wPtr = Atomics.load(ctrl, CTRL_W_PTR);
-      const xOrQ8Ptr = Atomics.load(ctrl, CTRL_X_OR_Q8_PTR);
-      const xF32Ptr = Atomics.load(ctrl, CTRL_X_F32_PTR);
-      const outPtr = Atomics.load(ctrl, CTRL_OUT_PTR);
+      const wPtr = Atomics.load(ctrl, CTRL_W_PTR) >>> 0;
+      const xOrQ8Ptr = Atomics.load(ctrl, CTRL_X_OR_Q8_PTR) >>> 0;
+      const xF32Ptr = Atomics.load(ctrl, CTRL_X_F32_PTR) >>> 0;
+      const outPtr = Atomics.load(ctrl, CTRL_OUT_PTR) >>> 0;
       const cols = Atomics.load(ctrl, CTRL_COLS);
       const rowBytes = Atomics.load(ctrl, CTRL_ROW_BYTES);
       const oStrideBytes = Atomics.load(ctrl, CTRL_O_STRIDE_BYTES);
@@ -191,7 +203,9 @@ export function runComputeWorkerLoop(
     }
 
     Atomics.store(ctrl, slotBase + SLOT_DONE_SEQ, seq);
-    Atomics.notify(ctrl, slotBase + SLOT_DONE_SEQ, 1);
+    if (Atomics.load(ctrl, CTRL_COORDINATOR_WAITING) !== 0) {
+      Atomics.notify(ctrl, slotBase + SLOT_DONE_SEQ, 1);
+    }
   }
 }
 
@@ -210,6 +224,10 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
   private readonly ctrlSab: SharedArrayBuffer;
   private readonly ctrl: Int32Array;
   private readonly workers: ManagedWorkerHandle[] = [];
+  private readonly stripeStarts: Int32Array;
+  private readonly stripeCounts: Int32Array;
+  private readonly localGroupStarts = new Int32Array(MAX_GROUP_ENTRIES);
+  private readonly localGroupCounts = new Int32Array(MAX_GROUP_ENTRIES);
   private active = false;
   private jobSeq = 0;
   private dispatches = 0;
@@ -227,6 +245,8 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
     this.helperCount = Math.max(0, workerCount - 1);
     this.ctrlSab = ctrlSab;
     this.ctrl = new Int32Array(ctrlSab);
+    this.stripeStarts = new Int32Array(workerCount);
+    this.stripeCounts = new Int32Array(workerCount);
     this.thresholdBytes = thresholdBytes;
     this.reason = 'Initializing multi-core vTensor WASM pool…';
   }
@@ -293,7 +313,7 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
       return null;
     }
 
-    const ctrlSab = new SharedArrayBuffer((WORKER_SLOT_BASE + MAX_POOL_WORKERS * WORKER_SLOT_STRIDE) * 4);
+    const ctrlSab = new SharedArrayBuffer((WORKER_SLOT_BASE + totalWorkers * WORKER_SLOT_STRIDE) * 4);
     const pool = new VTensorThreadPool(
       totalWorkers,
       ctrlSab,
@@ -384,26 +404,35 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
               seq = Atomics.load(ctrl, ${CTRL_JOB_SEQ});
             }
             while (seq === lastSeq) {
-              Atomics.wait(ctrl, ${CTRL_JOB_SEQ}, lastSeq, 25);
+              Atomics.add(ctrl, ${CTRL_SLEEPING_HELPERS}, 1);
               seq = Atomics.load(ctrl, ${CTRL_JOB_SEQ});
+              if (seq === lastSeq) {
+                Atomics.wait(ctrl, ${CTRL_JOB_SEQ}, lastSeq, 25);
+                seq = Atomics.load(ctrl, ${CTRL_JOB_SEQ});
+              }
+              Atomics.sub(ctrl, ${CTRL_SLEEPING_HELPERS}, 1);
             }
             lastSeq = seq;
             const op = Atomics.load(ctrl, ${CTRL_OP_CODE});
             if (op === ${OP_SHUTDOWN}) {
               Atomics.store(ctrl, slotBase + ${SLOT_DONE_SEQ}, seq);
-              Atomics.notify(ctrl, slotBase + ${SLOT_DONE_SEQ}, 1);
+              if (Atomics.load(ctrl, ${CTRL_COORDINATOR_WAITING}) !== 0) {
+                Atomics.notify(ctrl, slotBase + ${SLOT_DONE_SEQ}, 1);
+              }
               break;
             }
             if (op === ${OP_PING}) {
               Atomics.store(ctrl, slotBase + ${SLOT_DONE_SEQ}, seq);
-              Atomics.notify(ctrl, slotBase + ${SLOT_DONE_SEQ}, 1);
+              if (Atomics.load(ctrl, ${CTRL_COORDINATOR_WAITING}) !== 0) {
+                Atomics.notify(ctrl, slotBase + ${SLOT_DONE_SEQ}, 1);
+              }
               continue;
             }
             if (op === ${OP_GROUP_DISPATCH}) {
               const groupOp = Atomics.load(ctrl, ${CTRL_GROUP_OP});
               const groupCount = Atomics.load(ctrl, ${CTRL_GROUP_COUNT});
-              const xOrQ8 = Atomics.load(ctrl, ${CTRL_X_OR_Q8_PTR});
-              const xF32 = Atomics.load(ctrl, ${CTRL_X_F32_PTR});
+              const xOrQ8 = Atomics.load(ctrl, ${CTRL_X_OR_Q8_PTR}) >>> 0;
+              const xF32 = Atomics.load(ctrl, ${CTRL_X_F32_PTR}) >>> 0;
               const cols = Atomics.load(ctrl, ${CTRL_COLS});
               for (let g = 0; g < groupCount; g++) {
                 const startOff = g === 0 ? ${SLOT_ROW_START} : g === 1 ? ${SLOT_G1_ROW_START} : ${SLOT_G2_ROW_START};
@@ -413,32 +442,36 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
                   const rowStart = Atomics.load(ctrl, slotBase + startOff);
                   const dBase = ${GROUP_DESC_BASE} + g * ${GROUP_DESC_STRIDE};
                   const wt = Atomics.load(ctrl, dBase + ${GDESC_WEIGHT_TYPE});
-                  const wPtr = Atomics.load(ctrl, dBase + ${GDESC_W_PTR});
-                  const outPtr = Atomics.load(ctrl, dBase + ${GDESC_OUT_PTR});
+                  const wPtr = Atomics.load(ctrl, dBase + ${GDESC_W_PTR}) >>> 0;
+                  const outPtr = Atomics.load(ctrl, dBase + ${GDESC_OUT_PTR}) >>> 0;
                   const rowBytes = Atomics.load(ctrl, dBase + ${GDESC_ROW_BYTES});
                   const oStride = Atomics.load(ctrl, dBase + ${GDESC_O_STRIDE_BYTES});
                   runStripe(groupOp, wt, wPtr + rowStart * rowBytes, xOrQ8, xF32, outPtr + rowStart * 4, cols, rowCount, oStride);
                 }
               }
               Atomics.store(ctrl, slotBase + ${SLOT_DONE_SEQ}, seq);
-              Atomics.notify(ctrl, slotBase + ${SLOT_DONE_SEQ}, 1);
+              if (Atomics.load(ctrl, ${CTRL_COORDINATOR_WAITING}) !== 0) {
+                Atomics.notify(ctrl, slotBase + ${SLOT_DONE_SEQ}, 1);
+              }
               continue;
             }
             const rowCount = Atomics.load(ctrl, slotBase + ${SLOT_ROW_COUNT});
             if (rowCount > 0) {
               const rowStart = Atomics.load(ctrl, slotBase + ${SLOT_ROW_START});
               const wt = Atomics.load(ctrl, ${CTRL_WEIGHT_TYPE});
-              const wPtr = Atomics.load(ctrl, ${CTRL_W_PTR});
-              const xOrQ8 = Atomics.load(ctrl, ${CTRL_X_OR_Q8_PTR});
-              const xF32 = Atomics.load(ctrl, ${CTRL_X_F32_PTR});
-              const outPtr = Atomics.load(ctrl, ${CTRL_OUT_PTR});
+              const wPtr = Atomics.load(ctrl, ${CTRL_W_PTR}) >>> 0;
+              const xOrQ8 = Atomics.load(ctrl, ${CTRL_X_OR_Q8_PTR}) >>> 0;
+              const xF32 = Atomics.load(ctrl, ${CTRL_X_F32_PTR}) >>> 0;
+              const outPtr = Atomics.load(ctrl, ${CTRL_OUT_PTR}) >>> 0;
               const cols = Atomics.load(ctrl, ${CTRL_COLS});
               const rowBytes = Atomics.load(ctrl, ${CTRL_ROW_BYTES});
               const oStride = Atomics.load(ctrl, ${CTRL_O_STRIDE_BYTES});
               runStripe(op, wt, wPtr + rowStart * rowBytes, xOrQ8, xF32, outPtr + rowStart * 4, cols, rowCount, oStride);
             }
             Atomics.store(ctrl, slotBase + ${SLOT_DONE_SEQ}, seq);
-            Atomics.notify(ctrl, slotBase + ${SLOT_DONE_SEQ}, 1);
+            if (Atomics.load(ctrl, ${CTRL_COORDINATOR_WAITING}) !== 0) {
+              Atomics.notify(ctrl, slotBase + ${SLOT_DONE_SEQ}, 1);
+            }
           }
         `;
         for (let w = 0; w < pool.helperCount; w++) {
@@ -477,6 +510,50 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
   }
 
   /**
+   * Zero-allocation Theorem T3 deterministic row striping matching `partitionRowStripes` exactly.
+   * Writes stripe ranges into preallocated `this.stripeStarts`/`this.stripeCounts` and returns active count.
+   */
+  private fillRowStripes(totalRows: number, rowAlignment = 4): number {
+    const safeWorkers = Math.max(1, Math.min(this.workerCount, Math.max(1, totalRows)));
+    if (safeWorkers === 1 || totalRows <= rowAlignment) {
+      this.stripeStarts[0] = 0;
+      this.stripeCounts[0] = totalRows;
+      return 1;
+    }
+    const align = Math.max(1, rowAlignment);
+    const totalGroups = Math.floor(totalRows / align);
+    const remainderRows = totalRows - totalGroups * align;
+    const groupsPerWorker = Math.floor(totalGroups / safeWorkers);
+    const extraGroups = totalGroups % safeWorkers;
+
+    let cursor = 0;
+    let countOut = 0;
+    for (let w = 0; w < safeWorkers; w++) {
+      const groups = groupsPerWorker + (w < extraGroups ? 1 : 0);
+      let count = groups * align;
+      if (w === safeWorkers - 1) {
+        count += remainderRows;
+      }
+      if (count > 0) {
+        this.stripeStarts[countOut] = cursor;
+        this.stripeCounts[countOut] = count;
+        cursor += count;
+        countOut += 1;
+      }
+    }
+    return countOut;
+  }
+
+  /** Publishes `nextSeq` and wakes helpers ONLY if at least one helper entered kernel futex wait. */
+  private publishJob(nextSeq: number): void {
+    const ctrl = this.ctrl;
+    Atomics.store(ctrl, CTRL_JOB_SEQ, nextSeq);
+    if (Atomics.load(ctrl, CTRL_SLEEPING_HELPERS) > 0) {
+      Atomics.notify(ctrl, CTRL_JOB_SEQ, this.helperCount);
+    }
+  }
+
+  /**
    * Empirically measures hot spin-barrier round-trip latency in microseconds so Theorem T3
    * derives the true host parallel threshold `W_par*(P)` rather than a pessimistic constant.
    */
@@ -487,8 +564,7 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
       const nextSeq = (this.jobSeq + 1) | 0;
       this.jobSeq = nextSeq;
       Atomics.store(ctrl, CTRL_OP_CODE, OP_PING);
-      Atomics.store(ctrl, CTRL_JOB_SEQ, nextSeq);
-      Atomics.notify(ctrl, CTRL_JOB_SEQ, this.helperCount);
+      this.publishJob(nextSeq);
       this.joinHelpers(nextSeq);
     };
     // Warm up helper threads into active spin window
@@ -497,7 +573,7 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
     const t0 = performance.now();
     for (let i = 0; i < samples; i++) pingOnce();
     const elapsedUs = ((performance.now() - t0) * 1000) / samples;
-    return Math.max(0.8, Math.min(18, elapsedUs));
+    return Math.max(0.4, Math.min(18, elapsedUs));
   }
 
   private joinHelpers(nextSeq: number): void {
@@ -509,18 +585,24 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
         done = Atomics.load(ctrl, doneIdx);
       }
       while (done !== nextSeq) {
-        try {
-          Atomics.wait(ctrl, doneIdx, done, 5);
-        } catch {
-          // Non-blocking fallback if ever invoked in an environment where Atomics.wait is forbidden
-        }
+        Atomics.store(ctrl, CTRL_COORDINATOR_WAITING, 1);
         done = Atomics.load(ctrl, doneIdx);
+        if (done !== nextSeq) {
+          try {
+            Atomics.wait(ctrl, doneIdx, done, 5);
+          } catch {
+            // Non-blocking fallback if ever invoked in an environment where Atomics.wait is forbidden
+          }
+          done = Atomics.load(ctrl, doneIdx);
+        }
+        Atomics.store(ctrl, CTRL_COORDINATOR_WAITING, 0);
       }
     }
   }
 
   /**
-   * Synchronous zero-copy parallel matrix dispatch using Theorem T3 deterministic 4-row-aligned stripes.
+   * Synchronous zero-copy, zero-allocation parallel matrix dispatch using Theorem T3 deterministic
+   * 4-row-aligned stripes.
    */
   dispatchParallel(
     op: ParallelMatOp,
@@ -539,8 +621,8 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
       return;
     }
 
-    const stripes = partitionRowStripes(rows, this.workerCount, 4);
-    if (stripes.length <= 1) {
+    const activeStripes = this.fillRowStripes(rows, 4);
+    if (activeStripes <= 1) {
       runLocalStripe(0, rows);
       return;
     }
@@ -552,10 +634,10 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
 
     Atomics.store(ctrl, CTRL_OP_CODE, op);
     Atomics.store(ctrl, CTRL_WEIGHT_TYPE, weightType);
-    Atomics.store(ctrl, CTRL_W_PTR, wPtr);
-    Atomics.store(ctrl, CTRL_X_OR_Q8_PTR, xOrQ8Ptr);
-    Atomics.store(ctrl, CTRL_X_F32_PTR, xF32Ptr);
-    Atomics.store(ctrl, CTRL_OUT_PTR, outPtr);
+    Atomics.store(ctrl, CTRL_W_PTR, wPtr | 0);
+    Atomics.store(ctrl, CTRL_X_OR_Q8_PTR, xOrQ8Ptr | 0);
+    Atomics.store(ctrl, CTRL_X_F32_PTR, xF32Ptr | 0);
+    Atomics.store(ctrl, CTRL_OUT_PTR, outPtr | 0);
     Atomics.store(ctrl, CTRL_COLS, cols);
     Atomics.store(ctrl, CTRL_TOTAL_ROWS, rows);
     Atomics.store(ctrl, CTRL_ROW_BYTES, rowBytes);
@@ -564,23 +646,21 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
     // Assign stripes 1..P-1 to helper threads 0..P-2
     for (let w = 0; w < this.helperCount; w++) {
       const slotBase = WORKER_SLOT_BASE + w * WORKER_SLOT_STRIDE;
-      const stripe = stripes[w + 1];
-      if (stripe) {
-        Atomics.store(ctrl, slotBase + SLOT_ROW_START, stripe.rowStart);
-        Atomics.store(ctrl, slotBase + SLOT_ROW_COUNT, stripe.rowCount);
+      const stripeIdx = w + 1;
+      if (stripeIdx < activeStripes) {
+        Atomics.store(ctrl, slotBase + SLOT_ROW_START, this.stripeStarts[stripeIdx]);
+        Atomics.store(ctrl, slotBase + SLOT_ROW_COUNT, this.stripeCounts[stripeIdx]);
       } else {
         Atomics.store(ctrl, slotBase + SLOT_ROW_START, 0);
         Atomics.store(ctrl, slotBase + SLOT_ROW_COUNT, 0);
       }
     }
 
-    // Release barrier + wake all helper workers
-    Atomics.store(ctrl, CTRL_JOB_SEQ, nextSeq);
-    Atomics.notify(ctrl, CTRL_JOB_SEQ, this.helperCount);
+    // Release barrier (zero futex syscall when helpers are spinning!)
+    this.publishJob(nextSeq);
 
     // Coordinator computes stripe 0 immediately on its own WASM SIMD instance
-    const localStripe = stripes[0];
-    runLocalStripe(localStripe.rowStart, localStripe.rowCount);
+    runLocalStripe(this.stripeStarts[0], this.stripeCounts[0]);
 
     this.joinHelpers(nextSeq);
     this.dispatches += 1;
@@ -617,12 +697,12 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
       Atomics.store(ctrl, CTRL_OP_CODE, OP_GROUP_DISPATCH);
       Atomics.store(ctrl, CTRL_GROUP_OP, op);
       Atomics.store(ctrl, CTRL_GROUP_COUNT, groupCount);
-      Atomics.store(ctrl, CTRL_X_OR_Q8_PTR, xOrQ8Ptr);
-      Atomics.store(ctrl, CTRL_X_F32_PTR, xF32Ptr);
+      Atomics.store(ctrl, CTRL_X_OR_Q8_PTR, xOrQ8Ptr | 0);
+      Atomics.store(ctrl, CTRL_X_F32_PTR, xF32Ptr | 0);
       Atomics.store(ctrl, CTRL_COLS, cols);
 
-      const localStarts: number[] = [0, 0, 0];
-      const localCounts: number[] = [0, 0, 0];
+      const localStarts = this.localGroupStarts;
+      const localCounts = this.localGroupCounts;
       let chunkBytes = 0;
 
       for (let g = 0; g < groupCount; g++) {
@@ -631,24 +711,24 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
         chunkBytes += rowBytes * e.rows;
         const dBase = GROUP_DESC_BASE + g * GROUP_DESC_STRIDE;
         Atomics.store(ctrl, dBase + GDESC_WEIGHT_TYPE, e.weightType);
-        Atomics.store(ctrl, dBase + GDESC_W_PTR, e.wPtr);
-        Atomics.store(ctrl, dBase + GDESC_OUT_PTR, e.outPtr);
+        Atomics.store(ctrl, dBase + GDESC_W_PTR, e.wPtr | 0);
+        Atomics.store(ctrl, dBase + GDESC_OUT_PTR, e.outPtr | 0);
         Atomics.store(ctrl, dBase + GDESC_ROW_BYTES, rowBytes);
         Atomics.store(ctrl, dBase + GDESC_O_STRIDE_BYTES, e.oStrideBytes);
         Atomics.store(ctrl, dBase + GDESC_ROWS, e.rows);
 
-        const stripes = partitionRowStripes(e.rows, this.workerCount, 4);
-        localStarts[g] = stripes[0].rowStart;
-        localCounts[g] = stripes[0].rowCount;
+        const activeStripes = this.fillRowStripes(e.rows, 4);
+        localStarts[g] = this.stripeStarts[0];
+        localCounts[g] = this.stripeCounts[0];
 
         const startOff = g === 0 ? SLOT_ROW_START : g === 1 ? SLOT_G1_ROW_START : SLOT_G2_ROW_START;
         const countOff = g === 0 ? SLOT_ROW_COUNT : g === 1 ? SLOT_G1_ROW_COUNT : SLOT_G2_ROW_COUNT;
         for (let w = 0; w < this.helperCount; w++) {
           const slotBase = WORKER_SLOT_BASE + w * WORKER_SLOT_STRIDE;
-          const stripe = stripes[w + 1];
-          if (stripe) {
-            Atomics.store(ctrl, slotBase + startOff, stripe.rowStart);
-            Atomics.store(ctrl, slotBase + countOff, stripe.rowCount);
+          const stripeIdx = w + 1;
+          if (stripeIdx < activeStripes) {
+            Atomics.store(ctrl, slotBase + startOff, this.stripeStarts[stripeIdx]);
+            Atomics.store(ctrl, slotBase + countOff, this.stripeCounts[stripeIdx]);
           } else {
             Atomics.store(ctrl, slotBase + startOff, 0);
             Atomics.store(ctrl, slotBase + countOff, 0);
@@ -656,8 +736,7 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
         }
       }
 
-      Atomics.store(ctrl, CTRL_JOB_SEQ, nextSeq);
-      Atomics.notify(ctrl, CTRL_JOB_SEQ, this.helperCount);
+      this.publishJob(nextSeq);
 
       for (let g = 0; g < groupCount; g++) {
         if (localCounts[g] > 0) {
