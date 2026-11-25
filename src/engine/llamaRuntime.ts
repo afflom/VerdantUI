@@ -74,6 +74,17 @@ import {
   type VramBackingStore,
 } from './vramBackingStore';
 import {
+  computeBackingContentFingerprint,
+  computeBackingContentFingerprintAsync,
+  readHotEmbeddingsCacheFromOpfs,
+  readParsedGgufBootCacheFromOpfs,
+  readRopeTablesCacheFromOpfs,
+  writeHotEmbeddingsCacheToOpfs,
+  writeParsedGgufBootCacheToOpfs,
+  writeRopeTablesCacheToOpfs,
+  type RopeCacheParams,
+} from './vramBootCache';
+import {
   collectHotMetadataTensorInfos,
   computeLmHeadStripeRows,
   VramWeightPager,
@@ -522,6 +533,7 @@ export class LlamaVTensorRuntime {
 
   // OPFS-backed vRAM Virtual DIMM Weight Pager & parsed header state
   private backingStore: VramBackingStore | null = null;
+  private modelContentFingerprint: string | null = null;
   private parsedHeader: ParsedGgufModel | null = null;
   private weightPager: VramWeightPager | null = null;
   private weightResidencyPolicy: WeightResidencyPolicy = 'auto';
@@ -532,6 +544,8 @@ export class LlamaVTensorRuntime {
   private outWeightInfo: GgufTensorInfo | null = null;
   private isTiedOutput = false;
   private layerInfos: LayerTensorInfoGroup[] = [];
+  private preloadedRopeTables: RopeTables | null = null;
+  private preloadedRopeParams: RopeCacheParams | null = null;
 
   private scratch: ScratchTensors | null = null;
   private batchScratch: Batch4ScratchTensors | null = null;
@@ -685,18 +699,51 @@ export class LlamaVTensorRuntime {
     return this.unifiedStore;
   }
 
+  /** Returns the deterministic `<headerHash64>-<byteLength>` content fingerprint of the loaded model. */
+  getContentFingerprint(): string | null {
+    return this.modelContentFingerprint;
+  }
+
   async hydrateUnifiedStoreFromOpfs(
     opfsDirectoryOverride?: FileSystemDirectoryHandle,
   ): Promise<number> {
     if (!this.unifiedStore) return 0;
-    return this.unifiedStore.hydrateFromOpfs(opfsDirectoryOverride);
+    const kvCount = await this.unifiedStore.hydrateFromOpfs(opfsDirectoryOverride);
+    const wp = this.weightPager;
+    const fp = this.modelContentFingerprint;
+    if (wp && fp) {
+      const embdSig = wp.getHotEmbeddingSignature();
+      if (embdSig) {
+        const rows = await readHotEmbeddingsCacheFromOpfs(fp, embdSig, opfsDirectoryOverride).catch(
+          () => null,
+        );
+        if (rows && rows.length > 0) {
+          wp.hydrateHotEmbeddingRows(rows);
+        }
+      }
+    }
+    return kvCount;
   }
 
   async persistUnifiedStoreToOpfs(
     opfsDirectoryOverride?: FileSystemDirectoryHandle,
   ): Promise<number> {
     if (!this.unifiedStore) return 0;
-    return this.unifiedStore.persistToOpfs(opfsDirectoryOverride);
+    const kvCount = await this.unifiedStore.persistToOpfs(opfsDirectoryOverride);
+    const wp = this.weightPager;
+    const fp = this.modelContentFingerprint;
+    if (wp && fp) {
+      const embdSig = wp.getHotEmbeddingSignature();
+      if (embdSig) {
+        const hotRows = wp.exportHotEmbeddingRows(256);
+        if (hotRows.length > 0) {
+          await writeHotEmbeddingsCacheToOpfs(fp, embdSig, hotRows, opfsDirectoryOverride).catch(
+            () => false,
+          );
+        }
+      }
+    }
+    return kvCount;
   }
 
   unload(): void {
@@ -705,6 +752,7 @@ export class LlamaVTensorRuntime {
       this.backingStore.close();
       this.backingStore = null;
     }
+    this.modelContentFingerprint = null;
     this.parsedHeader = null;
     this.weightPager = null;
     this.embdInfo = null;
@@ -717,6 +765,8 @@ export class LlamaVTensorRuntime {
     this.unifiedStore = null;
     this.committedPageKeys.clear();
     this.ropeTables = null;
+    this.preloadedRopeTables = null;
+    this.preloadedRopeParams = null;
     this.scratch = null;
     this.batchScratch = null;
     this.compiledSingleGraph = null;
@@ -781,6 +831,7 @@ export class LlamaVTensorRuntime {
     let parsed: ParsedGgufModel;
     try {
       parsed = parseGgufFromBacking(backing);
+      this.modelContentFingerprint = computeBackingContentFingerprint(backing);
     } catch (err) {
       backing.close();
       throw err;
@@ -791,10 +842,11 @@ export class LlamaVTensorRuntime {
 
   /**
    * Async demand-aware model loader used by the Web Worker for multi-GB remote & OPFS models.
-   * For `opfs-demand` backings:
-   *  1. Prefetches GGUF header slabs in parallel via abortable `fetch()` (`parseGgufFromBackingAsync`).
-   *  2. Fetches all tiny scattered norm/bias tensors via exact coalesced HTTP Ranges (~1–2 MB total
-   *     instead of 150+ full 1–4 MiB slab faults), emitting live progress from 97% -> 99%.
+   * For `opfs-demand` & `opfs-sync` backings:
+   *  1. Computes the 4 KiB GGUF content fingerprint (`<headerHash64>-<byteLength>`) and checks
+   *     `<fp>.hdr.bin` to bypass re-fetching/re-parsing 8–12 MiB 150K-vocab GGUF headers.
+   *  2. Preloads `<fp>.rope.bin` and `<fp>.hot.bin` in parallel with lock-free read-only OPFS I/O,
+   *     falling back to coalesced exact HTTP Ranges only on first boot.
    *  3. Honors `AbortSignal` throughout so cancelling at 97% returns immediately.
    */
   async loadFromBackingAsync(
@@ -819,13 +871,37 @@ export class LlamaVTensorRuntime {
     }
     this.backingQuotaBytes = options?.backingQuotaBytes;
 
+    const useOpfsBootCache = backing.isPersistent || Boolean(options?.opfsDirectoryOverride);
+    let contentFingerprint: string | null = null;
     let parsed: ParsedGgufModel;
+    let headerLoadedFromBootCache = false;
     try {
       options?.onProgress?.({ percent: 97, detail: `Reading ${displayName} header` });
-      parsed = await parseGgufFromBackingAsync(backing, {
-        signal: options?.signal,
-        onProgress: (detail) => options?.onProgress?.({ percent: 97, detail }),
-      });
+      contentFingerprint = await computeBackingContentFingerprintAsync(backing, options?.signal);
+      this.modelContentFingerprint = contentFingerprint;
+
+      const cachedParsed = useOpfsBootCache
+        ? await readParsedGgufBootCacheFromOpfs(
+            contentFingerprint,
+            contentFingerprint,
+            backing.byteLength,
+            options?.opfsDirectoryOverride,
+          )
+        : null;
+
+      if (cachedParsed) {
+        parsed = cachedParsed;
+        headerLoadedFromBootCache = true;
+        options?.onProgress?.({
+          percent: 97,
+          detail: `Loaded ${displayName} header from local cache`,
+        });
+      } else {
+        parsed = await parseGgufFromBackingAsync(backing, {
+          signal: options?.signal,
+          onProgress: (detail) => options?.onProgress?.({ percent: 97, detail }),
+        });
+      }
     } catch (err) {
       backing.close();
       throw err;
@@ -838,129 +914,168 @@ export class LlamaVTensorRuntime {
 
     const prepared = this.prepareParsedBacking(id, displayName, source, backing, parsed, options?.maxContextCap);
 
+    // Persist parsed GGUF header + tokenizer vocab/merges boot cache on cold parse
+    if (useOpfsBootCache && !headerLoadedFromBootCache && contentFingerprint && !options?.signal?.aborted) {
+      await writeParsedGgufBootCacheToOpfs(
+        contentFingerprint,
+        contentFingerprint,
+        parsed,
+        options?.opfsDirectoryOverride,
+      ).catch(() => false);
+    }
+
+    // Solve contract once upfront so we can preload RoPE LUT + hot metadata tensors concurrently!
+    const env = this.backend.calibrateEnvironment();
+    const contract = derivePerformanceContract(env, prepared.modelSpec, {
+      precisionMode: this.precisionMode,
+      requestedMaxContext: this.requestedMaxContext,
+      backingKind: backing.kind,
+      weightResidencyPolicy: this.weightResidencyPolicy,
+      backingBandwidthMBs: this.calibratedBackingBandwidthMBs,
+      backingQuotaBytes: this.backingQuotaBytes,
+    });
+
+    const hp = parsed.hparams;
+    const ropeParams: RopeCacheParams = {
+      maxCtx: Math.min(contract.effectiveMaxContext, 4096),
+      ropeDim: hp.ropeDimensionCount,
+      freqBase: hp.ropeFreqBase,
+      freqScale: hp.ropeFreqScale,
+    };
+
+    const preloadRopePromise: Promise<void> =
+      useOpfsBootCache && contentFingerprint
+        ? readRopeTablesCacheFromOpfs(
+            contentFingerprint,
+            ropeParams,
+            options?.opfsDirectoryOverride,
+          )
+            .then((cachedRope) => {
+              if (cachedRope) {
+                this.preloadedRopeTables = cachedRope;
+                this.preloadedRopeParams = ropeParams;
+              }
+            })
+            .catch(() => {})
+        : Promise.resolve();
+
     // Preload tiny hot metadata tensors asynchronously on demand-paged backings (zero sync XHRs!)
-    if (backing.readRangesDirectAsync || backing.prefetchRanges) {
-      try {
-        const env = this.backend.calibrateEnvironment();
-        const contract = derivePerformanceContract(env, prepared.modelSpec, {
-          precisionMode: this.precisionMode,
-          requestedMaxContext: this.requestedMaxContext,
-          backingKind: backing.kind,
-          weightResidencyPolicy: this.weightResidencyPolicy,
-          backingBandwidthMBs: this.calibratedBackingBandwidthMBs,
-          backingQuotaBytes: this.backingQuotaBytes,
-        });
+    const preloadHotPromise: Promise<void> = (async () => {
+      if (!backing.readRangesDirectAsync && !backing.prefetchRanges) return;
+      if (contract.weightResidencyMode === 'opfs-paged') {
+        const hotInfos = collectHotMetadataTensorInfos(
+          prepared.embdInfo,
+          prepared.outNormInfo,
+          prepared.outWeightInfo,
+          prepared.isTiedOutput,
+          prepared.layerInfos,
+          {
+            streamEmbeddings: contract.streamEmbeddings,
+            streamLmHead: contract.streamLmHead,
+          },
+        );
+        const smallInfos = hotInfos.filter((t) => t.byteSize <= 256 * 1024);
+        const largeInfos = hotInfos.filter((t) => t.byteSize > 256 * 1024);
 
-        if (contract.weightResidencyMode === 'opfs-paged') {
-          const hotInfos = collectHotMetadataTensorInfos(
-            prepared.embdInfo,
-            prepared.outNormInfo,
-            prepared.outWeightInfo,
-            prepared.isTiedOutput,
-            prepared.layerInfos,
-            {
-              streamEmbeddings: contract.streamEmbeddings,
-              streamLmHead: contract.streamLmHead,
-            },
-          );
-          const smallInfos = hotInfos.filter((t) => t.byteSize <= 256 * 1024);
-          const largeInfos = hotInfos.filter((t) => t.byteSize > 256 * 1024);
-
-          const preloaded = new Map<string, Uint8Array>();
-          if (smallInfos.length > 0 && backing.readRangesDirectAsync) {
-            // Try persistent OPFS hot-metadata sidecar (`<stem>.hot.bin`) first to convert 30–100
-            // HTTP Range fetches on reload into 1 local lock-free OPFS read (~2ms)!
-            const cachedHot = backing.isPersistent
-              ? await readHotMetadataBundleFromOpfs(
-                  id,
-                  {
-                    dataOffset: parsed.dataOffset,
-                    backingByteLength: backing.byteLength,
-                    expectedTensors: smallInfos,
-                  },
-                  options?.opfsDirectoryOverride,
-                )
-              : null;
-
-            if (cachedHot) {
-              options?.onProgress?.({
-                percent: 98,
-                detail: `Loaded ${displayName} layer metadata from local cache`,
-              });
-              for (let i = 0; i < smallInfos.length; i++) {
-                const name = smallInfos[i].name;
-                const slice = cachedHot.get(name);
-                if (slice) preloaded.set(name, slice);
-              }
-            } else {
-              options?.onProgress?.({
-                percent: 98,
-                detail: `Loading ${displayName} layer metadata`,
-              });
-              const rawSlices = await backing.readRangesDirectAsync(
-                smallInfos.map((t) => ({
-                  fileOffset: parsed.dataOffset + t.offset,
-                  byteLength: t.byteSize,
-                })),
-                {
-                  signal: options?.signal,
-                  onProgress: (done, total) => {
-                    const pct = total > 0 ? 97 + Math.min(2, Math.round((done / total) * 2)) : 98;
-                    options?.onProgress?.({
-                      percent: pct,
-                      detail: `Loading layer metadata (${done}/${total})`,
-                    });
-                  },
-                },
-              );
-              for (let i = 0; i < smallInfos.length; i++) {
-                preloaded.set(smallInfos[i].name, rawSlices[i]);
-              }
-              if (backing.isPersistent && !options?.signal?.aborted) {
-                await writeHotMetadataBundleToOpfs(
-                  id,
-                  { dataOffset: parsed.dataOffset, backingByteLength: backing.byteLength },
-                  preloaded,
-                  options?.opfsDirectoryOverride,
-                ).catch(() => {});
-              }
-            }
+        const preloaded = new Map<string, Uint8Array>();
+        if (smallInfos.length > 0 && backing.readRangesDirectAsync) {
+          // Key `.hot.bin` by contentFingerprint so renamed/mirror/custom-URL mounts share it too,
+          // with transparent fallback to legacy `<id>.hot.bin`!
+          const hotKey = contentFingerprint ?? id;
+          const hotSig = {
+            dataOffset: parsed.dataOffset,
+            backingByteLength: backing.byteLength,
+            expectedTensors: smallInfos,
+          };
+          let cachedHot = useOpfsBootCache
+            ? await readHotMetadataBundleFromOpfs(hotKey, hotSig, options?.opfsDirectoryOverride)
+            : null;
+          if (!cachedHot && useOpfsBootCache && hotKey !== id) {
+            cachedHot = await readHotMetadataBundleFromOpfs(id, hotSig, options?.opfsDirectoryOverride);
           }
-          if (largeInfos.length > 0 && backing.prefetchRanges) {
+
+          if (cachedHot) {
             options?.onProgress?.({
-              percent: 99,
-              detail: `Caching ${displayName} embeddings`,
+              percent: 98,
+              detail: `Loaded ${displayName} layer metadata from local cache`,
             });
-            await backing.prefetchRanges(
-              largeInfos.map((t) => ({
+            for (let i = 0; i < smallInfos.length; i++) {
+              const name = smallInfos[i].name;
+              const slice = cachedHot.get(name);
+              if (slice) preloaded.set(name, slice);
+            }
+          } else {
+            options?.onProgress?.({
+              percent: 98,
+              detail: `Loading ${displayName} layer metadata`,
+            });
+            const rawSlices = await backing.readRangesDirectAsync(
+              smallInfos.map((t) => ({
                 fileOffset: parsed.dataOffset + t.offset,
                 byteLength: t.byteSize,
               })),
-              { signal: options?.signal },
+              {
+                signal: options?.signal,
+                onProgress: (done, total) => {
+                  const pct = total > 0 ? 97 + Math.min(2, Math.round((done / total) * 2)) : 98;
+                  options?.onProgress?.({
+                    percent: pct,
+                    detail: `Loading layer metadata (${done}/${total})`,
+                  });
+                },
+              },
             );
+            for (let i = 0; i < smallInfos.length; i++) {
+              preloaded.set(smallInfos[i].name, rawSlices[i]);
+            }
+            if (useOpfsBootCache && !options?.signal?.aborted) {
+              await writeHotMetadataBundleToOpfs(
+                hotKey,
+                { dataOffset: parsed.dataOffset, backingByteLength: backing.byteLength },
+                preloaded,
+                options?.opfsDirectoryOverride,
+              ).catch(() => {});
+            }
           }
-          if (preloaded.size > 0) {
-            this.preloadedHotTensors = preloaded;
-          }
-        } else if (backing.prefetchRanges) {
+        }
+        if (largeInfos.length > 0 && backing.prefetchRanges) {
           options?.onProgress?.({
-            percent: 98,
-            detail: `Loading ${displayName} weights`,
+            percent: 99,
+            detail: `Caching ${displayName} embeddings`,
           });
           await backing.prefetchRanges(
-            [
-              {
-                fileOffset: parsed.dataOffset,
-                byteLength: Math.max(0, backing.byteLength - parsed.dataOffset),
-              },
-            ],
+            largeInfos.map((t) => ({
+              fileOffset: parsed.dataOffset + t.offset,
+              byteLength: t.byteSize,
+            })),
             { signal: options?.signal },
           );
         }
-      } catch (err) {
-        this.unload();
-        throw err;
+        if (preloaded.size > 0) {
+          this.preloadedHotTensors = preloaded;
+        }
+      } else if (backing.prefetchRanges) {
+        options?.onProgress?.({
+          percent: 98,
+          detail: `Loading ${displayName} weights`,
+        });
+        await backing.prefetchRanges(
+          [
+            {
+              fileOffset: parsed.dataOffset,
+              byteLength: Math.max(0, backing.byteLength - parsed.dataOffset),
+            },
+          ],
+          { signal: options?.signal },
+        );
       }
+    })();
+
+    try {
+      await Promise.all([preloadRopePromise, preloadHotPromise]);
+    } catch (err) {
+      this.unload();
+      throw err;
     }
 
     if (options?.signal?.aborted) {
@@ -968,8 +1083,32 @@ export class LlamaVTensorRuntime {
       throw new DOMException('Aborted', 'AbortError');
     }
 
+    const ropeWasCached = this.preloadedRopeTables !== null;
     options?.onProgress?.({ percent: 99, detail: `Initializing ${displayName}` });
     this.allocateFromActiveBacking();
+
+    // Persist computed RoPE cos/sin LUT to `<fp>.rope.bin` on cold miss for instant future reloads
+    if (
+      useOpfsBootCache &&
+      !ropeWasCached &&
+      contentFingerprint &&
+      this.ropeTables &&
+      !options?.signal?.aborted
+    ) {
+      const actualRopeParams: RopeCacheParams = {
+        maxCtx: this.ropeTables.maxCtx,
+        ropeDim: hp.ropeDimensionCount,
+        freqBase: hp.ropeFreqBase,
+        freqScale: hp.ropeFreqScale,
+      };
+      await writeRopeTablesCacheToOpfs(
+        contentFingerprint,
+        this.ropeTables,
+        actualRopeParams,
+        options?.opfsDirectoryOverride,
+      ).catch(() => false);
+    }
+
     return this.modelSummary!;
   }
 
@@ -1400,12 +1539,15 @@ export class LlamaVTensorRuntime {
     );
     this.backend.attachVramKvTelemetry(() => kvPager.getTelemetry());
 
-    // 2b. Initialize or retain the Unified Virtual Store for this model's geometry
+    // 2b. Initialize or retain the Unified Virtual Store keyed by underlying GGUF contentFingerprint
+    //     so renamed, custom-URL, or mirror-deduplicated mounts share warm KV prefixes seamlessly!
     const modelId = this.modelSummary?.id ?? backing.modelId;
+    const contentFingerprint = this.modelContentFingerprint ?? undefined;
+    const expectedIdentityKey = contentFingerprint ?? modelId;
     const existingStore = this.unifiedStore;
     const reuseExistingStore =
       existingStore !== null &&
-      existingStore.geometry.modelId === modelId &&
+      existingStore.identityKey === expectedIdentityKey &&
       existingStore.geometry.numLayers === hp.blockCount &&
       existingStore.geometry.nHeadsKv === hp.headCountKv &&
       existingStore.geometry.headDim === headDim;
@@ -1415,6 +1557,7 @@ export class LlamaVTensorRuntime {
       : new VramUnifiedStore(
           {
             modelId,
+            contentFingerprint,
             numLayers: hp.blockCount,
             nHeadsKv: hp.headCountKv,
             headDim,
@@ -1584,13 +1727,25 @@ export class LlamaVTensorRuntime {
 
     // 4. Precompute bounded RoPE cos/sin LUT (<= 4096 rows) + PREFILL_BATCH_SIZE dynamic scratch slots
     //    so arbitrary full contexts (8K–131K+) never OOM WASM memory while remaining bit-exact.
+    //    Reuses OPFS `<fp>.rope.bin` directly on reload (0 trig evaluations) when geometry matches!
     const ropeLutMaxPos = Math.min(maxCtx, 4096);
-    const ropeTables = buildRopeTables(
-      ropeLutMaxPos,
-      hp.ropeDimensionCount,
-      hp.ropeFreqBase,
-      hp.ropeFreqScale,
-    );
+    const cachedRope =
+      this.preloadedRopeTables &&
+      this.preloadedRopeParams &&
+      this.preloadedRopeParams.maxCtx === ropeLutMaxPos &&
+      this.preloadedRopeParams.ropeDim === hp.ropeDimensionCount &&
+      this.preloadedRopeParams.freqBase === hp.ropeFreqBase &&
+      this.preloadedRopeParams.freqScale === hp.ropeFreqScale
+        ? this.preloadedRopeTables
+        : null;
+    const ropeTables =
+      cachedRope ??
+      buildRopeTables(
+        ropeLutMaxPos,
+        hp.ropeDimensionCount,
+        hp.ropeFreqBase,
+        hp.ropeFreqScale,
+      );
     const ropeTotalFloats = (ropeLutMaxPos + PREFILL_BATCH_SIZE) * ropeTables.half;
     const ropeTableBytes = alignUp32(ropeTotalFloats * 4);
     const ropeBuf = this.backend.allocBuffer(

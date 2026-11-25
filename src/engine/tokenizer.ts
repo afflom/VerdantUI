@@ -89,19 +89,41 @@ export class GgufTokenizer {
       throw new Error('GGUF model is missing "tokenizer.ggml.tokens" vocabulary.');
     }
 
-    const vocab: string[] = rawTokens.map((t) => String(t));
-    const rawScores = model.metadata['tokenizer.ggml.scores'];
-    const scores: number[] = Array.isArray(rawScores)
-      ? rawScores.map((s) => (typeof s === 'number' ? s : 0))
-      : new Array<number>(vocab.length).fill(0);
+    const vocab: string[] = new Array<string>(rawTokens.length);
+    for (let i = 0; i < rawTokens.length; i++) {
+      const t = rawTokens[i];
+      vocab[i] = typeof t === 'string' ? t : String(t);
+    }
+    const rawScores = model.metadata['tokenizer.ggml.scores'] as unknown;
+    let scores: ArrayLike<number>;
+    if (rawScores instanceof Float32Array) {
+      scores = rawScores;
+    } else if (Array.isArray(rawScores)) {
+      const sArr = new Float32Array(rawScores.length);
+      for (let i = 0; i < rawScores.length; i++) {
+        const s = rawScores[i];
+        sArr[i] = typeof s === 'number' ? s : 0;
+      }
+      scores = sArr;
+    } else {
+      scores = new Float32Array(vocab.length);
+    }
 
-    const rawTypes = model.metadata['tokenizer.ggml.token_type'];
-    const tokenTypes: number[] | null = Array.isArray(rawTypes)
-      ? rawTypes.map((t) => (typeof t === 'number' ? t : 1))
-      : null;
+    const rawTypes = model.metadata['tokenizer.ggml.token_type'] as unknown;
+    let tokenTypes: ArrayLike<number> | null = null;
+    if (rawTypes instanceof Int32Array) {
+      tokenTypes = rawTypes;
+    } else if (Array.isArray(rawTypes)) {
+      const tArr = new Int32Array(rawTypes.length);
+      for (let i = 0; i < rawTypes.length; i++) {
+        const t = rawTypes[i];
+        tArr[i] = typeof t === 'number' ? t | 0 : 1;
+      }
+      tokenTypes = tArr;
+    }
 
     this.vocab = vocab;
-    this.scores = scores;
+    this.scores = scores as readonly number[];
     this.bosTokenId = model.hparams.bosTokenId;
     this.eosTokenId = model.hparams.eosTokenId;
     this.unkTokenId = model.hparams.unkTokenId;

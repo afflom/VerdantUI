@@ -87,6 +87,13 @@ export interface UnifiedStoreTelemetry {
 
 export interface UnifiedStoreGeometry {
   readonly modelId: string;
+  /**
+   * Optional content-identity fingerprint (`<headerHash64>-<byteLength>`).
+   * When present, prefix block hashing AND OPFS `.unified.kv` persistence are keyed by the
+   * underlying GGUF content identity rather than alias `modelId`, so renamed, mirror, or
+   * custom-URL mounts of the same model share warm KV prefixes seamlessly!
+   */
+  readonly contentFingerprint?: string;
   readonly numLayers: number;
   readonly nHeadsKv: number;
   readonly headDim: number;
@@ -269,6 +276,11 @@ export class VramUnifiedStore {
     return this.blocks.size;
   }
 
+  /** Effective content-identity key shared across aliases/mirrors of the same GGUF payload. */
+  get identityKey(): string {
+    return this.geometry.contentFingerprint || this.geometry.modelId;
+  }
+
   get bytesStored(): number {
     return this.usedKvBytes;
   }
@@ -348,9 +360,10 @@ export class VramUnifiedStore {
     const matched: UnifiedKvBlockEntry[] = [];
     let parentHash = 'root';
 
+    const keySpace = this.identityKey;
     for (let p = 0; p < fullPages; p++) {
       const slice = tokens.slice(p * pageTokens, (p + 1) * pageTokens);
-      const key = computePrefixBlockHash(this.geometry.modelId, parentHash, slice);
+      const key = computePrefixBlockHash(keySpace, parentHash, slice);
       const found = this.getBlock(key);
       if (!found) break;
       matched.push(found);
@@ -365,9 +378,10 @@ export class VramUnifiedStore {
     const fullPages = Math.floor(tokens.length / pageTokens);
     const result: Array<{ pageIndex: number; key: string; slice: number[] }> = [];
     let parentHash = 'root';
+    const keySpace = this.identityKey;
     for (let p = 0; p < fullPages; p++) {
       const slice = tokens.slice(p * pageTokens, (p + 1) * pageTokens);
-      const key = computePrefixBlockHash(this.geometry.modelId, parentHash, slice);
+      const key = computePrefixBlockHash(keySpace, parentHash, slice);
       result.push({ pageIndex: p, key, slice });
       parentHash = key;
     }
@@ -444,14 +458,14 @@ export class VramUnifiedStore {
       .slice(0, MAX_PERSISTED_OPFS_BLOCKS);
 
     const payload = this.serializeBlocks(ranked);
-    const fileName = sanitizeUnifiedKvFileName(this.geometry.modelId);
+    const fileName = sanitizeUnifiedKvFileName(this.identityKey);
     try {
       const fh = (await dir.getFileHandle(fileName, { create: true })) as FileSystemFileHandle &
         SyncAccessHandleCapableFile;
       if (typeof fh.createSyncAccessHandle !== 'function') return 0;
       const sync = await openSyncAccessHandleWithRetry(fh, {
         mode: 'readwrite',
-        modelId: this.geometry.modelId,
+        modelId: this.identityKey,
         retryDelaysMs: [25, 50, 100],
       });
       try {
@@ -476,48 +490,57 @@ export class VramUnifiedStore {
   }
 
   /**
-   * Hydrates persisted embedded KV prefix blocks from OPFS (`<modelId>.unified.kv`) on model boot.
+   * Hydrates persisted embedded KV prefix blocks from OPFS (`<identityKey>.unified.kv`) on model boot,
+   * with transparent fallback to legacy `<modelId>.unified.kv` when upgrading to fingerprinted caches.
    * Silently discards stale or geometry-mismatched files without failing model load.
    */
   async hydrateFromOpfs(opfsDirectoryOverride?: FileSystemDirectoryHandle): Promise<number> {
     const dir = opfsDirectoryOverride ?? (await getOpfsDir(false));
     if (!dir) return 0;
 
-    const fileName = sanitizeUnifiedKvFileName(this.geometry.modelId);
-    try {
-      const fh = (await dir.getFileHandle(fileName, { create: false })) as FileSystemFileHandle &
-        SyncAccessHandleCapableFile;
-      if (typeof fh.createSyncAccessHandle !== 'function') return 0;
-      const sync = await openSyncAccessHandleWithRetry(fh, {
-        mode: 'read-only',
-        modelId: this.geometry.modelId,
-        retryDelaysMs: [25, 50, 100],
-      });
-      let raw: Uint8Array;
-      try {
-        const size = sync.getSize();
-        if (size < 28 || size > 64 * 1024 * 1024) return 0;
-        raw = new Uint8Array(size);
-        let read = 0;
-        while (read < size) {
-          const n = sync.read(read === 0 ? raw : raw.subarray(read), { at: read });
-          if (n <= 0) break;
-          read += n;
-        }
-        if (read !== size) return 0;
-      } finally {
-        sync.close();
-      }
+    const primaryFile = sanitizeUnifiedKvFileName(this.identityKey);
+    const legacyFile = sanitizeUnifiedKvFileName(this.geometry.modelId);
+    const candidates = primaryFile === legacyFile ? [primaryFile] : [primaryFile, legacyFile];
 
-      const hydrated = this.deserializeBlocks(raw);
-      if (hydrated > 0) {
-        this.dirtyForOpfs = false;
-        this.persistedOpfs = true;
+    for (let c = 0; c < candidates.length; c++) {
+      const fileName = candidates[c];
+      const isLegacyFallback = c > 0;
+      try {
+        const fh = (await dir.getFileHandle(fileName, { create: false })) as FileSystemFileHandle &
+          SyncAccessHandleCapableFile;
+        if (typeof fh.createSyncAccessHandle !== 'function') continue;
+        const sync = await openSyncAccessHandleWithRetry(fh, {
+          mode: 'read-only',
+          modelId: this.identityKey,
+          retryDelaysMs: [25, 50, 100],
+        });
+        let raw: Uint8Array;
+        try {
+          const size = sync.getSize();
+          if (size < 28 || size > 64 * 1024 * 1024) continue;
+          raw = new Uint8Array(size);
+          let read = 0;
+          while (read < size) {
+            const n = sync.read(read === 0 ? raw : raw.subarray(read), { at: read });
+            if (n <= 0) break;
+            read += n;
+          }
+          if (read !== size) continue;
+        } finally {
+          sync.close();
+        }
+
+        const hydrated = this.deserializeBlocks(raw, isLegacyFallback);
+        if (hydrated > 0) {
+          this.dirtyForOpfs = isLegacyFallback;
+          this.persistedOpfs = true;
+          return hydrated;
+        }
+      } catch {
+        // Try next candidate or return 0 cleanly
       }
-      return hydrated;
-    } catch {
-      return 0;
     }
+    return 0;
   }
 
   private serializeBlocks(entries: readonly UnifiedKvBlockEntry[]): Uint8Array {
@@ -601,7 +624,7 @@ export class VramUnifiedStore {
     return out;
   }
 
-  private deserializeBlocks(raw: Uint8Array): number {
+  private deserializeBlocks(raw: Uint8Array, rekeyToIdentity = false): number {
     if (raw.byteLength < 28) return 0;
     const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
     const magic = dv.getUint32(0, true);
@@ -620,6 +643,17 @@ export class VramUnifiedStore {
     const sizeField = dv.getUint32(24, true);
     const scaleBytes = scaleFloatsPerHalfPage * 4;
     const rawBlockBytes = q8BytesPerHalfPage * 2 + scaleBytes * 2;
+    // When hydrating a legacy `<modelId>.unified.kv` into a content-fingerprinted store, re-chain
+    // page keys under `this.identityKey` so lookups hit seamlessly!
+    const rekeyedByPage = rekeyToIdentity ? new Map<number, string>() : null;
+    const resolveKey = (storedKey: string, pageIndex: number, tokenIds: readonly number[]): string | null => {
+      if (!rekeyedByPage) return storedKey;
+      const parentHash = pageIndex === 0 ? 'root' : rekeyedByPage.get(pageIndex - 1);
+      if (!parentHash) return null;
+      const nextKey = computePrefixBlockHash(this.identityKey, parentHash, tokenIds);
+      rekeyedByPage.set(pageIndex, nextKey);
+      return nextKey;
+    };
 
     if (magic === UNIFIED_KV_MAGIC_V2) {
       if (sizeField !== rawBlockBytes) return 0;
@@ -628,6 +662,12 @@ export class VramUnifiedStore {
       let factoredCount = 0;
       let savedTotal = 0;
       const metaBytes = 16 + 4 + pageTokens * 4 + 4;
+      const pending: Array<{
+        key: string;
+        pageIndex: number;
+        tokenIds: number[];
+        data: CompressedKvPageBlock;
+      }> = [];
       for (let idx = 0; idx < count; idx++) {
         if (off + metaBytes > raw.byteLength) return loaded;
         let key = '';
@@ -671,7 +711,16 @@ export class VramUnifiedStore {
         const vScales = new Float32Array(scaleFloatsPerHalfPage);
         new Uint8Array(vScales.buffer).set(unpacked.subarray(uOff, uOff + scaleBytes));
 
-        this.putBlock(key, pageIndex, tokenIds, { kQ8, vQ8, kScales, vScales });
+        pending.push({ key, pageIndex, tokenIds, data: { kQ8, vQ8, kScales, vScales } });
+      }
+      if (rekeyedByPage) {
+        pending.sort((a, b) => a.pageIndex - b.pageIndex);
+      }
+      for (let i = 0; i < pending.length; i++) {
+        const p = pending[i];
+        const finalKey = resolveKey(p.key, p.pageIndex, p.tokenIds);
+        if (!finalKey) continue;
+        this.putBlock(finalKey, p.pageIndex, p.tokenIds, p.data);
         loaded += 1;
       }
       this.factoredBlocks = factoredCount;
@@ -687,6 +736,12 @@ export class VramUnifiedStore {
 
     let off = 28;
     let loaded = 0;
+    const pendingV1: Array<{
+      key: string;
+      pageIndex: number;
+      tokenIds: number[];
+      data: CompressedKvPageBlock;
+    }> = [];
     for (let idx = 0; idx < count; idx++) {
       let key = '';
       for (let i = 0; i < 16; i++) {
@@ -717,7 +772,16 @@ export class VramUnifiedStore {
       new Uint8Array(vScales.buffer).set(raw.subarray(off, off + scaleBytes));
       off += scaleBytes;
 
-      this.putBlock(key, pageIndex, tokenIds, { kQ8, vQ8, kScales, vScales });
+      pendingV1.push({ key, pageIndex, tokenIds, data: { kQ8, vQ8, kScales, vScales } });
+    }
+    if (rekeyedByPage) {
+      pendingV1.sort((a, b) => a.pageIndex - b.pageIndex);
+    }
+    for (let i = 0; i < pendingV1.length; i++) {
+      const p = pendingV1[i];
+      const finalKey = resolveKey(p.key, p.pageIndex, p.tokenIds);
+      if (!finalKey) continue;
+      this.putBlock(finalKey, p.pageIndex, p.tokenIds, p.data);
       loaded += 1;
     }
     return loaded;

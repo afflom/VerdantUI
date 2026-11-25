@@ -1194,6 +1194,97 @@ export class VramWeightPager {
     return { handle, rowIndex: targetSlot };
   }
 
+  /** Returns the signature identifying this model's streamed `token_embd` table for cross-alias OPFS caching. */
+  getHotEmbeddingSignature(): {
+    readonly dataOffset: number;
+    readonly backingByteLength: number;
+    readonly embdOffset: number;
+    readonly embdType: number;
+    readonly embdRowBytes: number;
+  } | null {
+    if (!this.streamEmbeddings || this.pinnedTokenEmbd || this.embdCacheSlots <= 0) {
+      return null;
+    }
+    return {
+      dataOffset: this.parsed.dataOffset,
+      backingByteLength: this.backing.byteLength,
+      embdOffset: this.embdInfo.offset,
+      embdType: this.embdInfo.type,
+      embdRowBytes: this.embdRowBytes,
+    };
+  }
+
+  /**
+   * Exports up to `maxRows` hottest Zipfian embedding rows (MRU order) from the WASM hot
+   * embedding slab for cross-session / cross-alias OPFS persistence.
+   */
+  exportHotEmbeddingRows(maxRows = 256): Array<{ readonly tokenId: number; readonly bytes: Uint8Array }> {
+    if (!this.streamEmbeddings || !this.embdRowBuffer || !this.embdRowHandle || this.embdCacheSlots <= 0) {
+      return [];
+    }
+    const raw = this.embdRowBuffer.rawBytes();
+    const base = this.embdRowHandle.byteOffset;
+    const out: Array<{ readonly tokenId: number; readonly bytes: Uint8Array }> = [];
+    const limit = Math.min(maxRows, this.embdCacheSlots);
+    let cur = this.embdHead;
+    let guard = 0;
+    while (cur >= 0 && out.length < limit && guard < this.embdCacheSlots) {
+      const tokenId = this.embdSlotToToken[cur];
+      if (tokenId >= 0) {
+        const off = base + cur * this.embdRowBytes;
+        out.push({ tokenId, bytes: raw.slice(off, off + this.embdRowBytes) });
+      }
+      cur = this.embdNext[cur];
+      guard += 1;
+    }
+    return out;
+  }
+
+  /**
+   * Hydrates pre-persisted Zipfian hot embedding rows straight into the WASM hot embedding slab
+   * in 0 backing reads (preserving MRU priority order: index 0 ends up most-recently-used).
+   */
+  hydrateHotEmbeddingRows(
+    rows: ReadonlyArray<{ readonly tokenId: number; readonly bytes: Uint8Array }>,
+  ): number {
+    if (!this.streamEmbeddings || !this.embdRowBuffer || !this.embdRowHandle || this.embdCacheSlots <= 0) {
+      return 0;
+    }
+    const raw = this.embdRowBuffer.rawBytes();
+    const base = this.embdRowHandle.byteOffset;
+    const vocabSize = this.embdInfo.dims[1] ?? 0;
+    let hydrated = 0;
+    // Insert from least-hot -> hottest so index 0 ends up at MRU head
+    const count = Math.min(rows.length, this.embdCacheSlots);
+    for (let i = count - 1; i >= 0; i--) {
+      const entry = rows[i];
+      if (
+        entry.tokenId < 0 ||
+        (vocabSize > 0 && entry.tokenId >= vocabSize) ||
+        entry.bytes.byteLength !== this.embdRowBytes ||
+        this.embdTokenToSlot.has(entry.tokenId)
+      ) {
+        continue;
+      }
+      const targetSlot =
+        this.embdFreeCursor < this.embdCacheSlots
+          ? this.embdFreeCursor++
+          : this.embdTail >= 0
+            ? this.embdTail
+            : 0;
+      const evictedToken = this.embdSlotToToken[targetSlot];
+      if (evictedToken >= 0) {
+        this.embdTokenToSlot.delete(evictedToken);
+      }
+      raw.set(entry.bytes, base + targetSlot * this.embdRowBytes);
+      this.embdSlotToToken[targetSlot] = entry.tokenId;
+      this.promoteEmbdSlot(targetSlot);
+      this.embdTokenToSlot.set(entry.tokenId, targetSlot);
+      hydrated += 1;
+    }
+    return hydrated;
+  }
+
   /**
    * Streams the LM-head output projection weight matrix in bounded row-stripes (or invokes once
    * directly against the pinned LM head when `!streamLmHead`).

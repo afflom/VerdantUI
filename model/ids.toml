@@ -54,6 +54,6 @@ evidence = ".github/workflows/pages.yml"
 
 [[id]]
 code = "VUI-DEDUP-01"
-title = "OPFS-to-runtime deduplication: cross-ID/ETag model reuse, .part slab salvage, persistent .hot.bin metadata cache, and conflict-free MoE waves"
-owner = "src/engine/vramBackingStore.ts"
-evidence = "src/engine/vramBackingStore.test.ts"
+title = "OPFS-to-runtime deduplication: cross-ID/ETag model reuse, .part slab salvage, content-fingerprinted KV/embedding/header/RoPE boot caches, and conflict-free MoE waves"
+owner = "src/engine/vramBootCache.ts"
+evidence = "src/engine/vramBootCache.test.ts"

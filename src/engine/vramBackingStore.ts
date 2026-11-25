@@ -1331,7 +1331,7 @@ export async function requestPersistentOpfsStorage(): Promise<boolean> {
   return false;
 }
 
-async function getOpfsVramDirectory(create = true): Promise<FileSystemDirectoryHandle | null> {
+export async function getOpfsVramDirectory(create = true): Promise<FileSystemDirectoryHandle | null> {
   if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) {
     return null;
   }
@@ -1501,7 +1501,7 @@ async function withModelOpfsLock<T>(modelId: string, fn: () => Promise<T>): Prom
 }
 
 /** Writes every byte of `data` at `fileOffset`, handling partial `SyncAccessHandle.write()` returns. */
-function writeAllSync(handle: SyncAccessHandleLike, data: Uint8Array, fileOffset: number): void {
+export function writeAllSync(handle: SyncAccessHandleLike, data: Uint8Array, fileOffset: number): void {
   let written = 0;
   while (written < data.byteLength) {
     const view = written === 0 ? data : data.subarray(written);
@@ -2134,6 +2134,9 @@ async function reclaimInactiveOpfsModels(
     else if (name.endsWith('.vram.cache')) stem = name.slice(0, -'.vram.cache'.length);
     else if (name.endsWith('.vram.idx')) stem = name.slice(0, -'.vram.idx'.length);
     else if (name.endsWith('.hot.bin')) stem = name.slice(0, -'.hot.bin'.length);
+    else if (name.endsWith('.hdr.bin')) stem = name.slice(0, -'.hdr.bin'.length);
+    else if (name.endsWith('.rope.bin')) stem = name.slice(0, -'.rope.bin'.length);
+    else if (name.endsWith('.embd.bin')) stem = name.slice(0, -'.embd.bin'.length);
     else if (name.endsWith('.unified.kv')) stem = name.slice(0, -'.unified.kv'.length);
     else if (name.endsWith('.meta')) stem = name.slice(0, -'.meta'.length);
     if (!stem || protectedModelIds.has(stem)) continue;
@@ -3501,6 +3504,9 @@ export async function deleteOpfsModel(
     if (!dir) return false;
     const stem = sanitizeOpfsBaseName(modelId);
     const base = `${stem}.gguf`;
+    // Read committed metadata before removal so we can also clean up content-fingerprinted sidecars
+    // when no other committed model references the same `<headerHash64>-<totalBytes>` payload!
+    const existingMeta = await readCommittedMeta(dir, `${stem}.meta`);
     let removed = false;
     for (const candidate of [
       base,
@@ -3509,6 +3515,9 @@ export async function deleteOpfsModel(
       `${base}.incomplete`,
       `${stem}.meta`,
       `${stem}.hot.bin`,
+      `${stem}.hdr.bin`,
+      `${stem}.rope.bin`,
+      `${stem}.embd.bin`,
       `${stem}.vram.cache`,
       `${stem}.vram.idx`,
       `${stem}.unified.kv`,
@@ -3518,6 +3527,45 @@ export async function deleteOpfsModel(
         removed = true;
       } catch {
         // Ignore missing sidecar/file
+      }
+    }
+
+    if (existingMeta) {
+      const fpStem = sanitizeOpfsBaseName(`${existingMeta.headerHash64}-${existingMeta.totalBytes}`);
+      let stillReferenced = false;
+      const iterable = dir as FileSystemDirectoryHandle & {
+        entries?: () => AsyncIterableIterator<[string, FileSystemHandle]>;
+      };
+      if (typeof iterable.entries === 'function') {
+        for await (const [name, handle] of iterable.entries()) {
+          if (handle.kind !== 'file' || !name.endsWith('.meta') || name.endsWith('.part.meta')) {
+            continue;
+          }
+          const other = await readCommittedMeta(dir, name);
+          if (
+            other &&
+            other.headerHash64 === existingMeta.headerHash64 &&
+            other.totalBytes === existingMeta.totalBytes
+          ) {
+            stillReferenced = true;
+            break;
+          }
+        }
+      }
+      if (!stillReferenced) {
+        for (const fpCandidate of [
+          `${fpStem}.hot.bin`,
+          `${fpStem}.hdr.bin`,
+          `${fpStem}.rope.bin`,
+          `${fpStem}.embd.bin`,
+          `${fpStem}.unified.kv`,
+        ]) {
+          try {
+            await dir.removeEntry(fpCandidate);
+          } catch {
+            // Ignore missing shared sidecar
+          }
+        }
       }
     }
     return removed;

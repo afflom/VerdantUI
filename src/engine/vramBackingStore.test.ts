@@ -1365,7 +1365,8 @@ test('Persistent OPFS hot-metadata bundle (<stem>.hot.bin) eliminates direct Ran
       opfsDirectoryOverride: dir,
     });
     assert.equal(directCallsFirst, 1, 'Expected first load to fetch hot metadata once and persist .hot.bin');
-    assert.equal(files.has('stories-hot-reload.hot.bin'), true, 'Expected .hot.bin sidecar written');
+    const hotFp = rt1.getContentFingerprint();
+    assert.ok(hotFp && files.has(`${hotFp}.hot.bin`), 'Expected content-fingerprinted .hot.bin sidecar written');
     for await (const ev of rt1.generate('Once upon a time', {
       temperature: 0,
       topP: 1,

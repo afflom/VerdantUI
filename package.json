@@ -12,7 +12,7 @@
     "verify:pages": "tsx scripts/verify-pages.ts dist",
     "ratchet": "tsx scripts/ratchet-gate.ts",
     "track:engine": "tsx scripts/track-engine.ts",
-    "test": "tsx --test src/engine/assistantAdapter.test.ts src/engine/gguf.test.ts src/engine/harnessConfig.test.ts src/engine/llamaRuntime.test.ts src/engine/performanceContract.test.ts src/engine/prismKernel.test.ts src/engine/tokenizer.test.ts src/engine/verdantObserver.test.ts src/engine/verdantWasmSimd.test.ts src/engine/vramBackingStore.test.ts src/engine/vramKvPager.test.ts src/engine/vramSwapPolicy.test.ts src/engine/vramUnifiedStore.test.ts src/engine/vramWeightPager.test.ts src/engine/vtensorProvider.test.ts",
+    "test": "tsx --test src/engine/assistantAdapter.test.ts src/engine/gguf.test.ts src/engine/harnessConfig.test.ts src/engine/llamaRuntime.test.ts src/engine/performanceContract.test.ts src/engine/prismKernel.test.ts src/engine/tokenizer.test.ts src/engine/verdantObserver.test.ts src/engine/verdantWasmSimd.test.ts src/engine/vramBackingStore.test.ts src/engine/vramBootCache.test.ts src/engine/vramKvPager.test.ts src/engine/vramSwapPolicy.test.ts src/engine/vramUnifiedStore.test.ts src/engine/vramWeightPager.test.ts src/engine/vtensorProvider.test.ts",
     "test:bench": "tsx --test src/engine/scalingBenchmarks.test.ts",
     "bench:catalog": "tsx scripts/bench-catalog.ts",
     "preview": "vite preview",
