@@ -1,0 +1,35 @@
+{
+  "schema": "verdant-ui/engine-pin/1",
+  "requirement": "REQ-ENGINE-TRACKING",
+  "repository": "afflom/verdant-engine",
+  "tag": "v2.22.4",
+  "version": "2.22.4",
+  "commit": "9d22f5ac364db8352d12434e1c9c3dbed65ac6c9",
+  "publishedAt": "2026-11-25T09:58:04Z",
+  "registers": [
+    {
+      "idPrefix": "VERDANT-ENGINE-AUTHORITIES-",
+      "path": "model/authorities.toml",
+      "mediaType": "application/toml",
+      "sha256": "9dae8000e668c8b6808587407e4d56c5a2fb7c98cd1a36b80d79b1cb6acce1b3"
+    },
+    {
+      "idPrefix": "VERDANT-ENGINE-IDS-",
+      "path": "model/ids.toml",
+      "mediaType": "application/toml",
+      "sha256": "00808d0a32eaa5fbd0dd2ddff3976af40e2236c7ea0ded4e664b299ab5fed453"
+    },
+    {
+      "idPrefix": "VERDANT-ENGINE-RELEASE-LEDGER-",
+      "path": "site/generated/release-ledger.json",
+      "mediaType": "application/json",
+      "sha256": "c53ca8b0a755dc776d1e94e214889df072e793c5928891af4e2bd7d94bc71009"
+    },
+    {
+      "idPrefix": "VERDANT-ENGINE-STANDARDS-LOCK-",
+      "path": "standards.lock",
+      "mediaType": "application/json",
+      "sha256": "5717dc99c3dbe05d9be26114be7e2df3f00df7128b12f3d9933b77543da8f866"
+    }
+  ]
+}

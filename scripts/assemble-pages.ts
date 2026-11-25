@@ -25,6 +25,13 @@ export function assemblePagesSite(distArg = 'dist', cwd = process.cwd()): void {
     version?: string;
     description?: string;
   };
+  const enginePin = JSON.parse(readFileSync(join(cwd, 'model/engine-pin.json'), 'utf8')) as {
+    repository: string;
+    tag: string;
+    version: string;
+    commit: string;
+    registers: ReadonlyArray<{ idPrefix: string; path: string; sha256: string }>;
+  };
 
   const ghRepo = process.env.GITHUB_REPOSITORY || 'afflom/VerdantUI';
   const [owner, repo] = ghRepo.split('/');
@@ -42,11 +49,22 @@ export function assemblePagesSite(distArg = 'dist', cwd = process.cwd()): void {
     repository: repoUrl,
     live: liveUrl,
     commit: commitSha,
+    enginePin: {
+      repository: enginePin.repository,
+      tag: enginePin.tag,
+      commit: enginePin.commit,
+      registers: enginePin.registers.map((r) => ({
+        idPrefix: r.idPrefix,
+        path: r.path,
+        sha256: r.sha256,
+      })),
+    },
     runtime: {
       deploymentModel: 'client-only',
       serverRuntime: false,
       computeSubstrate: 'verdant-engine/vTensor WASM SIMD (multi-threaded SharedArrayBuffer)',
       verdantTensorVersion: VERDANT_TENSOR_VERSION,
+      verdantTensorCommit: enginePin.commit,
       providerName: VTENSOR_CONTRACT.providerName,
       ggmlAbiVersion: VTENSOR_CONTRACT.ggmlAbiVersion,
       webgpuAllowed: false,

@@ -55,13 +55,14 @@ jobs:
         id: pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d
 
-      - name: Run Verdant ratchet, typecheck, and fast engine tests
+      - name: Run Verdant ratchet, typecheck, unit tests, and isolated multi-core parity checks
         shell: bash
         run: |
           set -euo pipefail
           npm run ratchet
           npm run lint
           npm test
+          npm run test:bench
 
       - name: Build and verify GitHub Pages bundle
         shell: bash

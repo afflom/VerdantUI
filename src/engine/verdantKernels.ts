@@ -12,7 +12,7 @@
 import { GgmlType } from './gguf';
 
 export const VERDANT_TENSOR_VERSION = '2.22.4';
-export const VERDANT_TENSOR_COMMIT = '9d22f5ac00000000000000000000000000000000';
+export const VERDANT_TENSOR_COMMIT = '9d22f5ac364db8352d12434e1c9c3dbed65ac6c9';
 
 /** IEEE 754 binary16 (F16) to binary32 (F32) exact conversion. */
 export function f16ToF32(h: number): number {

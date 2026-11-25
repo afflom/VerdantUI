@@ -1,0 +1,41 @@
+{
+  "schema": "verdant-ui/owner-decisions/1",
+  "decisions": [
+    {
+      "id": "DEC-001",
+      "at": "2026-11-25",
+      "requirements": ["REQ-CLIENT-ONLY"],
+      "quote": "We will only ever support the client-side implementation of VerdantUI. There will never be a server outside of the VerdantUI client runtime."
+    },
+    {
+      "id": "DEC-002",
+      "at": "2026-11-25",
+      "requirements": ["REQ-VERDANT-ENGINE-ONLY", "REQ-NO-WEBGPU"],
+      "quote": "Verdant studio will never make use of WebGPU or any processor API outside of verdant-engine."
+    },
+    {
+      "id": "DEC-003",
+      "at": "2026-11-25",
+      "requirements": ["REQ-PAGES-CD", "REQ-FAST-PIPELINE"],
+      "quote": "We need each push to main to publish to github pages. We need to make sure that the repo stays optimized, so that the development pipeline is not slowed down by validation overhead."
+    },
+    {
+      "id": "DEC-004",
+      "at": "2026-11-25",
+      "requirements": ["REQ-STUDIO-RATCHET"],
+      "quote": "We'll work towards the strict model of Verdant Studio using a version of the Verdant ratchet."
+    },
+    {
+      "id": "DEC-005",
+      "at": "2026-11-25",
+      "requirements": ["REQ-MULTITHREAD-PERF"],
+      "quote": "We are dedicated to the highest possible performance; lowest latency, highest throughput implementation. The multi-threaded implementation is required. We are committed to robust and scalable solutions."
+    },
+    {
+      "id": "DEC-006",
+      "at": "2026-11-25",
+      "requirements": ["REQ-STUDIO-HARNESS"],
+      "quote": "Verdant Studio will also be an agent harness in VerdantUI, so that Verdant Apps can be created, published, and managed in VerdantUI. We'll work on the Verdant Studio harness after we refine the VerdantUI implementation."
+    }
+  ]
+}

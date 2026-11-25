@@ -21,6 +21,8 @@ export interface RatchetViolation {
     | 'root-absolute-asset'
     | 'multithread-isolation'
     | 'vtensor-provider-lock'
+    | 'engine-pin-parity'
+    | 'owner-decisions'
     | 'policy-config';
   readonly path: string;
   readonly line?: number;
@@ -29,6 +31,8 @@ export interface RatchetViolation {
 
 export interface RatchetSnapshot {
   readonly policyToml: string;
+  readonly enginePinRaw: string;
+  readonly ownerDecisionsRaw: string;
   readonly packageJsonRaw: string;
   readonly metadataJsonRaw: string;
   readonly indexHtmlRaw: string;
@@ -126,6 +130,8 @@ export function loadRatchetSnapshot(cwd = process.cwd()): RatchetSnapshot {
   const coiPath = join(root, 'public/coi-serviceworker.js');
   return {
     policyToml: readReq('model/verdant-ratchet.toml'),
+    enginePinRaw: readReq('model/engine-pin.json'),
+    ownerDecisionsRaw: readReq('model/owner-decisions.json'),
     packageJsonRaw: readReq('package.json'),
     metadataJsonRaw: readReq('metadata.json'),
     indexHtmlRaw: readReq('index.html'),
@@ -286,6 +292,87 @@ export function evaluateVerdantRatchet(snapshot: RatchetSnapshot): RatchetReport
     }
   }
 
+  // 7. Verdant Engine pin parity (Studio REQ-ENGINE-TRACKING)
+  try {
+    const pin = JSON.parse(snapshot.enginePinRaw) as {
+      schema?: string;
+      version?: string;
+      commit?: string;
+      registers?: Array<{ path?: string; sha256?: string }>;
+    };
+    if (pin.schema !== 'verdant-ui/engine-pin/1') {
+      violations.push({
+        category: 'engine-pin-parity',
+        path: 'model/engine-pin.json',
+        detail: `Unexpected engine pin schema "${pin.schema ?? 'missing'}"`,
+      });
+    }
+    if (!pin.commit || !/^[0-9a-f]{40}$/.test(pin.commit) || /0{16,}$/.test(pin.commit)) {
+      violations.push({
+        category: 'engine-pin-parity',
+        path: 'model/engine-pin.json',
+        detail: 'Engine pin commit must be a full non-placeholder 40-char lowercase hex SHA',
+      });
+    }
+    const regs = pin.registers ?? [];
+    if (regs.length < 4 || regs.some((r) => !r.sha256 || !/^[0-9a-f]{64}$/.test(r.sha256))) {
+      violations.push({
+        category: 'engine-pin-parity',
+        path: 'model/engine-pin.json',
+        detail: 'Engine pin must record valid 64-hex SHA-256 digests for all 4 verdant-engine registers',
+      });
+    }
+    const kernelsSrc = snapshot.srcFiles['src/engine/verdantKernels.ts'] ?? '';
+    const verMatch = kernelsSrc.match(/export const VERDANT_TENSOR_VERSION\s*=\s*'([^']+)'/);
+    const shaMatch = kernelsSrc.match(/export const VERDANT_TENSOR_COMMIT\s*=\s*'([^']+)'/);
+    if (!verMatch || verMatch[1] !== pin.version) {
+      violations.push({
+        category: 'engine-pin-parity',
+        path: 'src/engine/verdantKernels.ts',
+        detail: `VERDANT_TENSOR_VERSION (${verMatch?.[1] ?? 'missing'}) does not match model/engine-pin.json (${pin.version ?? 'missing'})`,
+      });
+    }
+    if (!shaMatch || shaMatch[1] !== pin.commit) {
+      violations.push({
+        category: 'engine-pin-parity',
+        path: 'src/engine/verdantKernels.ts',
+        detail: `VERDANT_TENSOR_COMMIT (${shaMatch?.[1] ?? 'missing'}) does not match model/engine-pin.json (${pin.commit ?? 'missing'})`,
+      });
+    }
+  } catch (err) {
+    violations.push({
+      category: 'engine-pin-parity',
+      path: 'model/engine-pin.json',
+      detail: `Invalid engine-pin.json: ${err instanceof Error ? err.message : String(err)}`,
+    });
+  }
+
+  // 8. Owner decisions register (Studio record-decision pattern)
+  try {
+    const od = JSON.parse(snapshot.ownerDecisionsRaw) as {
+      schema?: string;
+      decisions?: Array<{ id?: string; quote?: string }>;
+    };
+    if (
+      od.schema !== 'verdant-ui/owner-decisions/1' ||
+      !Array.isArray(od.decisions) ||
+      od.decisions.length === 0 ||
+      od.decisions.some((d) => !d.id || !d.quote)
+    ) {
+      violations.push({
+        category: 'owner-decisions',
+        path: 'model/owner-decisions.json',
+        detail: 'owner-decisions.json must carry schema verdant-ui/owner-decisions/1 with non-empty id+quote entries',
+      });
+    }
+  } catch (err) {
+    violations.push({
+      category: 'owner-decisions',
+      path: 'model/owner-decisions.json',
+      detail: `Invalid owner-decisions.json: ${err instanceof Error ? err.message : String(err)}`,
+    });
+  }
+
   return {
     ok: violations.length === 0,
     schema,
@@ -359,6 +446,30 @@ export function verifyPlantedDefects(cleanSnapshot: RatchetSnapshot): {
             s.srcFiles['src/engine/vtensorProvider.ts'] ?? ''
           ).replace("'GGML_WEBGPU'", "'REMOVED'"),
         },
+      }),
+    },
+    {
+      name: 'planted-engine-commit-drift',
+      expectedCategory: 'engine-pin-parity',
+      mutate: (s) => ({
+        ...s,
+        srcFiles: {
+          ...s.srcFiles,
+          'src/engine/verdantKernels.ts': (
+            s.srcFiles['src/engine/verdantKernels.ts'] ?? ''
+          ).replace(
+            /VERDANT_TENSOR_COMMIT\s*=\s*'[^']+'/,
+            "VERDANT_TENSOR_COMMIT = '0000000000000000000000000000000000000000'",
+          ),
+        },
+      }),
+    },
+    {
+      name: 'planted-empty-owner-decisions',
+      expectedCategory: 'owner-decisions',
+      mutate: (s) => ({
+        ...s,
+        ownerDecisionsRaw: JSON.stringify({ schema: 'verdant-ui/owner-decisions/1', decisions: [] }),
       }),
     },
   ];

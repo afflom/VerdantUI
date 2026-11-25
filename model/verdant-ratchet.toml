@@ -19,3 +19,5 @@ root_absolute_bundled_asset_urls_max = 0
 [requirements]
 require_coop_coep_multithread_isolation = true
 require_exclusive_vtensor_provider_lock = true
+require_verdant_engine_pin_parity = true
+require_owner_decisions_register = true
