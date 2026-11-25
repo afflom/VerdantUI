@@ -357,12 +357,16 @@ export function sampleNextToken(
         }
       }
 
-      // In-place descending sort of candCount <= 1024 items (zero heap allocations)
+      // In-place descending sort of candCount <= 1024 items (VT-217: ties break by lower token ID)
       for (let i = 1; i < candCount; i++) {
         const keyId = samplerTopkIds[i];
         const keyVal = samplerTopkVals[i];
         let j = i - 1;
-        while (j >= 0 && samplerTopkVals[j] < keyVal) {
+        while (
+          j >= 0 &&
+          (samplerTopkVals[j] < keyVal ||
+            (samplerTopkVals[j] === keyVal && samplerTopkIds[j] > keyId))
+        ) {
           samplerTopkIds[j + 1] = samplerTopkIds[j];
           samplerTopkVals[j + 1] = samplerTopkVals[j];
           j--;
@@ -384,14 +388,14 @@ export function sampleNextToken(
           minVal = topVals[0];
           minSlot = 0;
           for (let j = 1; j < k; j++) {
-            if (topVals[j] < minVal) {
+            if (topVals[j] < minVal || (topVals[j] === minVal && topIds[j] > topIds[minSlot])) {
               minVal = topVals[j];
               minSlot = j;
             }
           }
         }
       }
-      const sorted = Array.from(topIds).sort((a, b) => logits[b] - logits[a]);
+      const sorted = Array.from(topIds).sort((a, b) => logits[b] - logits[a] || a - b);
       candIds = Int32Array.from(sorted);
       candCount = sorted.length;
     }

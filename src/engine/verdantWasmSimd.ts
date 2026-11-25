@@ -25,6 +25,9 @@ export const WASM_ATTN_SCORES_OFFSET = WASM_SCRATCH_BASE_OFFSET; // 64 bytes (16
 export const WASM_ATTN_WEIGHTS_OFFSET = WASM_SCRATCH_BASE_OFFSET + 64; // 64 bytes (16 x f32)
 export const WASM_TOPK_IDS_OFFSET = WASM_SCRATCH_BASE_OFFSET + 256; // up to 1024 x i32 (4 KiB)
 export const WASM_TOPK_VALS_OFFSET = WASM_SCRATCH_BASE_OFFSET + 4352; // up to 1024 x f32 (4 KiB)
+/** Per-worker 128-byte attention scratch (64B scores + 64B weights, 2 full cache lines) for up to 32 threads. */
+export const WASM_ATTN_WORKER_SCRATCH_BASE = WASM_SCRATCH_BASE_OFFSET + 8448; // 128-byte aligned (4 KiB total)
+export const WASM_ATTN_WORKER_SCRATCH_STRIDE = 128;
 export const WASM_DYNAMIC_ARENA_START = 524_288; // 512 KiB aligned start for VTensorBuffers
 
 /**
@@ -188,6 +191,8 @@ class FuncBuilder {
   i32ShrU(): this { return this.emit(0x76); }
 
   // f32 & f64 arithmetic
+  f32Eq(): this { return this.emit(0x5b); }
+  f32Ne(): this { return this.emit(0x5c); }
   f32Gt(): this { return this.emit(0x5e); }
   f32Nearest(): this { return this.emit(0x90); }
   f32Sqrt(): this { return this.emit(0x91); }
@@ -3257,7 +3262,7 @@ function buildMulMatQ6KQ8(useRelaxed: boolean): FuncBuilder {
   const sb2 = f.local(F32);
   const sb3 = f.local(F32);
   const mask0f = f.local(V128);
-  const mask03 = f.local(V128);
+  const mask30 = f.local(V128);
   const zero = f.local(V128);
   const x0 = f.local(V128);
   const x1 = f.local(V128);
@@ -3270,7 +3275,7 @@ function buildMulMatQ6KQ8(useRelaxed: boolean): FuncBuilder {
   const dotV = f.local(V128);
 
   f.i32Const(0x0f).i8x16Splat().set(mask0f);
-  f.i32Const(0x03).i8x16Splat().set(mask03);
+  f.i32Const(0x30).i8x16Splat().set(mask30);
   f.i32Const(0).i32x4Splat().set(zero);
   f.get(3).i32Const(8).i32ShrS().set(nSuper);
   f.get(nSuper).i32Const(210).i32Mul().set(rowBytes);
@@ -3326,19 +3331,19 @@ function buildMulMatQ6KQ8(useRelaxed: boolean): FuncBuilder {
 
     emitGroup(x0, sum32_0, dx0, 0 + s, () => {
       f.get(qla).get(mask0f).v128And()
-        .get(qhv).get(mask03).v128And().i32Const(4).i8x16Shl().v128Or();
+        .get(qhv).i32Const(4).i8x16Shl().get(mask30).v128And().v128Or();
     });
     emitGroup(x1, sum32_1, dx1, 2 + s, () => {
       f.get(qlb).get(mask0f).v128And()
-        .get(qhv).i32Const(2).i8x16ShrU().get(mask03).v128And().i32Const(4).i8x16Shl().v128Or();
+        .get(qhv).i32Const(2).i8x16Shl().get(mask30).v128And().v128Or();
     });
     emitGroup(x2, sum32_2, dx2, 4 + s, () => {
       f.get(qla).i32Const(4).i8x16ShrU()
-        .get(qhv).i32Const(4).i8x16ShrU().get(mask03).v128And().i32Const(4).i8x16Shl().v128Or();
+        .get(qhv).get(mask30).v128And().v128Or();
     });
     emitGroup(x3, sum32_3, dx3, 6 + s, () => {
       f.get(qlb).i32Const(4).i8x16ShrU()
-        .get(qhv).i32Const(6).i8x16ShrU().get(mask03).v128And().i32Const(4).i8x16Shl().v128Or();
+        .get(qhv).i32Const(2).i8x16ShrU().get(mask30).v128And().v128Or();
     });
   };
 
@@ -3455,7 +3460,7 @@ function buildMulMatQ6KQ8Batch4(useRelaxed: boolean): FuncBuilder {
   const sb2 = f.local(F32);
   const sb3 = f.local(F32);
   const mask0f = f.local(V128);
-  const mask03 = f.local(V128);
+  const mask30 = f.local(V128);
   const zero = f.local(V128);
   const qla = f.local(V128);
   const qlb = f.local(V128);
@@ -3465,7 +3470,7 @@ function buildMulMatQ6KQ8Batch4(useRelaxed: boolean): FuncBuilder {
   const dotV = f.local(V128);
 
   f.i32Const(0x0f).i8x16Splat().set(mask0f);
-  f.i32Const(0x03).i8x16Splat().set(mask03);
+  f.i32Const(0x30).i8x16Splat().set(mask30);
   f.i32Const(0).i32x4Splat().set(zero);
   f.get(3).i32Const(8).i32ShrS().set(nSuper);
   f.get(nSuper).i32Const(210).i32Mul().set(rowBytes);
@@ -3526,19 +3531,19 @@ function buildMulMatQ6KQ8Batch4(useRelaxed: boolean): FuncBuilder {
 
       emitGroup4(0, 0 + s, () => {
         f.get(qla).get(mask0f).v128And()
-          .get(qhv).get(mask03).v128And().i32Const(4).i8x16Shl().v128Or();
+          .get(qhv).i32Const(4).i8x16Shl().get(mask30).v128And().v128Or();
       });
       emitGroup4(1, 2 + s, () => {
         f.get(qlb).get(mask0f).v128And()
-          .get(qhv).i32Const(2).i8x16ShrU().get(mask03).v128And().i32Const(4).i8x16Shl().v128Or();
+          .get(qhv).i32Const(2).i8x16Shl().get(mask30).v128And().v128Or();
       });
       emitGroup4(2, 4 + s, () => {
         f.get(qla).i32Const(4).i8x16ShrU()
-          .get(qhv).i32Const(4).i8x16ShrU().get(mask03).v128And().i32Const(4).i8x16Shl().v128Or();
+          .get(qhv).get(mask30).v128And().v128Or();
       });
       emitGroup4(3, 6 + s, () => {
         f.get(qlb).i32Const(4).i8x16ShrU()
-          .get(qhv).i32Const(6).i8x16ShrU().get(mask03).v128And().i32Const(4).i8x16Shl().v128Or();
+          .get(qhv).i32Const(2).i8x16ShrU().get(mask30).v128And().v128Or();
       });
     }
   }
@@ -4314,12 +4319,13 @@ function buildFastExpF32(): FuncBuilder {
 }
 
 /**
- * 100% In-Verdant Whole-Layer 3-Tier FlashAttention (`flash_attn_layer`):
- * Executes ALL `nHeads` × ALL `ceil(seqLen / 16)` pages across Hot F32 (state=1), Warm Q8 (state=2),
- * and Cold Q4 (state=3) with in-WASM online softmax, in-WASM `fast_exp_f32`, and final `1/denom`
- * scaling in ONE SINGLE WASM call per layer (zero JS allocations, zero JS Math.exp, 8192x fewer crossings!).
+ * 100% In-Verdant Multi-Core Parallelizable 3-Tier FlashAttention (`flash_attn_layer_range`):
+ * Executes Q heads `[hStart, hEnd)` × ALL `ceil(seqLen / 16)` pages across Hot F32 (state=1),
+ * Warm Q8 (state=2), and Cold Q4 (state=3) with in-WASM online softmax, in-WASM `fast_exp_f32`,
+ * and per-worker isolated 128-byte scratch (`scratchBase`: 64B scores + 64B weights) so `P`
+ * shared-WASM threads scale long-context attention linearly with bit-exact parity!
  */
-function buildFlashAttnLayer(
+function buildFlashAttnLayerRange(
   fastExpIdx: number,
   scaleIdx: number,
   scoresF32Idx: number,
@@ -4329,7 +4335,7 @@ function buildFlashAttnLayer(
   scoresQ4Idx: number,
   accumQ4Idx: number,
 ): FuncBuilder {
-  // 26 I32 params:
+  // 29 I32 params:
   // 0: qPtr, 1: outPtr, 2: pageStatePtr, 3: pageSlotPtr
   // 4: hotKLayerPtr, 5: hotVLayerPtr
   // 6: q8KLayerPtr, 7: q8VLayerPtr, 8: q8KScLayerPtr, 9: q8VScLayerPtr
@@ -4337,7 +4343,8 @@ function buildFlashAttnLayer(
   // 14: nHeads, 15: nHeadsKv, 16: headDim, 17: seqLen
   // 18: hotPageBytes, 19: q8PageBytes, 20: q4PageBytes, 21: scPageBytes
   // 22: hotKvStrideBytes, 23: q8KvStrideBytes, 24: q4KvStrideBytes, 25: scStrideBytes
-  const f = new FuncBuilder(new Array(26).fill(I32));
+  // 26: hStart, 27: hEnd, 28: scratchBase (64B scores @ +0, 64B weights @ +64)
+  const f = new FuncBuilder(new Array(29).fill(I32));
   const headsPerKv = f.local(I32);
   const numPages = f.local(I32);
   const headBytes = f.local(I32);
@@ -4355,6 +4362,7 @@ function buildFlashAttnLayer(
   const baseOff = f.local(I32);
   const scOff = f.local(I32);
   const vScPtr = f.local(I32);
+  const weightsPtr = f.local(I32);
   const hasPrev = f.local(I32);
   const runningMax = f.local(F32);
   const runningDenom = f.local(F32);
@@ -4371,16 +4379,16 @@ function buildFlashAttnLayer(
   f.get(16).i32Const(2).i32Shl().set(headBytes);
   f.get(24).get(15).i32DivU().set(headQ4Bytes);
   f.f32Const(1.0).get(16).f32ConvertI32S().f32Sqrt().f32Div().set(invScale);
+  f.get(28).i32Const(64).i32Add().set(weightsPtr);
 
-  // Helper to emit in-WASM online softmax update for `pageEnd` scores at `WASM_ATTN_SCORES_OFFSET`.
-  // If `vScBaseLocal >= 0`, multiplies `weights[t]` by `vScale[t]` loaded from `vScBaseLocal + t * scStrideBytes`.
+  // Helper to emit in-WASM online softmax update for `pageEnd` scores at `scratchBase` (param 28).
   const emitPageSoftmax = (useVScale: boolean) => {
     // 1. Find pageMax over scores[0..pageEnd-1]
-    f.i32Const(WASM_ATTN_SCORES_OFFSET).f32Load(0).set(pageMax);
+    f.get(28).f32Load(0).set(pageMax);
     f.i32Const(1).set(t);
     f.block().loop();
     f.get(t).get(pageEnd).i32GeS().brIf(1);
-    f.i32Const(WASM_ATTN_SCORES_OFFSET).get(t).i32Const(2).i32Shl().i32Add().f32Load(0).set(scTmp);
+    f.get(28).get(t).i32Const(2).i32Shl().i32Add().f32Load(0).set(scTmp);
     f.get(scTmp).get(pageMax).f32Gt().if_();
     f.get(scTmp).set(pageMax);
     f.end();
@@ -4402,15 +4410,15 @@ function buildFlashAttnLayer(
     f.i32Const(0).set(t);
     f.block().loop();
     f.get(t).get(pageEnd).i32GeS().brIf(1);
-    f.i32Const(WASM_ATTN_SCORES_OFFSET).get(t).i32Const(2).i32Shl().i32Add().f32Load(0)
+    f.get(28).get(t).i32Const(2).i32Shl().i32Add().f32Load(0)
       .get(newMax).f32Sub().call(fastExpIdx).set(wVal);
     f.get(pageSum).get(wVal).f32Add().set(pageSum);
     if (useVScale) {
-      f.i32Const(WASM_ATTN_WEIGHTS_OFFSET).get(t).i32Const(2).i32Shl().i32Add()
+      f.get(weightsPtr).get(t).i32Const(2).i32Shl().i32Add()
         .get(wVal).get(vScPtr).f32Load(0).f32Mul().f32Store(0);
       f.get(vScPtr).get(25).i32Add().set(vScPtr);
     } else {
-      f.i32Const(WASM_ATTN_WEIGHTS_OFFSET).get(t).i32Const(2).i32Shl().i32Add()
+      f.get(weightsPtr).get(t).i32Const(2).i32Shl().i32Add()
         .get(wVal).f32Store(0);
     }
     f.get(t).i32Const(1).i32Add().set(t);
@@ -4421,13 +4429,13 @@ function buildFlashAttnLayer(
     f.get(newMax).set(runningMax);
   };
 
-  // Loop over all Q heads
-  f.i32Const(0).set(h);
-  f.get(0).set(qH);
-  f.get(1).set(oH);
+  // Loop over Q heads [hStart, hEnd)
+  f.get(26).set(h);
+  f.get(0).get(26).get(headBytes).i32Mul().i32Add().set(qH);
+  f.get(1).get(26).get(headBytes).i32Mul().i32Add().set(oH);
 
   f.block().loop();
-  f.get(h).get(14).i32GeS().brIf(1);
+  f.get(h).get(27).i32GeS().brIf(1);
   f.get(h).get(headsPerKv).i32DivU().set(kvHead);
 
   // Zero out[h] directly via bulk memory.fill
@@ -4453,10 +4461,10 @@ function buildFlashAttnLayer(
   // --- Tier 0: HOT_RESIDENT (state == 1) ---
   f.get(state).i32Const(1).i32Eq().if_();
   f.get(slot).get(18).i32Mul().get(kvHead).get(headBytes).i32Mul().i32Add().set(baseOff);
-  f.get(qH).get(4).get(baseOff).i32Add().i32Const(WASM_ATTN_SCORES_OFFSET)
+  f.get(qH).get(4).get(baseOff).i32Add().get(28)
     .get(16).get(22).get(pageEnd).get(invScale).call(scoresF32Idx);
   emitPageSoftmax(false);
-  f.get(oH).get(5).get(baseOff).i32Add().i32Const(WASM_ATTN_WEIGHTS_OFFSET)
+  f.get(oH).get(5).get(baseOff).i32Add().get(weightsPtr)
     .get(16).get(22).get(pageEnd).get(rescale).call(accumF32Idx);
 
   f.else_();
@@ -4465,11 +4473,11 @@ function buildFlashAttnLayer(
   f.get(slot).get(19).i32Mul().get(kvHead).get(16).i32Mul().i32Add().set(baseOff);
   f.get(slot).get(21).i32Mul().get(kvHead).i32Const(2).i32Shl().i32Add().set(scOff);
   f.get(qH).get(6).get(baseOff).i32Add().get(8).get(scOff).i32Add()
-    .i32Const(WASM_ATTN_SCORES_OFFSET).get(16).get(23).get(25).get(pageEnd).get(invScale)
+    .get(28).get(16).get(23).get(25).get(pageEnd).get(invScale)
     .call(scoresQ8Idx);
   f.get(9).get(scOff).i32Add().set(vScPtr);
   emitPageSoftmax(true);
-  f.get(oH).get(7).get(baseOff).i32Add().i32Const(WASM_ATTN_WEIGHTS_OFFSET)
+  f.get(oH).get(7).get(baseOff).i32Add().get(weightsPtr)
     .get(16).get(23).get(pageEnd).get(rescale).call(accumQ8Idx);
 
   f.else_();
@@ -4479,11 +4487,11 @@ function buildFlashAttnLayer(
   f.get(slot).get(20).i32Mul().get(kvHead).get(headQ4Bytes).i32Mul().i32Add().set(baseOff);
   f.get(slot).get(21).i32Mul().get(kvHead).i32Const(2).i32Shl().i32Add().set(scOff);
   f.get(qH).get(10).get(baseOff).i32Add().get(12).get(scOff).i32Add()
-    .i32Const(WASM_ATTN_SCORES_OFFSET).get(16).get(24).get(25).get(pageEnd).get(invScale)
+    .get(28).get(16).get(24).get(25).get(pageEnd).get(invScale)
     .call(scoresQ4Idx);
   f.get(13).get(scOff).i32Add().set(vScPtr);
   emitPageSoftmax(true);
-  f.get(oH).get(11).get(baseOff).i32Add().i32Const(WASM_ATTN_WEIGHTS_OFFSET)
+  f.get(oH).get(11).get(baseOff).i32Add().get(weightsPtr)
     .get(16).get(24).get(pageEnd).get(rescale).call(accumQ4Idx);
   f.end();
   f.end();
@@ -4506,10 +4514,18 @@ function buildFlashAttnLayer(
   return f;
 }
 
+/** Backwards-compatible whole-layer wrapper delegating to `flash_attn_layer_range(0, nHeads)`. */
+function buildFlashAttnLayer(flashAttnRangeIdx: number): FuncBuilder {
+  const f = new FuncBuilder(new Array(26).fill(I32));
+  for (let i = 0; i < 26; i++) f.get(i);
+  f.i32Const(0).get(14).i32Const(WASM_ATTN_SCORES_OFFSET).call(flashAttnRangeIdx);
+  return f;
+}
+
 /**
- * 100% In-Verdant WASM SIMD128 `argmax_f32(logitsPtr, n) -> bestId`:
- * Scans 4 f32 logits per iteration with `f32x4.gt` + `i32x4.bitmask`, only branching into
- * scalar lane tie-breaking on the O(ln V) new maxima (~12 times across 151,936 tokens).
+ * 100% In-Verdant WASM SIMD128 `argmax_f32(logitsPtr, n) -> bestId` (`VT-217` / `verdant_row_ranking`):
+ * Scans 4 f32 logits per iteration with `f32x4.gt` + `i32x4.bitmask`, breaking ties strictly by
+ * lower lane index and guaranteeing NaNs never outrank finite or `-Infinity` logits.
  */
 function buildArgmaxF32(): FuncBuilder {
   // params: 0=logitsPtr, 1=n -> result: i32 bestId
@@ -4529,18 +4545,18 @@ function buildArgmaxF32(): FuncBuilder {
   f.end();
 
   f.i32Const(0).set(bestId);
-  f.get(0).f32Load(0).set(bestVal);
+  f.f32Const(-Infinity).set(bestVal);
   f.get(bestVal).f32x4Splat().set(vBest);
 
   f.i32Const(0).set(i);
   f.get(1).i32Const(-4).i32And().set(n4);
   f.get(0).set(p);
 
-  // 4-wide SIMD fast-skip loop
+  // 4-wide SIMD fast-skip loop (NaN lanes never satisfy f32x4.gt -> immune to NaN poisoning!)
   f.block().loop();
   f.get(i).get(n4).i32GeS().brIf(1);
   f.get(p).v128Load(0).tee(v).get(vBest).f32x4Gt().i32x4Bitmask().if_();
-  // Lane 0..3 exact scalar tie-breaking (strictly > preserves first-index parity with JS)
+  // Lane 0..3 exact scalar tie-breaking (strictly > preserves first-index VT-217 parity)
   for (let lane = 0; lane < 4; lane++) {
     f.get(v).f32x4Extract(lane).tee(val).get(bestVal).f32Gt().if_();
     f.get(val).set(bestVal);
@@ -4568,20 +4584,36 @@ function buildArgmaxF32(): FuncBuilder {
   f.get(p).i32Const(4).i32Add().set(p);
   f.br(0).end().end();
 
+  // Edge case: if all non-NaN elements are -Infinity and logits[0] is NaN, select first non-NaN (-Inf)
+  f.get(bestVal).f32Const(-Infinity).f32Eq().if_();
+  f.get(0).f32Load(0).tee(val).get(val).f32Ne().if_();
+  f.i32Const(1).set(i);
+  f.block().loop();
+  f.get(i).get(1).i32GeS().brIf(1);
+  f.get(0).get(i).i32Const(2).i32Shl().i32Add().f32Load(0).tee(val).get(val).f32Eq().if_();
+  f.get(i).set(bestId);
+  f.br(2);
+  f.end();
+  f.get(i).i32Const(1).i32Add().set(i);
+  f.br(0).end().end();
+  f.end();
+  f.end();
+
   f.get(bestId);
   return f;
 }
 
 /**
  * 100% In-Verdant WASM SIMD128 `topk_f32(logitsPtr, n, k, outIdsPtr, outValsPtr) -> effK`:
- * Selects the exact top-K `(id, logit)` pairs in a single SIMD pass with zero heap allocations.
- * Uses `f32x4.gt(v, vMin)` + `i32x4.bitmask` to skip >99% of 4-float chunks in 1 SIMD cycle.
+ * Selects exact `VT-217` / `verdant_row_ranking` top-K `(id, logit)` pairs in a single SIMD pass
+ * with zero heap allocations, sorting NaNs strictly last and preserving lower lane indices on ties.
  */
 function buildTopkF32(): FuncBuilder {
   // params: 0=logitsPtr, 1=n, 2=k, 3=outIdsPtr, 4=outValsPtr -> result: i32 effK
   const f = new FuncBuilder([I32, I32, I32, I32, I32], [I32]);
   const effK = f.local(I32);
   const minSlot = f.local(I32);
+  const minId = f.local(I32);
   const minVal = f.local(F32);
   const vMin = f.local(V128);
   const v = f.local(V128);
@@ -4591,6 +4623,7 @@ function buildTopkF32(): FuncBuilder {
   const nLimit4 = f.local(I32);
   const val = f.local(F32);
   const tmp = f.local(F32);
+  const tmpId = f.local(I32);
   const slotOff = f.local(I32);
 
   // effK = min(k, n)
@@ -4604,29 +4637,49 @@ function buildTopkF32(): FuncBuilder {
   f.i32Const(0).ret();
   f.end();
 
-  // Phase 1: seed slots [0..effK-1] with logits[0..effK-1] and track initial minSlot/minVal
+  // Helper: update (minVal, minId, minSlot) when slot `slotIdx` with `(candVal, candId)` is strictly
+  // worse under VT-217 total order: `candVal < minVal` OR `(candVal == minVal && candId > minId)`.
+  const emitCheckMinSlot = (slotIdxLocal: number, candValLocal: number, candIdLocal: number) => {
+    f.get(minVal).get(candValLocal).f32Gt().if_();
+    f.get(candValLocal).set(minVal);
+    f.get(candIdLocal).set(minId);
+    f.get(slotIdxLocal).set(minSlot);
+    f.else_();
+    f.get(candValLocal).get(minVal).f32Eq().if_();
+    f.get(candIdLocal).get(minId).i32GtS().if_();
+    f.get(candIdLocal).set(minId);
+    f.get(slotIdxLocal).set(minSlot);
+    f.end();
+    f.end();
+    f.end();
+  };
+
+  // Phase 1: seed slots [0..effK-1] with logits[0..effK-1] (normalizing NaNs -> -Infinity so finite logits always evict them)
   f.get(3).i32Const(0).i32Store(0);
-  f.get(0).f32Load(0).tee(minVal);
+  f.get(0).f32Load(0).set(val);
+  f.get(val).get(val).f32Ne().if_();
+  f.f32Const(-Infinity).set(val);
+  f.end();
+  f.get(val).set(minVal);
   f.get(4).get(minVal).f32Store(0);
-  f.drop();
   f.i32Const(0).set(minSlot);
+  f.i32Const(0).set(minId);
 
   f.i32Const(1).set(j);
   f.block().loop();
   f.get(j).get(effK).i32GeS().brIf(1);
   f.get(j).i32Const(2).i32Shl().set(slotOff);
   f.get(0).get(slotOff).i32Add().f32Load(0).set(val);
+  f.get(val).get(val).f32Ne().if_();
+  f.f32Const(-Infinity).set(val);
+  f.end();
   f.get(3).get(slotOff).i32Add().get(j).i32Store(0);
   f.get(4).get(slotOff).i32Add().get(val).f32Store(0);
-  // if (val < minVal) i.e. minVal > val
-  f.get(minVal).get(val).f32Gt().if_();
-  f.get(val).set(minVal);
-  f.get(j).set(minSlot);
-  f.end();
+  emitCheckMinSlot(j, val, j);
   f.get(j).i32Const(1).i32Add().set(j);
   f.br(0).end().end();
 
-  // Helper to replace minSlot when `val > minVal` and refresh minSlot/minVal
+  // Helper to replace worst slot (lowest value, highest ID on tie) when `val > minVal` (NaNs never pass f32.gt!)
   const emitInsertIfGreater = (laneOffset: number) => {
     f.get(val).get(minVal).f32Gt().if_();
     f.get(minSlot).i32Const(2).i32Shl().set(slotOff);
@@ -4637,18 +4690,17 @@ function buildTopkF32(): FuncBuilder {
     }
     f.get(4).get(slotOff).i32Add().get(val).f32Store(0);
 
-    // Recompute minVal / minSlot over [0..effK-1]
+    // Recompute worst slot (minVal, maxId on tie) over [0..effK-1]
     f.get(4).f32Load(0).set(minVal);
+    f.get(3).i32Load(0).set(minId);
     f.i32Const(0).set(minSlot);
     f.i32Const(1).set(j);
     f.block().loop();
     f.get(j).get(effK).i32GeS().brIf(1);
-    f.get(4).get(j).i32Const(2).i32Shl().i32Add().f32Load(0).tee(tmp);
-    f.get(minVal).get(tmp).f32Gt().if_();
-    f.get(tmp).set(minVal);
-    f.get(j).set(minSlot);
-    f.end();
-    f.drop();
+    f.get(j).i32Const(2).i32Shl().set(slotOff);
+    f.get(4).get(slotOff).i32Add().f32Load(0).set(tmp);
+    f.get(3).get(slotOff).i32Add().i32Load(0).set(tmpId);
+    emitCheckMinSlot(j, tmp, tmpId);
     f.get(j).i32Const(1).i32Add().set(j);
     f.br(0).end().end();
     f.end();
@@ -5205,11 +5257,430 @@ function buildMulMatQ4KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
 }
 
 /**
+ * Verdant Tensor `v2.22.4` 2-row register-blocked `Q5_K × Q8_K` Narrow-Lane Integer Contraction:
+ * `(wPtr, q8kPtr, outPtr, cols, rows)`.
+ * - SWAR 3-load `u32` scale/min unpacking + 1-op `i32x4.dot_i16x8_s` min term per row
+ * - Single-shift/zero-shift `mask10 = 0x10` 5th-bit extraction from `qh[32]`
+ * - Pure `i32x4` narrow-lane super-block accumulation (33.82x i32 headroom, 2.08x i16 headroom)
+ * - Strictly 13 live V128 registers (zero x86-64 XMM spills in V8 TurboFan!)
+ */
+function buildMulMatQ5KQ8K(useRelaxed: boolean): FuncBuilder {
+  const f = new FuncBuilder([I32, I32, I32, I32, I32]);
+  const r = f.local(I32);
+  const nSuper = f.local(I32);
+  const rowBytes = f.local(I32);
+  const wp0 = f.local(I32);
+  const wp1 = f.local(I32);
+  const qp = f.local(I32);
+  const sb = f.local(I32);
+  const u0 = f.local(I32);
+  const u1 = f.local(I32);
+  const u2 = f.local(I32);
+  const sc03_0 = f.local(I32);
+  const sc47_0 = f.local(I32);
+  const sc03_1 = f.local(I32);
+  const sc47_1 = f.local(I32);
+  const mn03 = f.local(I32);
+  const mn47 = f.local(I32);
+  const acc0 = f.local(F32);
+  const acc1 = f.local(F32);
+  const dxS = f.local(F32);
+
+  // Strictly 13 V128 locals -> 3 free XMM scratch registers on x86-64 (0 spills!)
+  const mask0f = f.local(V128);
+  const mask10 = f.local(V128);
+  const sumi0 = f.local(V128);
+  const sumi1 = f.local(V128);
+  const xlo0 = f.local(V128);
+  const xhi0 = f.local(V128);
+  const xlo1 = f.local(V128);
+  const xhi1 = f.local(V128);
+  const qh0 = f.local(V128);
+  const qh1 = f.local(V128);
+  const raw0 = f.local(V128);
+  const raw1 = f.local(V128);
+  const q5v = f.local(V128);
+
+  f.i32Const(0x0f).i8x16Splat().set(mask0f);
+  f.i32Const(0x10).i8x16Splat().set(mask10);
+  f.get(3).i32Const(8).i32ShrS().set(nSuper);
+  f.get(nSuper).i32Const(176).i32Mul().set(rowBytes);
+  f.i32Const(0).set(r);
+
+  const unpackScalesAndMinDot = (
+    wpLoc: number,
+    sc03Loc: number,
+    sc47Loc: number,
+    bsums32Loc: number,
+    dstMinLoc: number,
+  ) => {
+    f.get(wpLoc).i32Load(4).set(u0);
+    f.get(wpLoc).i32Load(8).set(u1);
+    f.get(wpLoc).i32Load(12).set(u2);
+    f.get(u0).i32Const(0x3f3f3f3f).i32And().set(sc03Loc);
+    f.get(u1).i32Const(0x3f3f3f3f).i32And().set(mn03);
+    f.get(u2).i32Const(0x0f0f0f0f).i32And()
+      .get(u0).i32Const(2).i32ShrU().i32Const(0x30303030).i32And()
+      .i32Or().set(sc47Loc);
+    f.get(u2).i32Const(4).i32ShrU().i32Const(0x0f0f0f0f).i32And()
+      .get(u1).i32Const(2).i32ShrU().i32Const(0x30303030).i32And()
+      .i32Or().set(mn47);
+    f.i32Const(0).i32x4Splat().get(mn03).i32x4ReplaceLane(0).get(mn47).i32x4ReplaceLane(1)
+      .i16x8ExtendLowI8x16U()
+      .get(bsums32Loc).i32x4DotI16x8S().set(dstMinLoc);
+  };
+
+  const emitScaleSplat16 = (scWordLoc: number, byteIdx: number) => {
+    f.get(scWordLoc);
+    if (byteIdx > 0) f.i32Const(byteIdx * 8).i32ShrU();
+    if (byteIdx < 3) f.i32Const(0xff).i32And();
+    f.i16x8Splat();
+  };
+
+  // Shift bit `bitIdx` (0..7) of `qhLoc` into bit 4 (0x10): 0 shifts for bit 4, 1 shift otherwise!
+  const emitQhBit4 = (qhLoc: number, bitIdx: number) => {
+    f.get(qhLoc);
+    if (bitIdx < 4) {
+      f.i32Const(4 - bitIdx).i8x16Shl();
+    } else if (bitIdx > 4) {
+      f.i32Const(bitIdx - 4).i8x16ShrU();
+    }
+    f.get(mask10).v128And();
+  };
+
+  const emitChunkRow = (
+    wpLoc: number,
+    sc03Loc: number,
+    sc47Loc: number,
+    sumiLoc: number,
+    c: number,
+  ) => {
+    const qsBase = 48 + c * 32;
+    const scWord = c < 2 ? sc03Loc : sc47Loc;
+    const scLoIdx = (c & 1) * 2;
+    const scHiIdx = scLoIdx + 1;
+    const bitLo = c * 2;
+    const bitHi = c * 2 + 1;
+
+    f.get(wpLoc).v128Load(16).set(qh0);
+    f.get(wpLoc).v128Load(32).set(qh1);
+    f.get(wpLoc).v128Load(qsBase).set(raw0);
+    f.get(wpLoc).v128Load(qsBase + 16).set(raw1);
+
+    // Sub-block 2c (low nibbles + qh bit 2c): 2x vpmaddubsw -> i16x8.add (max 15748 <= 32767) -> pmaddwd(sc)
+    f.get(raw0).get(mask0f).v128And();
+    emitQhBit4(qh0, bitLo);
+    f.v128Or().set(q5v);
+    f.pushDotI8I7ToI16x8(xlo0, q5v, useRelaxed);
+
+    f.get(raw1).get(mask0f).v128And();
+    emitQhBit4(qh1, bitLo);
+    f.v128Or().set(q5v);
+    f.pushDotI8I7ToI16x8(xhi0, q5v, useRelaxed);
+
+    f.i16x8Add();
+    emitScaleSplat16(scWord, scLoIdx);
+    f.i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
+
+    // Sub-block 2c+1 (high nibbles + qh bit 2c+1)
+    f.get(raw0).i32Const(4).i8x16ShrU();
+    emitQhBit4(qh0, bitHi);
+    f.v128Or().set(q5v);
+    f.pushDotI8I7ToI16x8(xlo1, q5v, useRelaxed);
+
+    f.get(raw1).i32Const(4).i8x16ShrU();
+    emitQhBit4(qh1, bitHi);
+    f.v128Or().set(q5v);
+    f.pushDotI8I7ToI16x8(xhi1, q5v, useRelaxed);
+
+    f.i16x8Add();
+    emitScaleSplat16(scWord, scHiIdx);
+    f.i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
+  };
+
+  // 2-row zero-spill main loop
+  f.block().loop();
+  f.get(r).i32Const(1).i32Add().get(4).i32GeS().brIf(1);
+  f.get(0).get(r).get(rowBytes).i32Mul().i32Add().tee(wp0).get(rowBytes).i32Add().set(wp1);
+  f.get(1).set(qp);
+  f.f32Const(0).tee(acc0).set(acc1);
+  f.i32Const(0).set(sb);
+
+  f.block().loop();
+  f.get(sb).get(nSuper).i32GeS().brIf(1);
+
+  f.get(qp).f32Load(0).set(dxS);
+  f.get(qp).v128Load(48, 4).set(xlo0);
+  unpackScalesAndMinDot(wp0, sc03_0, sc47_0, xlo0, sumi0);
+  unpackScalesAndMinDot(wp1, sc03_1, sc47_1, xlo0, sumi1);
+  f.get(acc0).hsumI32x4(sumi0).f32ConvertI32S().loadF16AsF32(wp0, 2).get(dxS).f32Mul().f32Mul().f32Sub().set(acc0);
+  f.get(acc1).hsumI32x4(sumi1).f32ConvertI32S().loadF16AsF32(wp1, 2).get(dxS).f32Mul().f32Mul().f32Sub().set(acc1);
+
+  f.i32Const(0).i32x4Splat().tee(sumi0).set(sumi1);
+  for (let c = 0; c < 4; c++) {
+    const xBase = 64 + c * 64;
+    f.get(qp).v128Load(xBase, 4).set(xlo0);
+    f.get(qp).v128Load(xBase + 16, 4).set(xhi0);
+    f.get(qp).v128Load(xBase + 32, 4).set(xlo1);
+    f.get(qp).v128Load(xBase + 48, 4).set(xhi1);
+    emitChunkRow(wp0, sc03_0, sc47_0, sumi0, c);
+    emitChunkRow(wp1, sc03_1, sc47_1, sumi1, c);
+  }
+
+  f.hsumI32x4(sumi0).f32ConvertI32S().loadF16AsF32(wp0, 0).get(dxS).f32Mul().f32Mul()
+    .get(acc0).f32Add().set(acc0);
+  f.hsumI32x4(sumi1).f32ConvertI32S().loadF16AsF32(wp1, 0).get(dxS).f32Mul().f32Mul()
+    .get(acc1).f32Add().set(acc1);
+
+  f.get(wp0).i32Const(176).i32Add().set(wp0);
+  f.get(wp1).i32Const(176).i32Add().set(wp1);
+  f.get(qp).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Add().set(qp);
+  f.get(sb).i32Const(1).i32Add().set(sb);
+  f.br(0).end().end();
+
+  f.get(2).get(r).i32Const(2).i32Shl().i32Add().get(acc0).f32Store(0);
+  f.get(2).get(r).i32Const(2).i32Shl().i32Add().get(acc1).f32Store(4);
+  f.get(r).i32Const(2).i32Add().set(r);
+  f.br(0).end().end();
+
+  // Odd trailing row (0..1)
+  f.block();
+  f.get(r).get(4).i32GeS().brIf(0);
+  f.get(0).get(r).get(rowBytes).i32Mul().i32Add().set(wp0);
+  f.get(1).set(qp);
+  f.f32Const(0).set(acc0);
+  f.i32Const(0).set(sb);
+
+  f.block().loop();
+  f.get(sb).get(nSuper).i32GeS().brIf(1);
+  f.get(qp).f32Load(0).set(dxS);
+  f.get(qp).v128Load(48, 4).set(xlo0);
+  unpackScalesAndMinDot(wp0, sc03_0, sc47_0, xlo0, sumi1);
+  f.i32Const(0).i32x4Splat().set(sumi0);
+  for (let c = 0; c < 4; c++) {
+    const xBase = 64 + c * 64;
+    f.get(qp).v128Load(xBase, 4).set(xlo0);
+    f.get(qp).v128Load(xBase + 16, 4).set(xhi0);
+    f.get(qp).v128Load(xBase + 32, 4).set(xlo1);
+    f.get(qp).v128Load(xBase + 48, 4).set(xhi1);
+    emitChunkRow(wp0, sc03_0, sc47_0, sumi0, c);
+  }
+  f.loadF16AsF32(wp0, 0).hsumI32x4(sumi0).f32ConvertI32S().f32Mul()
+    .loadF16AsF32(wp0, 2).hsumI32x4(sumi1).f32ConvertI32S().f32Mul()
+    .f32Sub().get(dxS).f32Mul().get(acc0).f32Add().set(acc0);
+
+  f.get(wp0).i32Const(176).i32Add().set(wp0);
+  f.get(qp).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Add().set(qp);
+  f.get(sb).i32Const(1).i32Add().set(sb);
+  f.br(0).end().end();
+
+  f.get(2).get(r).i32Const(2).i32Shl().i32Add().get(acc0).f32Store(0);
+  f.end();
+
+  return f;
+}
+
+/**
+ * Verdant Tensor `v2.22.4` 4-token batched prefill `Q5_K × Q8_K` Narrow-Lane Contraction:
+ * `(wPtr, q8kBatchPtr, outBatchPtr, cols, rows, oStrideBytes)`.
+ * Unpacks each `Q5_K` weight super-block (`qh[32]` + `qs[128]` + SWAR scales) ONCE across all
+ * 4 prompt tokens, accumulates in pure `i32x4`, and encodes to float ONCE per 256 weights.
+ */
+function buildMulMatQ5KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
+  const f = new FuncBuilder([I32, I32, I32, I32, I32, I32]);
+  const r = f.local(I32);
+  const nSuper = f.local(I32);
+  const rowBytes = f.local(I32);
+  const qStride = f.local(I32);
+  const oStride = f.local(I32);
+  const wp = f.local(I32);
+  const qp0 = f.local(I32);
+  const qp1 = f.local(I32);
+  const qp2 = f.local(I32);
+  const qp3 = f.local(I32);
+  const op = f.local(I32);
+  const sb = f.local(I32);
+  const u0 = f.local(I32);
+  const u1 = f.local(I32);
+  const u2 = f.local(I32);
+  const sc03 = f.local(I32);
+  const sc47 = f.local(I32);
+  const mn03 = f.local(I32);
+  const mn47 = f.local(I32);
+
+  // Strictly 13 V128 locals -> 3 free XMM scratch registers on x86-64 (0 spills!)
+  const mask0f = f.local(V128);
+  const mask10 = f.local(V128);
+  const acc4 = f.local(V128);
+  const sumi0 = f.local(V128);
+  const sumi1 = f.local(V128);
+  const sumi2 = f.local(V128);
+  const sumi3 = f.local(V128);
+  const raw0 = f.local(V128);
+  const raw1 = f.local(V128);
+  const w0 = f.local(V128);
+  const w1 = f.local(V128);
+  const scV = f.local(V128);
+  const xtmp = f.local(V128);
+
+  f.i32Const(0x0f).i8x16Splat().set(mask0f);
+  f.i32Const(0x10).i8x16Splat().set(mask10);
+  f.get(3).i32Const(8).i32ShrS().set(nSuper);
+  f.get(nSuper).i32Const(176).i32Mul().set(rowBytes);
+  f.get(nSuper).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Mul().set(qStride);
+  f.get(5).set(oStride);
+  f.i32Const(0).set(r);
+
+  const emitScaleSplat16 = (scWordLoc: number, byteIdx: number) => {
+    f.get(scWordLoc);
+    if (byteIdx > 0) f.i32Const(byteIdx * 8).i32ShrU();
+    if (byteIdx < 3) f.i32Const(0xff).i32And();
+    f.i16x8Splat().set(scV);
+  };
+
+  const emitQhBit4FromMem = (qhOff: number, bitIdx: number) => {
+    f.get(wp).v128Load(qhOff);
+    if (bitIdx < 4) {
+      f.i32Const(4 - bitIdx).i8x16Shl();
+    } else if (bitIdx > 4) {
+      f.i32Const(bitIdx - 4).i8x16ShrU();
+    }
+    f.get(mask10).v128And();
+  };
+
+  const emitTokSub = (qpLoc: number, xOff: number, sumiLoc: number) => {
+    f.get(qpLoc).v128Load(xOff, 4).set(xtmp);
+    f.pushDotI8I7ToI16x8(xtmp, w0, useRelaxed);
+    f.get(qpLoc).v128Load(xOff + 16, 4).set(xtmp);
+    f.pushDotI8I7ToI16x8(xtmp, w1, useRelaxed);
+    f.i16x8Add().get(scV).i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
+  };
+
+  const pushDx4 = () => {
+    f.f32Const(0).f32x4Splat()
+      .get(qp0).f32Load(0).f32x4ReplaceLane(0)
+      .get(qp1).f32Load(0).f32x4ReplaceLane(1)
+      .get(qp2).f32Load(0).f32x4ReplaceLane(2)
+      .get(qp3).f32Load(0).f32x4ReplaceLane(3);
+  };
+
+  f.block().loop();
+  f.get(r).get(4).i32GeS().brIf(1);
+  f.get(0).get(r).get(rowBytes).i32Mul().i32Add().set(wp);
+  f.get(1).tee(qp0)
+    .get(qStride).i32Add().tee(qp1)
+    .get(qStride).i32Add().tee(qp2)
+    .get(qStride).i32Add().set(qp3);
+  f.f32Const(0).f32x4Splat().set(acc4);
+  f.i32Const(0).set(sb);
+
+  f.block().loop();
+  f.get(sb).get(nSuper).i32GeS().brIf(1);
+
+  // SWAR unpack scales & mins ONCE for all 4 tokens
+  f.get(wp).i32Load(4).set(u0);
+  f.get(wp).i32Load(8).set(u1);
+  f.get(wp).i32Load(12).set(u2);
+  f.get(u0).i32Const(0x3f3f3f3f).i32And().set(sc03);
+  f.get(u1).i32Const(0x3f3f3f3f).i32And().set(mn03);
+  f.get(u2).i32Const(0x0f0f0f0f).i32And()
+    .get(u0).i32Const(2).i32ShrU().i32Const(0x30303030).i32And()
+    .i32Or().set(sc47);
+  f.get(u2).i32Const(4).i32ShrU().i32Const(0x0f0f0f0f).i32And()
+    .get(u1).i32Const(2).i32ShrU().i32Const(0x30303030).i32And()
+    .i32Or().set(mn47);
+
+  // Compute min dots for all 4 tokens via 1x dot_i16x8 each, fold into acc4
+  f.i32Const(0).i32x4Splat().get(mn03).i32x4ReplaceLane(0).get(mn47).i32x4ReplaceLane(1)
+    .i16x8ExtendLowI8x16U().set(scV);
+  f.get(scV).get(qp0).v128Load(48, 4).i32x4DotI16x8S().set(sumi0);
+  f.get(scV).get(qp1).v128Load(48, 4).i32x4DotI16x8S().set(sumi1);
+  f.get(scV).get(qp2).v128Load(48, 4).i32x4DotI16x8S().set(sumi2);
+  f.get(scV).get(qp3).v128Load(48, 4).i32x4DotI16x8S().set(sumi3);
+  f.hsum4RowsI32x4(sumi0, sumi1, sumi2, sumi3, raw0, raw1, w0);
+  pushDx4();
+  f.loadF16AsF32(wp, 2).f32x4Splat().f32x4Mul().set(raw0);
+  f.get(acc4)
+    .get(w0).f32x4ConvertI32x4S().get(raw0).f32x4Mul()
+    .f32x4Sub().set(acc4);
+
+  f.i32Const(0).i32x4Splat().tee(sumi0).tee(sumi1).tee(sumi2).set(sumi3);
+
+  for (let c = 0; c < 4; c++) {
+    const qsBase = 48 + c * 32;
+    const xBase = 64 + c * 64;
+    const scWord = c < 2 ? sc03 : sc47;
+    const scLoIdx = (c & 1) * 2;
+    const scHiIdx = scLoIdx + 1;
+    const bitLo = c * 2;
+    const bitHi = c * 2 + 1;
+
+    f.get(wp).v128Load(qsBase).set(raw0);
+    f.get(wp).v128Load(qsBase + 16).set(raw1);
+
+    // Sub-block 2c (low nibbles + qh bit 2c) across all 4 tokens
+    f.get(raw0).get(mask0f).v128And();
+    emitQhBit4FromMem(16, bitLo);
+    f.v128Or().set(w0);
+    f.get(raw1).get(mask0f).v128And();
+    emitQhBit4FromMem(32, bitLo);
+    f.v128Or().set(w1);
+    emitScaleSplat16(scWord, scLoIdx);
+    emitTokSub(qp0, xBase, sumi0);
+    emitTokSub(qp1, xBase, sumi1);
+    emitTokSub(qp2, xBase, sumi2);
+    emitTokSub(qp3, xBase, sumi3);
+
+    // Sub-block 2c+1 (high nibbles + qh bit 2c+1) across all 4 tokens
+    f.get(raw0).i32Const(4).i8x16ShrU();
+    emitQhBit4FromMem(16, bitHi);
+    f.v128Or().set(w0);
+    f.get(raw1).i32Const(4).i8x16ShrU();
+    emitQhBit4FromMem(32, bitHi);
+    f.v128Or().set(w1);
+    emitScaleSplat16(scWord, scHiIdx);
+    emitTokSub(qp0, xBase + 32, sumi0);
+    emitTokSub(qp1, xBase + 32, sumi1);
+    emitTokSub(qp2, xBase + 32, sumi2);
+    emitTokSub(qp3, xBase + 32, sumi3);
+  }
+
+  // Encode all 4 tokens ONCE per 256-weight super-block!
+  f.hsum4RowsI32x4(sumi0, sumi1, sumi2, sumi3, raw0, raw1, w0);
+  pushDx4();
+  f.loadF16AsF32(wp, 0).f32x4Splat().f32x4Mul().set(raw0);
+  if (useRelaxed) {
+    f.get(w0).f32x4ConvertI32x4S().get(raw0).get(acc4).f32x4RelaxedMadd().set(acc4);
+  } else {
+    f.get(w0).f32x4ConvertI32x4S().get(raw0).f32x4Mul().get(acc4).f32x4Add().set(acc4);
+  }
+
+  f.get(wp).i32Const(176).i32Add().set(wp);
+  f.get(qp0).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Add().set(qp0);
+  f.get(qp1).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Add().set(qp1);
+  f.get(qp2).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Add().set(qp2);
+  f.get(qp3).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Add().set(qp3);
+  f.get(sb).i32Const(1).i32Add().set(sb);
+  f.br(0).end().end();
+
+  f.get(2).get(r).i32Const(2).i32Shl().i32Add().tee(op).get(acc4).f32x4Extract(0).f32Store(0);
+  f.get(op).get(oStride).i32Add().tee(op).get(acc4).f32x4Extract(1).f32Store(0);
+  f.get(op).get(oStride).i32Add().tee(op).get(acc4).f32x4Extract(2).f32Store(0);
+  f.get(op).get(oStride).i32Add().get(acc4).f32x4Extract(3).f32Store(0);
+
+  f.get(r).i32Const(1).i32Add().set(r);
+  f.br(0).end().end();
+
+  return f;
+}
+
+/**
  * Verdant/Prism 2-row register-blocked `Q6_K × Q8_K` Narrow-Lane Integer Contraction:
  * `(wPtr, q8kPtr, outPtr, cols, rows)`.
  * - Absorbs all 16 sub-blocks' `-32 * sc[j] * bsums16[j]` offset via TWO `i32x4.dot_i16x8_s` ops
  * - Fuses every sub-block scale multiply into 1-op `i32x4.dot_i16x8_s(vpmaddubsw, i16x8.splat(sc))`
  *   (ZERO `pmulld`, ZERO `qhv` reloads!)
+ * - `mask30 = 0x30` bit-shift elimination saves 16 `i8x16` vector shifts (~32 x86-64 ops) per super-block
  * - Strictly 12 live V128 registers (zero x86-64 XMM spills in V8 TurboFan!) + compact rolled `h` loop
  */
 function buildMulMatQ6KQ8K(useRelaxed: boolean): FuncBuilder {
@@ -5235,7 +5706,7 @@ function buildMulMatQ6KQ8K(useRelaxed: boolean): FuncBuilder {
 
   // Strictly 12 V128 locals -> 4 free XMM scratch registers on x86-64 (0 spills!)
   const mask0f = f.local(V128);
-  const mask03 = f.local(V128);
+  const mask30 = f.local(V128);
   const sumi0 = f.local(V128);
   const sumi1 = f.local(V128);
   const x0 = f.local(V128);
@@ -5248,7 +5719,7 @@ function buildMulMatQ6KQ8K(useRelaxed: boolean): FuncBuilder {
   const q6v = f.local(V128);
 
   f.i32Const(0x0f).i8x16Splat().set(mask0f);
-  f.i32Const(0x03).i8x16Splat().set(mask03);
+  f.i32Const(0x30).i8x16Splat().set(mask30);
   f.get(3).i32Const(8).i32ShrS().set(nSuper);
   f.get(nSuper).i32Const(210).i32Mul().set(rowBytes);
   f.i32Const(0).set(r);
@@ -5286,19 +5757,19 @@ function buildMulMatQ6KQ8K(useRelaxed: boolean): FuncBuilder {
 
     emitGroup(x0, 0 + s, () => {
       f.get(qla).get(mask0f).v128And()
-        .get(qhv).get(mask03).v128And().i32Const(4).i8x16Shl().v128Or();
+        .get(qhv).i32Const(4).i8x16Shl().get(mask30).v128And().v128Or();
     });
     emitGroup(x1, 2 + s, () => {
       f.get(qlb).get(mask0f).v128And()
-        .get(qhv).i32Const(2).i8x16ShrU().get(mask03).v128And().i32Const(4).i8x16Shl().v128Or();
+        .get(qhv).i32Const(2).i8x16Shl().get(mask30).v128And().v128Or();
     });
     emitGroup(x2, 4 + s, () => {
       f.get(qla).i32Const(4).i8x16ShrU()
-        .get(qhv).i32Const(4).i8x16ShrU().get(mask03).v128And().i32Const(4).i8x16Shl().v128Or();
+        .get(qhv).get(mask30).v128And().v128Or();
     });
     emitGroup(x3, 6 + s, () => {
       f.get(qlb).i32Const(4).i8x16ShrU()
-        .get(qhv).i32Const(6).i8x16ShrU().i32Const(4).i8x16Shl().v128Or();
+        .get(qhv).i32Const(2).i8x16ShrU().get(mask30).v128And().v128Or();
     });
   };
 
@@ -5437,7 +5908,7 @@ function buildMulMatQ6KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
   const sb = f.local(I32);
 
   const mask0f = f.local(V128);
-  const mask03 = f.local(V128);
+  const mask30 = f.local(V128);
   const acc4 = f.local(V128);
   const sumi0 = f.local(V128);
   const sumi1 = f.local(V128);
@@ -5452,7 +5923,7 @@ function buildMulMatQ6KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
   const dotV = f.local(V128);
 
   f.i32Const(0x0f).i8x16Splat().set(mask0f);
-  f.i32Const(0x03).i8x16Splat().set(mask03);
+  f.i32Const(0x30).i8x16Splat().set(mask30);
   f.get(3).i32Const(8).i32ShrS().set(nSuper);
   f.get(nSuper).i32Const(210).i32Mul().set(rowBytes);
   f.get(nSuper).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Mul().set(qStride);
@@ -5519,19 +5990,19 @@ function buildMulMatQ6KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
 
       emitGroup4(xHalf + 0 + sOff, 0 + s, () => {
         f.get(qla).get(mask0f).v128And()
-          .get(qhv).get(mask03).v128And().i32Const(4).i8x16Shl().v128Or();
+          .get(qhv).i32Const(4).i8x16Shl().get(mask30).v128And().v128Or();
       });
       emitGroup4(xHalf + 32 + sOff, 2 + s, () => {
         f.get(qlb).get(mask0f).v128And()
-          .get(qhv).i32Const(2).i8x16ShrU().get(mask03).v128And().i32Const(4).i8x16Shl().v128Or();
+          .get(qhv).i32Const(2).i8x16Shl().get(mask30).v128And().v128Or();
       });
       emitGroup4(xHalf + 64 + sOff, 4 + s, () => {
         f.get(qla).i32Const(4).i8x16ShrU()
-          .get(qhv).i32Const(4).i8x16ShrU().get(mask03).v128And().i32Const(4).i8x16Shl().v128Or();
+          .get(qhv).get(mask30).v128And().v128Or();
       });
       emitGroup4(xHalf + 96 + sOff, 6 + s, () => {
         f.get(qlb).i32Const(4).i8x16ShrU()
-          .get(qhv).i32Const(6).i8x16ShrU().i32Const(4).i8x16Shl().v128Or();
+          .get(qhv).i32Const(2).i8x16ShrU().get(mask30).v128And().v128Or();
       });
     }
   }
@@ -5727,6 +6198,8 @@ export function buildVerdantSimdModuleBytes(
   add('quantize_f32_to_q8_k', buildQuantizeF32ToQ8K());
   add('mul_mat_q4_k_q8k', buildMulMatQ4KQ8K(useRelaxed));
   add('mul_mat_q4_k_q8k_batch4', buildMulMatQ4KQ8KBatch4(useRelaxed));
+  add('mul_mat_q5_k_q8k', buildMulMatQ5KQ8K(useRelaxed));
+  add('mul_mat_q5_k_q8k_batch4', buildMulMatQ5KQ8KBatch4(useRelaxed));
   add('mul_mat_q6_k_q8k', buildMulMatQ6KQ8K(useRelaxed));
   add('mul_mat_q6_k_q8k_batch4', buildMulMatQ6KQ8KBatch4(useRelaxed));
   add('uor_table_build_i8_v4', buildUorTableBuildI8V4());
@@ -5750,16 +6223,16 @@ export function buildVerdantSimdModuleBytes(
   add('scale_add_f32', buildScaleAddF32());
   const scaleIdx = add('scale_f32', buildScaleF32());
 
-  // Fused 16-token page-level attention kernels & 100% in-Verdant whole-layer FlashAttention
+  // Fused 16-token page-level attention kernels & 100% in-Verdant multi-core FlashAttention
   const scoresF32Idx = add('attn_page_scores_f32', buildAttnPageScoresF32(useRelaxed));
   const accumF32Idx = add('attn_page_accum_f32', buildAttnPageAccumF32(useRelaxed));
   const scoresQ8Idx = add('attn_page_scores_q8', buildAttnPageScoresQ8(dotQ8Idx));
   const accumQ8Idx = add('attn_page_accum_q8', buildAttnPageAccumQ8(scaleIdx, axpyQ8Idx));
   const scoresQ4Idx = add('attn_page_scores_q4', buildAttnPageScoresQ4(dotQ4Idx));
   const accumQ4Idx = add('attn_page_accum_q4', buildAttnPageAccumQ4(scaleIdx, axpyQ4Idx));
-  add(
-    'flash_attn_layer',
-    buildFlashAttnLayer(
+  const flashAttnRangeIdx = add(
+    'flash_attn_layer_range',
+    buildFlashAttnLayerRange(
       fastExpIdx,
       scaleIdx,
       scoresF32Idx,
@@ -5770,6 +6243,7 @@ export function buildVerdantSimdModuleBytes(
       accumQ4Idx,
     ),
   );
+  add('flash_attn_layer', buildFlashAttnLayer(flashAttnRangeIdx));
   add('argmax_f32', buildArgmaxF32());
   add('topk_f32', buildTopkF32());
 
@@ -5882,6 +6356,37 @@ export interface VerdantSimdExports {
   attn_page_accum_q8(outPtr: number, vQ8BasePtr: number, weightsPtr: number, headDim: number, kvStrideBytes: number, count: number, rescale: number): void;
   attn_page_scores_q4(qPtr: number, kQ4BasePtr: number, kScBasePtr: number, scoresPtr: number, headDim: number, kvStrideBytes: number, scStrideBytes: number, count: number, invScale: number): void;
   attn_page_accum_q4(outPtr: number, vQ4BasePtr: number, weightsPtr: number, headDim: number, kvStrideBytes: number, count: number, rescale: number): void;
+  flash_attn_layer_range(
+    qPtr: number,
+    outPtr: number,
+    pageStatePtr: number,
+    pageSlotPtr: number,
+    hotKLayerPtr: number,
+    hotVLayerPtr: number,
+    q8KLayerPtr: number,
+    q8VLayerPtr: number,
+    q8KScLayerPtr: number,
+    q8VScLayerPtr: number,
+    q4KLayerPtr: number,
+    q4VLayerPtr: number,
+    q4KScLayerPtr: number,
+    q4VScLayerPtr: number,
+    nHeads: number,
+    nHeadsKv: number,
+    headDim: number,
+    seqLen: number,
+    hotPageBytes: number,
+    q8PageBytes: number,
+    q4PageBytes: number,
+    scPageBytes: number,
+    hotKvStrideBytes: number,
+    q8KvStrideBytes: number,
+    q4KvStrideBytes: number,
+    scStrideBytes: number,
+    hStart: number,
+    hEnd: number,
+    scratchBase: number,
+  ): void;
   flash_attn_layer(
     qPtr: number,
     outPtr: number,
@@ -5915,6 +6420,8 @@ export interface VerdantSimdExports {
   quantize_f32_to_q8_k(xPtr: number, q8kPtr: number, cols: number): void;
   mul_mat_q4_k_q8k(wPtr: number, q8kPtr: number, outPtr: number, cols: number, rows: number): void;
   mul_mat_q4_k_q8k_batch4(wPtr: number, q8kBatchPtr: number, outBatchPtr: number, cols: number, rows: number, oStrideBytes: number): void;
+  mul_mat_q5_k_q8k(wPtr: number, q8kPtr: number, outPtr: number, cols: number, rows: number): void;
+  mul_mat_q5_k_q8k_batch4(wPtr: number, q8kBatchPtr: number, outBatchPtr: number, cols: number, rows: number, oStrideBytes: number): void;
   mul_mat_q6_k_q8k(wPtr: number, q8kPtr: number, outPtr: number, cols: number, rows: number): void;
   mul_mat_q6_k_q8k_batch4(wPtr: number, q8kBatchPtr: number, outBatchPtr: number, cols: number, rows: number, oStrideBytes: number): void;
   uor_table_build_i8_v4(space: number, block: number, bookPtr: number, actsPtr: number, outPtr: number): void;
@@ -5963,6 +6470,35 @@ export interface VTensorThreadPoolLike {
     xF32Ptr: number,
     cols: number,
     runLocalEntry: (entryIdx: number, rowStart: number, rowCount: number) => void,
+  ): void;
+  dispatchParallelFlashAttn(
+    qPtr: number,
+    outPtr: number,
+    pageStatePtr: number,
+    pageSlotPtr: number,
+    hotKLayerPtr: number,
+    hotVLayerPtr: number,
+    q8KLayerPtr: number,
+    q8VLayerPtr: number,
+    q8KScLayerPtr: number,
+    q8VScLayerPtr: number,
+    q4KLayerPtr: number,
+    q4VLayerPtr: number,
+    q4KScLayerPtr: number,
+    q4VScLayerPtr: number,
+    nHeads: number,
+    nHeadsKv: number,
+    headDim: number,
+    seqLen: number,
+    hotPageBytes: number,
+    q8PageBytes: number,
+    q4PageBytes: number,
+    scPageBytes: number,
+    hotKvStrideBytes: number,
+    q8KvStrideBytes: number,
+    q4KvStrideBytes: number,
+    scStrideBytes: number,
+    runLocalHeads: (hStart: number, hEnd: number, scratchBase: number) => void,
   ): void;
 }
 
@@ -6020,6 +6556,9 @@ export function executeWasmMatStripe(
       case GgmlType.Q4_K:
         kernels.mul_mat_q4_k_q8k_batch4(wPtr, xOrQ8Ptr, outPtr, cols, rows, oStrideBytes);
         return;
+      case GgmlType.Q5_K:
+        kernels.mul_mat_q5_k_q8k_batch4(wPtr, xOrQ8Ptr, outPtr, cols, rows, oStrideBytes);
+        return;
       case GgmlType.Q6_K:
         kernels.mul_mat_q6_k_q8k_batch4(wPtr, xOrQ8Ptr, outPtr, cols, rows, oStrideBytes);
         return;
@@ -6033,6 +6572,9 @@ export function executeWasmMatStripe(
     switch (weightType) {
       case GgmlType.Q4_K:
         kernels.mul_mat_q4_k_q8k(wPtr, xOrQ8Ptr, outPtr, cols, rows);
+        return;
+      case GgmlType.Q5_K:
+        kernels.mul_mat_q5_k_q8k(wPtr, xOrQ8Ptr, outPtr, cols, rows);
         return;
       case GgmlType.Q6_K:
         kernels.mul_mat_q6_k_q8k(wPtr, xOrQ8Ptr, outPtr, cols, rows);
@@ -6883,7 +7425,139 @@ export class VerdantWasmArena {
 
   /** Returns true if `weightType` supports Verdant/Prism Q8_K super-block narrow-lane contraction. */
   supportsQ8KActivation(weightType: GgmlType): boolean {
-    return weightType === GgmlType.Q4_K || weightType === GgmlType.Q6_K;
+    return (
+      weightType === GgmlType.Q4_K ||
+      weightType === GgmlType.Q5_K ||
+      weightType === GgmlType.Q6_K
+    );
+  }
+
+  /**
+   * Executes whole-layer 3-tier FlashAttention (`Hot F32 + Warm Q8 + Cold Q4`) in-Verdant,
+   * automatically distributing Q heads across all `P` shared-WASM threads on long contexts
+   * (`seqLen >= 192 && nHeads >= 2`) with zero-copy, zero-race per-worker scratch and bit-exact parity.
+   */
+  flashAttnLayer(
+    qPtr: number,
+    outPtr: number,
+    pageStatePtr: number,
+    pageSlotPtr: number,
+    hotKLayerPtr: number,
+    hotVLayerPtr: number,
+    q8KLayerPtr: number,
+    q8VLayerPtr: number,
+    q8KScLayerPtr: number,
+    q8VScLayerPtr: number,
+    q4KLayerPtr: number,
+    q4VLayerPtr: number,
+    q4KScLayerPtr: number,
+    q4VScLayerPtr: number,
+    nHeads: number,
+    nHeadsKv: number,
+    headDim: number,
+    seqLen: number,
+    hotPageBytes: number,
+    q8PageBytes: number,
+    q4PageBytes: number,
+    scPageBytes: number,
+    hotKvStrideBytes: number,
+    q8KvStrideBytes: number,
+    q4KvStrideBytes: number,
+    scStrideBytes: number,
+  ): void {
+    const pool = this.threadPool;
+    if (pool && pool.isActive && nHeads >= 2 && seqLen >= 192) {
+      pool.dispatchParallelFlashAttn(
+        qPtr,
+        outPtr,
+        pageStatePtr,
+        pageSlotPtr,
+        hotKLayerPtr,
+        hotVLayerPtr,
+        q8KLayerPtr,
+        q8VLayerPtr,
+        q8KScLayerPtr,
+        q8VScLayerPtr,
+        q4KLayerPtr,
+        q4VLayerPtr,
+        q4KScLayerPtr,
+        q4VScLayerPtr,
+        nHeads,
+        nHeadsKv,
+        headDim,
+        seqLen,
+        hotPageBytes,
+        q8PageBytes,
+        q4PageBytes,
+        scPageBytes,
+        hotKvStrideBytes,
+        q8KvStrideBytes,
+        q4KvStrideBytes,
+        scStrideBytes,
+        (hStart, hEnd, scratchBase) => {
+          this.kernels.flash_attn_layer_range(
+            qPtr,
+            outPtr,
+            pageStatePtr,
+            pageSlotPtr,
+            hotKLayerPtr,
+            hotVLayerPtr,
+            q8KLayerPtr,
+            q8VLayerPtr,
+            q8KScLayerPtr,
+            q8VScLayerPtr,
+            q4KLayerPtr,
+            q4VLayerPtr,
+            q4KScLayerPtr,
+            q4VScLayerPtr,
+            nHeads,
+            nHeadsKv,
+            headDim,
+            seqLen,
+            hotPageBytes,
+            q8PageBytes,
+            q4PageBytes,
+            scPageBytes,
+            hotKvStrideBytes,
+            q8KvStrideBytes,
+            q4KvStrideBytes,
+            scStrideBytes,
+            hStart,
+            hEnd,
+            scratchBase,
+          );
+        },
+      );
+      return;
+    }
+    this.kernels.flash_attn_layer(
+      qPtr,
+      outPtr,
+      pageStatePtr,
+      pageSlotPtr,
+      hotKLayerPtr,
+      hotVLayerPtr,
+      q8KLayerPtr,
+      q8VLayerPtr,
+      q8KScLayerPtr,
+      q8VScLayerPtr,
+      q4KLayerPtr,
+      q4VLayerPtr,
+      q4KScLayerPtr,
+      q4VScLayerPtr,
+      nHeads,
+      nHeadsKv,
+      headDim,
+      seqLen,
+      hotPageBytes,
+      q8PageBytes,
+      q4PageBytes,
+      scPageBytes,
+      hotKvStrideBytes,
+      q8KvStrideBytes,
+      q4KvStrideBytes,
+      scStrideBytes,
+    );
   }
 
   /**

@@ -324,7 +324,9 @@ export function derivePerformanceContract(
 
   const usesQ8KNarrowLane =
     useQ8Activations &&
-    (model.dominantWeightType === GgmlType.Q4_K || model.dominantWeightType === GgmlType.Q6_K) &&
+    (model.dominantWeightType === GgmlType.Q4_K ||
+      model.dominantWeightType === GgmlType.Q5_K ||
+      model.dominantWeightType === GgmlType.Q6_K) &&
     (hp.embeddingLength & 255) === 0;
 
   const activationQuantLabel = useQ8Activations

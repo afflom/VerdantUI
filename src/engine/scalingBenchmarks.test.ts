@@ -4,6 +4,7 @@ import os from 'node:os';
 import { GgmlType, type GgufTensorInfo, type ParsedGgufModel } from './gguf';
 import {
   Q8_0_ACT_BLOCK_BYTES,
+  Q8_K_ACT_BLOCK_BYTES,
   VerdantWasmArena,
   WASM_TOPK_IDS_OFFSET,
   WASM_TOPK_VALS_OFFSET,
@@ -16,6 +17,10 @@ import { VramKvPager } from './vramKvPager';
 import { VramWeightPager, type LayerTensorInfoGroup } from './vramWeightPager';
 import { MemoryBackingStore } from './vramBackingStore';
 import { VTensorBackendRegistry } from './vtensorProvider';
+import {
+  PRISM_NARROW_LANE_PROOFS,
+  selectCertifiedPrismRoute,
+} from './prismKernel';
 import {
   derivePerformanceContract,
   partitionRowStripes,
@@ -1059,3 +1064,265 @@ test('Prism Q8_K narrow-lane accelerates Q4_K & Q6_K over Q8_0 and maintains bit
     pool.dispose();
   }
 });
+
+test('Verdant v2.22.4 Q5_K × Q8_K single & batch-4 narrow-lane kernels match exact F64 reference, Prism proofs, and multi-core P=N parity', async () => {
+  // 1. Prism algebraic proof & certified route selection for Q5_K × Q8_K
+  assert.equal(PRISM_NARROW_LANE_PROOFS.q5k_x_q8k.fitsI32Exactly, true);
+  assert.ok(PRISM_NARROW_LANE_PROOFS.q5k_x_q8k.i32MaxHeadroomFactor > 30);
+  const cert = selectCertifiedPrismRoute(
+    {
+      wasmSimd: true,
+      relaxedVnni: true,
+      hardwareWebGpu: false,
+      effectiveWorkers: 4,
+      memoryBandwidthGBs: 25,
+      computeGops: 140,
+      barrierLatencyUs: 2,
+      precisionMode: 'q8-vnni',
+    },
+    {
+      weightType: GgmlType.Q5_K,
+      rows: 3072,
+      cols: 8192,
+      batchSize: 1,
+      groupSize: 1,
+      weightBytes: 3072 * (8192 / 256) * 176,
+      gpuResident: false,
+    },
+  );
+  assert.equal(cert.selectedRoute, 'wasm-q8k-4row');
+
+  const arena = new VerdantWasmArena({ initialPages: 256, shared: true });
+  const availCpus = Math.max(1, os.cpus().length);
+  const targetWorkers = Math.min(4, Math.max(2, availCpus));
+  const pool = await VTensorThreadPool.create(arena, {
+    maxWorkers: targetWorkers,
+    parallelThresholdBytes: 16 * 1024,
+  });
+  assert.ok(pool !== null && pool.isActive);
+
+  try {
+    const cols = 1024;
+    const rows = 515; // exercises 2-row tiled loop + odd remainder row across stripes
+    const B = 4;
+    const blocksPerRow = cols / 256;
+    const rowBytes = blocksPerRow * 176;
+    const wBytes = rows * rowBytes;
+    const rng = makeRng(2224);
+
+    const wOff = arena.allocRegion(wBytes);
+    const wSlice = arena.bytes().subarray(wOff, wOff + wBytes);
+    for (let r = 0; r < rows; r++) {
+      for (let b = 0; b < blocksPerRow; b++) {
+        const off = r * rowBytes + b * 176;
+        wSlice[off] = 0x00;
+        wSlice[off + 1] = 0x2c; // F16 0.0625
+        wSlice[off + 2] = 0x00;
+        wSlice[off + 3] = 0x28; // F16 0.03125
+        for (let i = 4; i < 176; i++) wSlice[off + i] = Math.floor(rng() * 256) & 0xff;
+      }
+    }
+
+    const xOff = arena.allocRegion(B * cols * 4);
+    const xBatch = new Float32Array(arena.memory.buffer, xOff, B * cols);
+    for (let i = 0; i < xBatch.length; i++) xBatch[i] = (rng() - 0.5) * 2.0;
+
+    const q8kStride = blocksPerRow * Q8_K_ACT_BLOCK_BYTES;
+    const q8kOff = arena.allocRegion(B * q8kStride);
+    for (let t = 0; t < B; t++) {
+      arena.quantizeActivationQ8K(xOff + t * cols * 4, q8kOff + t * q8kStride, cols);
+    }
+
+    const ySingleSeq = arena.allocRegion(B * rows * 4);
+    const ySinglePar = arena.allocRegion(B * rows * 4);
+    const yBatchSeq = arena.allocRegion(B * rows * 4);
+    const yBatchPar = arena.allocRegion(B * rows * 4);
+
+    // P=1 vs P=N bit-exactness for single-token and batch-4 Q5_K × Q8_K
+    arena.attachThreadPool(null);
+    for (let t = 0; t < B; t++) {
+      arena.mulMatQ8K(GgmlType.Q5_K, wOff, q8kOff + t * q8kStride, xOff + t * cols * 4, ySingleSeq + t * rows * 4, cols, rows);
+    }
+    arena.mulMatBatchQ8K(GgmlType.Q5_K, wOff, q8kOff, xOff, yBatchSeq, cols, rows, B);
+
+    arena.attachThreadPool(pool);
+    for (let t = 0; t < B; t++) {
+      arena.mulMatQ8K(GgmlType.Q5_K, wOff, q8kOff + t * q8kStride, xOff + t * cols * 4, ySinglePar + t * rows * 4, cols, rows);
+    }
+    arena.mulMatBatchQ8K(GgmlType.Q5_K, wOff, q8kOff, xOff, yBatchPar, cols, rows, B);
+
+    const sSeq = new Float32Array(arena.memory.buffer, ySingleSeq, B * rows);
+    const sPar = new Float32Array(arena.memory.buffer, ySinglePar, B * rows);
+    const bSeq = new Float32Array(arena.memory.buffer, yBatchSeq, B * rows);
+    const bPar = new Float32Array(arena.memory.buffer, yBatchPar, B * rows);
+
+    for (let i = 0; i < B * rows; i++) {
+      assert.equal(sPar[i], sSeq[i], `Q5_K×Q8_K single P=N mismatch at idx ${i}`);
+      assert.equal(bPar[i], bSeq[i], `Q5_K×Q8_K batch-4 P=N mismatch at idx ${i}`);
+      assert.ok(Math.abs(sPar[i] - bPar[i]) <= 1e-3, `Q5_K×Q8_K batch4 vs single drift at idx ${i}`);
+    }
+
+    // Exact dequantized Q8_K algebraic check against JS F64 verdantMulMat
+    const dv = new DataView(arena.memory.buffer);
+    const xDeq = new Float32Array(cols);
+    const refDeq = new Float32Array(rows);
+    for (let t = 0; t < B; t++) {
+      for (let b = 0; b < blocksPerRow; b++) {
+        const blkOff = q8kOff + t * q8kStride + b * Q8_K_ACT_BLOCK_BYTES;
+        const d = dv.getFloat32(blkOff, true);
+        for (let j = 0; j < 256; j++) xDeq[b * 256 + j] = dv.getInt8(blkOff + 64 + j) * d;
+      }
+      verdantMulMat(wSlice, 0, GgmlType.Q5_K, cols, rows, xDeq, refDeq);
+      for (let r = 0; r < rows; r++) {
+        const err = Math.abs(refDeq[r] - sSeq[t * rows + r]);
+        assert.ok(err <= 1e-3, `Q5_K×Q8_K exact algebraic mismatch tok=${t} row=${r}: ref=${refDeq[r]}, got=${sSeq[t * rows + r]} (err=${err})`);
+      }
+    }
+  } finally {
+    arena.attachThreadPool(null);
+    pool.dispose();
+  }
+});
+
+test('Multi-core parallel flash_attn_layer_range is bit-exact (maxDiff === 0) across Hot+Warm+Cold KV tiers and accelerates long context', async () => {
+  const numLayers = 1;
+  const seqLen = 1024;
+  const nHeadsQ = 16;
+  const nHeadsKv = 4;
+  const headDim = 128;
+  const kvDim = nHeadsKv * headDim;
+  const qDim = nHeadsQ * headDim;
+
+  const reg = new VTensorBackendRegistry({ initialWasmPages: 256, sharedWasmMemory: true });
+  assert.ok(reg.arena !== null);
+  const arena = reg.arena;
+  const availCpus = Math.max(1, os.cpus().length);
+  const targetWorkers = Math.min(4, Math.max(2, availCpus));
+  const pool = await VTensorThreadPool.create(arena, {
+    maxWorkers: targetWorkers,
+    parallelThresholdBytes: 32 * 1024,
+  });
+  assert.ok(pool !== null && pool.isActive);
+
+  try {
+    const pager = new VramKvPager(
+      {
+        numLayers,
+        maxContext: seqLen,
+        nHeadsKv,
+        headDim,
+        hotFrameLimit: 12,
+        warmQ8Limit: 20,
+        coldQ4Enabled: true,
+      },
+      (id, usage, cap) => reg.allocBuffer(id, usage, cap),
+    );
+    const actBuf = reg.allocBuffer('attn.par', 'compute', (qDim * 3 + kvDim * 2) * 4 + 256);
+    const qT = actBuf.allocTensor('q', GgmlType.F32, [qDim]);
+    const kT = actBuf.allocTensor('k', GgmlType.F32, [kvDim]);
+    const vT = actBuf.allocTensor('v', GgmlType.F32, [kvDim]);
+    const oSeqT = actBuf.allocTensor('oSeq', GgmlType.F32, [qDim]);
+    const oParT = actBuf.allocTensor('oPar', GgmlType.F32, [qDim]);
+
+    const rng = makeRng(9090);
+    const kArr = actBuf.f32View(kT);
+    const vArr = actBuf.f32View(vT);
+    const qArr = actBuf.f32View(qT);
+    for (let i = 0; i < qDim; i++) qArr[i] = (rng() - 0.5) * 1.4;
+    for (let pos = 0; pos < seqLen; pos++) {
+      for (let i = 0; i < kvDim; i++) {
+        kArr[i] = (rng() - 0.5) * 1.1;
+        vArr[i] = (rng() - 0.5) * 1.1;
+      }
+      pager.writeKvPtr(false, 0, pos, actBuf.wasmPtr(kT), arena);
+      pager.writeKvPtr(true, 0, pos, actBuf.wasmPtr(vT), arena);
+    }
+
+    const kvTel = pager.getTelemetry();
+    assert.ok(kvTel.hotResidentPages > 0 && kvTel.warmQ8Pages > 0 && kvTel.coldQ4Pages > 0);
+
+    const empty = new Float32Array(0);
+    const qPtr = actBuf.wasmPtr(qT);
+    const oSeqPtr = actBuf.wasmPtr(oSeqT);
+    const oParPtr = actBuf.wasmPtr(oParT);
+
+    arena.attachThreadPool(null);
+    pager.flashAttnExt(empty, qPtr, empty, oSeqPtr, nHeadsQ, 0, seqLen, arena);
+
+    arena.attachThreadPool(pool);
+    pager.flashAttnExt(empty, qPtr, empty, oParPtr, nHeadsQ, 0, seqLen, arena);
+
+    const oSeq = actBuf.f32View(oSeqT);
+    const oPar = actBuf.f32View(oParT);
+    for (let i = 0; i < qDim; i++) {
+      assert.equal(oPar[i], oSeq[i], `Parallel FlashAttention mismatch at idx ${i}: ${oPar[i]} !== ${oSeq[i]}`);
+    }
+
+    // Measure speedup
+    const iters = 16;
+    arena.attachThreadPool(null);
+    const tSeq0 = performance.now();
+    for (let i = 0; i < iters; i++) pager.flashAttnExt(empty, qPtr, empty, oSeqPtr, nHeadsQ, 0, seqLen, arena);
+    const seqMs = performance.now() - tSeq0;
+
+    arena.attachThreadPool(pool);
+    const tPar0 = performance.now();
+    for (let i = 0; i < iters; i++) pager.flashAttnExt(empty, qPtr, empty, oParPtr, nHeadsQ, 0, seqLen, arena);
+    const parMs = performance.now() - tPar0;
+
+    const speedup = seqMs / Math.max(0.01, parMs);
+    console.log(
+      `[Parallel FlashAttn P=${pool.workerCount} seqLen=${seqLen} 16H×128D] ${speedup.toFixed(2)}x (${seqMs.toFixed(2)}ms -> ${parMs.toFixed(2)}ms, bit-exact)`,
+    );
+    if (availCpus >= 2) {
+      assert.ok(speedup > 1.25, `Expected multi-core FlashAttention speedup > 1.25x (got ${speedup.toFixed(2)}x)`);
+    }
+  } finally {
+    arena.attachThreadPool(null);
+    pool.dispose();
+    reg.freeAllBuffers();
+  }
+});
+
+test('Upstream VT-217 / verdant_row_ranking NaN-safe deterministic Argmax and Top-K enforce lower-index tie-breaking', () => {
+  const arena = new VerdantWasmArena({ initialPages: 8, shared: false });
+  const n = 23; // exercises 4-wide SIMD lanes + 3-element scalar tail
+  const lOff = arena.allocRegion(n * 4);
+  const logits = new Float32Array(arena.memory.buffer, lOff, n);
+
+  // Case 1: NaN at index 0 + interior NaNs + exact tie across SIMD & scalar tail
+  logits.fill(-5.0);
+  logits[0] = Number.NaN;
+  logits[1] = Number.NaN;
+  logits[5] = 4.25;
+  logits[9] = Number.NaN;
+  logits[14] = 4.25; // tied with 5 -> lower index 5 MUST win!
+  logits[21] = 4.25; // tied in scalar tail -> lower index 5 MUST win!
+  logits[22] = Number.NaN;
+  assert.equal(arena.kernels.argmax_f32(lOff, n), 5);
+
+  // Top-4 must ignore all NaNs and preserve lower indices (5, 14, 21) on ties
+  const effK = arena.kernels.topk_f32(lOff, n, 4, WASM_TOPK_IDS_OFFSET, WASM_TOPK_VALS_OFFSET);
+  assert.equal(effK, 4);
+  const ids = Array.from(new Int32Array(arena.memory.buffer, WASM_TOPK_IDS_OFFSET, effK));
+  const vals = Array.from(new Float32Array(arena.memory.buffer, WASM_TOPK_VALS_OFFSET, effK));
+  const ranked = ids
+    .map((id, idx) => ({ id, val: vals[idx] }))
+    .sort((a, b) => b.val - a.val || a.id - b.id);
+  assert.deepEqual(
+    ranked.map((r) => r.id),
+    [5, 14, 21, 2],
+  );
+  assert.ok(ranked.every((r) => !Number.isNaN(r.val)));
+
+  // Case 2: All NaN -> deterministic fallback to index 0 (never out-of-bounds or negative)
+  logits.fill(Number.NaN);
+  assert.equal(arena.kernels.argmax_f32(lOff, n), 0);
+
+  // Case 3: Negative finite values after leading NaN -> finite negative beats -Infinity/NaN
+  logits.fill(Number.NaN);
+  logits[17] = -123.5;
+  logits[19] = -123.5;
+  assert.equal(arena.kernels.argmax_f32(lOff, n), 17);
+});
+

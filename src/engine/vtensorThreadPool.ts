@@ -19,6 +19,8 @@ import {
   executeWasmMatStripe,
   ParallelMatOp,
   VerdantWasmArena,
+  WASM_ATTN_WORKER_SCRATCH_BASE,
+  WASM_ATTN_WORKER_SCRATCH_STRIDE,
   weightRowByteSize,
   type MatGroupEntry,
   type VerdantSimdExports,
@@ -65,8 +67,11 @@ export const SLOT_G2_ROW_COUNT = 6;
 
 export const OP_GROUP_DISPATCH = 50;
 export const OP_PING = 51;
+export const OP_FLASH_ATTN_RANGE = 52;
 export const OP_SHUTDOWN = 99;
 export const MAX_POOL_WORKERS = 32;
+/** 26-int FlashAttention descriptor overlaid onto indices 16..41 (strictly < WORKER_SLOT_BASE = 48). */
+export const ATTN_DESC_BASE = GROUP_DESC_BASE;
 
 /** Active spin window (~400–800 µs) keeps helper threads hot across attention/RMSNorm gaps without futex syscalls. */
 export const WORKER_ACTIVE_SPIN = 80_000;
@@ -127,6 +132,51 @@ export function runComputeWorkerLoop(
     }
 
     if (op === OP_PING) {
+      Atomics.store(ctrl, slotBase + SLOT_DONE_SEQ, seq);
+      if (Atomics.load(ctrl, CTRL_COORDINATOR_WAITING) !== 0) {
+        Atomics.notify(ctrl, slotBase + SLOT_DONE_SEQ, 1);
+      }
+      continue;
+    }
+
+    if (op === OP_FLASH_ATTN_RANGE) {
+      const hCount = Atomics.load(ctrl, slotBase + SLOT_ROW_COUNT);
+      if (hCount > 0) {
+        const hStart = Atomics.load(ctrl, slotBase + SLOT_ROW_START);
+        const d = ATTN_DESC_BASE;
+        const scratchBase = WASM_ATTN_WORKER_SCRATCH_BASE + (workerIndex + 1) * WASM_ATTN_WORKER_SCRATCH_STRIDE;
+        kernels.flash_attn_layer_range(
+          Atomics.load(ctrl, d + 0) >>> 0,
+          Atomics.load(ctrl, d + 1) >>> 0,
+          Atomics.load(ctrl, d + 2) >>> 0,
+          Atomics.load(ctrl, d + 3) >>> 0,
+          Atomics.load(ctrl, d + 4) >>> 0,
+          Atomics.load(ctrl, d + 5) >>> 0,
+          Atomics.load(ctrl, d + 6) >>> 0,
+          Atomics.load(ctrl, d + 7) >>> 0,
+          Atomics.load(ctrl, d + 8) >>> 0,
+          Atomics.load(ctrl, d + 9) >>> 0,
+          Atomics.load(ctrl, d + 10) >>> 0,
+          Atomics.load(ctrl, d + 11) >>> 0,
+          Atomics.load(ctrl, d + 12) >>> 0,
+          Atomics.load(ctrl, d + 13) >>> 0,
+          Atomics.load(ctrl, d + 14),
+          Atomics.load(ctrl, d + 15),
+          Atomics.load(ctrl, d + 16),
+          Atomics.load(ctrl, d + 17),
+          Atomics.load(ctrl, d + 18),
+          Atomics.load(ctrl, d + 19),
+          Atomics.load(ctrl, d + 20),
+          Atomics.load(ctrl, d + 21),
+          Atomics.load(ctrl, d + 22),
+          Atomics.load(ctrl, d + 23),
+          Atomics.load(ctrl, d + 24),
+          Atomics.load(ctrl, d + 25),
+          hStart,
+          hStart + hCount,
+          scratchBase,
+        );
+      }
       Atomics.store(ctrl, slotBase + SLOT_DONE_SEQ, seq);
       if (Atomics.load(ctrl, CTRL_COORDINATOR_WAITING) !== 0) {
         Atomics.notify(ctrl, slotBase + SLOT_DONE_SEQ, 1);
@@ -359,10 +409,12 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
           function runStripe(op, wt, wPtr, xOrQ8, xF32, outPtr, cols, rows, oStride) {
             if (op === ${ParallelMatOp.MUL_MAT_BATCH4_Q8K}) {
               if (wt === ${GgmlType.Q4_K}) { k.mul_mat_q4_k_q8k_batch4(wPtr, xOrQ8, outPtr, cols, rows, oStride); return; }
+              if (wt === ${GgmlType.Q5_K}) { k.mul_mat_q5_k_q8k_batch4(wPtr, xOrQ8, outPtr, cols, rows, oStride); return; }
               if (wt === ${GgmlType.Q6_K}) { k.mul_mat_q6_k_q8k_batch4(wPtr, xOrQ8, outPtr, cols, rows, oStride); return; }
               if (wt === ${GgmlType.F32}) { k.mul_mat_f32_batch4(wPtr, xF32, outPtr, cols, rows, oStride); return; }
             } else if (op === ${ParallelMatOp.MUL_MAT_Q8K}) {
               if (wt === ${GgmlType.Q4_K}) { k.mul_mat_q4_k_q8k(wPtr, xOrQ8, outPtr, cols, rows); return; }
+              if (wt === ${GgmlType.Q5_K}) { k.mul_mat_q5_k_q8k(wPtr, xOrQ8, outPtr, cols, rows); return; }
               if (wt === ${GgmlType.Q6_K}) { k.mul_mat_q6_k_q8k(wPtr, xOrQ8, outPtr, cols, rows); return; }
             } else if (op === ${ParallelMatOp.MUL_MAT_BATCH4_Q8}) {
               if (wt === ${GgmlType.Q4_0}) { k.mul_mat_q4_0_q8_batch4(wPtr, xOrQ8, outPtr, cols, rows, oStride); return; }
@@ -422,6 +474,50 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
               break;
             }
             if (op === ${OP_PING}) {
+              Atomics.store(ctrl, slotBase + ${SLOT_DONE_SEQ}, seq);
+              if (Atomics.load(ctrl, ${CTRL_COORDINATOR_WAITING}) !== 0) {
+                Atomics.notify(ctrl, slotBase + ${SLOT_DONE_SEQ}, 1);
+              }
+              continue;
+            }
+            if (op === ${OP_FLASH_ATTN_RANGE}) {
+              const hCount = Atomics.load(ctrl, slotBase + ${SLOT_ROW_COUNT});
+              if (hCount > 0) {
+                const hStart = Atomics.load(ctrl, slotBase + ${SLOT_ROW_START});
+                const d = ${ATTN_DESC_BASE};
+                const scratchBase = ${WASM_ATTN_WORKER_SCRATCH_BASE} + (workerIndex + 1) * ${WASM_ATTN_WORKER_SCRATCH_STRIDE};
+                k.flash_attn_layer_range(
+                  Atomics.load(ctrl, d + 0) >>> 0,
+                  Atomics.load(ctrl, d + 1) >>> 0,
+                  Atomics.load(ctrl, d + 2) >>> 0,
+                  Atomics.load(ctrl, d + 3) >>> 0,
+                  Atomics.load(ctrl, d + 4) >>> 0,
+                  Atomics.load(ctrl, d + 5) >>> 0,
+                  Atomics.load(ctrl, d + 6) >>> 0,
+                  Atomics.load(ctrl, d + 7) >>> 0,
+                  Atomics.load(ctrl, d + 8) >>> 0,
+                  Atomics.load(ctrl, d + 9) >>> 0,
+                  Atomics.load(ctrl, d + 10) >>> 0,
+                  Atomics.load(ctrl, d + 11) >>> 0,
+                  Atomics.load(ctrl, d + 12) >>> 0,
+                  Atomics.load(ctrl, d + 13) >>> 0,
+                  Atomics.load(ctrl, d + 14),
+                  Atomics.load(ctrl, d + 15),
+                  Atomics.load(ctrl, d + 16),
+                  Atomics.load(ctrl, d + 17),
+                  Atomics.load(ctrl, d + 18),
+                  Atomics.load(ctrl, d + 19),
+                  Atomics.load(ctrl, d + 20),
+                  Atomics.load(ctrl, d + 21),
+                  Atomics.load(ctrl, d + 22),
+                  Atomics.load(ctrl, d + 23),
+                  Atomics.load(ctrl, d + 24),
+                  Atomics.load(ctrl, d + 25),
+                  hStart,
+                  hStart + hCount,
+                  scratchBase,
+                );
+              }
               Atomics.store(ctrl, slotBase + ${SLOT_DONE_SEQ}, seq);
               if (Atomics.load(ctrl, ${CTRL_COORDINATOR_WAITING}) !== 0) {
                 Atomics.notify(ctrl, slotBase + ${SLOT_DONE_SEQ}, 1);
@@ -748,6 +844,109 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
       this.dispatches += 1;
       this.bytesProcessed += chunkBytes;
     }
+  }
+
+  /**
+   * Synchronous zero-copy multi-core 3-tier FlashAttention dispatch across Q heads `[0, nHeads)`.
+   * Each thread owns an isolated 128-byte scratch buffer (`WASM_ATTN_WORKER_SCRATCH_BASE + id * 128`)
+   * so long-context attention scales linearly across cores with bit-exact parity vs `P = 1`.
+   */
+  dispatchParallelFlashAttn(
+    qPtr: number,
+    outPtr: number,
+    pageStatePtr: number,
+    pageSlotPtr: number,
+    hotKLayerPtr: number,
+    hotVLayerPtr: number,
+    q8KLayerPtr: number,
+    q8VLayerPtr: number,
+    q8KScLayerPtr: number,
+    q8VScLayerPtr: number,
+    q4KLayerPtr: number,
+    q4VLayerPtr: number,
+    q4KScLayerPtr: number,
+    q4VScLayerPtr: number,
+    nHeads: number,
+    nHeadsKv: number,
+    headDim: number,
+    seqLen: number,
+    hotPageBytes: number,
+    q8PageBytes: number,
+    q4PageBytes: number,
+    scPageBytes: number,
+    hotKvStrideBytes: number,
+    q8KvStrideBytes: number,
+    q4KvStrideBytes: number,
+    scStrideBytes: number,
+    runLocalHeads: (hStart: number, hEnd: number, scratchBase: number) => void,
+  ): void {
+    if (!this.active || this.helperCount === 0 || nHeads < 2) {
+      runLocalHeads(0, nHeads, WASM_ATTN_WORKER_SCRATCH_BASE);
+      return;
+    }
+
+    const activeStripes = this.fillRowStripes(nHeads, 1);
+    if (activeStripes <= 1) {
+      runLocalHeads(0, nHeads, WASM_ATTN_WORKER_SCRATCH_BASE);
+      return;
+    }
+
+    const ctrl = this.ctrl;
+    const nextSeq = (this.jobSeq + 1) | 0;
+    this.jobSeq = nextSeq;
+    const d = ATTN_DESC_BASE;
+
+    Atomics.store(ctrl, CTRL_OP_CODE, OP_FLASH_ATTN_RANGE);
+    Atomics.store(ctrl, d + 0, qPtr | 0);
+    Atomics.store(ctrl, d + 1, outPtr | 0);
+    Atomics.store(ctrl, d + 2, pageStatePtr | 0);
+    Atomics.store(ctrl, d + 3, pageSlotPtr | 0);
+    Atomics.store(ctrl, d + 4, hotKLayerPtr | 0);
+    Atomics.store(ctrl, d + 5, hotVLayerPtr | 0);
+    Atomics.store(ctrl, d + 6, q8KLayerPtr | 0);
+    Atomics.store(ctrl, d + 7, q8VLayerPtr | 0);
+    Atomics.store(ctrl, d + 8, q8KScLayerPtr | 0);
+    Atomics.store(ctrl, d + 9, q8VScLayerPtr | 0);
+    Atomics.store(ctrl, d + 10, q4KLayerPtr | 0);
+    Atomics.store(ctrl, d + 11, q4VLayerPtr | 0);
+    Atomics.store(ctrl, d + 12, q4KScLayerPtr | 0);
+    Atomics.store(ctrl, d + 13, q4VScLayerPtr | 0);
+    Atomics.store(ctrl, d + 14, nHeads);
+    Atomics.store(ctrl, d + 15, nHeadsKv);
+    Atomics.store(ctrl, d + 16, headDim);
+    Atomics.store(ctrl, d + 17, seqLen);
+    Atomics.store(ctrl, d + 18, hotPageBytes);
+    Atomics.store(ctrl, d + 19, q8PageBytes);
+    Atomics.store(ctrl, d + 20, q4PageBytes);
+    Atomics.store(ctrl, d + 21, scPageBytes);
+    Atomics.store(ctrl, d + 22, hotKvStrideBytes);
+    Atomics.store(ctrl, d + 23, q8KvStrideBytes);
+    Atomics.store(ctrl, d + 24, q4KvStrideBytes);
+    Atomics.store(ctrl, d + 25, scStrideBytes);
+
+    for (let w = 0; w < this.helperCount; w++) {
+      const slotBase = WORKER_SLOT_BASE + w * WORKER_SLOT_STRIDE;
+      const stripeIdx = w + 1;
+      if (stripeIdx < activeStripes) {
+        Atomics.store(ctrl, slotBase + SLOT_ROW_START, this.stripeStarts[stripeIdx]);
+        Atomics.store(ctrl, slotBase + SLOT_ROW_COUNT, this.stripeCounts[stripeIdx]);
+      } else {
+        Atomics.store(ctrl, slotBase + SLOT_ROW_START, 0);
+        Atomics.store(ctrl, slotBase + SLOT_ROW_COUNT, 0);
+      }
+    }
+
+    this.publishJob(nextSeq);
+
+    // Coordinator computes stripe 0 on its dedicated scratch slot (workerId = 0)
+    runLocalHeads(
+      this.stripeStarts[0],
+      this.stripeStarts[0] + this.stripeCounts[0],
+      WASM_ATTN_WORKER_SCRATCH_BASE,
+    );
+
+    this.joinHelpers(nextSeq);
+    this.dispatches += 1;
   }
 
   dispose(): void {

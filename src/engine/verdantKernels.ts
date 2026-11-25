@@ -11,8 +11,8 @@
 
 import { GgmlType } from './gguf';
 
-export const VERDANT_TENSOR_VERSION = '2.21.7';
-export const VERDANT_TENSOR_COMMIT = 'cf25bac200000000000000000000000000000000';
+export const VERDANT_TENSOR_VERSION = '2.22.4';
+export const VERDANT_TENSOR_COMMIT = '9d22f5ac00000000000000000000000000000000';
 
 /** IEEE 754 binary16 (F16) to binary32 (F32) exact conversion. */
 export function f16ToF32(h: number): number {

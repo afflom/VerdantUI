@@ -967,7 +967,7 @@ export class VramKvPager {
       const layerQ4OffBytes = layerIndex * VRAM_KV_PAGE_TOKENS * nHeadsKv * this.headQ4Bytes;
       const layerScOffBytes = layerIndex * VRAM_KV_PAGE_TOKENS * nHeadsKv * 4;
 
-      arena.kernels.flash_attn_layer(
+      arena.flashAttnLayer(
         qWasmPtr,
         outWasmPtr,
         this.wasmPageStateHandle.buffer.wasmPtr(this.wasmPageStateHandle),
