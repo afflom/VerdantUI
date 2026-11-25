@@ -122,7 +122,10 @@ export function runComputeWorkerLoop(
     }
     lastSeq = seq;
 
-    const op = Atomics.load(ctrl, CTRL_OP_CODE);
+    // Release-acquire invariant (ECMA-262 §29): Atomics.load(CTRL_JOB_SEQ) synchronizes-with
+    // coordinator's Atomics.store(CTRL_JOB_SEQ), so all descriptor fields written prior to
+    // publishJob() are safely visible via plain typed-array reads with zero redundant fences.
+    const op = ctrl[CTRL_OP_CODE];
     if (op === OP_SHUTDOWN) {
       Atomics.store(ctrl, slotBase + SLOT_DONE_SEQ, seq);
       if (Atomics.load(ctrl, CTRL_COORDINATOR_WAITING) !== 0) {
@@ -140,38 +143,38 @@ export function runComputeWorkerLoop(
     }
 
     if (op === OP_FLASH_ATTN_RANGE) {
-      const hCount = Atomics.load(ctrl, slotBase + SLOT_ROW_COUNT);
+      const hCount = ctrl[slotBase + SLOT_ROW_COUNT];
       if (hCount > 0) {
-        const hStart = Atomics.load(ctrl, slotBase + SLOT_ROW_START);
+        const hStart = ctrl[slotBase + SLOT_ROW_START];
         const d = ATTN_DESC_BASE;
         const scratchBase = WASM_ATTN_WORKER_SCRATCH_BASE + (workerIndex + 1) * WASM_ATTN_WORKER_SCRATCH_STRIDE;
         kernels.flash_attn_layer_range(
-          Atomics.load(ctrl, d + 0) >>> 0,
-          Atomics.load(ctrl, d + 1) >>> 0,
-          Atomics.load(ctrl, d + 2) >>> 0,
-          Atomics.load(ctrl, d + 3) >>> 0,
-          Atomics.load(ctrl, d + 4) >>> 0,
-          Atomics.load(ctrl, d + 5) >>> 0,
-          Atomics.load(ctrl, d + 6) >>> 0,
-          Atomics.load(ctrl, d + 7) >>> 0,
-          Atomics.load(ctrl, d + 8) >>> 0,
-          Atomics.load(ctrl, d + 9) >>> 0,
-          Atomics.load(ctrl, d + 10) >>> 0,
-          Atomics.load(ctrl, d + 11) >>> 0,
-          Atomics.load(ctrl, d + 12) >>> 0,
-          Atomics.load(ctrl, d + 13) >>> 0,
-          Atomics.load(ctrl, d + 14),
-          Atomics.load(ctrl, d + 15),
-          Atomics.load(ctrl, d + 16),
-          Atomics.load(ctrl, d + 17),
-          Atomics.load(ctrl, d + 18),
-          Atomics.load(ctrl, d + 19),
-          Atomics.load(ctrl, d + 20),
-          Atomics.load(ctrl, d + 21),
-          Atomics.load(ctrl, d + 22),
-          Atomics.load(ctrl, d + 23),
-          Atomics.load(ctrl, d + 24),
-          Atomics.load(ctrl, d + 25),
+          ctrl[d + 0] >>> 0,
+          ctrl[d + 1] >>> 0,
+          ctrl[d + 2] >>> 0,
+          ctrl[d + 3] >>> 0,
+          ctrl[d + 4] >>> 0,
+          ctrl[d + 5] >>> 0,
+          ctrl[d + 6] >>> 0,
+          ctrl[d + 7] >>> 0,
+          ctrl[d + 8] >>> 0,
+          ctrl[d + 9] >>> 0,
+          ctrl[d + 10] >>> 0,
+          ctrl[d + 11] >>> 0,
+          ctrl[d + 12] >>> 0,
+          ctrl[d + 13] >>> 0,
+          ctrl[d + 14],
+          ctrl[d + 15],
+          ctrl[d + 16],
+          ctrl[d + 17],
+          ctrl[d + 18],
+          ctrl[d + 19],
+          ctrl[d + 20],
+          ctrl[d + 21],
+          ctrl[d + 22],
+          ctrl[d + 23],
+          ctrl[d + 24],
+          ctrl[d + 25],
           hStart,
           hStart + hCount,
           scratchBase,
@@ -185,24 +188,24 @@ export function runComputeWorkerLoop(
     }
 
     if (op === OP_GROUP_DISPATCH) {
-      const groupOp = Atomics.load(ctrl, CTRL_GROUP_OP) as ParallelMatOp;
-      const groupCount = Atomics.load(ctrl, CTRL_GROUP_COUNT);
-      const xOrQ8Ptr = Atomics.load(ctrl, CTRL_X_OR_Q8_PTR) >>> 0;
-      const xF32Ptr = Atomics.load(ctrl, CTRL_X_F32_PTR) >>> 0;
-      const cols = Atomics.load(ctrl, CTRL_COLS);
+      const groupOp = ctrl[CTRL_GROUP_OP] as ParallelMatOp;
+      const groupCount = ctrl[CTRL_GROUP_COUNT];
+      const xOrQ8Ptr = ctrl[CTRL_X_OR_Q8_PTR] >>> 0;
+      const xF32Ptr = ctrl[CTRL_X_F32_PTR] >>> 0;
+      const cols = ctrl[CTRL_COLS];
 
       for (let g = 0; g < groupCount; g++) {
         const startOff = g === 0 ? SLOT_ROW_START : g === 1 ? SLOT_G1_ROW_START : SLOT_G2_ROW_START;
         const countOff = g === 0 ? SLOT_ROW_COUNT : g === 1 ? SLOT_G1_ROW_COUNT : SLOT_G2_ROW_COUNT;
-        const rowCount = Atomics.load(ctrl, slotBase + countOff);
+        const rowCount = ctrl[slotBase + countOff];
         if (rowCount > 0) {
-          const rowStart = Atomics.load(ctrl, slotBase + startOff);
+          const rowStart = ctrl[slotBase + startOff];
           const dBase = GROUP_DESC_BASE + g * GROUP_DESC_STRIDE;
-          const weightType = Atomics.load(ctrl, dBase + GDESC_WEIGHT_TYPE) as GgmlType;
-          const wPtr = Atomics.load(ctrl, dBase + GDESC_W_PTR) >>> 0;
-          const outPtr = Atomics.load(ctrl, dBase + GDESC_OUT_PTR) >>> 0;
-          const rowBytes = Atomics.load(ctrl, dBase + GDESC_ROW_BYTES);
-          const oStrideBytes = Atomics.load(ctrl, dBase + GDESC_O_STRIDE_BYTES);
+          const weightType = ctrl[dBase + GDESC_WEIGHT_TYPE] as GgmlType;
+          const wPtr = ctrl[dBase + GDESC_W_PTR] >>> 0;
+          const outPtr = ctrl[dBase + GDESC_OUT_PTR] >>> 0;
+          const rowBytes = ctrl[dBase + GDESC_ROW_BYTES];
+          const oStrideBytes = ctrl[dBase + GDESC_O_STRIDE_BYTES];
 
           executeWasmMatStripe(
             kernels,
@@ -226,17 +229,17 @@ export function runComputeWorkerLoop(
       continue;
     }
 
-    const rowCount = Atomics.load(ctrl, slotBase + SLOT_ROW_COUNT);
+    const rowCount = ctrl[slotBase + SLOT_ROW_COUNT];
     if (rowCount > 0) {
-      const rowStart = Atomics.load(ctrl, slotBase + SLOT_ROW_START);
-      const weightType = Atomics.load(ctrl, CTRL_WEIGHT_TYPE) as GgmlType;
-      const wPtr = Atomics.load(ctrl, CTRL_W_PTR) >>> 0;
-      const xOrQ8Ptr = Atomics.load(ctrl, CTRL_X_OR_Q8_PTR) >>> 0;
-      const xF32Ptr = Atomics.load(ctrl, CTRL_X_F32_PTR) >>> 0;
-      const outPtr = Atomics.load(ctrl, CTRL_OUT_PTR) >>> 0;
-      const cols = Atomics.load(ctrl, CTRL_COLS);
-      const rowBytes = Atomics.load(ctrl, CTRL_ROW_BYTES);
-      const oStrideBytes = Atomics.load(ctrl, CTRL_O_STRIDE_BYTES);
+      const rowStart = ctrl[slotBase + SLOT_ROW_START];
+      const weightType = ctrl[CTRL_WEIGHT_TYPE] as GgmlType;
+      const wPtr = ctrl[CTRL_W_PTR] >>> 0;
+      const xOrQ8Ptr = ctrl[CTRL_X_OR_Q8_PTR] >>> 0;
+      const xF32Ptr = ctrl[CTRL_X_F32_PTR] >>> 0;
+      const outPtr = ctrl[CTRL_OUT_PTR] >>> 0;
+      const cols = ctrl[CTRL_COLS];
+      const rowBytes = ctrl[CTRL_ROW_BYTES];
+      const oStrideBytes = ctrl[CTRL_O_STRIDE_BYTES];
 
       executeWasmMatStripe(
         kernels,
@@ -471,7 +474,7 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
               Atomics.sub(ctrl, ${CTRL_SLEEPING_HELPERS}, 1);
             }
             lastSeq = seq;
-            const op = Atomics.load(ctrl, ${CTRL_OP_CODE});
+            const op = ctrl[${CTRL_OP_CODE}];
             if (op === ${OP_SHUTDOWN}) {
               Atomics.store(ctrl, slotBase + ${SLOT_DONE_SEQ}, seq);
               if (Atomics.load(ctrl, ${CTRL_COORDINATOR_WAITING}) !== 0) {
@@ -487,38 +490,38 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
               continue;
             }
             if (op === ${OP_FLASH_ATTN_RANGE}) {
-              const hCount = Atomics.load(ctrl, slotBase + ${SLOT_ROW_COUNT});
+              const hCount = ctrl[slotBase + ${SLOT_ROW_COUNT}];
               if (hCount > 0) {
-                const hStart = Atomics.load(ctrl, slotBase + ${SLOT_ROW_START});
+                const hStart = ctrl[slotBase + ${SLOT_ROW_START}];
                 const d = ${ATTN_DESC_BASE};
                 const scratchBase = ${WASM_ATTN_WORKER_SCRATCH_BASE} + (workerIndex + 1) * ${WASM_ATTN_WORKER_SCRATCH_STRIDE};
                 k.flash_attn_layer_range(
-                  Atomics.load(ctrl, d + 0) >>> 0,
-                  Atomics.load(ctrl, d + 1) >>> 0,
-                  Atomics.load(ctrl, d + 2) >>> 0,
-                  Atomics.load(ctrl, d + 3) >>> 0,
-                  Atomics.load(ctrl, d + 4) >>> 0,
-                  Atomics.load(ctrl, d + 5) >>> 0,
-                  Atomics.load(ctrl, d + 6) >>> 0,
-                  Atomics.load(ctrl, d + 7) >>> 0,
-                  Atomics.load(ctrl, d + 8) >>> 0,
-                  Atomics.load(ctrl, d + 9) >>> 0,
-                  Atomics.load(ctrl, d + 10) >>> 0,
-                  Atomics.load(ctrl, d + 11) >>> 0,
-                  Atomics.load(ctrl, d + 12) >>> 0,
-                  Atomics.load(ctrl, d + 13) >>> 0,
-                  Atomics.load(ctrl, d + 14),
-                  Atomics.load(ctrl, d + 15),
-                  Atomics.load(ctrl, d + 16),
-                  Atomics.load(ctrl, d + 17),
-                  Atomics.load(ctrl, d + 18),
-                  Atomics.load(ctrl, d + 19),
-                  Atomics.load(ctrl, d + 20),
-                  Atomics.load(ctrl, d + 21),
-                  Atomics.load(ctrl, d + 22),
-                  Atomics.load(ctrl, d + 23),
-                  Atomics.load(ctrl, d + 24),
-                  Atomics.load(ctrl, d + 25),
+                  ctrl[d + 0] >>> 0,
+                  ctrl[d + 1] >>> 0,
+                  ctrl[d + 2] >>> 0,
+                  ctrl[d + 3] >>> 0,
+                  ctrl[d + 4] >>> 0,
+                  ctrl[d + 5] >>> 0,
+                  ctrl[d + 6] >>> 0,
+                  ctrl[d + 7] >>> 0,
+                  ctrl[d + 8] >>> 0,
+                  ctrl[d + 9] >>> 0,
+                  ctrl[d + 10] >>> 0,
+                  ctrl[d + 11] >>> 0,
+                  ctrl[d + 12] >>> 0,
+                  ctrl[d + 13] >>> 0,
+                  ctrl[d + 14],
+                  ctrl[d + 15],
+                  ctrl[d + 16],
+                  ctrl[d + 17],
+                  ctrl[d + 18],
+                  ctrl[d + 19],
+                  ctrl[d + 20],
+                  ctrl[d + 21],
+                  ctrl[d + 22],
+                  ctrl[d + 23],
+                  ctrl[d + 24],
+                  ctrl[d + 25],
                   hStart,
                   hStart + hCount,
                   scratchBase,
@@ -531,23 +534,23 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
               continue;
             }
             if (op === ${OP_GROUP_DISPATCH}) {
-              const groupOp = Atomics.load(ctrl, ${CTRL_GROUP_OP});
-              const groupCount = Atomics.load(ctrl, ${CTRL_GROUP_COUNT});
-              const xOrQ8 = Atomics.load(ctrl, ${CTRL_X_OR_Q8_PTR}) >>> 0;
-              const xF32 = Atomics.load(ctrl, ${CTRL_X_F32_PTR}) >>> 0;
-              const cols = Atomics.load(ctrl, ${CTRL_COLS});
+              const groupOp = ctrl[${CTRL_GROUP_OP}];
+              const groupCount = ctrl[${CTRL_GROUP_COUNT}];
+              const xOrQ8 = ctrl[${CTRL_X_OR_Q8_PTR}] >>> 0;
+              const xF32 = ctrl[${CTRL_X_F32_PTR}] >>> 0;
+              const cols = ctrl[${CTRL_COLS}];
               for (let g = 0; g < groupCount; g++) {
                 const startOff = g === 0 ? ${SLOT_ROW_START} : g === 1 ? ${SLOT_G1_ROW_START} : ${SLOT_G2_ROW_START};
                 const countOff = g === 0 ? ${SLOT_ROW_COUNT} : g === 1 ? ${SLOT_G1_ROW_COUNT} : ${SLOT_G2_ROW_COUNT};
-                const rowCount = Atomics.load(ctrl, slotBase + countOff);
+                const rowCount = ctrl[slotBase + countOff];
                 if (rowCount > 0) {
-                  const rowStart = Atomics.load(ctrl, slotBase + startOff);
+                  const rowStart = ctrl[slotBase + startOff];
                   const dBase = ${GROUP_DESC_BASE} + g * ${GROUP_DESC_STRIDE};
-                  const wt = Atomics.load(ctrl, dBase + ${GDESC_WEIGHT_TYPE});
-                  const wPtr = Atomics.load(ctrl, dBase + ${GDESC_W_PTR}) >>> 0;
-                  const outPtr = Atomics.load(ctrl, dBase + ${GDESC_OUT_PTR}) >>> 0;
-                  const rowBytes = Atomics.load(ctrl, dBase + ${GDESC_ROW_BYTES});
-                  const oStride = Atomics.load(ctrl, dBase + ${GDESC_O_STRIDE_BYTES});
+                  const wt = ctrl[dBase + ${GDESC_WEIGHT_TYPE}];
+                  const wPtr = ctrl[dBase + ${GDESC_W_PTR}] >>> 0;
+                  const outPtr = ctrl[dBase + ${GDESC_OUT_PTR}] >>> 0;
+                  const rowBytes = ctrl[dBase + ${GDESC_ROW_BYTES}];
+                  const oStride = ctrl[dBase + ${GDESC_O_STRIDE_BYTES}];
                   runStripe(groupOp, wt, wPtr + rowStart * rowBytes, xOrQ8, xF32, outPtr + rowStart * 4, cols, rowCount, oStride);
                 }
               }
@@ -557,17 +560,17 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
               }
               continue;
             }
-            const rowCount = Atomics.load(ctrl, slotBase + ${SLOT_ROW_COUNT});
+            const rowCount = ctrl[slotBase + ${SLOT_ROW_COUNT}];
             if (rowCount > 0) {
-              const rowStart = Atomics.load(ctrl, slotBase + ${SLOT_ROW_START});
-              const wt = Atomics.load(ctrl, ${CTRL_WEIGHT_TYPE});
-              const wPtr = Atomics.load(ctrl, ${CTRL_W_PTR}) >>> 0;
-              const xOrQ8 = Atomics.load(ctrl, ${CTRL_X_OR_Q8_PTR}) >>> 0;
-              const xF32 = Atomics.load(ctrl, ${CTRL_X_F32_PTR}) >>> 0;
-              const outPtr = Atomics.load(ctrl, ${CTRL_OUT_PTR}) >>> 0;
-              const cols = Atomics.load(ctrl, ${CTRL_COLS});
-              const rowBytes = Atomics.load(ctrl, ${CTRL_ROW_BYTES});
-              const oStride = Atomics.load(ctrl, ${CTRL_O_STRIDE_BYTES});
+              const rowStart = ctrl[slotBase + ${SLOT_ROW_START}];
+              const wt = ctrl[${CTRL_WEIGHT_TYPE}];
+              const wPtr = ctrl[${CTRL_W_PTR}] >>> 0;
+              const xOrQ8 = ctrl[${CTRL_X_OR_Q8_PTR}] >>> 0;
+              const xF32 = ctrl[${CTRL_X_F32_PTR}] >>> 0;
+              const outPtr = ctrl[${CTRL_OUT_PTR}] >>> 0;
+              const cols = ctrl[${CTRL_COLS}];
+              const rowBytes = ctrl[${CTRL_ROW_BYTES}];
+              const oStride = ctrl[${CTRL_O_STRIDE_BYTES}];
               runStripe(op, wt, wPtr + rowStart * rowBytes, xOrQ8, xF32, outPtr + rowStart * 4, cols, rowCount, oStride);
             }
             Atomics.store(ctrl, slotBase + ${SLOT_DONE_SEQ}, seq);
@@ -665,7 +668,7 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
     const pingOnce = () => {
       const nextSeq = (this.jobSeq + 1) | 0;
       this.jobSeq = nextSeq;
-      Atomics.store(ctrl, CTRL_OP_CODE, OP_PING);
+      ctrl[CTRL_OP_CODE] = OP_PING;
       this.publishJob(nextSeq);
       this.joinHelpers(nextSeq);
     };
@@ -734,27 +737,28 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
     const nextSeq = (this.jobSeq + 1) | 0;
     this.jobSeq = nextSeq;
 
-    Atomics.store(ctrl, CTRL_OP_CODE, op);
-    Atomics.store(ctrl, CTRL_WEIGHT_TYPE, weightType);
-    Atomics.store(ctrl, CTRL_W_PTR, wPtr | 0);
-    Atomics.store(ctrl, CTRL_X_OR_Q8_PTR, xOrQ8Ptr | 0);
-    Atomics.store(ctrl, CTRL_X_F32_PTR, xF32Ptr | 0);
-    Atomics.store(ctrl, CTRL_OUT_PTR, outPtr | 0);
-    Atomics.store(ctrl, CTRL_COLS, cols);
-    Atomics.store(ctrl, CTRL_TOTAL_ROWS, rows);
-    Atomics.store(ctrl, CTRL_ROW_BYTES, rowBytes);
-    Atomics.store(ctrl, CTRL_O_STRIDE_BYTES, oStrideBytes);
+    // Plain descriptor stores published by the single release fence in publishJob(nextSeq)
+    ctrl[CTRL_OP_CODE] = op;
+    ctrl[CTRL_WEIGHT_TYPE] = weightType;
+    ctrl[CTRL_W_PTR] = wPtr | 0;
+    ctrl[CTRL_X_OR_Q8_PTR] = xOrQ8Ptr | 0;
+    ctrl[CTRL_X_F32_PTR] = xF32Ptr | 0;
+    ctrl[CTRL_OUT_PTR] = outPtr | 0;
+    ctrl[CTRL_COLS] = cols;
+    ctrl[CTRL_TOTAL_ROWS] = rows;
+    ctrl[CTRL_ROW_BYTES] = rowBytes;
+    ctrl[CTRL_O_STRIDE_BYTES] = oStrideBytes;
 
     // Assign stripes 1..P-1 to helper threads 0..P-2
     for (let w = 0; w < this.helperCount; w++) {
       const slotBase = WORKER_SLOT_BASE + w * WORKER_SLOT_STRIDE;
       const stripeIdx = w + 1;
       if (stripeIdx < activeStripes) {
-        Atomics.store(ctrl, slotBase + SLOT_ROW_START, this.stripeStarts[stripeIdx]);
-        Atomics.store(ctrl, slotBase + SLOT_ROW_COUNT, this.stripeCounts[stripeIdx]);
+        ctrl[slotBase + SLOT_ROW_START] = this.stripeStarts[stripeIdx];
+        ctrl[slotBase + SLOT_ROW_COUNT] = this.stripeCounts[stripeIdx];
       } else {
-        Atomics.store(ctrl, slotBase + SLOT_ROW_START, 0);
-        Atomics.store(ctrl, slotBase + SLOT_ROW_COUNT, 0);
+        ctrl[slotBase + SLOT_ROW_START] = 0;
+        ctrl[slotBase + SLOT_ROW_COUNT] = 0;
       }
     }
 
@@ -796,12 +800,12 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
       const nextSeq = (this.jobSeq + 1) | 0;
       this.jobSeq = nextSeq;
 
-      Atomics.store(ctrl, CTRL_OP_CODE, OP_GROUP_DISPATCH);
-      Atomics.store(ctrl, CTRL_GROUP_OP, op);
-      Atomics.store(ctrl, CTRL_GROUP_COUNT, groupCount);
-      Atomics.store(ctrl, CTRL_X_OR_Q8_PTR, xOrQ8Ptr | 0);
-      Atomics.store(ctrl, CTRL_X_F32_PTR, xF32Ptr | 0);
-      Atomics.store(ctrl, CTRL_COLS, cols);
+      ctrl[CTRL_OP_CODE] = OP_GROUP_DISPATCH;
+      ctrl[CTRL_GROUP_OP] = op;
+      ctrl[CTRL_GROUP_COUNT] = groupCount;
+      ctrl[CTRL_X_OR_Q8_PTR] = xOrQ8Ptr | 0;
+      ctrl[CTRL_X_F32_PTR] = xF32Ptr | 0;
+      ctrl[CTRL_COLS] = cols;
 
       const localStarts = this.localGroupStarts;
       const localCounts = this.localGroupCounts;
@@ -812,12 +816,12 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
         const rowBytes = weightRowByteSize(e.weightType, cols);
         chunkBytes += rowBytes * e.rows;
         const dBase = GROUP_DESC_BASE + g * GROUP_DESC_STRIDE;
-        Atomics.store(ctrl, dBase + GDESC_WEIGHT_TYPE, e.weightType);
-        Atomics.store(ctrl, dBase + GDESC_W_PTR, e.wPtr | 0);
-        Atomics.store(ctrl, dBase + GDESC_OUT_PTR, e.outPtr | 0);
-        Atomics.store(ctrl, dBase + GDESC_ROW_BYTES, rowBytes);
-        Atomics.store(ctrl, dBase + GDESC_O_STRIDE_BYTES, e.oStrideBytes);
-        Atomics.store(ctrl, dBase + GDESC_ROWS, e.rows);
+        ctrl[dBase + GDESC_WEIGHT_TYPE] = e.weightType;
+        ctrl[dBase + GDESC_W_PTR] = e.wPtr | 0;
+        ctrl[dBase + GDESC_OUT_PTR] = e.outPtr | 0;
+        ctrl[dBase + GDESC_ROW_BYTES] = rowBytes;
+        ctrl[dBase + GDESC_O_STRIDE_BYTES] = e.oStrideBytes;
+        ctrl[dBase + GDESC_ROWS] = e.rows;
 
         const activeStripes = this.fillRowStripes(e.rows, 4);
         localStarts[g] = this.stripeStarts[0];
@@ -829,11 +833,11 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
           const slotBase = WORKER_SLOT_BASE + w * WORKER_SLOT_STRIDE;
           const stripeIdx = w + 1;
           if (stripeIdx < activeStripes) {
-            Atomics.store(ctrl, slotBase + startOff, this.stripeStarts[stripeIdx]);
-            Atomics.store(ctrl, slotBase + countOff, this.stripeCounts[stripeIdx]);
+            ctrl[slotBase + startOff] = this.stripeStarts[stripeIdx];
+            ctrl[slotBase + countOff] = this.stripeCounts[stripeIdx];
           } else {
-            Atomics.store(ctrl, slotBase + startOff, 0);
-            Atomics.store(ctrl, slotBase + countOff, 0);
+            ctrl[slotBase + startOff] = 0;
+            ctrl[slotBase + countOff] = 0;
           }
         }
       }
@@ -902,43 +906,43 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
     this.jobSeq = nextSeq;
     const d = ATTN_DESC_BASE;
 
-    Atomics.store(ctrl, CTRL_OP_CODE, OP_FLASH_ATTN_RANGE);
-    Atomics.store(ctrl, d + 0, qPtr | 0);
-    Atomics.store(ctrl, d + 1, outPtr | 0);
-    Atomics.store(ctrl, d + 2, pageStatePtr | 0);
-    Atomics.store(ctrl, d + 3, pageSlotPtr | 0);
-    Atomics.store(ctrl, d + 4, hotKLayerPtr | 0);
-    Atomics.store(ctrl, d + 5, hotVLayerPtr | 0);
-    Atomics.store(ctrl, d + 6, q8KLayerPtr | 0);
-    Atomics.store(ctrl, d + 7, q8VLayerPtr | 0);
-    Atomics.store(ctrl, d + 8, q8KScLayerPtr | 0);
-    Atomics.store(ctrl, d + 9, q8VScLayerPtr | 0);
-    Atomics.store(ctrl, d + 10, q4KLayerPtr | 0);
-    Atomics.store(ctrl, d + 11, q4VLayerPtr | 0);
-    Atomics.store(ctrl, d + 12, q4KScLayerPtr | 0);
-    Atomics.store(ctrl, d + 13, q4VScLayerPtr | 0);
-    Atomics.store(ctrl, d + 14, nHeads);
-    Atomics.store(ctrl, d + 15, nHeadsKv);
-    Atomics.store(ctrl, d + 16, headDim);
-    Atomics.store(ctrl, d + 17, seqLen);
-    Atomics.store(ctrl, d + 18, hotPageBytes);
-    Atomics.store(ctrl, d + 19, q8PageBytes);
-    Atomics.store(ctrl, d + 20, q4PageBytes);
-    Atomics.store(ctrl, d + 21, scPageBytes);
-    Atomics.store(ctrl, d + 22, hotKvStrideBytes);
-    Atomics.store(ctrl, d + 23, q8KvStrideBytes);
-    Atomics.store(ctrl, d + 24, q4KvStrideBytes);
-    Atomics.store(ctrl, d + 25, scStrideBytes);
+    ctrl[CTRL_OP_CODE] = OP_FLASH_ATTN_RANGE;
+    ctrl[d + 0] = qPtr | 0;
+    ctrl[d + 1] = outPtr | 0;
+    ctrl[d + 2] = pageStatePtr | 0;
+    ctrl[d + 3] = pageSlotPtr | 0;
+    ctrl[d + 4] = hotKLayerPtr | 0;
+    ctrl[d + 5] = hotVLayerPtr | 0;
+    ctrl[d + 6] = q8KLayerPtr | 0;
+    ctrl[d + 7] = q8VLayerPtr | 0;
+    ctrl[d + 8] = q8KScLayerPtr | 0;
+    ctrl[d + 9] = q8VScLayerPtr | 0;
+    ctrl[d + 10] = q4KLayerPtr | 0;
+    ctrl[d + 11] = q4VLayerPtr | 0;
+    ctrl[d + 12] = q4KScLayerPtr | 0;
+    ctrl[d + 13] = q4VScLayerPtr | 0;
+    ctrl[d + 14] = nHeads;
+    ctrl[d + 15] = nHeadsKv;
+    ctrl[d + 16] = headDim;
+    ctrl[d + 17] = seqLen;
+    ctrl[d + 18] = hotPageBytes;
+    ctrl[d + 19] = q8PageBytes;
+    ctrl[d + 20] = q4PageBytes;
+    ctrl[d + 21] = scPageBytes;
+    ctrl[d + 22] = hotKvStrideBytes;
+    ctrl[d + 23] = q8KvStrideBytes;
+    ctrl[d + 24] = q4KvStrideBytes;
+    ctrl[d + 25] = scStrideBytes;
 
     for (let w = 0; w < this.helperCount; w++) {
       const slotBase = WORKER_SLOT_BASE + w * WORKER_SLOT_STRIDE;
       const stripeIdx = w + 1;
       if (stripeIdx < activeStripes) {
-        Atomics.store(ctrl, slotBase + SLOT_ROW_START, this.stripeStarts[stripeIdx]);
-        Atomics.store(ctrl, slotBase + SLOT_ROW_COUNT, this.stripeCounts[stripeIdx]);
+        ctrl[slotBase + SLOT_ROW_START] = this.stripeStarts[stripeIdx];
+        ctrl[slotBase + SLOT_ROW_COUNT] = this.stripeCounts[stripeIdx];
       } else {
-        Atomics.store(ctrl, slotBase + SLOT_ROW_START, 0);
-        Atomics.store(ctrl, slotBase + SLOT_ROW_COUNT, 0);
+        ctrl[slotBase + SLOT_ROW_START] = 0;
+        ctrl[slotBase + SLOT_ROW_COUNT] = 0;
       }
     }
 

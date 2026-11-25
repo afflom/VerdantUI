@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useCallback, useEffect, useMemo, useState, type FC } from 'react';
+import { Suspense, lazy, useCallback, useEffect, useMemo, useState, type FC } from 'react';
 import {
   AssistantRuntimeProvider,
   SimpleTextAttachmentAdapter,
@@ -12,11 +12,17 @@ import {
   useRemoteThreadListRuntime,
 } from '@assistant-ui/react';
 import { Layers, Menu, Moon, SlidersHorizontal, Sun } from 'lucide-react';
-import { ModelManagerModal, type ModalViewTab } from './components/ModelManagerModal';
+import type { ModalViewTab } from './components/ModelManagerModal';
 import { ThreadSidebar } from './components/ThreadSidebar';
 import { ThreadView } from './components/ThreadView';
-import { VTensorInspector } from './components/VTensorInspector';
 import { createLlamaVTensorAdapter } from './engine/assistantAdapter';
+
+const ModelManagerModal = lazy(() =>
+  import('./components/ModelManagerModal').then((m) => ({ default: m.ModelManagerModal })),
+);
+const VTensorInspector = lazy(() =>
+  import('./components/VTensorInspector').then((m) => ({ default: m.VTensorInspector })),
+);
 import {
   buildModelContextFromHarness,
   type ImportedHarnessSpec,
@@ -263,37 +269,45 @@ export default function App() {
             />
           </main>
 
-          <VTensorInspector
-            open={inspectorOpen}
-            onClose={() => setInspectorOpen(false)}
-            engineState={engineState}
-            onOpenHarness={() => openModelsModal('harness')}
-            onClearHarness={handleClearHarness}
-            onUpdateSampling={(patch) => workerClient.updateSampling(patch)}
-            onUpdatePromptMode={(mode) => workerClient.updatePromptMode(mode)}
-            onUpdatePrecisionMode={(mode) => void workerClient.updatePrecisionMode(mode)}
-            onUpdateWeightResidencyPolicy={(policy) =>
-              void workerClient.updateWeightResidencyPolicy(policy)
-            }
-            onResetSampling={() => workerClient.resetSampling()}
-            onRunConformance={handleRunConformance}
-          />
+          {inspectorOpen && (
+            <Suspense fallback={null}>
+              <VTensorInspector
+                open={inspectorOpen}
+                onClose={() => setInspectorOpen(false)}
+                engineState={engineState}
+                onOpenHarness={() => openModelsModal('harness')}
+                onClearHarness={handleClearHarness}
+                onUpdateSampling={(patch) => workerClient.updateSampling(patch)}
+                onUpdatePromptMode={(mode) => workerClient.updatePromptMode(mode)}
+                onUpdatePrecisionMode={(mode) => void workerClient.updatePrecisionMode(mode)}
+                onUpdateWeightResidencyPolicy={(policy) =>
+                  void workerClient.updateWeightResidencyPolicy(policy)
+                }
+                onResetSampling={() => workerClient.resetSampling()}
+                onRunConformance={handleRunConformance}
+              />
+            </Suspense>
+          )}
         </div>
 
-        <ModelManagerModal
-          open={modelsModalOpen}
-          initialTab={modelsModalTab}
-          onClose={() => setModelsModalOpen(false)}
-          engineState={engineState}
-          onSelectCatalogModel={handleSelectCatalogModel}
-          onUploadLocalFile={handleUploadLocalFile}
-          onLoadCustomUrl={handleLoadCustomUrl}
-          onImportHarness={handleImportHarness}
-          onClearHarness={handleClearHarness}
-          onCancelDownload={handleCancelDownload}
-          onDeleteCachedModel={handleDeleteCachedModel}
-          onClearCache={handleClearCache}
-        />
+        {modelsModalOpen && (
+          <Suspense fallback={null}>
+            <ModelManagerModal
+              open={modelsModalOpen}
+              initialTab={modelsModalTab}
+              onClose={() => setModelsModalOpen(false)}
+              engineState={engineState}
+              onSelectCatalogModel={handleSelectCatalogModel}
+              onUploadLocalFile={handleUploadLocalFile}
+              onLoadCustomUrl={handleLoadCustomUrl}
+              onImportHarness={handleImportHarness}
+              onClearHarness={handleClearHarness}
+              onCancelDownload={handleCancelDownload}
+              onDeleteCachedModel={handleDeleteCachedModel}
+              onClearCache={handleClearCache}
+            />
+          </Suspense>
+        )}
       </div>
     </AssistantRuntimeProvider>
   );
