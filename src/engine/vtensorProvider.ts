@@ -2375,8 +2375,8 @@ export function runVTensorConformanceSuite(): ConformanceSuiteReport {
     return `100% in-Verdant: SwiGLU ${maxSwErr.toExponential(1)} · Layer-Attn ${maxAttnErr.toExponential(1)} · RoPE ${maxRopeErr.toExponential(1)} · SIMD argmax/topK · Belady ${beladyHitPct.toFixed(1)}% (${beladyPinned}/${L}L)`;
   });
 
-  // VT-67: Verdant/Prism Q8_K Narrow-Lane (Q4_K/Q6_K) & uor-matmul V=4 Tabulated Kernel Parity
-  runCheck('VT-67', 'Verdant/Prism Q8_K narrow-lane (Q4_K/Q6_K) & uor-matmul tabulated V=4', () => {
+  // VT-67: Verdant/Prism Q8_K Narrow-Lane (Q2_K/Q3_K/Q4_K/Q6_K) & uor-matmul V=4 Tabulated Kernel Parity
+  runCheck('VT-67', 'Verdant/Prism Q8_K narrow-lane (Q2_K/Q3_K/Q4_K/Q6_K) & uor-matmul tabulated V=4', () => {
     if (!isVerdantWasmSimdSupported()) {
       return 'Scalar JS fallback active (WASM SIMD128 unavailable)';
     }
@@ -2385,7 +2385,7 @@ export function runVTensorConformanceSuite(): ConformanceSuiteReport {
     const rows = 5;
     const cols = 512;
     const B = 4;
-    const buf = reg.allocBuffer('vt67.q8k', 'compute', 262144);
+    const buf = reg.allocBuffer('vt67.q8k', 'compute', 524288);
     const xBatchH = buf.allocTensor('x.b4', GgmlType.F32, [cols * B]);
     const q8kBatchH = buf.allocTensor('q8k.b4', GgmlType.I8, [(cols >>> 8) * Q8_K_ACT_BLOCK_BYTES * B]);
     const outSH = buf.allocTensor('out.s', GgmlType.F32, [rows]);
@@ -2406,7 +2406,12 @@ export function runVTensorConformanceSuite(): ConformanceSuiteReport {
 
     let worstCos = 1.0;
     const refOut = new Float32Array(rows);
-    for (const [label, type] of [['Q4_K', GgmlType.Q4_K], ['Q6_K', GgmlType.Q6_K]] as const) {
+    for (const [label, type] of [
+      ['Q2_K', GgmlType.Q2_K],
+      ['Q3_K', GgmlType.Q3_K],
+      ['Q4_K', GgmlType.Q4_K],
+      ['Q6_K', GgmlType.Q6_K],
+    ] as const) {
       const wH = buf.allocTensor(`w67.${label}`, type, [cols, rows]);
       const trait = getGgmlTypeTrait(type);
       const raw = new Uint8Array(wH.byteSize);
@@ -2414,7 +2419,12 @@ export function runVTensorConformanceSuite(): ConformanceSuiteReport {
       const nBlk = (cols / trait.blockSize) * rows;
       for (let b = 0; b < nBlk; b++) {
         const off = b * trait.typeSizeBytes;
-        if (type === GgmlType.Q6_K) {
+        if (type === GgmlType.Q2_K) {
+          raw[off + 80] = 0x00; raw[off + 81] = 0x34;
+          raw[off + 82] = 0x00; raw[off + 83] = 0x30;
+        } else if (type === GgmlType.Q3_K) {
+          raw[off + 108] = 0x00; raw[off + 109] = 0x34;
+        } else if (type === GgmlType.Q6_K) {
           raw[off + 208] = 0x00; raw[off + 209] = 0x34;
         } else {
           raw[off] = 0x00; raw[off + 1] = 0x34;
@@ -2500,7 +2510,7 @@ export function runVTensorConformanceSuite(): ConformanceSuiteReport {
     }
 
     reg.freeAllBuffers();
-    return `Q4_K/Q6_K × Q8_K cos=${worstCos.toFixed(6)} + batch-4 exact · uor-matmul V=4 table bit-exact`;
+    return `Q2_K/Q3_K/Q4_K/Q6_K × Q8_K cos=${worstCos.toFixed(6)} + batch-4 exact · uor-matmul V=4 table bit-exact`;
   });
 
   // PRISM-01..05: Formal Prism NativeBackend, Narrow-Lane, Planted-Defect & CostSurface gates

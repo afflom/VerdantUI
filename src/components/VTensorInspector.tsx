@@ -11,6 +11,8 @@ interface VTensorInspectorProps {
   open: boolean;
   onClose: () => void;
   engineState: EngineState;
+  onOpenHarness: () => void;
+  onClearHarness: () => void;
   onUpdateSampling: (patch: Partial<SamplingConfig>) => void;
   onUpdatePromptMode: (mode: PromptFormatMode) => void;
   onUpdatePrecisionMode: (mode: PrecisionContractMode) => void;
@@ -25,6 +27,8 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
   open,
   onClose,
   engineState,
+  onOpenHarness,
+  onClearHarness,
   onUpdateSampling,
   onUpdatePromptMode,
   onUpdatePrecisionMode,
@@ -32,7 +36,7 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
   onResetSampling,
   onRunConformance,
 }) => {
-  const [tab, setTab] = useState<InspectorTab>('backend');
+  const [tab, setTab] = useState<InspectorTab>('sampling');
 
   if (!open) return null;
 
@@ -71,16 +75,16 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
       <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3.5 dark:border-slate-800">
         <div>
           <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-            vTensor Provider
+            Settings
           </h2>
           <p className="text-[11px] text-slate-500 dark:text-slate-400">
-            GGML v{telemetry.ggmlAbiVersion} · Verdant Tensor {telemetry.verdantVersion}
+            Generation controls &amp; diagnostics
           </p>
         </div>
         <button
           type="button"
           onClick={onClose}
-          aria-label="Close vTensor inspector"
+          aria-label="Close settings"
           className="inline-flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100"
         >
           <X className="h-4 w-4" />
@@ -90,14 +94,14 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
       <div className="border-b border-slate-200 px-3 py-2 dark:border-slate-800">
         <div
           role="tablist"
-          aria-label="Inspector sections"
+          aria-label="Settings sections"
           className="grid grid-cols-3 gap-1 rounded-lg bg-slate-100 p-1 dark:bg-slate-900"
         >
           {(
             [
-              ['backend', 'Backend'],
+              ['sampling', 'Generation'],
+              ['backend', 'Runtime'],
               ['graph', 'Graph'],
-              ['sampling', 'Sampling'],
             ] as const
           ).map(([id, label]) => (
             <button
@@ -349,8 +353,14 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
                       Backing / mode
                     </dt>
                     <dd className="whitespace-nowrap font-mono text-[11px] text-slate-900 dark:text-slate-100">
-                      {vramWeights.backingKind === 'opfs-sync' ? 'OPFS Sync' : 'Memory'} ·{' '}
-                      {vramWeights.residencyMode === 'opfs-paged' ? 'OPFS Paged' : 'Resident'}
+                      {vramWeights.backingKind === 'opfs-sync'
+                        ? 'OPFS Sync'
+                        : vramWeights.backingKind === 'opfs-demand'
+                          ? 'OPFS Demand'
+                          : vramWeights.backingKind === 'local-file-sync'
+                            ? 'Local File'
+                            : 'Memory'}{' '}
+                      · {vramWeights.residencyMode === 'opfs-paged' ? 'Paged' : 'Resident'}
                     </dd>
                   </div>
                   <div className="flex items-center justify-between gap-2 px-3 py-1.5">
@@ -384,6 +394,17 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
                         : ''}
                     </dd>
                   </div>
+                  {vramWeights.isMoe && (
+                    <div className="flex items-center justify-between gap-2 px-3 py-1.5">
+                      <dt className="whitespace-nowrap text-slate-500 dark:text-slate-400">
+                        MoE expert cache
+                      </dt>
+                      <dd className="whitespace-nowrap font-mono text-[11px] tabular-nums text-emerald-800 dark:text-emerald-400">
+                        {vramWeights.moeExpertResidentCount}/{vramWeights.moeExpertCacheSlots}E ·{' '}
+                        {vramWeights.moeExpertHits}H/{vramWeights.moeExpertMisses}M
+                      </dd>
+                    </div>
+                  )}
                   <div className="flex items-center justify-between gap-2 px-3 py-1.5">
                     <dt className="whitespace-nowrap text-slate-500 dark:text-slate-400">
                       Embd / LM-head
@@ -790,9 +811,44 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
 
         {tab === 'sampling' && (
           <div className="space-y-4">
+            <div className="rounded-lg border border-slate-200 p-3 dark:border-slate-800">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-semibold text-slate-900 dark:text-slate-100">
+                  Harness Context
+                </span>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={onOpenHarness}
+                    className="rounded-md px-2 py-0.5 text-[11px] font-medium text-emerald-800 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/50"
+                  >
+                    {engineState.importedHarness ? 'Inspect' : 'Import'}
+                  </button>
+                  {engineState.importedHarness && (
+                    <button
+                      type="button"
+                      onClick={onClearHarness}
+                      className="rounded-md px-2 py-0.5 text-[11px] font-medium text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100"
+                    >
+                      Unload
+                    </button>
+                  )}
+                </div>
+              </div>
+              <p className="mt-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+                {engineState.importedHarness
+                  ? `${engineState.importedHarness.name}${
+                      engineState.importedHarness.system
+                        ? ' · sets system message'
+                        : ' · no system message'
+                    }`
+                  : 'No harness loaded. Model runs unmodified with no injected system prompt.'}
+              </p>
+            </div>
+
             <div className="flex items-center justify-between">
               <h3 className="font-semibold text-slate-900 dark:text-slate-100">
-                llama.cpp Sampler Parameters
+                Sampler Parameters
               </h3>
               <button
                 type="button"

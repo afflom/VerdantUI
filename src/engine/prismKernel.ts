@@ -175,6 +175,8 @@ export function proveNarrowLaneExactness(
 
 /** Standard narrow-lane proofs hoisted once at module load (zero per-op overhead). */
 export const PRISM_NARROW_LANE_PROOFS = Object.freeze({
+  q2k_x_q8k: proveNarrowLaneExactness('Q2_K × Q8_K', 3, 127, 15, 256),
+  q3k_x_q8k: proveNarrowLaneExactness('Q3_K × Q8_K', 7, 127, 32, 256),
   q4k_x_q8k: proveNarrowLaneExactness('Q4_K × Q8_K', 15, 127, 63, 256),
   q5k_x_q8k: proveNarrowLaneExactness('Q5_K × Q8_K', 31, 127, 63, 256),
   q6k_x_q8k: proveNarrowLaneExactness('Q6_K × Q8_K', 63, 127, 128, 256),
@@ -326,6 +328,8 @@ export function selectCertifiedPrismRoute(
   op: PrismOpDescriptor,
 ): PrismDispatchCertificate {
   const isKQuant =
+    op.weightType === GgmlType.Q2_K ||
+    op.weightType === GgmlType.Q3_K ||
     op.weightType === GgmlType.Q4_K ||
     op.weightType === GgmlType.Q5_K ||
     op.weightType === GgmlType.Q6_K;
@@ -387,6 +391,8 @@ export function selectCertifiedPrismRoute(
       host.precisionMode === 'q8-vnni' &&
       isKQuant &&
       op.cols % 256 === 0 &&
+      PRISM_NARROW_LANE_PROOFS.q2k_x_q8k.fitsI32Exactly &&
+      PRISM_NARROW_LANE_PROOFS.q3k_x_q8k.fitsI32Exactly &&
       PRISM_NARROW_LANE_PROOFS.q4k_x_q8k.fitsI32Exactly &&
       PRISM_NARROW_LANE_PROOFS.q5k_x_q8k.fitsI32Exactly &&
       PRISM_NARROW_LANE_PROOFS.q6k_x_q8k.fitsI32Exactly;
@@ -408,7 +414,7 @@ export function selectCertifiedPrismRoute(
       admitted,
       cost,
       score: canonicalObjectiveScore(cost),
-      refusalReason: admitted ? undefined : 'Requires K-quant (Q4_K/Q5_K/Q6_K) in q8-vnni mode',
+      refusalReason: admitted ? undefined : 'Requires K-quant (Q2_K–Q6_K) in q8-vnni mode',
     });
   }
 

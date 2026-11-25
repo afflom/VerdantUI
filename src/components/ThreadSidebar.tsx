@@ -4,8 +4,18 @@ import {
   ThreadListPrimitive,
   useAuiState,
 } from '@assistant-ui/react';
-import { Archive, ArchiveRestore, ChevronDown, ChevronRight, Cpu, Plus, Trash2, X } from 'lucide-react';
-import { formatBytes } from '../engine/modelCatalog';
+import {
+  Archive,
+  ArchiveRestore,
+  ChevronDown,
+  ChevronRight,
+  FileJson,
+  Plus,
+  SlidersHorizontal,
+  Trash2,
+  X,
+} from 'lucide-react';
+import { isInternalBootstrapModel } from '../engine/modelCatalog';
 import type { EngineState } from '../engine/workerClient';
 
 interface ThreadSidebarProps {
@@ -13,6 +23,7 @@ interface ThreadSidebarProps {
   mobileOpen: boolean;
   onCloseMobile: () => void;
   onOpenModels: () => void;
+  onOpenHarness: () => void;
   onOpenInspector: () => void;
 }
 
@@ -61,15 +72,13 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
   mobileOpen,
   onCloseMobile,
   onOpenModels,
+  onOpenHarness,
   onOpenInspector,
 }) => {
   const [showArchived, setShowArchived] = useState(false);
   const archivedCount = useAuiState((s) => s.threads.archivedThreadIds.length);
-
-  const totalBufferBytes = engineState.telemetry.buffers.reduce(
-    (sum, b) => sum + b.usedBytes,
-    0,
-  );
+  const isBootstrapUnbound = isInternalBootstrapModel(engineState.model?.id);
+  const importedHarness = engineState.importedHarness;
 
   const sidebarContent = (
     <div className="flex h-full w-full flex-col bg-white dark:bg-[#0F141C]">
@@ -130,19 +139,35 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
       </ThreadListPrimitive.Root>
 
       <div className="border-t border-slate-200 p-3.5 dark:border-slate-800">
-        <div className="flex items-center justify-between text-xs font-medium text-slate-900 dark:text-slate-100">
-          <span className="truncate">{engineState.model?.displayName ?? 'Loading model'}</span>
-          <span className="font-mono text-[11px] text-emerald-800 dark:text-emerald-400 shrink-0 ml-2">
-            vTensor
+        <div className="truncate text-xs font-semibold text-slate-900 dark:text-slate-100">
+          {isBootstrapUnbound
+            ? 'No model selected'
+            : (engineState.model?.displayName ?? 'Loading model...')}
+        </div>
+        <div className="mt-0.5 truncate text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
+          {isBootstrapUnbound
+            ? 'Select a model to get started'
+            : `${engineState.model?.hparams.primaryQuantization ?? 'F32'} · ${
+                engineState.model
+                  ? `${Math.round(engineState.model.maxContextWindow / 1024)}K context`
+                  : ''
+              }`}
+        </div>
+
+        <button
+          type="button"
+          onClick={() => {
+            onCloseMobile();
+            onOpenHarness();
+          }}
+          className="mt-2 flex w-full items-center gap-1.5 truncate text-left text-[11px] text-slate-600 hover:text-emerald-800 dark:text-slate-400 dark:hover:text-emerald-400 transition-colors"
+        >
+          <FileJson className="h-3.5 w-3.5 shrink-0" />
+          <span className="truncate">
+            {importedHarness ? `Harness: ${importedHarness.name}` : 'Import harness'}
           </span>
-        </div>
-        <div className="mt-1 flex items-center gap-1.5 text-[11px] text-slate-500 dark:text-slate-400 font-mono tabular-nums">
-          <span>{engineState.model?.hparams.primaryQuantization ?? 'F32'}</span>
-          <span aria-hidden="true">·</span>
-          <span>{totalBufferBytes > 0 ? formatBytes(totalBufferBytes) : '0 B'}</span>
-          <span aria-hidden="true">·</span>
-          <span>{engineState.telemetry.totalOpsExecuted.toLocaleString()} ops</span>
-        </div>
+        </button>
+
         <div className="mt-3 grid grid-cols-2 gap-2">
           <button
             type="button"
@@ -152,7 +177,7 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
             }}
             className="inline-flex h-8 items-center justify-center rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
           >
-            Switch GGUF
+            Models
           </button>
           <button
             type="button"
@@ -162,8 +187,8 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
             }}
             className="inline-flex h-8 items-center justify-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
           >
-            <Cpu className="h-3.5 w-3.5" />
-            <span>Provider</span>
+            <SlidersHorizontal className="h-3.5 w-3.5" />
+            <span>Settings</span>
           </button>
         </div>
       </div>

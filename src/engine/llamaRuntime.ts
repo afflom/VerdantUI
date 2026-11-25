@@ -20,6 +20,7 @@ import {
   type LlamaHyperParams,
   type ParsedGgufModel,
   parseGgufFromBacking,
+  parseGgufFromBackingAsync,
 } from './gguf';
 import {
   derivePerformanceContract,
@@ -68,6 +69,7 @@ import {
   type VramBackingStore,
 } from './vramBackingStore';
 import {
+  collectHotMetadataTensorInfos,
   computeLmHeadStripeRows,
   VramWeightPager,
   type LayerTensorInfoGroup,
@@ -99,8 +101,11 @@ import {
 export const SUPPORTED_ARCHITECTURES: ReadonlySet<string> = new Set<string>([
   'llama',
   'qwen2',
+  'qwen2moe',
   'qwen3',
+  'qwen3moe',
   'mistral',
+  'mixtral',
   'granite',
   'smollm3',
   'internlm2',
@@ -158,6 +163,39 @@ export interface PrefillProgressEvent {
   readonly completedTokens: number;
   readonly totalTokens: number;
   readonly reusedPrefixTokens: number;
+  readonly detail?: string;
+}
+
+export interface AsyncLoadProgressEvent {
+  readonly percent: number;
+  readonly detail: string;
+}
+
+interface AsyncLayerPlan {
+  readonly layerIdx: number;
+  readonly acquireNode: GgmlGraphNode | null;
+  readonly preMoeNodes: readonly GgmlGraphNode[];
+  readonly moe?: {
+    readonly routeAndGetExperts: () => { readonly count: number; readonly expertIds: number[] };
+    readonly executeRouted: (count: number) => void;
+    readonly residualNode: GgmlGraphNode;
+  };
+  readonly denseFfnNodes: readonly GgmlGraphNode[];
+}
+
+interface SingleAsyncGraphPlan {
+  readonly embedNode: GgmlGraphNode;
+  readonly layers: readonly AsyncLayerPlan[];
+  readonly lmNormAndQuantNodes: readonly GgmlGraphNode[];
+  readonly pinnedLmHeadNode: GgmlGraphNode | null;
+  readonly executeLmHeadStripe:
+    | ((weightStripe: VTensorHandle, rowStart: number, rowCount: number) => void)
+    | null;
+}
+
+interface Batch4AsyncGraphPlan {
+  readonly embedNode: GgmlGraphNode;
+  readonly layers: readonly AsyncLayerPlan[];
 }
 
 export interface SpeculativePrefillProgress {
@@ -199,6 +237,9 @@ interface ScratchTensors {
   readonly ffnHidden: VTensorHandle;
   readonly ffnProj: VTensorHandle;
   readonly logits: VTensorHandle;
+  // Sparse MoE reusable scratch vectors (null for dense models)
+  readonly moeRouterLogits: VTensorHandle | null;
+  readonly moeExpertProj: VTensorHandle | null;
   // Shared packed Q8_0_ACT & Q8_K_ACT scratch vectors (amortized across Q/K/V and gate/up!)
   readonly q8Dim: VTensorHandle | null;
   readonly q8AttnOut: VTensorHandle | null;
@@ -230,6 +271,8 @@ interface Batch4ScratchTensors {
 }
 
 const PREFILL_BATCH_SIZE = SPILL_FREE_BATCH_WIDTH;
+/** Up to 8 Batch-4 micro-batches (32 tokens) per OPFS layer acquire during Layer-Major Chunked Prefill. */
+const PREFILL_LAYER_MAJOR_MAX_MICROBATCHES = 8;
 
 function alignUp32(n: number): number {
   const rem = n % 32;
@@ -494,6 +537,13 @@ export class LlamaVTensorRuntime {
   private compiledSingleGraph: CompiledVTensorGraph | null = null;
   private singleGraphBodyNodeCount = 0;
   private compiledBatch4Graph: CompiledVTensorGraph | null = null;
+  private batchEmbedNode: GgmlGraphNode | null = null;
+  private batchLayerAcquireNodes: Array<GgmlGraphNode | null> = [];
+  private batchLayerBodyNodes: GgmlGraphNode[][] = [];
+  private prefillChunkX: Float32Array | null = null;
+  private singleAsyncPlan: SingleAsyncGraphPlan | null = null;
+  private batchAsyncPlan: Batch4AsyncGraphPlan | null = null;
+  private preloadedHotTensors: ReadonlyMap<string, Uint8Array> | null = null;
   private readonly singleExec = { tokenId: 0, pos: 0, seqLen: 1 };
   private readonly batchExec = { tokens: new Int32Array(PREFILL_BATCH_SIZE), startPos: 0 };
 
@@ -660,6 +710,13 @@ export class LlamaVTensorRuntime {
     this.batchScratch = null;
     this.compiledSingleGraph = null;
     this.compiledBatch4Graph = null;
+    this.batchEmbedNode = null;
+    this.batchLayerAcquireNodes = [];
+    this.batchLayerBodyNodes = [];
+    this.prefillChunkX = null;
+    this.singleAsyncPlan = null;
+    this.batchAsyncPlan = null;
+    this.preloadedHotTensors = null;
     this.singleGraphBodyNodeCount = 0;
     this.modelSummary = null;
     this.modelSpec = null;
@@ -718,7 +775,198 @@ export class LlamaVTensorRuntime {
       throw err;
     }
 
+    return this.finishLoadFromParsedBacking(id, displayName, source, backing, parsed, options?.maxContextCap);
+  }
+
+  /**
+   * Async demand-aware model loader used by the Web Worker for multi-GB remote & OPFS models.
+   * For `opfs-demand` backings:
+   *  1. Prefetches GGUF header slabs in parallel via abortable `fetch()` (`parseGgufFromBackingAsync`).
+   *  2. Fetches all tiny scattered norm/bias tensors via exact coalesced HTTP Ranges (~1–2 MB total
+   *     instead of 150+ full 1–4 MiB slab faults), emitting live progress from 97% -> 99%.
+   *  3. Honors `AbortSignal` throughout so cancelling at 97% returns immediately.
+   */
+  async loadFromBackingAsync(
+    id: string,
+    displayName: string,
+    source: string,
+    backing: VramBackingStore,
+    options?: {
+      maxContextCap?: number;
+      weightResidencyPolicy?: WeightResidencyPolicy;
+      backingQuotaBytes?: number;
+      signal?: AbortSignal;
+      onProgress?: (progress: AsyncLoadProgressEvent) => void;
+    },
+  ): Promise<LoadedModelSummary> {
+    this.unload();
+    this.backend.resetMetrics();
+
+    if (options?.weightResidencyPolicy) {
+      this.weightResidencyPolicy = options.weightResidencyPolicy;
+    }
+    this.backingQuotaBytes = options?.backingQuotaBytes;
+
+    let parsed: ParsedGgufModel;
+    try {
+      options?.onProgress?.({ percent: 97, detail: `Reading ${displayName} header` });
+      parsed = await parseGgufFromBackingAsync(backing, {
+        signal: options?.signal,
+        onProgress: (detail) => options?.onProgress?.({ percent: 97, detail }),
+      });
+    } catch (err) {
+      backing.close();
+      throw err;
+    }
+
+    if (options?.signal?.aborted) {
+      backing.close();
+      throw new DOMException('Aborted', 'AbortError');
+    }
+
+    const prepared = this.prepareParsedBacking(id, displayName, source, backing, parsed, options?.maxContextCap);
+
+    // Preload tiny hot metadata tensors asynchronously on demand-paged backings (zero sync XHRs!)
+    if (backing.readRangesDirectAsync || backing.prefetchRanges) {
+      try {
+        const env = this.backend.calibrateEnvironment();
+        const contract = derivePerformanceContract(env, prepared.modelSpec, {
+          precisionMode: this.precisionMode,
+          requestedMaxContext: this.requestedMaxContext,
+          backingKind: backing.kind,
+          weightResidencyPolicy: this.weightResidencyPolicy,
+          backingBandwidthMBs: this.calibratedBackingBandwidthMBs,
+          backingQuotaBytes: this.backingQuotaBytes,
+        });
+
+        if (contract.weightResidencyMode === 'opfs-paged') {
+          const hotInfos = collectHotMetadataTensorInfos(
+            prepared.embdInfo,
+            prepared.outNormInfo,
+            prepared.outWeightInfo,
+            prepared.isTiedOutput,
+            prepared.layerInfos,
+            {
+              streamEmbeddings: contract.streamEmbeddings,
+              streamLmHead: contract.streamLmHead,
+            },
+          );
+          const smallInfos = hotInfos.filter((t) => t.byteSize <= 256 * 1024);
+          const largeInfos = hotInfos.filter((t) => t.byteSize > 256 * 1024);
+
+          const preloaded = new Map<string, Uint8Array>();
+          if (smallInfos.length > 0 && backing.readRangesDirectAsync) {
+            options?.onProgress?.({
+              percent: 98,
+              detail: `Loading ${displayName} layer metadata`,
+            });
+            const rawSlices = await backing.readRangesDirectAsync(
+              smallInfos.map((t) => ({
+                fileOffset: parsed.dataOffset + t.offset,
+                byteLength: t.byteSize,
+              })),
+              {
+                signal: options?.signal,
+                onProgress: (done, total) => {
+                  const pct = total > 0 ? 97 + Math.min(2, Math.round((done / total) * 2)) : 98;
+                  options?.onProgress?.({
+                    percent: pct,
+                    detail: `Loading layer metadata (${done}/${total})`,
+                  });
+                },
+              },
+            );
+            for (let i = 0; i < smallInfos.length; i++) {
+              preloaded.set(smallInfos[i].name, rawSlices[i]);
+            }
+          }
+          if (largeInfos.length > 0 && backing.prefetchRanges) {
+            options?.onProgress?.({
+              percent: 99,
+              detail: `Caching ${displayName} embeddings`,
+            });
+            await backing.prefetchRanges(
+              largeInfos.map((t) => ({
+                fileOffset: parsed.dataOffset + t.offset,
+                byteLength: t.byteSize,
+              })),
+              { signal: options?.signal },
+            );
+          }
+          if (preloaded.size > 0) {
+            this.preloadedHotTensors = preloaded;
+          }
+        } else if (backing.prefetchRanges) {
+          options?.onProgress?.({
+            percent: 98,
+            detail: `Loading ${displayName} weights`,
+          });
+          await backing.prefetchRanges(
+            [
+              {
+                fileOffset: parsed.dataOffset,
+                byteLength: Math.max(0, backing.byteLength - parsed.dataOffset),
+              },
+            ],
+            { signal: options?.signal },
+          );
+        }
+      } catch (err) {
+        this.unload();
+        throw err;
+      }
+    }
+
+    if (options?.signal?.aborted) {
+      this.unload();
+      throw new DOMException('Aborted', 'AbortError');
+    }
+
+    options?.onProgress?.({ percent: 99, detail: `Initializing ${displayName}` });
+    this.allocateFromActiveBacking();
+    return this.modelSummary!;
+  }
+
+  private finishLoadFromParsedBacking(
+    id: string,
+    displayName: string,
+    source: string,
+    backing: VramBackingStore,
+    parsed: ParsedGgufModel,
+    maxContextCap?: number,
+  ): LoadedModelSummary {
+    this.prepareParsedBacking(id, displayName, source, backing, parsed, maxContextCap);
+    this.allocateFromActiveBacking();
+    return this.modelSummary!;
+  }
+
+  private prepareParsedBacking(
+    id: string,
+    displayName: string,
+    source: string,
+    backing: VramBackingStore,
+    parsed: ParsedGgufModel,
+    maxContextCap?: number,
+  ): {
+    embdInfo: GgufTensorInfo;
+    outNormInfo: GgufTensorInfo;
+    outWeightInfo: GgufTensorInfo;
+    isTiedOutput: boolean;
+    layerInfos: LayerTensorInfoGroup[];
+    modelSpec: ModelGeometrySpec;
+  } {
+
     const hp = parsed.hparams;
+    const hasDenseFfn0 =
+      parsed.tensorMap.has('blk.0.ffn_gate.weight') &&
+      parsed.tensorMap.has('blk.0.ffn_up.weight') &&
+      parsed.tensorMap.has('blk.0.ffn_down.weight');
+    const hasMoeFfn0 =
+      parsed.tensorMap.has('blk.0.ffn_gate_inp.weight') &&
+      parsed.tensorMap.has('blk.0.ffn_gate_exps.weight') &&
+      parsed.tensorMap.has('blk.0.ffn_up_exps.weight') &&
+      parsed.tensorMap.has('blk.0.ffn_down_exps.weight');
+
     const hasStandardTransformerTopology =
       parsed.tensorMap.has('token_embd.weight') &&
       parsed.tensorMap.has('output_norm.weight') &&
@@ -728,14 +976,12 @@ export class LlamaVTensorRuntime {
       parsed.tensorMap.has('blk.0.attn_v.weight') &&
       parsed.tensorMap.has('blk.0.attn_output.weight') &&
       parsed.tensorMap.has('blk.0.ffn_norm.weight') &&
-      parsed.tensorMap.has('blk.0.ffn_gate.weight') &&
-      parsed.tensorMap.has('blk.0.ffn_up.weight') &&
-      parsed.tensorMap.has('blk.0.ffn_down.weight');
+      (hasDenseFfn0 || hasMoeFfn0);
 
     if (!SUPPORTED_ARCHITECTURES.has(hp.architecture) && !hasStandardTransformerTopology) {
       backing.close();
       throw new Error(
-        `GGUF architecture "${hp.architecture}" uses an unsupported tensor graph topology. Supported architectures: llama, qwen2, qwen3, mistral, granite, smollm3, internlm2, olmo2 (or any LLaMA-compatible SwiGLU GGUF).`,
+        `GGUF architecture "${hp.architecture}" uses an unsupported tensor graph topology. Supported architectures: llama, qwen2, qwen2moe, qwen3, qwen3moe, mistral, mixtral, granite, smollm3, internlm2, olmo2.`,
       );
     }
 
@@ -767,7 +1013,15 @@ export class LlamaVTensorRuntime {
     if (!isTiedOutput) tensorInfosToLoad.push(outWeightInfo);
 
     const layerInfos: LayerTensorInfoGroup[] = [];
+    let anyMoeLayer = false;
     for (let l = 0; l < hp.blockCount; l++) {
+      const ffnGateInp = optionalTensor(`blk.${l}.ffn_gate_inp.weight`);
+      const ffnGateExps = optionalTensor(`blk.${l}.ffn_gate_exps.weight`);
+      const ffnUpExps = optionalTensor(`blk.${l}.ffn_up_exps.weight`);
+      const ffnDownExps = optionalTensor(`blk.${l}.ffn_down_exps.weight`);
+      const layerIsMoe = Boolean(ffnGateInp && ffnGateExps && ffnUpExps && ffnDownExps);
+      if (layerIsMoe) anyMoeLayer = true;
+
       const layer: LayerTensorInfoGroup = {
         attnNorm: requireTensor(`blk.${l}.attn_norm.weight`),
         attnQ: requireTensor(`blk.${l}.attn_q.weight`),
@@ -781,9 +1035,13 @@ export class LlamaVTensorRuntime {
         attnOutput: requireTensor(`blk.${l}.attn_output.weight`),
         attnOutputBias: optionalTensor(`blk.${l}.attn_output.bias`),
         ffnNorm: requireTensor(`blk.${l}.ffn_norm.weight`),
-        ffnGate: requireTensor(`blk.${l}.ffn_gate.weight`),
-        ffnUp: requireTensor(`blk.${l}.ffn_up.weight`),
-        ffnDown: requireTensor(`blk.${l}.ffn_down.weight`),
+        ffnGate: layerIsMoe ? null : requireTensor(`blk.${l}.ffn_gate.weight`),
+        ffnUp: layerIsMoe ? null : requireTensor(`blk.${l}.ffn_up.weight`),
+        ffnDown: layerIsMoe ? null : requireTensor(`blk.${l}.ffn_down.weight`),
+        ffnGateInp,
+        ffnGateExps,
+        ffnUpExps,
+        ffnDownExps,
       };
       layerInfos.push(layer);
       tensorInfosToLoad.push(
@@ -793,10 +1051,14 @@ export class LlamaVTensorRuntime {
         layer.attnV,
         layer.attnOutput,
         layer.ffnNorm,
-        layer.ffnGate,
-        layer.ffnUp,
-        layer.ffnDown,
       );
+      if (layer.ffnGate) tensorInfosToLoad.push(layer.ffnGate);
+      if (layer.ffnUp) tensorInfosToLoad.push(layer.ffnUp);
+      if (layer.ffnDown) tensorInfosToLoad.push(layer.ffnDown);
+      if (layer.ffnGateInp) tensorInfosToLoad.push(layer.ffnGateInp);
+      if (layer.ffnGateExps) tensorInfosToLoad.push(layer.ffnGateExps);
+      if (layer.ffnUpExps) tensorInfosToLoad.push(layer.ffnUpExps);
+      if (layer.ffnDownExps) tensorInfosToLoad.push(layer.ffnDownExps);
       if (layer.attnQBias) tensorInfosToLoad.push(layer.attnQBias);
       if (layer.attnQNorm) tensorInfosToLoad.push(layer.attnQNorm);
       if (layer.attnKBias) tensorInfosToLoad.push(layer.attnKBias);
@@ -815,7 +1077,7 @@ export class LlamaVTensorRuntime {
       }
     }
 
-    // Compute exact ModelGeometrySpec for Prism Theorems T1–T4b
+    // Compute exact ModelGeometrySpec for Prism Theorems T1–T4b (distinguishing active vs total bytes on MoE!)
     let weightsCapacity = 0;
     for (const info of tensorInfosToLoad) {
       weightsCapacity += alignUp32(info.byteSize) + 32;
@@ -829,23 +1091,63 @@ export class LlamaVTensorRuntime {
     const typeByteCounts = new Map<GgmlType, number>();
     typeByteCounts.set(outWeightInfo.type, outWeightInfo.byteSize);
 
+    let moeAttentionLayerBytesSum = 0;
+    let moeSingleExpertTripleBytes = 0;
+    let detectedExpertCount = hp.expertCount ?? 0;
+    const detectedExpertUsedCount = Math.max(1, hp.expertUsedCount ?? (anyMoeLayer ? 2 : 0));
+
     for (const l of layerInfos) {
-      const linearWeights = [
-        l.attnQ,
-        l.attnK,
-        l.attnV,
-        l.attnOutput,
-        l.ffnGate,
-        l.ffnUp,
-        l.ffnDown,
-      ];
-      for (const w of linearWeights) {
+      const attnWeights = [l.attnQ, l.attnK, l.attnV, l.attnOutput];
+      for (const w of attnWeights) {
         activeWeightBytes += w.byteSize;
         activeParamCount += (w.dims[0] ?? 1) * (w.dims[1] ?? 1);
         if (INTEGER_DOT_COMPATIBLE_TYPES.has(w.type)) {
           quantizedLinearBytes += w.byteSize;
         }
         typeByteCounts.set(w.type, (typeByteCounts.get(w.type) ?? 0) + w.byteSize);
+        moeAttentionLayerBytesSum += w.byteSize;
+      }
+
+      if (l.ffnGateInp && l.ffnGateExps && l.ffnUpExps && l.ffnDownExps) {
+        moeAttentionLayerBytesSum += l.ffnGateInp.byteSize;
+        activeWeightBytes += l.ffnGateInp.byteSize;
+        activeParamCount += (l.ffnGateInp.dims[0] ?? 1) * (l.ffnGateInp.dims[1] ?? 1);
+
+        const nExps = Math.max(1, l.ffnGateExps.dims[2] ?? hp.expertCount ?? 1);
+        detectedExpertCount = Math.max(detectedExpertCount, nExps);
+        const kUsed = Math.min(nExps, detectedExpertUsedCount);
+        const singleGateBytes = Math.floor(l.ffnGateExps.byteSize / nExps);
+        const singleUpBytes = Math.floor(l.ffnUpExps.byteSize / nExps);
+        const singleDownBytes = Math.floor(l.ffnDownExps.byteSize / nExps);
+        moeSingleExpertTripleBytes = Math.max(
+          moeSingleExpertTripleBytes,
+          singleGateBytes + singleUpBytes + singleDownBytes,
+        );
+
+        const expTensors: Array<{ w: GgufTensorInfo; singleBytes: number }> = [
+          { w: l.ffnGateExps, singleBytes: singleGateBytes },
+          { w: l.ffnUpExps, singleBytes: singleUpBytes },
+          { w: l.ffnDownExps, singleBytes: singleDownBytes },
+        ];
+        for (const { w, singleBytes } of expTensors) {
+          const activeExpBytes = singleBytes * kUsed;
+          activeWeightBytes += activeExpBytes;
+          activeParamCount += (w.dims[0] ?? 1) * (w.dims[1] ?? 1) * kUsed;
+          if (INTEGER_DOT_COMPATIBLE_TYPES.has(w.type)) {
+            quantizedLinearBytes += activeExpBytes;
+          }
+          typeByteCounts.set(w.type, (typeByteCounts.get(w.type) ?? 0) + activeExpBytes);
+        }
+      } else if (l.ffnGate && l.ffnUp && l.ffnDown) {
+        const denseFfn = [l.ffnGate, l.ffnUp, l.ffnDown];
+        for (const w of denseFfn) {
+          activeWeightBytes += w.byteSize;
+          activeParamCount += (w.dims[0] ?? 1) * (w.dims[1] ?? 1);
+          if (INTEGER_DOT_COMPATIBLE_TYPES.has(w.type)) {
+            quantizedLinearBytes += w.byteSize;
+          }
+          typeByteCounts.set(w.type, (typeByteCounts.get(w.type) ?? 0) + w.byteSize);
+        }
       }
     }
 
@@ -866,9 +1168,15 @@ export class LlamaVTensorRuntime {
       totalWeightBufferBytes: weightsCapacity,
       dominantWeightType,
       quantizedWeightFraction: activeWeightBytes > 0 ? quantizedLinearBytes / activeWeightBytes : 0,
+      isMoe: anyMoeLayer,
+      expertCount: anyMoeLayer ? detectedExpertCount : 0,
+      expertUsedCount: anyMoeLayer ? detectedExpertUsedCount : 0,
+      moeAttentionLayerBytes: anyMoeLayer
+        ? Math.ceil(moeAttentionLayerBytesSum / Math.max(1, layerInfos.length))
+        : 0,
+      moeSingleExpertTripleBytes,
     };
 
-    const maxContextCap = options?.maxContextCap;
     this.backingStore = backing;
     this.calibratedBackingBandwidthMBs = calibrateBackingReadBandwidthMBs(backing);
     this.parsedHeader = parsed;
@@ -896,8 +1204,14 @@ export class LlamaVTensorRuntime {
       backingKind: backing.kind,
     };
 
-    this.allocateFromActiveBacking();
-    return this.modelSummary!;
+    return {
+      embdInfo,
+      outNormInfo,
+      outWeightInfo,
+      isTiedOutput,
+      layerInfos,
+      modelSpec,
+    };
   }
 
   /**
@@ -998,7 +1312,7 @@ export class LlamaVTensorRuntime {
       kvPageBytesWarmQ8,
     });
 
-    // 1. Allocate model weights through OPFS-backed vRAM Weight Pager (resident-all or opfs-paged + Zipfian hot embedding slab)
+    // 1. Allocate model weights through OPFS-backed vRAM Weight Pager (resident-all or opfs-paged + Zipfian hot embedding slab + Sparse MoE LRU expert cache)
     const weightPager = new VramWeightPager(
       parsed,
       backing,
@@ -1014,8 +1328,10 @@ export class LlamaVTensorRuntime {
         streamLmHead: contract.streamLmHead,
         lmHeadStripeRows: computeLmHeadStripeRows(outWeightInfo, contract.lmHeadTileTargetBytes),
         hotEmbeddingCacheSlots: unifiedPlan.hotEmbeddingCacheSlots,
+        moeExpertCacheSlots: contract.moeExpertCacheSlots,
       },
       (bufId, usage, cap) => this.backend.allocBuffer(bufId, usage, cap),
+      this.preloadedHotTensors ?? undefined,
     );
     this.backend.attachVramWeightTelemetry(() => weightPager.getTelemetry());
 
@@ -1079,9 +1395,10 @@ export class LlamaVTensorRuntime {
       });
     });
 
-    // 3. Allocate single-token + batched-4 compute scratch tensors (including packed Q8_0_ACT slots)
+    // 3. Allocate single-token + batched-4 compute scratch tensors (including packed Q8_0_ACT & MoE slots)
     const dim = hp.embeddingLength;
-    const ffnDim = hp.feedForwardLength;
+    const ffnDim = Math.max(hp.feedForwardLength, hp.expertFeedForwardLength ?? 0);
+    const moeExpertCount = modelSpec.isMoe ? Math.max(1, modelSpec.expertCount ?? hp.expertCount ?? 1) : 0;
     const vocab = hp.vocabSize;
     const B = PREFILL_BATCH_SIZE;
 
@@ -1100,11 +1417,12 @@ export class LlamaVTensorRuntime {
     const q8kFfnBytes = canQuantizeQ8KFfn ? (ffnDim >>> 8) * Q8_K_ACT_BLOCK_BYTES : 0;
 
     const scratchCapacity =
-      alignUp32(dim * 4) * 4 +
+      alignUp32(dim * 4) * 5 +
       alignUp32(qDim * 4) * 2 +
       alignUp32(kvDim * 4) * 2 +
       alignUp32(ffnDim * 4) * 3 +
       alignUp32(vocab * 4) +
+      (moeExpertCount > 0 ? alignUp32(moeExpertCount * 4) + 64 : 0) +
       alignUp32(dim * B * 4) * 4 +
       alignUp32(qDim * B * 4) * 2 +
       alignUp32(kvDim * B * 4) * 2 +
@@ -1136,6 +1454,14 @@ export class LlamaVTensorRuntime {
       ffnHidden: computeBuffer.allocTensor('act.ffn_hidden', GgmlType.F32, [ffnDim]),
       ffnProj: computeBuffer.allocTensor('act.ffn_proj', GgmlType.F32, [dim]),
       logits: computeBuffer.allocTensor('act.logits', GgmlType.F32, [vocab]),
+      moeRouterLogits:
+        moeExpertCount > 0
+          ? computeBuffer.allocTensor('act.moe_router', GgmlType.F32, [moeExpertCount])
+          : null,
+      moeExpertProj:
+        moeExpertCount > 0
+          ? computeBuffer.allocTensor('act.moe_exp_proj', GgmlType.F32, [dim])
+          : null,
       q8Dim: q8DimBytes > 0 ? computeBuffer.allocTensor('act.q8_dim', GgmlType.I8, [q8DimBytes]) : null,
       q8AttnOut:
         q8AttnOutBytes > 0
@@ -1257,8 +1583,575 @@ export class LlamaVTensorRuntime {
     const dim = hp.embeddingLength;
     const qDim = hp.headCount * headDim;
     const kvDim = hp.headCountKv * headDim;
-    const ffnDim = hp.feedForwardLength;
+    const ffnDim = Math.max(hp.feedForwardLength, hp.expertFeedForwardLength ?? 0);
     const useNeoxRope = hp.ropeType === 'neox';
+    const moeTopK = Math.max(1, hp.expertUsedCount ?? 2);
+    const moeNormalizeWeights = hp.expertWeightsNorm !== false;
+    const moeTopIds = new Int32Array(moeTopK);
+    const moeTopProbs = new Float64Array(moeTopK);
+    const moeSoftmaxBuf = new Float64Array(Math.max(1, this.modelSpec?.expertCount ?? hp.expertCount ?? 1));
+    // Preallocated mutable 2-entry tuple so Sparse MoE dispatches create 0 JS heap objects per expert
+    const moeGateUpGroupEntries: Array<{
+      weightType: GgmlType;
+      wPtr: number;
+      outPtr: number;
+      rows: number;
+      oStrideBytes: number;
+    }> = [
+      { weightType: GgmlType.F32, wPtr: 0, outPtr: 0, rows: 0, oStrideBytes: 0 },
+      { weightType: GgmlType.F32, wPtr: 0, outPtr: 0, rows: 0, oStrideBytes: 0 },
+    ];
+    // Preallocated zero-alloc expert-grouping tables for Batch-4 Sparse MoE prefill
+    const moeBatchMaxUnique = PREFILL_BATCH_SIZE * moeTopK;
+    const moeBatchExpIds = new Int32Array(moeBatchMaxUnique);
+    const moeBatchExpMask = new Uint8Array(moeBatchMaxUnique);
+    const moeBatchExpWeights = new Float64Array(moeBatchMaxUnique * PREFILL_BATCH_SIZE);
+
+    const routeTopKFromLogits = (rLogits: Float32Array, nExperts: number, kUsed: number): void => {
+      let maxL = Number.NEGATIVE_INFINITY;
+      for (let i = 0; i < nExperts; i++) {
+        const v = rLogits[i];
+        if (v > maxL) maxL = v;
+      }
+      let sumExp = 0;
+      for (let i = 0; i < nExperts; i++) {
+        const p = Math.exp(rLogits[i] - maxL);
+        moeSoftmaxBuf[i] = p;
+        sumExp += p;
+      }
+      const invSum = sumExp > 0 ? 1 / sumExp : 1 / nExperts;
+      for (let i = 0; i < nExperts; i++) {
+        moeSoftmaxBuf[i] *= invSum;
+      }
+
+      for (let k = 0; k < kUsed; k++) {
+        moeTopIds[k] = -1;
+        moeTopProbs[k] = -1;
+      }
+      for (let i = 0; i < nExperts; i++) {
+        const p = moeSoftmaxBuf[i];
+        if (p > moeTopProbs[kUsed - 1]) {
+          let pos = kUsed - 1;
+          while (pos > 0 && p > moeTopProbs[pos - 1]) {
+            moeTopProbs[pos] = moeTopProbs[pos - 1];
+            moeTopIds[pos] = moeTopIds[pos - 1];
+            pos -= 1;
+          }
+          moeTopProbs[pos] = p;
+          moeTopIds[pos] = i;
+        }
+      }
+      if (moeNormalizeWeights) {
+        let topSum = 0;
+        for (let k = 0; k < kUsed; k++) topSum += moeTopProbs[k];
+        if (topSum > 0) {
+          for (let k = 0; k < kUsed; k++) moeTopProbs[k] /= topSum;
+        }
+      }
+    };
+
+    const routeSparseMoeSingle = (
+      routerWeight: VTensorHandle,
+      xNormHandle: VTensorHandle,
+      xNormOffsetFloats: number,
+    ): number => {
+      const nExperts = routerWeight.dims[1] ?? 1;
+      const kUsed = Math.min(moeTopK, nExperts);
+      const routerLogits = s.moeRouterLogits!;
+
+      // 1. Router projection: routerLogits[nExperts] = routerWeight[nExperts x dim] . xNorm[dim]
+      const xInView = xNormHandle.buffer.f32View(xNormHandle);
+      const xSlice = xNormOffsetFloats === 0 ? xInView : xInView.subarray(xNormOffsetFloats, xNormOffsetFloats + dim);
+      if (xNormOffsetFloats !== 0) {
+        s.xNorm.buffer.f32View(s.xNorm).set(xSlice, 0);
+      }
+      const xActHandle = xNormOffsetFloats === 0 ? xNormHandle : s.xNorm;
+      const useRouterWasm =
+        arena !== null &&
+        xActHandle.buffer.isWasmBacked &&
+        routerLogits.buffer.isWasmBacked &&
+        routerWeight.buffer.isWasmBacked;
+
+      if (useRouterWasm && arena) {
+        arena.mulMat(
+          routerWeight.type,
+          routerWeight.buffer.wasmPtr(routerWeight),
+          xActHandle.buffer.wasmPtr(xActHandle),
+          routerLogits.buffer.wasmPtr(routerLogits),
+          dim,
+          nExperts,
+        );
+      } else {
+        verdantMulMat(
+          routerWeight.buffer.rawBytes(),
+          routerWeight.byteOffset,
+          routerWeight.type,
+          dim,
+          nExperts,
+          xActHandle.buffer.f32View(xActHandle),
+          routerLogits.buffer.f32View(routerLogits),
+        );
+      }
+
+      // 2. Numerically exact Float64 softmax + deterministic Top-K selection
+      routeTopKFromLogits(routerLogits.buffer.f32View(routerLogits), nExperts, kUsed);
+      return kUsed;
+    };
+
+    const executeSparseMoeSingleRouted = (
+      layerIdx: number,
+      xNormHandle: VTensorHandle,
+      xNormOffsetFloats: number,
+      q8DimHandle: VTensorHandle | null,
+      q8kDimHandle: VTensorHandle | null,
+      outProjHandle: VTensorHandle,
+      outProjOffsetFloats: number,
+      expFfnDim: number,
+      kUsed: number,
+    ): void => {
+      const expertProj = s.moeExpertProj!;
+      const xActHandle = xNormOffsetFloats === 0 ? xNormHandle : s.xNorm;
+      const useWasm =
+        arena !== null &&
+        xActHandle.buffer.isWasmBacked &&
+        s.ffnGate.buffer.isWasmBacked &&
+        s.ffnUp.buffer.isWasmBacked &&
+        s.ffnHidden.buffer.isWasmBacked &&
+        expertProj.buffer.isWasmBacked;
+
+      const xPtr = useWasm ? xActHandle.buffer.wasmPtr(xActHandle) : -1;
+      const gateOutPtr = useWasm ? s.ffnGate.buffer.wasmPtr(s.ffnGate) : -1;
+      const upOutPtr = useWasm ? s.ffnUp.buffer.wasmPtr(s.ffnUp) : -1;
+      const hidPtr = useWasm ? s.ffnHidden.buffer.wasmPtr(s.ffnHidden) : -1;
+      const expProjPtr = useWasm ? expertProj.buffer.wasmPtr(expertProj) : -1;
+
+      // Quantize xActHandle ONCE across all K selected experts if gate/up support Q8_K or Q8_0
+      const infoL = this.layerInfos[layerIdx];
+      const expGateType = infoL.ffnGateExps!.type;
+      const expUpType = infoL.ffnUpExps!.type;
+      const expDownType = infoL.ffnDownExps!.type;
+      const expInQ8K =
+        useWasm &&
+        arena !== null &&
+        q8kDimHandle !== null &&
+        q8kDimHandle.buffer.isWasmBacked &&
+        canQ8K(expGateType, dim, q8kDimHandle) &&
+        canQ8K(expUpType, dim, q8kDimHandle);
+      const expInQ8 =
+        !expInQ8K &&
+        useWasm &&
+        useQ8 &&
+        arena !== null &&
+        q8DimHandle !== null &&
+        q8DimHandle.buffer.isWasmBacked &&
+        (arena.supportsQ8Activation(expGateType) || arena.supportsQ8Activation(expUpType));
+      const qkDimPtr = expInQ8K && q8kDimHandle ? q8kDimHandle.buffer.wasmPtr(q8kDimHandle) : -1;
+      const qDimPtr = expInQ8 && q8DimHandle ? q8DimHandle.buffer.wasmPtr(q8DimHandle) : -1;
+
+      if (expInQ8K && arena) {
+        arena.quantizeActivationQ8K(xPtr, qkDimPtr, dim);
+      } else if (expInQ8 && arena) {
+        arena.quantizeActivation(xPtr, qDimPtr, dim);
+      }
+
+      const expDownQ8K =
+        useWasm &&
+        arena !== null &&
+        s.q8kFfn !== null &&
+        s.q8kFfn.buffer.isWasmBacked &&
+        canQ8K(expDownType, expFfnDim, s.q8kFfn);
+      const expDownQ8 =
+        !expDownQ8K &&
+        useWasm &&
+        useQ8 &&
+        arena !== null &&
+        s.q8Ffn !== null &&
+        s.q8Ffn.buffer.isWasmBacked &&
+        arena.supportsQ8Activation(expDownType);
+      const qkFfnPtr = expDownQ8K && s.q8kFfn ? s.q8kFfn.buffer.wasmPtr(s.q8kFfn) : -1;
+      const qFfnPtr = expDownQ8 && s.q8Ffn ? s.q8Ffn.buffer.wasmPtr(s.q8Ffn) : -1;
+
+      // 3. Zero destination ffnProj slice and accumulate weighted Top-K experts
+      const outAll = outProjHandle.buffer.f32View(outProjHandle);
+      const outSlice =
+        outProjOffsetFloats === 0
+          ? outAll.subarray(0, dim)
+          : outAll.subarray(outProjOffsetFloats, outProjOffsetFloats + dim);
+      outSlice.fill(0);
+
+      const ge0 = moeGateUpGroupEntries[0];
+      const ge1 = moeGateUpGroupEntries[1];
+      ge0.outPtr = gateOutPtr;
+      ge0.rows = expFfnDim;
+      ge0.oStrideBytes = expFfnDim * 4;
+      ge1.outPtr = upOutPtr;
+      ge1.rows = expFfnDim;
+      ge1.oStrideBytes = expFfnDim * 4;
+
+      for (let k = 0; k < kUsed; k++) {
+        const expId = moeTopIds[k];
+        const weight = moeTopProbs[k];
+        if (expId < 0 || weight === 0) continue;
+
+        const exp = wp.acquireExpertSlice(layerIdx, expId);
+        if (useWasm && arena && exp.gate.buffer.isWasmBacked && exp.up.buffer.isWasmBacked && exp.down.buffer.isWasmBacked) {
+          ge0.weightType = exp.gate.type;
+          ge0.wPtr = exp.gate.buffer.wasmPtr(exp.gate);
+          ge1.weightType = exp.up.type;
+          ge1.wPtr = exp.up.buffer.wasmPtr(exp.up);
+          const dPtr = exp.down.buffer.wasmPtr(exp.down);
+          if (expInQ8K) {
+            arena.mulMatQ8KGroup(moeGateUpGroupEntries, qkDimPtr, xPtr, dim);
+          } else {
+            arena.mulMatQ8Group(moeGateUpGroupEntries, expInQ8 ? qDimPtr : xPtr, xPtr, dim, expInQ8);
+          }
+          arena.kernels.swiglu_f32(gateOutPtr, upOutPtr, hidPtr, expFfnDim);
+          if (expDownQ8K) {
+            arena.quantizeActivationQ8K(hidPtr, qkFfnPtr, expFfnDim);
+            arena.mulMatQ8K(exp.down.type, dPtr, qkFfnPtr, hidPtr, expProjPtr, expFfnDim, dim);
+          } else if (expDownQ8) {
+            arena.quantizeActivation(hidPtr, qFfnPtr, expFfnDim);
+            arena.mulMatQ8(exp.down.type, dPtr, qFfnPtr, hidPtr, expProjPtr, expFfnDim, dim);
+          } else {
+            arena.mulMat(exp.down.type, dPtr, hidPtr, expProjPtr, expFfnDim, dim);
+          }
+        } else {
+          const xView = xActHandle.buffer.f32View(xActHandle);
+          const gView = s.ffnGate.buffer.f32View(s.ffnGate).subarray(0, expFfnDim);
+          const uView = s.ffnUp.buffer.f32View(s.ffnUp).subarray(0, expFfnDim);
+          const hView = s.ffnHidden.buffer.f32View(s.ffnHidden).subarray(0, expFfnDim);
+          const eView = expertProj.buffer.f32View(expertProj);
+          verdantMulMat(exp.gate.buffer.rawBytes(), exp.gate.byteOffset, exp.gate.type, dim, expFfnDim, xView, gView);
+          verdantMulMat(exp.up.buffer.rawBytes(), exp.up.byteOffset, exp.up.type, dim, expFfnDim, xView, uView);
+          verdantSwiGlu(gView, uView, hView, expFfnDim);
+          verdantMulMat(exp.down.buffer.rawBytes(), exp.down.byteOffset, exp.down.type, expFfnDim, dim, hView, eView);
+        }
+
+        const eOut = expertProj.buffer.f32View(expertProj);
+        for (let i = 0; i < dim; i++) {
+          outSlice[i] += weight * eOut[i];
+        }
+      }
+    };
+
+    const runSparseMoeSingle = (
+      layerIdx: number,
+      routerWeight: VTensorHandle,
+      xNormHandle: VTensorHandle,
+      xNormOffsetFloats: number,
+      q8DimHandle: VTensorHandle | null,
+      q8kDimHandle: VTensorHandle | null,
+      outProjHandle: VTensorHandle,
+      outProjOffsetFloats: number,
+      expFfnDim: number,
+    ): void => {
+      const kUsed = routeSparseMoeSingle(routerWeight, xNormHandle, xNormOffsetFloats);
+      executeSparseMoeSingleRouted(
+        layerIdx,
+        xNormHandle,
+        xNormOffsetFloats,
+        q8DimHandle,
+        q8kDimHandle,
+        outProjHandle,
+        outProjOffsetFloats,
+        expFfnDim,
+        kUsed,
+      );
+    };
+
+    const routeSparseMoeBatch4 = (routerWeight: VTensorHandle): number => {
+      const B4 = PREFILL_BATCH_SIZE;
+      const nExperts = routerWeight.dims[1] ?? 1;
+      const kUsed = Math.min(moeTopK, nExperts);
+      const routerLogits = s.moeRouterLogits!;
+      const useRouterWasm =
+        arena !== null &&
+        bs.xNorm.buffer.isWasmBacked &&
+        routerLogits.buffer.isWasmBacked &&
+        routerWeight.buffer.isWasmBacked;
+
+      const bXNormPtr = useRouterWasm ? bs.xNorm.buffer.wasmPtr(bs.xNorm) : -1;
+      const routerOutPtr = useRouterWasm ? routerLogits.buffer.wasmPtr(routerLogits) : -1;
+      const xStrideBytes = dim * 4;
+      const xAll = bs.xNorm.buffer.f32View(bs.xNorm);
+      const rLogitsView = routerLogits.buffer.f32View(routerLogits);
+
+      // 1. Route all 4 tokens and group by unique expertId (zero JS allocations)
+      let uniqueCount = 0;
+      for (let t = 0; t < B4; t++) {
+        if (useRouterWasm && arena) {
+          arena.mulMat(
+            routerWeight.type,
+            routerWeight.buffer.wasmPtr(routerWeight),
+            bXNormPtr + t * xStrideBytes,
+            routerOutPtr,
+            dim,
+            nExperts,
+          );
+        } else {
+          verdantMulMat(
+            routerWeight.buffer.rawBytes(),
+            routerWeight.byteOffset,
+            routerWeight.type,
+            dim,
+            nExperts,
+            xAll.subarray(t * dim, (t + 1) * dim),
+            rLogitsView,
+          );
+        }
+        routeTopKFromLogits(rLogitsView, nExperts, kUsed);
+        for (let k = 0; k < kUsed; k++) {
+          const expId = moeTopIds[k];
+          const weight = moeTopProbs[k];
+          if (expId < 0 || weight === 0) continue;
+          let u = -1;
+          for (let j = 0; j < uniqueCount; j++) {
+            if (moeBatchExpIds[j] === expId) {
+              u = j;
+              break;
+            }
+          }
+          if (u < 0) {
+            u = uniqueCount++;
+            moeBatchExpIds[u] = expId;
+            moeBatchExpMask[u] = 0;
+            const wBase = u * B4;
+            moeBatchExpWeights[wBase] = 0;
+            moeBatchExpWeights[wBase + 1] = 0;
+            moeBatchExpWeights[wBase + 2] = 0;
+            moeBatchExpWeights[wBase + 3] = 0;
+          }
+          moeBatchExpMask[u] |= 1 << t;
+          moeBatchExpWeights[u * B4 + t] = weight;
+        }
+      }
+      return uniqueCount;
+    };
+
+    /**
+     * Expert-Grouped Batch-4 Sparse MoE prefill kernel:
+     * Executes all `uniqueCount` routed experts populated by `routeSparseMoeBatch4()`.
+     */
+    const executeSparseMoeBatch4Routed = (
+      layerIdx: number,
+      expFfnDim: number,
+      uniqueCount: number,
+    ): void => {
+      const B4 = PREFILL_BATCH_SIZE;
+      const expertProj = s.moeExpertProj!;
+      const useWasm =
+        arena !== null &&
+        bs.xNorm.buffer.isWasmBacked &&
+        bs.ffnGate.buffer.isWasmBacked &&
+        bs.ffnUp.buffer.isWasmBacked &&
+        bs.ffnHidden.buffer.isWasmBacked &&
+        bs.attnProj.buffer.isWasmBacked &&
+        s.ffnGate.buffer.isWasmBacked &&
+        s.ffnUp.buffer.isWasmBacked &&
+        s.ffnHidden.buffer.isWasmBacked &&
+        expertProj.buffer.isWasmBacked;
+
+      const bXNormPtr = useWasm ? bs.xNorm.buffer.wasmPtr(bs.xNorm) : -1;
+      const xStrideBytes = dim * 4;
+      const xAll = bs.xNorm.buffer.f32View(bs.xNorm);
+
+      // 2. Quantize all 4 token activations ONCE into bs.q8kDim or bs.q8Dim
+      const infoL = this.layerInfos[layerIdx];
+      const expGateType = infoL.ffnGateExps!.type;
+      const expUpType = infoL.ffnUpExps!.type;
+      const expDownType = infoL.ffnDownExps!.type;
+
+      const expInQ8K =
+        useWasm &&
+        arena !== null &&
+        bs.q8kDim !== null &&
+        bs.q8kDim.buffer.isWasmBacked &&
+        canQ8K(expGateType, dim, bs.q8kDim) &&
+        canQ8K(expUpType, dim, bs.q8kDim);
+      const expInQ8 =
+        !expInQ8K &&
+        useWasm &&
+        useQ8 &&
+        arena !== null &&
+        bs.q8Dim !== null &&
+        bs.q8Dim.buffer.isWasmBacked &&
+        (arena.supportsQ8Activation(expGateType) || arena.supportsQ8Activation(expUpType));
+      const bQkDimPtr = expInQ8K && bs.q8kDim ? bs.q8kDim.buffer.wasmPtr(bs.q8kDim) : -1;
+      const bQDimPtr = expInQ8 && bs.q8Dim ? bs.q8Dim.buffer.wasmPtr(bs.q8Dim) : -1;
+      const qkDimStride = (dim >>> 8) * Q8_K_ACT_BLOCK_BYTES;
+      const qDimStride = (dim >>> 5) * Q8_0_ACT_BLOCK_BYTES;
+
+      if (expInQ8K && arena) {
+        for (let t = 0; t < B4; t++) {
+          arena.quantizeActivationQ8K(bXNormPtr + t * xStrideBytes, bQkDimPtr + t * qkDimStride, dim);
+        }
+      } else if (expInQ8 && arena) {
+        for (let t = 0; t < B4; t++) {
+          arena.quantizeActivation(bXNormPtr + t * xStrideBytes, bQDimPtr + t * qDimStride, dim);
+        }
+      }
+
+      const expDownQ8K =
+        useWasm &&
+        arena !== null &&
+        s.q8kFfn !== null &&
+        s.q8kFfn.buffer.isWasmBacked &&
+        canQ8K(expDownType, expFfnDim, s.q8kFfn);
+      const expDownQ8 =
+        !expDownQ8K &&
+        useWasm &&
+        useQ8 &&
+        arena !== null &&
+        s.q8Ffn !== null &&
+        s.q8Ffn.buffer.isWasmBacked &&
+        arena.supportsQ8Activation(expDownType);
+      const qkFfnPtr = expDownQ8K && s.q8kFfn ? s.q8kFfn.buffer.wasmPtr(s.q8kFfn) : -1;
+      const qFfnPtr = expDownQ8 && s.q8Ffn ? s.q8Ffn.buffer.wasmPtr(s.q8Ffn) : -1;
+      const bQkFfnPtr =
+        expDownQ8K && bs.q8kFfn && bs.q8kFfn.buffer.isWasmBacked ? bs.q8kFfn.buffer.wasmPtr(bs.q8kFfn) : -1;
+      const bQFfnPtr =
+        expDownQ8 && bs.q8Ffn && bs.q8Ffn.buffer.isWasmBacked ? bs.q8Ffn.buffer.wasmPtr(bs.q8Ffn) : -1;
+      const qkFfnStride = (expFfnDim >>> 8) * Q8_K_ACT_BLOCK_BYTES;
+      const qFfnStride = (expFfnDim >>> 5) * Q8_0_ACT_BLOCK_BYTES;
+
+      const sGateOutPtr = useWasm ? s.ffnGate.buffer.wasmPtr(s.ffnGate) : -1;
+      const sUpOutPtr = useWasm ? s.ffnUp.buffer.wasmPtr(s.ffnUp) : -1;
+      const sHidPtr = useWasm ? s.ffnHidden.buffer.wasmPtr(s.ffnHidden) : -1;
+      const sExpProjPtr = useWasm ? expertProj.buffer.wasmPtr(expertProj) : -1;
+
+      const bGateOutPtr = useWasm ? bs.ffnGate.buffer.wasmPtr(bs.ffnGate) : -1;
+      const bUpOutPtr = useWasm ? bs.ffnUp.buffer.wasmPtr(bs.ffnUp) : -1;
+      const bHidPtr = useWasm ? bs.ffnHidden.buffer.wasmPtr(bs.ffnHidden) : -1;
+      // Reuse bs.attnProj ([B4 x dim], already consumed at attn_residual_b4) for Batch-4 expert down output
+      const bTmpProjPtr = useWasm ? bs.attnProj.buffer.wasmPtr(bs.attnProj) : -1;
+      const bTmpProjView = bs.attnProj.buffer.f32View(bs.attnProj);
+
+      const outAll = bs.ffnProj.buffer.f32View(bs.ffnProj);
+      outAll.fill(0);
+
+      const ge0 = moeGateUpGroupEntries[0];
+      const ge1 = moeGateUpGroupEntries[1];
+      const eOutView = expertProj.buffer.f32View(expertProj);
+
+      // 3. Process each unique routed expert ONCE across all matching tokens in the 4-token batch!
+      for (let u = 0; u < uniqueCount; u++) {
+        const expId = moeBatchExpIds[u];
+        const mask = moeBatchExpMask[u];
+        const exp = wp.acquireExpertSlice(layerIdx, expId);
+        const expWasm =
+          useWasm &&
+          arena !== null &&
+          exp.gate.buffer.isWasmBacked &&
+          exp.up.buffer.isWasmBacked &&
+          exp.down.buffer.isWasmBacked;
+
+        if (expWasm && arena) {
+          const gPtr = exp.gate.buffer.wasmPtr(exp.gate);
+          const uPtr = exp.up.buffer.wasmPtr(exp.up);
+          const dPtr = exp.down.buffer.wasmPtr(exp.down);
+          ge0.weightType = exp.gate.type;
+          ge0.wPtr = gPtr;
+          ge0.rows = expFfnDim;
+          ge0.oStrideBytes = expFfnDim * 4;
+          ge1.weightType = exp.up.type;
+          ge1.wPtr = uPtr;
+          ge1.rows = expFfnDim;
+          ge1.oStrideBytes = expFfnDim * 4;
+
+          if (mask === 0b1111) {
+            // All 4 tokens routed to this expert -> true Batch-4 weight-amortized contraction!
+            ge0.outPtr = bGateOutPtr;
+            ge1.outPtr = bUpOutPtr;
+            if (expInQ8K) {
+              arena.mulMatBatch4Q8KGroup(moeGateUpGroupEntries, bQkDimPtr, bXNormPtr, dim);
+            } else {
+              arena.mulMatBatch4Q8Group(moeGateUpGroupEntries, expInQ8 ? bQDimPtr : bXNormPtr, bXNormPtr, dim, expInQ8);
+            }
+            arena.kernels.swiglu_f32(bGateOutPtr, bUpOutPtr, bHidPtr, B4 * expFfnDim);
+            if (expDownQ8K && bQkFfnPtr >= 0) {
+              for (let t = 0; t < B4; t++) {
+                arena.quantizeActivationQ8K(bHidPtr + t * expFfnDim * 4, bQkFfnPtr + t * qkFfnStride, expFfnDim);
+              }
+              arena.mulMatBatchQ8K(exp.down.type, dPtr, bQkFfnPtr, bHidPtr, bTmpProjPtr, expFfnDim, dim, B4);
+            } else if (expDownQ8 && bQFfnPtr >= 0) {
+              for (let t = 0; t < B4; t++) {
+                arena.quantizeActivation(bHidPtr + t * expFfnDim * 4, bQFfnPtr + t * qFfnStride, expFfnDim);
+              }
+              arena.mulMatBatchQ8(exp.down.type, dPtr, bQFfnPtr, bHidPtr, bTmpProjPtr, expFfnDim, dim, B4);
+            } else {
+              arena.mulMatBatch(exp.down.type, dPtr, bHidPtr, bTmpProjPtr, expFfnDim, dim, B4);
+            }
+            for (let t = 0; t < B4; t++) {
+              const weight = moeBatchExpWeights[u * B4 + t];
+              const base = t * dim;
+              for (let i = 0; i < dim; i++) {
+                outAll[base + i] += weight * bTmpProjView[base + i];
+              }
+            }
+          } else {
+            // 1..3 tokens routed to this expert -> weights stay hot in L1/L2 across matching tokens!
+            ge0.outPtr = sGateOutPtr;
+            ge1.outPtr = sUpOutPtr;
+            for (let t = 0; t < B4; t++) {
+              if ((mask & (1 << t)) === 0) continue;
+              const weight = moeBatchExpWeights[u * B4 + t];
+              const txPtr = bXNormPtr + t * xStrideBytes;
+              if (expInQ8K) {
+                arena.mulMatQ8KGroup(moeGateUpGroupEntries, bQkDimPtr + t * qkDimStride, txPtr, dim);
+              } else {
+                arena.mulMatQ8Group(
+                  moeGateUpGroupEntries,
+                  expInQ8 ? bQDimPtr + t * qDimStride : txPtr,
+                  txPtr,
+                  dim,
+                  expInQ8,
+                );
+              }
+              arena.kernels.swiglu_f32(sGateOutPtr, sUpOutPtr, sHidPtr, expFfnDim);
+              if (expDownQ8K) {
+                arena.quantizeActivationQ8K(sHidPtr, qkFfnPtr, expFfnDim);
+                arena.mulMatQ8K(exp.down.type, dPtr, qkFfnPtr, sHidPtr, sExpProjPtr, expFfnDim, dim);
+              } else if (expDownQ8) {
+                arena.quantizeActivation(sHidPtr, qFfnPtr, expFfnDim);
+                arena.mulMatQ8(exp.down.type, dPtr, qFfnPtr, sHidPtr, sExpProjPtr, expFfnDim, dim);
+              } else {
+                arena.mulMat(exp.down.type, dPtr, sHidPtr, sExpProjPtr, expFfnDim, dim);
+              }
+              const base = t * dim;
+              for (let i = 0; i < dim; i++) {
+                outAll[base + i] += weight * eOutView[i];
+              }
+            }
+          }
+        } else {
+          const gView = s.ffnGate.buffer.f32View(s.ffnGate).subarray(0, expFfnDim);
+          const uView = s.ffnUp.buffer.f32View(s.ffnUp).subarray(0, expFfnDim);
+          const hView = s.ffnHidden.buffer.f32View(s.ffnHidden).subarray(0, expFfnDim);
+          for (let t = 0; t < B4; t++) {
+            if ((mask & (1 << t)) === 0) continue;
+            const weight = moeBatchExpWeights[u * B4 + t];
+            const xView = xAll.subarray(t * dim, (t + 1) * dim);
+            verdantMulMat(exp.gate.buffer.rawBytes(), exp.gate.byteOffset, exp.gate.type, dim, expFfnDim, xView, gView);
+            verdantMulMat(exp.up.buffer.rawBytes(), exp.up.byteOffset, exp.up.type, dim, expFfnDim, xView, uView);
+            verdantSwiGlu(gView, uView, hView, expFfnDim);
+            verdantMulMat(exp.down.buffer.rawBytes(), exp.down.byteOffset, exp.down.type, expFfnDim, dim, hView, eOutView);
+            const base = t * dim;
+            for (let i = 0; i < dim; i++) {
+              outAll[base + i] += weight * eOutView[i];
+            }
+          }
+        }
+      }
+    };
+
+    const runSparseMoeBatch4 = (
+      layerIdx: number,
+      routerWeight: VTensorHandle,
+      expFfnDim: number,
+    ): void => {
+      const uniqueCount = routeSparseMoeBatch4(routerWeight);
+      executeSparseMoeBatch4Routed(layerIdx, expFfnDim, uniqueCount);
+    };
     const embdInfo = this.embdInfo!;
     const outWeightInfo = this.outWeightInfo!;
     const embdTrait = getGgmlTypeTrait(embdInfo.type);
@@ -1315,9 +2208,30 @@ export class LlamaVTensorRuntime {
       pushOp(`blk.${l}.attn_k`, li.attnK, 3);
       pushOp(`blk.${l}.attn_v`, li.attnV, 3);
       pushOp(`blk.${l}.attn_output`, li.attnOutput, 1);
-      pushOp(`blk.${l}.ffn_gate`, li.ffnGate, 2);
-      pushOp(`blk.${l}.ffn_up`, li.ffnUp, 2);
-      pushOp(`blk.${l}.ffn_down`, li.ffnDown, 1);
+      if (li.ffnGateInp && li.ffnGateExps && li.ffnUpExps && li.ffnDownExps) {
+        pushOp(`blk.${l}.ffn_gate_inp`, li.ffnGateInp, 1);
+        const nExp = Math.max(1, hp.expertCount ?? li.ffnGateExps.dims[2] ?? 1);
+        const expUsed = Math.max(1, hp.expertUsedCount ?? 1);
+        const pushMoeExp = (label: string, info: GgufTensorInfo, groupSize: number) => {
+          scheduleOps.push({
+            label,
+            weightType: info.type,
+            rows: info.dims[1] ?? 1,
+            cols: info.dims[0] ?? 1,
+            batchSize: expUsed,
+            groupSize,
+            weightBytes: Math.ceil((info.byteSize / nExp) * expUsed),
+            gpuResident: false,
+          });
+        };
+        pushMoeExp(`blk.${l}.ffn_gate_exps`, li.ffnGateExps, 2);
+        pushMoeExp(`blk.${l}.ffn_up_exps`, li.ffnUpExps, 2);
+        pushMoeExp(`blk.${l}.ffn_down_exps`, li.ffnDownExps, 1);
+      } else if (li.ffnGate && li.ffnUp && li.ffnDown) {
+        pushOp(`blk.${l}.ffn_gate`, li.ffnGate, 2);
+        pushOp(`blk.${l}.ffn_up`, li.ffnUp, 2);
+        pushOp(`blk.${l}.ffn_down`, li.ffnDown, 1);
+      }
     }
     scheduleOps.push({
       label: 'output.weight',
@@ -1684,24 +2598,36 @@ export class LlamaVTensorRuntime {
       },
     });
 
+    const singleAsyncLayers: AsyncLayerPlan[] = [];
+
     for (let l = 0; l < layerCount; l++) {
       const layerIdx = l;
       const info = this.layerInfos[l];
       const hot = isPaged ? wp.getHotLayer(l) : residentLayers![l];
       const lw = isPaged ? null : residentLayers![l];
+      let singleLayerAcquireNode: GgmlGraphNode | null = null;
 
       if (isPaged) {
         // Single DIMM publication for all 7 projections in layer `l` (afflom/vRAM 3f27a941)
-        singleNodes.push({
+        singleLayerAcquireNode = {
           op: GgmlOp.CPY,
           label: `blk.${l}.vram_dimm_acquire`,
           shapeDesc: `vRAM DIMM L${l} -> frame`,
-          srcType: wp.backingKind === 'opfs-sync' ? 'OPFS DIMM' : 'vRAM DIMM',
+          srcType:
+            wp.backingKind === 'opfs-sync'
+              ? 'OPFS DIMM'
+              : wp.backingKind === 'opfs-demand'
+                ? 'OPFS Demand'
+                : wp.backingKind === 'local-file-sync'
+                  ? 'Local Disk'
+                  : 'vRAM DIMM',
           execute: () => {
             singleActivePub.current = wp.acquireLayer(layerIdx);
           },
-        });
+        };
+        singleNodes.push(singleLayerAcquireNode);
       }
+      const singlePreMoeStartIdx = singleNodes.length;
 
       const allAttnQ8K =
         canQ8K(info.attnQ.type, dim, s.q8kDim) &&
@@ -1943,86 +2869,153 @@ export class LlamaVTensorRuntime {
         b.nodeRmsNorm(`blk.${l}.ffn_norm`, s.x, hot.ffnNorm, s.xNorm, hp.rmsNormEps),
       );
 
-      const allFfnInQ8K =
-        canQ8K(info.ffnGate.type, dim, s.q8kDim) && canQ8K(info.ffnUp.type, dim, s.q8kDim);
-      const anyFfnInQ8 =
-        !allFfnInQ8K &&
-        useQ8 &&
-        s.q8Dim !== null &&
-        arena !== null &&
-        (arena.supportsQ8Activation(info.ffnGate.type) || arena.supportsQ8Activation(info.ffnUp.type));
-      if (allFfnInQ8K && s.q8kDim) {
-        singleNodes.push(b.nodeQuantizeQ8K(`blk.${l}.q8k_ffn_in`, s.xNorm, s.q8kDim, dim));
-        singleBodyTally.q8kOps += 2;
-        singleBodyTally.q8kSb += (ffnDim * 2) * (dim >>> 8);
-      } else if (anyFfnInQ8 && s.q8Dim) {
-        singleNodes.push(b.nodeQuantizeQ8(`blk.${l}.q8_ffn_in`, s.xNorm, s.q8Dim, dim));
-        singleBodyTally.q80Ops += 2;
-      } else {
-        singleBodyTally.strictOps += 2;
-      }
-      singleBodyTally.fusedBarriers += 1;
+      const singlePreMoeNodes = singleNodes.slice(singlePreMoeStartIdx);
 
-      singleNodes.push(
-        isPaged
-          ? makePagedSingleLinearGroup(
-              `blk.${l}.ffn_gate_up`,
-              [
-                { info: info.ffnGate, selectHandle: (p) => p.ffnGate, out: s.ffnGate },
-                { info: info.ffnUp, selectHandle: (p) => p.ffnUp, out: s.ffnUp },
-              ],
-              singleActivePub,
-              s.q8Dim,
-              s.q8kDim,
-              s.xNorm,
-              anyFfnInQ8,
-              allFfnInQ8K,
-            )
-          : makeSingleLinearGroup(
-              `blk.${l}.ffn_gate_up`,
-              [
-                { weight: lw!.ffnGate, out: s.ffnGate },
-                { weight: lw!.ffnUp, out: s.ffnUp },
-              ],
-              s.q8Dim,
-              s.q8kDim,
-              s.xNorm,
-              anyFfnInQ8,
-              allFfnInQ8K,
-            ),
-        b.nodeSwiGlu(`blk.${l}.ffn_swiglu`, s.ffnGate, s.ffnUp, s.ffnHidden),
-      );
-
-      const ffnDownQ8K = canQ8K(info.ffnDown.type, ffnDim, s.q8kFfn);
-      if (ffnDownQ8K && s.q8kFfn) {
-        singleNodes.push(b.nodeQuantizeQ8K(`blk.${l}.q8k_ffn_down`, s.ffnHidden, s.q8kFfn, ffnDim));
-        singleBodyTally.q8kOps += 1;
-        singleBodyTally.q8kSb += dim * (ffnDim >>> 8);
-      } else if (useQ8 && s.q8Ffn && arena?.supportsQ8Activation(info.ffnDown.type)) {
-        singleNodes.push(b.nodeQuantizeQ8(`blk.${l}.q8_ffn_down`, s.ffnHidden, s.q8Ffn, ffnDim));
-        singleBodyTally.q80Ops += 1;
+      if (info.ffnGateInp && info.ffnGateExps && info.ffnUpExps && info.ffnDownExps) {
+        const expFfnDim = info.ffnGateExps.dims[1] ?? ffnDim;
+        const nExps = info.ffnGateExps.dims[2] ?? hp.expertCount ?? 1;
+        const expTrait = getGgmlTypeTrait(info.ffnGateExps.type);
+        const residualNode = b.nodeAdd(`blk.${l}.ffn_residual`, s.x, s.ffnProj, s.x);
+        singleNodes.push(
+          {
+            op: GgmlOp.MUL_MAT,
+            label: `blk.${l}.ffn_moe_sparse`,
+            shapeDesc: `Top-${Math.min(moeTopK, nExps)}/${nExps} × [${expFfnDim}×${dim}] (vRAM MoE)`,
+            srcType: `${expTrait.name} Sparse MoE`,
+            execute: () => {
+              const routerW = isPaged ? singleActivePub.current!.ffnGateInp! : lw!.ffnGateInp!;
+              runSparseMoeSingle(layerIdx, routerW, s.xNorm, 0, s.q8Dim, s.q8kDim, s.ffnProj, 0, expFfnDim);
+            },
+          },
+          residualNode,
+        );
+        singleAsyncLayers.push({
+          layerIdx,
+          acquireNode: singleLayerAcquireNode,
+          preMoeNodes: singlePreMoeNodes,
+          moe: {
+            routeAndGetExperts: () => {
+              const routerW = isPaged ? singleActivePub.current!.ffnGateInp! : lw!.ffnGateInp!;
+              const kUsed = routeSparseMoeSingle(routerW, s.xNorm, 0);
+              const expertIds: number[] = [];
+              for (let k = 0; k < kUsed; k++) {
+                const id = moeTopIds[k];
+                if (id >= 0 && moeTopProbs[k] !== 0) {
+                  expertIds.push(id);
+                }
+              }
+              return { count: kUsed, expertIds };
+            },
+            executeRouted: (kUsed: number) => {
+              executeSparseMoeSingleRouted(
+                layerIdx,
+                s.xNorm,
+                0,
+                s.q8Dim,
+                s.q8kDim,
+                s.ffnProj,
+                0,
+                expFfnDim,
+                kUsed,
+              );
+            },
+            residualNode,
+          },
+          denseFfnNodes: [],
+        });
       } else {
-        singleBodyTally.strictOps += 1;
+        const singleDenseStartIdx = singleNodes.length;
+        const ffnGateInfo = info.ffnGate!;
+        const ffnUpInfo = info.ffnUp!;
+        const ffnDownInfo = info.ffnDown!;
+        const allFfnInQ8K =
+          canQ8K(ffnGateInfo.type, dim, s.q8kDim) && canQ8K(ffnUpInfo.type, dim, s.q8kDim);
+        const anyFfnInQ8 =
+          !allFfnInQ8K &&
+          useQ8 &&
+          s.q8Dim !== null &&
+          arena !== null &&
+          (arena.supportsQ8Activation(ffnGateInfo.type) || arena.supportsQ8Activation(ffnUpInfo.type));
+        if (allFfnInQ8K && s.q8kDim) {
+          singleNodes.push(b.nodeQuantizeQ8K(`blk.${l}.q8k_ffn_in`, s.xNorm, s.q8kDim, dim));
+          singleBodyTally.q8kOps += 2;
+          singleBodyTally.q8kSb += (ffnDim * 2) * (dim >>> 8);
+        } else if (anyFfnInQ8 && s.q8Dim) {
+          singleNodes.push(b.nodeQuantizeQ8(`blk.${l}.q8_ffn_in`, s.xNorm, s.q8Dim, dim));
+          singleBodyTally.q80Ops += 2;
+        } else {
+          singleBodyTally.strictOps += 2;
+        }
+        singleBodyTally.fusedBarriers += 1;
+
+        singleNodes.push(
+          isPaged
+            ? makePagedSingleLinearGroup(
+                `blk.${l}.ffn_gate_up`,
+                [
+                  { info: ffnGateInfo, selectHandle: (p) => p.ffnGate!, out: s.ffnGate },
+                  { info: ffnUpInfo, selectHandle: (p) => p.ffnUp!, out: s.ffnUp },
+                ],
+                singleActivePub,
+                s.q8Dim,
+                s.q8kDim,
+                s.xNorm,
+                anyFfnInQ8,
+                allFfnInQ8K,
+              )
+            : makeSingleLinearGroup(
+                `blk.${l}.ffn_gate_up`,
+                [
+                  { weight: lw!.ffnGate!, out: s.ffnGate },
+                  { weight: lw!.ffnUp!, out: s.ffnUp },
+                ],
+                s.q8Dim,
+                s.q8kDim,
+                s.xNorm,
+                anyFfnInQ8,
+                allFfnInQ8K,
+              ),
+          b.nodeSwiGlu(`blk.${l}.ffn_swiglu`, s.ffnGate, s.ffnUp, s.ffnHidden),
+        );
+
+        const ffnDownQ8K = canQ8K(ffnDownInfo.type, ffnDim, s.q8kFfn);
+        if (ffnDownQ8K && s.q8kFfn) {
+          singleNodes.push(b.nodeQuantizeQ8K(`blk.${l}.q8k_ffn_down`, s.ffnHidden, s.q8kFfn, ffnDim));
+          singleBodyTally.q8kOps += 1;
+          singleBodyTally.q8kSb += dim * (ffnDim >>> 8);
+        } else if (useQ8 && s.q8Ffn && arena?.supportsQ8Activation(ffnDownInfo.type)) {
+          singleNodes.push(b.nodeQuantizeQ8(`blk.${l}.q8_ffn_down`, s.ffnHidden, s.q8Ffn, ffnDim));
+          singleBodyTally.q80Ops += 1;
+        } else {
+          singleBodyTally.strictOps += 1;
+        }
+        singleNodes.push(
+          isPaged
+            ? makePagedSingleLinear(
+                `blk.${l}.ffn_down`,
+                ffnDownInfo,
+                singleActivePub,
+                (p) => p.ffnDown!,
+                s.q8Ffn,
+                s.q8kFfn,
+                s.ffnHidden,
+                s.ffnProj,
+              )
+            : makeSingleLinear(`blk.${l}.ffn_down`, lw!.ffnDown!, s.q8Ffn, s.q8kFfn, s.ffnHidden, s.ffnProj),
+          b.nodeAdd(`blk.${l}.ffn_residual`, s.x, s.ffnProj, s.x),
+        );
+        singleAsyncLayers.push({
+          layerIdx,
+          acquireNode: singleLayerAcquireNode,
+          preMoeNodes: singlePreMoeNodes,
+          denseFfnNodes: singleNodes.slice(singleDenseStartIdx),
+        });
       }
-      singleNodes.push(
-        isPaged
-          ? makePagedSingleLinear(
-              `blk.${l}.ffn_down`,
-              info.ffnDown,
-              singleActivePub,
-              (p) => p.ffnDown,
-              s.q8Ffn,
-              s.q8kFfn,
-              s.ffnHidden,
-              s.ffnProj,
-            )
-          : makeSingleLinear(`blk.${l}.ffn_down`, lw!.ffnDown, s.q8Ffn, s.q8kFfn, s.ffnHidden, s.ffnProj),
-        b.nodeAdd(`blk.${l}.ffn_residual`, s.x, s.ffnProj, s.x),
-      );
     }
 
     // Record exact boundary before LM head so non-final prefill tokens can skip output.weight!
     this.singleGraphBodyNodeCount = singleNodes.length;
+    const lmNormStartIdx = singleNodes.length;
 
     singleNodes.push(b.nodeRmsNorm('output_norm', s.x, wp.outputNorm, s.xNorm, hp.rmsNormEps));
     const lmHeadQ8K = canQ8K(outWeightInfo.type, dim, s.q8kDim);
@@ -2037,10 +3030,22 @@ export class LlamaVTensorRuntime {
       singleLmTally.strictOps = 1;
     }
 
+    const lmNormAndQuantNodes = singleNodes.slice(lmNormStartIdx);
+    let pinnedLmHeadNode: GgmlGraphNode | null = null;
+    let executeLmHeadStripe:
+      | ((weightStripe: VTensorHandle, rowStart: number, rowCount: number) => void)
+      | null = null;
+
     if (pinnedOutputWeight) {
-      singleNodes.push(
-        makeSingleLinear('output.weight', pinnedOutputWeight, s.q8Dim, s.q8kDim, s.xNorm, s.logits),
+      pinnedLmHeadNode = makeSingleLinear(
+        'output.weight',
+        pinnedOutputWeight,
+        s.q8Dim,
+        s.q8kDim,
+        s.xNorm,
+        s.logits,
       );
+      singleNodes.push(pinnedLmHeadNode);
     } else {
       // Row-striped OPFS LM-head streaming: bit-exact logits inside a bounded <= 6 MiB WASM tile!
       const outCols = outWeightInfo.dims[0] ?? dim;
@@ -2064,6 +3069,31 @@ export class LlamaVTensorRuntime {
       const xPtr = useWasmLm ? s.xNorm.buffer.wasmPtr(s.xNorm) : -1;
       const oBasePtr = useWasmLm ? s.logits.buffer.wasmPtr(s.logits) : -1;
 
+      const runLmHeadStripe = (weightStripe: VTensorHandle, rowStart: number, rowCount: number) => {
+        if (useWasmLm && arena && weightStripe.buffer.isWasmBacked) {
+          const wPtr = weightStripe.buffer.wasmPtr(weightStripe);
+          const stripeOutPtr = oBasePtr + rowStart * 4;
+          if (useLmQ8K) {
+            arena.mulMatQ8K(weightStripe.type, wPtr, qkPtr, xPtr, stripeOutPtr, outCols, rowCount);
+          } else if (useLmQ8) {
+            arena.mulMatQ8(weightStripe.type, wPtr, qPtr, xPtr, stripeOutPtr, outCols, rowCount);
+          } else {
+            arena.mulMat(weightStripe.type, wPtr, xPtr, stripeOutPtr, outCols, rowCount);
+          }
+        } else {
+          verdantMulMat(
+            weightStripe.buffer.rawBytes(),
+            weightStripe.byteOffset,
+            weightStripe.type,
+            outCols,
+            rowCount,
+            s.xNorm.buffer.f32View(s.xNorm),
+            s.logits.buffer.f32View(s.logits).subarray(rowStart, rowStart + rowCount),
+          );
+        }
+      };
+      executeLmHeadStripe = runLmHeadStripe;
+
       singleNodes.push({
         op: GgmlOp.MUL_MAT,
         label: 'output.weight',
@@ -2074,34 +3104,19 @@ export class LlamaVTensorRuntime {
             ? `${outTrait.name}×Q8 ${arena.relaxedSimdActive ? 'VNNI' : 'Int8'} OPFS`
             : `${outTrait.name}×F32 OPFS`,
         execute: () => {
-          wp.forEachLmHeadStripe((weightStripe, rowStart, rowCount) => {
-            if (useWasmLm && arena && weightStripe.buffer.isWasmBacked) {
-              const wPtr = weightStripe.buffer.wasmPtr(weightStripe);
-              const stripeOutPtr = oBasePtr + rowStart * 4;
-              if (useLmQ8K) {
-                arena.mulMatQ8K(weightStripe.type, wPtr, qkPtr, xPtr, stripeOutPtr, outCols, rowCount);
-              } else if (useLmQ8) {
-                arena.mulMatQ8(weightStripe.type, wPtr, qPtr, xPtr, stripeOutPtr, outCols, rowCount);
-              } else {
-                arena.mulMat(weightStripe.type, wPtr, xPtr, stripeOutPtr, outCols, rowCount);
-              }
-            } else {
-              verdantMulMat(
-                weightStripe.buffer.rawBytes(),
-                weightStripe.byteOffset,
-                weightStripe.type,
-                outCols,
-                rowCount,
-                s.xNorm.buffer.f32View(s.xNorm),
-                s.logits.buffer.f32View(s.logits).subarray(rowStart, rowStart + rowCount),
-              );
-            }
-          });
+          wp.forEachLmHeadStripe(runLmHeadStripe);
         },
       });
     }
 
     this.compiledSingleGraph = b.compileGraph(singleNodes);
+    this.singleAsyncPlan = {
+      embedNode: singleNodes[0],
+      layers: singleAsyncLayers,
+      lmNormAndQuantNodes,
+      pinnedLmHeadNode,
+      executeLmHeadStripe,
+    };
     this.prismSingleBodyTally = singleBodyTally;
     this.prismSingleLmTally = singleLmTally;
 
@@ -2548,7 +3563,7 @@ export class LlamaVTensorRuntime {
       };
     };
 
-    batchNodes.push({
+    const batchEmbedNode: GgmlGraphNode = {
       op: GgmlOp.GET_ROWS,
       label: 'token_embd.get_rows_b4',
       shapeDesc: wp.streamEmbeddings ? `[${B}×${dim}] <- OPFS` : `[${B}×${dim}]`,
@@ -2581,7 +3596,11 @@ export class LlamaVTensorRuntime {
           }
         }
       },
-    });
+    };
+    batchNodes.push(batchEmbedNode);
+    const batchLayerAcquireNodes: Array<GgmlGraphNode | null> = new Array(layerCount).fill(null);
+    const batchLayerBodyNodes: GgmlGraphNode[][] = new Array(layerCount);
+    const batchAsyncLayers: AsyncLayerPlan[] = [];
 
     for (let l = 0; l < layerCount; l++) {
       const layerIdx = l;
@@ -2592,17 +3611,27 @@ export class LlamaVTensorRuntime {
       const bAttnOutBasePtr = bs.attnOut.buffer.wasmPtr(bs.attnOut);
 
       if (isPaged) {
-        // Amortizes ONE OPFS coalesced layer restore across all B* = 4 prefill tokens!
-        batchNodes.push({
+        // Amortizes ONE OPFS coalesced layer restore across all B* = 4 (or Layer-Major C = 32) prefill tokens!
+        const acqNode: GgmlGraphNode = {
           op: GgmlOp.CPY,
           label: `blk.${l}.vram_dimm_acquire_b4`,
           shapeDesc: `vRAM DIMM L${l} -> B${B} frame`,
-          srcType: wp.backingKind === 'opfs-sync' ? 'OPFS DIMM B4' : 'vRAM DIMM B4',
+          srcType:
+            wp.backingKind === 'opfs-sync'
+              ? 'OPFS DIMM B4'
+              : wp.backingKind === 'opfs-demand'
+                ? 'OPFS Demand B4'
+                : wp.backingKind === 'local-file-sync'
+                  ? 'Local Disk B4'
+                  : 'vRAM DIMM B4',
           execute: () => {
             batchActivePub.current = wp.acquireLayer(layerIdx);
           },
-        });
+        };
+        batchLayerAcquireNodes[l] = acqNode;
+        batchNodes.push(acqNode);
       }
+      const layerBodyStartIdx = batchNodes.length;
 
       batchNodes.push(makeBatchRmsNorm(`blk.${l}.attn_norm_b4`, bs.x, hot.attnNorm, bs.xNorm));
       const allAttnQ8K =
@@ -2911,108 +3940,13 @@ export class LlamaVTensorRuntime {
         makeBatchRmsNorm(`blk.${l}.ffn_norm_b4`, bs.x, hot.ffnNorm, bs.xNorm),
       );
 
-      const allFfnInB4Q8K =
-        canQ8K(info.ffnGate.type, dim, bs.q8kDim) && canQ8K(info.ffnUp.type, dim, bs.q8kDim);
-      const anyFfnInQ8 =
-        !allFfnInB4Q8K &&
-        useQ8 &&
-        bs.q8Dim !== null &&
-        arena !== null &&
-        (arena.supportsQ8Activation(info.ffnGate.type) || arena.supportsQ8Activation(info.ffnUp.type));
-      if (allFfnInB4Q8K && bs.q8kDim) {
-        batchNodes.push(makeBatchQuantizeQ8K(`blk.${l}.q8k_ffn_in_b4`, bs.xNorm, bs.q8kDim, dim));
-        batch4Tally.q8kOps += 2;
-        batch4Tally.q8kSb += (ffnDim * 2) * (dim >>> 8) * B;
-      } else if (anyFfnInQ8 && bs.q8Dim) {
-        batchNodes.push(makeBatchQuantizeQ8(`blk.${l}.q8_ffn_in_b4`, bs.xNorm, bs.q8Dim, dim));
-        batch4Tally.q80Ops += 2;
-      } else {
-        batch4Tally.strictOps += 2;
-      }
-      batch4Tally.fusedBarriers += 1;
+      const batchPreMoeNodes = batchNodes.slice(layerBodyStartIdx);
 
-      batchNodes.push(
-        isPaged
-          ? makePagedBatchLinearGroup(
-              `blk.${l}.ffn_gate_up_b4`,
-              [
-                { info: info.ffnGate, selectHandle: (p) => p.ffnGate, outBatch: bs.ffnGate },
-                { info: info.ffnUp, selectHandle: (p) => p.ffnUp, outBatch: bs.ffnUp },
-              ],
-              bs.q8Dim,
-              bs.q8kDim,
-              bs.xNorm,
-              anyFfnInQ8,
-              allFfnInB4Q8K,
-            )
-          : makeBatchLinearGroup(
-              `blk.${l}.ffn_gate_up_b4`,
-              [
-                { weight: lw!.ffnGate, outBatch: bs.ffnGate },
-                { weight: lw!.ffnUp, outBatch: bs.ffnUp },
-              ],
-              bs.q8Dim,
-              bs.q8kDim,
-              bs.xNorm,
-              anyFfnInQ8,
-              allFfnInB4Q8K,
-            ),
-        {
-          op: GgmlOp.SWIGLU,
-          label: `blk.${l}.ffn_swiglu_b4`,
-          shapeDesc: `[${B}×${ffnDim}]`,
-          srcType: useBatchAddSimd ? 'F32 SIMD' : 'F32',
-          execute: () => {
-            if (useBatchAddSimd && arena) {
-              arena.kernels.swiglu_f32(
-                bs.ffnGate.buffer.wasmPtr(bs.ffnGate),
-                bs.ffnUp.buffer.wasmPtr(bs.ffnUp),
-                bs.ffnHidden.buffer.wasmPtr(bs.ffnHidden),
-                B * ffnDim,
-              );
-            } else {
-              verdantSwiGlu(
-                bs.ffnGate.buffer.f32View(bs.ffnGate),
-                bs.ffnUp.buffer.f32View(bs.ffnUp),
-                bs.ffnHidden.buffer.f32View(bs.ffnHidden),
-                B * ffnDim,
-              );
-            }
-          },
-        },
-      );
-
-      const ffnDownB4Q8K = canQ8K(info.ffnDown.type, ffnDim, bs.q8kFfn);
-      if (ffnDownB4Q8K && bs.q8kFfn) {
-        batchNodes.push(makeBatchQuantizeQ8K(`blk.${l}.q8k_ffn_down_b4`, bs.ffnHidden, bs.q8kFfn, ffnDim));
-        batch4Tally.q8kOps += 1;
-        batch4Tally.q8kSb += dim * (ffnDim >>> 8) * B;
-      } else if (useQ8 && bs.q8Ffn && arena?.supportsQ8Activation(info.ffnDown.type)) {
-        batchNodes.push(makeBatchQuantizeQ8(`blk.${l}.q8_ffn_down_b4`, bs.ffnHidden, bs.q8Ffn, ffnDim));
-        batch4Tally.q80Ops += 1;
-      } else {
-        batch4Tally.strictOps += 1;
-      }
-      batchNodes.push(
-        isPaged
-          ? makePagedBatchMulMat(
-              `blk.${l}.ffn_down_b4`,
-              info.ffnDown,
-              (p) => p.ffnDown,
-              bs.q8Ffn,
-              bs.q8kFfn,
-              bs.ffnHidden,
-              bs.ffnProj,
-            )
-          : makeBatchMulMat(
-              `blk.${l}.ffn_down_b4`,
-              lw!.ffnDown,
-              bs.q8Ffn,
-              bs.q8kFfn,
-              bs.ffnHidden,
-              bs.ffnProj,
-            ),
-        {
+      if (info.ffnGateInp && info.ffnGateExps && info.ffnUpExps && info.ffnDownExps) {
+        const expFfnDim = info.ffnGateExps.dims[1] ?? ffnDim;
+        const nExps = info.ffnGateExps.dims[2] ?? hp.expertCount ?? 1;
+        const expTrait = getGgmlTypeTrait(info.ffnGateExps.type);
+        const batchResidualNode: GgmlGraphNode = {
           op: GgmlOp.ADD,
           label: `blk.${l}.ffn_residual_b4`,
           shapeDesc: `[${B}×${dim}]`,
@@ -3025,11 +3959,183 @@ export class LlamaVTensorRuntime {
               verdantAdd(bx, bs.ffnProj.buffer.f32View(bs.ffnProj), bx, B * dim);
             }
           },
-        },
-      );
+        };
+        batchNodes.push(
+          {
+            op: GgmlOp.MUL_MAT,
+            label: `blk.${l}.ffn_moe_sparse_b4`,
+            shapeDesc: `B${B} × Top-${Math.min(moeTopK, nExps)}/${nExps} × [${expFfnDim}×${dim}] (vRAM MoE)`,
+            srcType: `${expTrait.name} Sparse MoE B${B}`,
+            execute: () => {
+              const routerW = isPaged ? batchActivePub.current!.ffnGateInp! : lw!.ffnGateInp!;
+              runSparseMoeBatch4(layerIdx, routerW, expFfnDim);
+            },
+          },
+          batchResidualNode,
+        );
+        batchAsyncLayers.push({
+          layerIdx,
+          acquireNode: batchLayerAcquireNodes[l],
+          preMoeNodes: batchPreMoeNodes,
+          moe: {
+            routeAndGetExperts: () => {
+              const routerW = isPaged ? batchActivePub.current!.ffnGateInp! : lw!.ffnGateInp!;
+              const uniqueCount = routeSparseMoeBatch4(routerW);
+              const expertIds: number[] = [];
+              for (let u = 0; u < uniqueCount; u++) {
+                expertIds.push(moeBatchExpIds[u]);
+              }
+              return { count: uniqueCount, expertIds };
+            },
+            executeRouted: (uniqueCount: number) => {
+              executeSparseMoeBatch4Routed(layerIdx, expFfnDim, uniqueCount);
+            },
+            residualNode: batchResidualNode,
+          },
+          denseFfnNodes: [],
+        });
+      } else {
+        const batchDenseStartIdx = batchNodes.length;
+        const ffnGateInfo = info.ffnGate!;
+        const ffnUpInfo = info.ffnUp!;
+        const ffnDownInfo = info.ffnDown!;
+        const allFfnInB4Q8K =
+          canQ8K(ffnGateInfo.type, dim, bs.q8kDim) && canQ8K(ffnUpInfo.type, dim, bs.q8kDim);
+        const anyFfnInQ8 =
+          !allFfnInB4Q8K &&
+          useQ8 &&
+          bs.q8Dim !== null &&
+          arena !== null &&
+          (arena.supportsQ8Activation(ffnGateInfo.type) || arena.supportsQ8Activation(ffnUpInfo.type));
+        if (allFfnInB4Q8K && bs.q8kDim) {
+          batchNodes.push(makeBatchQuantizeQ8K(`blk.${l}.q8k_ffn_in_b4`, bs.xNorm, bs.q8kDim, dim));
+          batch4Tally.q8kOps += 2;
+          batch4Tally.q8kSb += (ffnDim * 2) * (dim >>> 8) * B;
+        } else if (anyFfnInQ8 && bs.q8Dim) {
+          batchNodes.push(makeBatchQuantizeQ8(`blk.${l}.q8_ffn_in_b4`, bs.xNorm, bs.q8Dim, dim));
+          batch4Tally.q80Ops += 2;
+        } else {
+          batch4Tally.strictOps += 2;
+        }
+        batch4Tally.fusedBarriers += 1;
+
+        batchNodes.push(
+          isPaged
+            ? makePagedBatchLinearGroup(
+                `blk.${l}.ffn_gate_up_b4`,
+                [
+                  { info: ffnGateInfo, selectHandle: (p) => p.ffnGate!, outBatch: bs.ffnGate },
+                  { info: ffnUpInfo, selectHandle: (p) => p.ffnUp!, outBatch: bs.ffnUp },
+                ],
+                bs.q8Dim,
+                bs.q8kDim,
+                bs.xNorm,
+                anyFfnInQ8,
+                allFfnInB4Q8K,
+              )
+            : makeBatchLinearGroup(
+                `blk.${l}.ffn_gate_up_b4`,
+                [
+                  { weight: lw!.ffnGate!, outBatch: bs.ffnGate },
+                  { weight: lw!.ffnUp!, outBatch: bs.ffnUp },
+                ],
+                bs.q8Dim,
+                bs.q8kDim,
+                bs.xNorm,
+                anyFfnInQ8,
+                allFfnInB4Q8K,
+              ),
+          {
+            op: GgmlOp.SWIGLU,
+            label: `blk.${l}.ffn_swiglu_b4`,
+            shapeDesc: `[${B}×${ffnDim}]`,
+            srcType: useBatchAddSimd ? 'F32 SIMD' : 'F32',
+            execute: () => {
+              if (useBatchAddSimd && arena) {
+                arena.kernels.swiglu_f32(
+                  bs.ffnGate.buffer.wasmPtr(bs.ffnGate),
+                  bs.ffnUp.buffer.wasmPtr(bs.ffnUp),
+                  bs.ffnHidden.buffer.wasmPtr(bs.ffnHidden),
+                  B * ffnDim,
+                );
+              } else {
+                verdantSwiGlu(
+                  bs.ffnGate.buffer.f32View(bs.ffnGate),
+                  bs.ffnUp.buffer.f32View(bs.ffnUp),
+                  bs.ffnHidden.buffer.f32View(bs.ffnHidden),
+                  B * ffnDim,
+                );
+              }
+            },
+          },
+        );
+
+        const ffnDownB4Q8K = canQ8K(ffnDownInfo.type, ffnDim, bs.q8kFfn);
+        if (ffnDownB4Q8K && bs.q8kFfn) {
+          batchNodes.push(makeBatchQuantizeQ8K(`blk.${l}.q8k_ffn_down_b4`, bs.ffnHidden, bs.q8kFfn, ffnDim));
+          batch4Tally.q8kOps += 1;
+          batch4Tally.q8kSb += dim * (ffnDim >>> 8) * B;
+        } else if (useQ8 && bs.q8Ffn && arena?.supportsQ8Activation(ffnDownInfo.type)) {
+          batchNodes.push(makeBatchQuantizeQ8(`blk.${l}.q8_ffn_down_b4`, bs.ffnHidden, bs.q8Ffn, ffnDim));
+          batch4Tally.q80Ops += 1;
+        } else {
+          batch4Tally.strictOps += 1;
+        }
+        batchNodes.push(
+          isPaged
+            ? makePagedBatchMulMat(
+                `blk.${l}.ffn_down_b4`,
+                ffnDownInfo,
+                (p) => p.ffnDown!,
+                bs.q8Ffn,
+                bs.q8kFfn,
+                bs.ffnHidden,
+                bs.ffnProj,
+              )
+            : makeBatchMulMat(
+                `blk.${l}.ffn_down_b4`,
+                lw!.ffnDown!,
+                bs.q8Ffn,
+                bs.q8kFfn,
+                bs.ffnHidden,
+                bs.ffnProj,
+              ),
+          {
+            op: GgmlOp.ADD,
+            label: `blk.${l}.ffn_residual_b4`,
+            shapeDesc: `[${B}×${dim}]`,
+            srcType: useBatchAddSimd ? 'F32 SIMD' : 'F32',
+            execute: () => {
+              if (useBatchAddSimd && arena) {
+                arena.kernels.add_f32(bxPtr, bFfnProjPtr, bxPtr, B * dim);
+              } else {
+                const bx = bs.x.buffer.f32View(bs.x);
+                verdantAdd(bx, bs.ffnProj.buffer.f32View(bs.ffnProj), bx, B * dim);
+              }
+            },
+          },
+        );
+        batchAsyncLayers.push({
+          layerIdx,
+          acquireNode: batchLayerAcquireNodes[l],
+          preMoeNodes: batchPreMoeNodes,
+          denseFfnNodes: batchNodes.slice(batchDenseStartIdx),
+        });
+      }
+      batchLayerBodyNodes[l] = batchNodes.slice(layerBodyStartIdx);
     }
 
     this.compiledBatch4Graph = b.compileGraph(batchNodes);
+    this.batchAsyncPlan = {
+      embedNode: batchEmbedNode,
+      layers: batchAsyncLayers,
+    };
+    this.batchEmbedNode = batchEmbedNode;
+    this.batchLayerAcquireNodes = batchLayerAcquireNodes;
+    this.batchLayerBodyNodes = batchLayerBodyNodes;
+    this.prefillChunkX = isPaged
+      ? new Float32Array(PREFILL_LAYER_MAJOR_MAX_MICROBATCHES * B * dim)
+      : null;
     this.prismBatch4Tally = batch4Tally;
   }
 
@@ -3133,7 +4239,15 @@ export class LlamaVTensorRuntime {
     signal?: AbortSignal,
     onProgress?: (progress: SpeculativePrefillProgress) => void,
   ): Promise<SpeculativePrefillResult> {
-    if (!this.tokenizer || !this.hparams || !this.kvPager || !prompt) {
+    // Never run background speculative prefill on network demand-paged models:
+    // warming even 1 prefix token would stream gigabytes of cold weights before the user prompts.
+    if (
+      !this.tokenizer ||
+      !this.hparams ||
+      !this.kvPager ||
+      !prompt ||
+      this.backingStore?.kind === 'opfs-demand'
+    ) {
       return {
         targetTokens: 0,
         readyTokens: 0,
@@ -3183,6 +4297,29 @@ export class LlamaVTensorRuntime {
         }
 
         const tStep0 = performance.now();
+        const chunkBatches =
+          this.backend.isWasmSimdActive && batchWidth >= PREFILL_BATCH_SIZE
+            ? this.computeLayerMajorMicroBatches(i, targetTokens.length)
+            : 0;
+        if (chunkBatches >= 2) {
+          const chunkTokens = chunkBatches * PREFILL_BATCH_SIZE;
+          this.evalPrefillChunkLayerMajor(targetTokens, i, i, chunkBatches);
+          for (let k = 0; k < chunkTokens; k++) {
+            this.cachedTokens.push(targetTokens[i + k]);
+          }
+          i += chunkTokens;
+          newlyPrefilled += chunkTokens;
+          this.commitFullPagesToUnifiedStore(this.cachedTokens);
+          onProgress?.({ readyTokens: i, targetTokens: targetTokens.length });
+          const stepUs = (performance.now() - tStep0) * 1000;
+          if (
+            i < targetTokens.length &&
+            this.frameBudget.recordStepAndShouldYield(stepUs, SPECULATIVE_SLICE_BUDGET_US, 2)
+          ) {
+            await this.yielder.yieldNow();
+          }
+          continue;
+        }
         if (
           this.backend.isWasmSimdActive &&
           batchWidth >= PREFILL_BATCH_SIZE &&
@@ -3317,6 +4454,420 @@ export class LlamaVTensorRuntime {
   }
 
   /**
+   * Computes how many Batch-4 micro-batches (`2..8`, i.e., `8..32` tokens) can execute in a single
+   * Layer-Major OPFS-Paged prefill chunk starting at `startPos` while keeping every touched KV page
+   * simultaneously HOT_RESIDENT across all layers (zero mid-chunk partial-layer KV evictions!).
+   */
+  private computeLayerMajorMicroBatches(startPos: number, endExclusive: number): number {
+    if (
+      !this.weightPager ||
+      this.weightPager.residencyMode !== 'opfs-paged' ||
+      !this.kvPager ||
+      !this.batchEmbedNode ||
+      !this.prefillChunkX ||
+      this.batchLayerBodyNodes.length === 0
+    ) {
+      return 0;
+    }
+    const maxAvailBatches = Math.min(
+      PREFILL_LAYER_MAJOR_MAX_MICROBATCHES,
+      Math.floor((endExclusive - startPos) / PREFILL_BATCH_SIZE),
+    );
+    if (maxAvailBatches < 2) return 0;
+
+    const startPage = Math.floor(startPos / VRAM_KV_PAGE_TOKENS);
+    const maxPagesInChunk = Math.max(1, this.kvPager.hotFrameLimit - (startPage > 0 ? 1 : 0));
+    let m = maxAvailBatches;
+    while (m >= 2) {
+      const endPos = startPos + m * PREFILL_BATCH_SIZE - 1;
+      const endPage = Math.floor(endPos / VRAM_KV_PAGE_TOKENS);
+      if (endPage - startPage + 1 <= maxPagesInChunk) {
+        return m;
+      }
+      m -= 1;
+    }
+    return 0;
+  }
+
+  /**
+   * Layer-Major Chunked Prefill for OPFS-Paged models (`C = 4 * microBatches`, up to 32 tokens):
+   * Acquires each transformer layer from OPFS ONCE for the entire `C`-token chunk, cutting OPFS
+   * weight I/O during multi-token prompt prefill by up to 8× with mathematically bit-exact KV state!
+   */
+  private evalPrefillChunkLayerMajor(
+    tokens: readonly number[],
+    offset: number,
+    startPos: number,
+    microBatches: number,
+  ): void {
+    const bs = this.batchScratch!;
+    const hp = this.hparams!;
+    const embedNode = this.batchEmbedNode!;
+    const chunkX = this.prefillChunkX!;
+    const batchFloats = PREFILL_BATCH_SIZE * hp.embeddingLength;
+    const bsXView = bs.x.buffer.f32View(bs.x);
+
+    // 1. Embed all micro-batches into compact chunkX staging slab (<= 640 KB even on 32B!)
+    for (let m = 0; m < microBatches; m++) {
+      const baseTok = offset + m * PREFILL_BATCH_SIZE;
+      this.batchExec.tokens[0] = tokens[baseTok];
+      this.batchExec.tokens[1] = tokens[baseTok + 1];
+      this.batchExec.tokens[2] = tokens[baseTok + 2];
+      this.batchExec.tokens[3] = tokens[baseTok + 3];
+      embedNode.execute();
+      chunkX.set(bsXView, m * batchFloats);
+    }
+
+    // 2. Sweep Layer-Major: restore layer `l` from OPFS ONCE, run all `microBatches` causally!
+    const layerCount = this.batchLayerBodyNodes.length;
+    for (let l = 0; l < layerCount; l++) {
+      const acqNode = this.batchLayerAcquireNodes[l];
+      if (acqNode) acqNode.execute();
+      const bodyNodes = this.batchLayerBodyNodes[l];
+      const nodeCount = bodyNodes.length;
+      for (let m = 0; m < microBatches; m++) {
+        const sliceStart = m * batchFloats;
+        bsXView.set(chunkX.subarray(sliceStart, sliceStart + batchFloats), 0);
+        this.batchExec.startPos = startPos + m * PREFILL_BATCH_SIZE;
+        for (let n = 0; n < nodeCount; n++) {
+          bodyNodes[n].execute();
+        }
+        chunkX.set(bsXView, sliceStart);
+      }
+    }
+
+    const b4 = this.prismBatch4Tally;
+    this.prismLedger.q8kDispatches += b4.q8kOps * microBatches;
+    this.prismLedger.q8kSuperBlocks += b4.q8kSb * microBatches;
+    this.prismLedger.q80Dispatches += b4.q80Ops * microBatches;
+    this.prismLedger.strictF32Dispatches += b4.strictOps * microBatches;
+    this.prismLedger.fusedGroupBarriers += b4.fusedBarriers * microBatches;
+  }
+
+  private static isAbortError(err: unknown): boolean {
+    if (!err) return false;
+    if (err instanceof DOMException && err.name === 'AbortError') return true;
+    if (err instanceof Error && err.name === 'AbortError') return true;
+    return false;
+  }
+
+  private static throwIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+  }
+
+  /**
+   * Async demand-paged single-token forward pass:
+   * Prefetches all missing embedding, layer, routed MoE expert, and LM-head stripe ranges
+   * concurrently via abortable `fetch()` before touching synchronous vRAM weight handles,
+   * eliminating blocking sync XHRs and enabling live layer progress + instant Stop cancellation.
+   */
+  private async evalTokenAsync(
+    tokenId: number,
+    pos: number,
+    computeLogits: boolean,
+    signal?: AbortSignal,
+    onDetail?: (detail: string) => void,
+  ): Promise<Float32Array> {
+    const plan = this.singleAsyncPlan;
+    const wp = this.weightPager;
+    const backing = this.backingStore;
+    if (!plan || !this.scratch || !wp || !backing?.prefetchRanges) {
+      return this.evalToken(tokenId, pos, false, computeLogits);
+    }
+    if (pos < 0 || pos >= this.maxContextWindow) {
+      throw new Error(
+        `Token position ${pos} exceeds vTensor KV-cache context window (${this.maxContextWindow}).`,
+      );
+    }
+
+    LlamaVTensorRuntime.throwIfAborted(signal);
+    this.singleExec.tokenId = tokenId;
+    this.singleExec.pos = pos;
+    this.singleExec.seqLen = pos + 1;
+
+    const embdMissing = wp.getEmbeddingMissingRanges([tokenId]);
+    if (embdMissing.length > 0) {
+      await backing.prefetchRanges(embdMissing, { signal });
+    }
+    LlamaVTensorRuntime.throwIfAborted(signal);
+    plan.embedNode.execute();
+
+    const layerCount = plan.layers.length;
+    for (let l = 0; l < layerCount; l++) {
+      LlamaVTensorRuntime.throwIfAborted(signal);
+      const tLayer0 = performance.now();
+      const layerPlan = plan.layers[l];
+      const layerMissing = wp.getLayerMissingRanges(l);
+      if (layerMissing.length > 0) {
+        onDetail?.(`Layer ${l + 1}/${layerCount}`);
+        await backing.prefetchRanges(layerMissing, { signal });
+      } else if (l === 0 || (l + 1) % 4 === 0 || l === layerCount - 1) {
+        onDetail?.(`Layer ${l + 1}/${layerCount}`);
+      }
+      LlamaVTensorRuntime.throwIfAborted(signal);
+
+      layerPlan.acquireNode?.execute();
+      for (let n = 0; n < layerPlan.preMoeNodes.length; n++) {
+        layerPlan.preMoeNodes[n].execute();
+      }
+
+      if (layerPlan.moe) {
+        const routed = layerPlan.moe.routeAndGetExperts();
+        const expMissing = wp.getExpertMissingRanges(l, routed.expertIds);
+        if (expMissing.length > 0) {
+          onDetail?.(`Layer ${l + 1}/${layerCount} · loading experts`);
+          await backing.prefetchRanges(expMissing, { signal });
+        }
+        LlamaVTensorRuntime.throwIfAborted(signal);
+        layerPlan.moe.executeRouted(routed.count);
+        layerPlan.moe.residualNode.execute();
+      } else {
+        for (let n = 0; n < layerPlan.denseFfnNodes.length; n++) {
+          layerPlan.denseFfnNodes[n].execute();
+        }
+      }
+
+      if (performance.now() - tLayer0 >= 12) {
+        await this.yielder.yieldNow();
+      }
+    }
+
+    if (computeLogits) {
+      LlamaVTensorRuntime.throwIfAborted(signal);
+      for (let n = 0; n < plan.lmNormAndQuantNodes.length; n++) {
+        plan.lmNormAndQuantNodes[n].execute();
+      }
+      if (plan.pinnedLmHeadNode) {
+        plan.pinnedLmHeadNode.execute();
+      } else if (plan.executeLmHeadStripe) {
+        const stripes = wp.getLmHeadStripeSpecs();
+        for (let sIdx = 0; sIdx < stripes.length; sIdx++) {
+          LlamaVTensorRuntime.throwIfAborted(signal);
+          const tStripe0 = performance.now();
+          const spec = stripes[sIdx];
+          const pct = Math.min(99, Math.max(1, Math.round(((sIdx + 1) / stripes.length) * 100)));
+          onDetail?.(`Computing logits (${pct}%)`);
+          await backing.prefetchRanges([spec], { signal });
+          LlamaVTensorRuntime.throwIfAborted(signal);
+          const weightStripe = wp.acquireLmHeadStripe(spec.rowStart, spec.rowCount);
+          plan.executeLmHeadStripe(weightStripe, spec.rowStart, spec.rowCount);
+          if (performance.now() - tStripe0 >= 12) {
+            await this.yielder.yieldNow();
+          }
+        }
+      }
+    }
+
+    const bt = this.prismSingleBodyTally;
+    this.prismLedger.q8kDispatches += bt.q8kOps;
+    this.prismLedger.q8kSuperBlocks += bt.q8kSb;
+    this.prismLedger.q80Dispatches += bt.q80Ops;
+    this.prismLedger.strictF32Dispatches += bt.strictOps;
+    this.prismLedger.fusedGroupBarriers += bt.fusedBarriers;
+    if (computeLogits) {
+      const lt = this.prismSingleLmTally;
+      this.prismLedger.q8kDispatches += lt.q8kOps;
+      this.prismLedger.q8kSuperBlocks += lt.q8kSb;
+      this.prismLedger.q80Dispatches += lt.q80Ops;
+      this.prismLedger.strictF32Dispatches += lt.strictOps;
+    }
+
+    return this.scratch.logits.buffer.f32View(this.scratch.logits);
+  }
+
+  /**
+   * Async demand-paged Batch-4 prefill pass (4 non-final tokens simultaneously).
+   */
+  private async evalPrefillBatch4Async(
+    tokens: readonly number[],
+    offset: number,
+    startPos: number,
+    signal?: AbortSignal,
+    onDetail?: (detail: string) => void,
+  ): Promise<void> {
+    const plan = this.batchAsyncPlan;
+    const wp = this.weightPager;
+    const backing = this.backingStore;
+    if (!plan || !wp || !backing?.prefetchRanges) {
+      this.evalPrefillBatch4(tokens, offset, startPos);
+      return;
+    }
+
+    LlamaVTensorRuntime.throwIfAborted(signal);
+    const batchToks = [
+      tokens[offset],
+      tokens[offset + 1],
+      tokens[offset + 2],
+      tokens[offset + 3],
+    ];
+    this.batchExec.tokens[0] = batchToks[0];
+    this.batchExec.tokens[1] = batchToks[1];
+    this.batchExec.tokens[2] = batchToks[2];
+    this.batchExec.tokens[3] = batchToks[3];
+    this.batchExec.startPos = startPos;
+
+    const embdMissing = wp.getEmbeddingMissingRanges(batchToks);
+    if (embdMissing.length > 0) {
+      await backing.prefetchRanges(embdMissing, { signal });
+    }
+    LlamaVTensorRuntime.throwIfAborted(signal);
+    plan.embedNode.execute();
+
+    const layerCount = plan.layers.length;
+    for (let l = 0; l < layerCount; l++) {
+      LlamaVTensorRuntime.throwIfAborted(signal);
+      const tLayer0 = performance.now();
+      const layerPlan = plan.layers[l];
+      const layerMissing = wp.getLayerMissingRanges(l);
+      if (layerMissing.length > 0) {
+        onDetail?.(`Layer ${l + 1}/${layerCount}`);
+        await backing.prefetchRanges(layerMissing, { signal });
+      } else if (l === 0 || (l + 1) % 4 === 0 || l === layerCount - 1) {
+        onDetail?.(`Layer ${l + 1}/${layerCount}`);
+      }
+      LlamaVTensorRuntime.throwIfAborted(signal);
+
+      layerPlan.acquireNode?.execute();
+      for (let n = 0; n < layerPlan.preMoeNodes.length; n++) {
+        layerPlan.preMoeNodes[n].execute();
+      }
+      if (layerPlan.moe) {
+        const routed = layerPlan.moe.routeAndGetExperts();
+        const expMissing = wp.getExpertMissingRanges(l, routed.expertIds);
+        if (expMissing.length > 0) {
+          onDetail?.(`Layer ${l + 1}/${layerCount} · loading experts`);
+          await backing.prefetchRanges(expMissing, { signal });
+        }
+        LlamaVTensorRuntime.throwIfAborted(signal);
+        layerPlan.moe.executeRouted(routed.count);
+        layerPlan.moe.residualNode.execute();
+      } else {
+        for (let n = 0; n < layerPlan.denseFfnNodes.length; n++) {
+          layerPlan.denseFfnNodes[n].execute();
+        }
+      }
+
+      if (performance.now() - tLayer0 >= 12) {
+        await this.yielder.yieldNow();
+      }
+    }
+
+    const b4 = this.prismBatch4Tally;
+    this.prismLedger.q8kDispatches += b4.q8kOps;
+    this.prismLedger.q8kSuperBlocks += b4.q8kSb;
+    this.prismLedger.q80Dispatches += b4.q80Ops;
+    this.prismLedger.strictF32Dispatches += b4.strictOps;
+    this.prismLedger.fusedGroupBarriers += b4.fusedBarriers;
+  }
+
+  /**
+   * Async Layer-Major Chunked Prefill (`C = 4 * microBatches`, up to 32 tokens):
+   * Prefetches each layer ONCE across the entire chunk via parallel abortable `fetch()`,
+   * then routes and prefetches missing MoE experts per micro-batch with live progress.
+   */
+  private async evalPrefillChunkLayerMajorAsync(
+    tokens: readonly number[],
+    offset: number,
+    startPos: number,
+    microBatches: number,
+    signal?: AbortSignal,
+    onDetail?: (detail: string) => void,
+  ): Promise<void> {
+    const plan = this.batchAsyncPlan;
+    const wp = this.weightPager;
+    const backing = this.backingStore;
+    const bs = this.batchScratch;
+    const hp = this.hparams;
+    const chunkX = this.prefillChunkX;
+    if (!plan || !wp || !backing?.prefetchRanges || !bs || !hp || !chunkX) {
+      this.evalPrefillChunkLayerMajor(tokens, offset, startPos, microBatches);
+      return;
+    }
+
+    LlamaVTensorRuntime.throwIfAborted(signal);
+    const chunkTokensCount = microBatches * PREFILL_BATCH_SIZE;
+    const chunkTokenIds: number[] = new Array(chunkTokensCount);
+    for (let k = 0; k < chunkTokensCount; k++) {
+      chunkTokenIds[k] = tokens[offset + k];
+    }
+    const embdMissing = wp.getEmbeddingMissingRanges(chunkTokenIds);
+    if (embdMissing.length > 0) {
+      await backing.prefetchRanges(embdMissing, { signal });
+    }
+    LlamaVTensorRuntime.throwIfAborted(signal);
+
+    const batchFloats = PREFILL_BATCH_SIZE * hp.embeddingLength;
+    const bsXView = bs.x.buffer.f32View(bs.x);
+
+    for (let m = 0; m < microBatches; m++) {
+      const baseTok = offset + m * PREFILL_BATCH_SIZE;
+      this.batchExec.tokens[0] = tokens[baseTok];
+      this.batchExec.tokens[1] = tokens[baseTok + 1];
+      this.batchExec.tokens[2] = tokens[baseTok + 2];
+      this.batchExec.tokens[3] = tokens[baseTok + 3];
+      plan.embedNode.execute();
+      chunkX.set(bsXView, m * batchFloats);
+    }
+
+    const layerCount = plan.layers.length;
+    for (let l = 0; l < layerCount; l++) {
+      LlamaVTensorRuntime.throwIfAborted(signal);
+      const tLayer0 = performance.now();
+      const layerPlan = plan.layers[l];
+      const layerMissing = wp.getLayerMissingRanges(l);
+      if (layerMissing.length > 0) {
+        onDetail?.(`Layer ${l + 1}/${layerCount}`);
+        await backing.prefetchRanges(layerMissing, { signal });
+      } else if (l === 0 || (l + 1) % 4 === 0 || l === layerCount - 1) {
+        onDetail?.(`Layer ${l + 1}/${layerCount}`);
+      }
+      LlamaVTensorRuntime.throwIfAborted(signal);
+
+      layerPlan.acquireNode?.execute();
+
+      for (let m = 0; m < microBatches; m++) {
+        LlamaVTensorRuntime.throwIfAborted(signal);
+        const sliceStart = m * batchFloats;
+        bsXView.set(chunkX.subarray(sliceStart, sliceStart + batchFloats), 0);
+        this.batchExec.startPos = startPos + m * PREFILL_BATCH_SIZE;
+
+        for (let n = 0; n < layerPlan.preMoeNodes.length; n++) {
+          layerPlan.preMoeNodes[n].execute();
+        }
+        if (layerPlan.moe) {
+          const routed = layerPlan.moe.routeAndGetExperts();
+          const expMissing = wp.getExpertMissingRanges(l, routed.expertIds);
+          if (expMissing.length > 0) {
+            onDetail?.(`Layer ${l + 1}/${layerCount} · loading experts`);
+            await backing.prefetchRanges(expMissing, { signal });
+          }
+          LlamaVTensorRuntime.throwIfAborted(signal);
+          layerPlan.moe.executeRouted(routed.count);
+          layerPlan.moe.residualNode.execute();
+        } else {
+          for (let n = 0; n < layerPlan.denseFfnNodes.length; n++) {
+            layerPlan.denseFfnNodes[n].execute();
+          }
+        }
+        chunkX.set(bsXView, sliceStart);
+      }
+
+      if (performance.now() - tLayer0 >= 12) {
+        await this.yielder.yieldNow();
+      }
+    }
+
+    const b4 = this.prismBatch4Tally;
+    this.prismLedger.q8kDispatches += b4.q8kOps * microBatches;
+    this.prismLedger.q8kSuperBlocks += b4.q8kSb * microBatches;
+    this.prismLedger.q80Dispatches += b4.q80Ops * microBatches;
+    this.prismLedger.strictF32Dispatches += b4.strictOps * microBatches;
+    this.prismLedger.fusedGroupBarriers += b4.fusedBarriers * microBatches;
+  }
+
+  /**
    * Returns the exact token count for `prompt` under the active GGUF model's tokenizer
    * (including BOS when configured by the model), or 0 if no model is loaded.
    */
@@ -3381,98 +4932,156 @@ export class LlamaVTensorRuntime {
     const tokensToEval = truncatedPrompt.length - commonPrefix;
     const lastIdx = truncatedPrompt.length - 1;
     const batchWidth = this.performanceContract?.optimalPrefillBatchSize ?? PREFILL_BATCH_SIZE;
+    const useAsyncDemand = Boolean(
+      this.backingStore?.prefetchRanges && this.singleAsyncPlan && this.batchAsyncPlan,
+    );
     let i = commonPrefix;
     this.frameBudget.beginSlice();
 
-    while (i < truncatedPrompt.length) {
-      if (signal?.aborted) return;
-
-      const tStep0 = performance.now();
-      if (
-        this.backend.isWasmSimdActive &&
-        batchWidth >= PREFILL_BATCH_SIZE &&
-        i + PREFILL_BATCH_SIZE <= lastIdx
-      ) {
-        this.evalPrefillBatch4(truncatedPrompt, i, i);
-        for (let k = 0; k < PREFILL_BATCH_SIZE; k++) {
-          this.cachedTokens.push(truncatedPrompt[i + k]);
-        }
-        i += PREFILL_BATCH_SIZE;
-
-        if (onPrefillProgress) {
-          onPrefillProgress({
-            completedTokens: i - commonPrefix,
-            totalTokens: tokensToEval,
-            reusedPrefixTokens: commonPrefix,
-          });
-        }
-        const stepUs = (performance.now() - tStep0) * 1000;
-        if (
-          this.frameBudget.recordStepAndShouldYield(stepUs, GENERATION_SLICE_BUDGET_US, 8)
-        ) {
-          await this.yielder.yieldNow();
-        }
-        continue;
-      }
-
-      const isLastPrefill = i === lastIdx;
-      logits = this.evalToken(truncatedPrompt[i], i, isLastPrefill, isLastPrefill);
-      this.cachedTokens.push(truncatedPrompt[i]);
-      i += 1;
-
-      if (onPrefillProgress) {
-        onPrefillProgress({
-          completedTokens: i - commonPrefix,
-          totalTokens: tokensToEval,
-          reusedPrefixTokens: commonPrefix,
-        });
-      }
-      if (!isLastPrefill) {
-        const stepUs = (performance.now() - tStep0) * 1000;
-        if (
-          this.frameBudget.recordStepAndShouldYield(stepUs, GENERATION_SLICE_BUDGET_US, 8)
-        ) {
-          await this.yielder.yieldNow();
-        }
-      }
-    }
-
-    if (!logits) {
-      logits = this.evalToken(this.hparams.bosTokenId, 0, true, true);
-      this.cachedTokens = [this.hparams.bosTokenId];
-    }
-
-    // Commit completed prompt prefix pages into Unified Virtual Store immediately after prefill
-    this.commitFullPagesToUnifiedStore(this.cachedTokens);
-
-    const prefillElapsedSec = Math.max(0.001, (performance.now() - prefillStart) / 1000);
-    const observedPrefillTokSec = Number((Math.max(1, tokensToEval) / prefillElapsedSec).toFixed(1));
-
-    const decodeStart = performance.now();
-    let pos = truncatedPrompt.length;
-    let accumulated = '';
-    const requestedMaxGen =
-      config.fullContextOutput || config.maxTokens <= 0
-        ? this.maxContextWindow
-        : config.maxTokens;
-    const remainingSlots = Math.max(0, this.maxContextWindow - pos);
-    // Final prompt logits can always emit 1 token without writing a new KV slot; each subsequent token
-    // consumes 1 KV slot up to `this.maxContextWindow - 1`, allowing responses up to full context length.
-    const maxPossibleGen = Math.min(this.maxContextWindow, remainingSlots + 1);
-    const maxGen = Math.max(1, Math.min(requestedMaxGen, maxPossibleGen));
-
-    const updateContract = (tokSec: number) => {
-      if (this.performanceContract && tokSec > 0) {
-        this.performanceContract = evaluateContractCompliance(
-          this.performanceContract,
-          tokSec,
-          observedPrefillTokSec,
-          0,
-        );
-      }
+    const emitStageDetail = (completedTokens: number, detail?: string) => {
+      if (!onPrefillProgress) return;
+      onPrefillProgress({
+        completedTokens,
+        totalTokens: tokensToEval,
+        reusedPrefixTokens: commonPrefix,
+        detail,
+      });
     };
 
     try {
+      while (i < truncatedPrompt.length) {
+        if (signal?.aborted) return;
+
+        const tStep0 = performance.now();
+        const chunkBatches =
+          this.backend.isWasmSimdActive && batchWidth >= PREFILL_BATCH_SIZE
+            ? this.computeLayerMajorMicroBatches(i, lastIdx)
+            : 0;
+        if (chunkBatches >= 2) {
+          const chunkTokens = chunkBatches * PREFILL_BATCH_SIZE;
+          if (useAsyncDemand) {
+            await this.evalPrefillChunkLayerMajorAsync(
+              truncatedPrompt,
+              i,
+              i,
+              chunkBatches,
+              signal,
+              (detail) => emitStageDetail(i - commonPrefix, detail),
+            );
+          } else {
+            this.evalPrefillChunkLayerMajor(truncatedPrompt, i, i, chunkBatches);
+          }
+          for (let k = 0; k < chunkTokens; k++) {
+            this.cachedTokens.push(truncatedPrompt[i + k]);
+          }
+          i += chunkTokens;
+
+          emitStageDetail(i - commonPrefix);
+          const stepUs = (performance.now() - tStep0) * 1000;
+          if (
+            this.frameBudget.recordStepAndShouldYield(stepUs, GENERATION_SLICE_BUDGET_US, 2)
+          ) {
+            await this.yielder.yieldNow();
+          }
+          continue;
+        }
+
+        if (
+          this.backend.isWasmSimdActive &&
+          batchWidth >= PREFILL_BATCH_SIZE &&
+          i + PREFILL_BATCH_SIZE <= lastIdx
+        ) {
+          if (useAsyncDemand) {
+            await this.evalPrefillBatch4Async(
+              truncatedPrompt,
+              i,
+              i,
+              signal,
+              (detail) => emitStageDetail(i - commonPrefix, detail),
+            );
+          } else {
+            this.evalPrefillBatch4(truncatedPrompt, i, i);
+          }
+          for (let k = 0; k < PREFILL_BATCH_SIZE; k++) {
+            this.cachedTokens.push(truncatedPrompt[i + k]);
+          }
+          i += PREFILL_BATCH_SIZE;
+
+          emitStageDetail(i - commonPrefix);
+          const stepUs = (performance.now() - tStep0) * 1000;
+          if (
+            this.frameBudget.recordStepAndShouldYield(stepUs, GENERATION_SLICE_BUDGET_US, 8)
+          ) {
+            await this.yielder.yieldNow();
+          }
+          continue;
+        }
+
+        const isLastPrefill = i === lastIdx;
+        if (useAsyncDemand) {
+          logits = await this.evalTokenAsync(
+            truncatedPrompt[i],
+            i,
+            isLastPrefill,
+            signal,
+            (detail) => emitStageDetail(i - commonPrefix, detail),
+          );
+        } else {
+          logits = this.evalToken(truncatedPrompt[i], i, isLastPrefill, isLastPrefill);
+        }
+        this.cachedTokens.push(truncatedPrompt[i]);
+        i += 1;
+
+        emitStageDetail(i - commonPrefix);
+        if (!isLastPrefill) {
+          const stepUs = (performance.now() - tStep0) * 1000;
+          if (
+            this.frameBudget.recordStepAndShouldYield(stepUs, GENERATION_SLICE_BUDGET_US, 8)
+          ) {
+            await this.yielder.yieldNow();
+          }
+        }
+      }
+
+      if (!logits) {
+        logits = useAsyncDemand
+          ? await this.evalTokenAsync(this.hparams.bosTokenId, 0, true, signal, (detail) =>
+              emitStageDetail(0, detail),
+            )
+          : this.evalToken(this.hparams.bosTokenId, 0, true, true);
+        this.cachedTokens = [this.hparams.bosTokenId];
+      }
+
+      // Commit completed prompt prefix pages into Unified Virtual Store immediately after prefill
+      this.commitFullPagesToUnifiedStore(this.cachedTokens);
+
+      const prefillElapsedSec = Math.max(0.001, (performance.now() - prefillStart) / 1000);
+      const observedPrefillTokSec = Number((Math.max(1, tokensToEval) / prefillElapsedSec).toFixed(1));
+
+      const decodeStart = performance.now();
+      let pos = truncatedPrompt.length;
+      let accumulated = '';
+      const requestedMaxGen =
+        config.fullContextOutput || config.maxTokens <= 0
+          ? this.maxContextWindow
+          : config.maxTokens;
+      const remainingSlots = Math.max(0, this.maxContextWindow - pos);
+      // Final prompt logits can always emit 1 token without writing a new KV slot; each subsequent token
+      // consumes 1 KV slot up to `this.maxContextWindow - 1`, allowing responses up to full context length.
+      const maxPossibleGen = Math.min(this.maxContextWindow, remainingSlots + 1);
+      const maxGen = Math.max(1, Math.min(requestedMaxGen, maxPossibleGen));
+
+      const updateContract = (tokSec: number) => {
+        if (this.performanceContract && tokSec > 0) {
+          this.performanceContract = evaluateContractCompliance(
+            this.performanceContract,
+            tokSec,
+            observedPrefillTokSec,
+            0,
+          );
+        }
+      };
+
       for (let step = 0; step < maxGen; step++) {
         if (signal?.aborted) return;
 
@@ -3536,11 +5145,20 @@ export class LlamaVTensorRuntime {
         };
 
         if (!finished && pos < this.maxContextWindow) {
-          logits = this.evalToken(nextToken, pos, step === 0, true);
+          if (useAsyncDemand) {
+            logits = await this.evalTokenAsync(nextToken, pos, true, signal);
+          } else {
+            logits = this.evalToken(nextToken, pos, step === 0, true);
+          }
           this.cachedTokens.push(nextToken);
           pos += 1;
         }
       }
+    } catch (err) {
+      if (signal?.aborted || LlamaVTensorRuntime.isAbortError(err)) {
+        return;
+      }
+      throw err;
     } finally {
       // Persist any newly completed assistant-turn 16-token KV pages into Unified Store
       this.commitFullPagesToUnifiedStore(this.cachedTokens);

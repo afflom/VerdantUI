@@ -6,6 +6,7 @@ import {
   buildVerdantSimdModuleBytes,
   isVerdantWasmSimdSupported,
   Q8_0_ACT_BLOCK_BYTES,
+  Q8_K_ACT_BLOCK_BYTES,
   VerdantWasmArena,
 } from './verdantWasmSimd';
 
@@ -23,6 +24,8 @@ test('Verdant WASM SIMD128 MUL_MAT matches JS F64 reference across all 11 GGML f
     ['Q4_1', GgmlType.Q4_1, 32, 20, 256, 5e-4],
     ['Q5_0', GgmlType.Q5_0, 32, 22, 256, 5e-4],
     ['Q5_1', GgmlType.Q5_1, 32, 24, 256, 5e-4],
+    ['Q2_K', GgmlType.Q2_K, 256, 84, 512, 1e-3],
+    ['Q3_K', GgmlType.Q3_K, 256, 110, 512, 1e-3],
     ['Q4_K', GgmlType.Q4_K, 256, 144, 512, 1e-3],
     ['Q5_K', GgmlType.Q5_K, 256, 176, 512, 1e-3],
     ['Q6_K', GgmlType.Q6_K, 256, 210, 512, 1e-3],
@@ -51,7 +54,15 @@ test('Verdant WASM SIMD128 MUL_MAT matches JS F64 reference across all 11 GGML f
       const nBlk = rows * (cols / bs);
       for (let b = 0; b < nBlk; b++) {
         const off = wPtr + b * bbytes;
-        if (type === GgmlType.Q6_K) {
+        if (type === GgmlType.Q2_K) {
+          memU8[off + 80] = 0x00;
+          memU8[off + 81] = 0x34;
+          memU8[off + 82] = 0x00;
+          memU8[off + 83] = 0x30;
+        } else if (type === GgmlType.Q3_K) {
+          memU8[off + 108] = 0x00;
+          memU8[off + 109] = 0x34;
+        } else if (type === GgmlType.Q6_K) {
           memU8[off + 208] = 0x00;
           memU8[off + 209] = 0x34;
         } else {
@@ -363,3 +374,86 @@ test('Verdant WASM SIMD RMS_NORM and precomputed RoPE tables match scalar refere
     assert.ok(Math.abs(a[i] - expectedAdd[i]) <= 1e-6, `add_f32 in-place idx ${i}`);
   }
 });
+
+test('Verdant WASM SIMD/VNNI Q2_K & Q3_K × Q8_K narrow-lane (4-row / 2-row + batch-4) match exact F64 dequantized reference', () => {
+  const arena = new VerdantWasmArena(64);
+  const cols = 512;
+  const B = 4;
+
+  const cases: Array<[string, GgmlType, number, number]> = [
+    ['Q2_K', GgmlType.Q2_K, 84, 17],
+    ['Q2_K-aligned', GgmlType.Q2_K, 84, 32],
+    ['Q3_K', GgmlType.Q3_K, 110, 17],
+    ['Q3_K-aligned', GgmlType.Q3_K, 110, 32],
+  ];
+
+  for (const [label, type, bbytes, rows] of cases) {
+    arena.reset();
+    const nSuper = cols >>> 8;
+    const wBytes = rows * nSuper * bbytes;
+    const wPtr = arena.allocRegion(wBytes);
+    const xPtr = arena.allocRegion(cols * B * 4);
+    const qStride = nSuper * Q8_K_ACT_BLOCK_BYTES;
+    const q8kPtr = arena.allocRegion(qStride * B);
+    const outS = arena.allocRegion(rows * 4);
+    const outB = arena.allocRegion(rows * B * 4);
+
+    const memU8 = arena.bytes();
+    for (let i = 0; i < wBytes; i++) memU8[wPtr + i] = (i * 59 + 17) & 0xff;
+    for (let b = 0; b < rows * nSuper; b++) {
+      const off = wPtr + b * bbytes;
+      if (type === GgmlType.Q2_K) {
+        memU8[off + 80] = 0x00;
+        memU8[off + 81] = 0x34;
+        memU8[off + 82] = 0x00;
+        memU8[off + 83] = 0x30;
+      } else {
+        memU8[off + 108] = 0x00;
+        memU8[off + 109] = 0x34;
+      }
+    }
+
+    const xBatch = new Float32Array(arena.memory.buffer, xPtr, cols * B);
+    for (let t = 0; t < B; t++) {
+      for (let i = 0; i < cols; i++) {
+        xBatch[t * cols + i] = Math.sin(i * 0.09 + t * 0.71) * 0.85;
+      }
+      arena.quantizeActivationQ8K(xPtr + t * cols * 4, q8kPtr + t * qStride, cols);
+    }
+
+    arena.mulMatBatchQ8K(type, wPtr, q8kPtr, xPtr, outB, cols, rows, B);
+    const gotB = new Float32Array(arena.memory.buffer, outB, rows * B);
+
+    const dv = new DataView(arena.memory.buffer);
+    const xDeq = new Float32Array(cols);
+    const refDeq = new Float32Array(rows);
+    for (let t = 0; t < B; t++) {
+      const qTokOff = q8kPtr + t * qStride;
+      // Reconstruct exact dequantized Q8_K vector: d at +0, bsums16 at +16, bsums32 at +48, qs[256] at +64
+      for (let sb = 0; sb < nSuper; sb++) {
+        const sbOff = qTokOff + sb * Q8_K_ACT_BLOCK_BYTES;
+        const d = dv.getFloat32(sbOff, true);
+        for (let j = 0; j < 256; j++) {
+          xDeq[sb * 256 + j] = dv.getInt8(sbOff + 64 + j) * d;
+        }
+      }
+      verdantMulMat(memU8.subarray(wPtr, wPtr + wBytes), 0, type, cols, rows, xDeq, refDeq);
+      arena.mulMatQ8K(type, wPtr, qTokOff, xPtr + t * cols * 4, outS, cols, rows);
+      const gotS = new Float32Array(arena.memory.buffer, outS, rows);
+
+      for (let r = 0; r < rows; r++) {
+        const diff = Math.abs(refDeq[r] - gotS[r]);
+        assert.ok(
+          Number.isFinite(gotS[r]) && diff <= 2e-3,
+          `${label} tok=${t} row=${r}: refDeq=${refDeq[r]} got=${gotS[r]} (diff=${diff})`,
+        );
+        const bDiff = Math.abs(gotS[r] - gotB[t * rows + r]);
+        assert.ok(
+          bDiff <= 1e-4,
+          `${label} batch4 vs single tok=${t} row=${r}: single=${gotS[r]} batch=${gotB[t * rows + r]}`,
+        );
+      }
+    }
+  }
+});
+

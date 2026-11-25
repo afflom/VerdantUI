@@ -25,6 +25,7 @@ import {
   type VerdantWasmArena,
   WASM_ATTN_SCORES_OFFSET,
   WASM_ATTN_WEIGHTS_OFFSET,
+  WASM_KV_QUANT_ERR_OFFSET,
 } from './verdantWasmSimd';
 
 export const VRAM_KV_PAGE_TOKENS = 16;
@@ -414,14 +415,14 @@ export class VramKvPager {
    * vRAM's automatic reclaim governor + Tier-1->Tier-2 cascade if needed).
    * If the page was previously Warm Q8 or Cold Q4, performs a vRAM refault back to F32!
    */
-  ensurePageHot(pageIdx: number): number {
+  ensurePageHot(pageIdx: number, arena?: VerdantWasmArena | null): number {
     if (this.pageState[pageIdx] === VramPageState.HOT_RESIDENT) {
       return this.pageHotSlot[pageIdx];
     }
 
     // Trigger vRAM automatic reclaim governor if no free hot slots remain
     if (this.freeHotSlots.length === 0 || vramTrim(this.hotFrameLimit, this.hotResidentCount + 1)) {
-      this.reclaimColdestPage(pageIdx);
+      this.reclaimColdestPage(pageIdx, arena);
     }
 
     const hotSlot = this.freeHotSlots.pop();
@@ -470,7 +471,7 @@ export class VramKvPager {
    * When Tier-2 Cold Q4 is enabled and Warm Q8 exceeds `warmQ8Limit`, cascades the oldest Warm Q8
    * page down to Cold Q4 first so a Warm Q8 slot is always free.
    */
-  private reclaimColdestPage(protectPageIdx: number): void {
+  private reclaimColdestPage(protectPageIdx: number, arena?: VerdantWasmArena | null): void {
     // Pin page 0 as the attention sink when possible; evict lowest pageIdx > 0 that isn't protected
     let victim = -1;
     for (let p = 1; p < this.maxPages; p++) {
@@ -499,7 +500,7 @@ export class VramKvPager {
     const coldSlot = this.freeColdSlots.pop();
     if (coldSlot === undefined) return;
 
-    const admitted = this.captureHotToCold(hotSlot, coldSlot);
+    const admitted = this.captureHotToCold(hotSlot, coldSlot, arena);
     if (!admitted) {
       this.freeColdSlots.push(coldSlot);
       return;
@@ -608,7 +609,58 @@ export class VramKvPager {
   }
 
   /** Compresses one F32 hot page across all layers into symmetric per-head int8 (Warm Q8) backing. */
-  private captureHotToCold(hotSlot: number, coldSlot: number): boolean {
+  private captureHotToCold(
+    hotSlot: number,
+    coldSlot: number,
+    arena?: VerdantWasmArena | null,
+  ): boolean {
+    const headDim = this.headDim;
+    const totalVectors = this.numLayers * VRAM_KV_PAGE_TOKENS * this.nHeadsKv;
+
+    // Fast path: 16-wide WASM SIMD128 page quantization directly inside WASM linear memory
+    if (
+      arena &&
+      headDim >= 16 &&
+      (headDim & 15) === 0 &&
+      this.hotKHandle.buffer.isWasmBacked &&
+      this.hotVHandle.buffer.isWasmBacked &&
+      this.coldKQ8Handle.buffer.isWasmBacked &&
+      this.coldVQ8Handle.buffer.isWasmBacked &&
+      this.coldKScaleHandle.buffer.isWasmBacked &&
+      this.coldVScaleHandle.buffer.isWasmBacked
+    ) {
+      const hotByteOff = hotSlot * this.hotPageFloats * 4;
+      const coldQ8ByteOff = coldSlot * this.coldPageQ8Bytes;
+      const coldScByteOff = coldSlot * this.coldPageScaleFloats * 4;
+      const errView = new Float32Array(arena.memory.buffer, WASM_KV_QUANT_ERR_OFFSET, 2);
+
+      arena.kernels.quantize_kv_page_f32_to_q8(
+        this.hotKHandle.buffer.wasmPtr(this.hotKHandle) + hotByteOff,
+        this.coldKQ8Handle.buffer.wasmPtr(this.coldKQ8Handle) + coldQ8ByteOff,
+        this.coldKScaleHandle.buffer.wasmPtr(this.coldKScaleHandle) + coldScByteOff,
+        totalVectors,
+        headDim,
+        WASM_KV_QUANT_ERR_OFFSET,
+      );
+      let maxErr = errView[0];
+      let maxSig = errView[1];
+
+      arena.kernels.quantize_kv_page_f32_to_q8(
+        this.hotVHandle.buffer.wasmPtr(this.hotVHandle) + hotByteOff,
+        this.coldVQ8Handle.buffer.wasmPtr(this.coldVQ8Handle) + coldQ8ByteOff,
+        this.coldVScaleHandle.buffer.wasmPtr(this.coldVScaleHandle) + coldScByteOff,
+        totalVectors,
+        headDim,
+        WASM_KV_QUANT_ERR_OFFSET,
+      );
+      if (errView[0] > maxErr) maxErr = errView[0];
+      if (errView[1] > maxSig) maxSig = errView[1];
+
+      const rawBytes = this.hotPageFloats * 4 * 2;
+      const compressedBytes = (this.coldPageQ8Bytes + this.coldPageScaleFloats * 4) * 2;
+      return admitColdKvPage(rawBytes, compressedBytes, maxErr, maxSig);
+    }
+
     const hotK = this.hotKHandle.buffer.f32View(this.hotKHandle);
     const hotV = this.hotVHandle.buffer.f32View(this.hotVHandle);
     const coldKQ8 = this.coldKQ8Handle.buffer.i8View(this.coldKQ8Handle);
@@ -616,8 +668,6 @@ export class VramKvPager {
     const coldKSc = this.coldKScaleHandle.buffer.f32View(this.coldKScaleHandle);
     const coldVSc = this.coldVScaleHandle.buffer.f32View(this.coldVScaleHandle);
 
-    const headDim = this.headDim;
-    const totalVectors = this.numLayers * VRAM_KV_PAGE_TOKENS * this.nHeadsKv;
     const hotBase = hotSlot * this.hotPageFloats;
     const coldQ8Base = coldSlot * this.coldPageQ8Bytes;
     const coldScBase = coldSlot * this.coldPageScaleFloats;
@@ -916,7 +966,7 @@ export class VramKvPager {
   ): void {
     const pageIdx = pos >>> 4;
     const slotInPage = pos & 15;
-    const hotSlot = this.ensurePageHot(pageIdx);
+    const hotSlot = this.ensurePageHot(pageIdx, arena);
     const handle = isValue ? this.hotVHandle : this.hotKHandle;
     const dstPtr =
       handle.buffer.wasmPtr(handle) +

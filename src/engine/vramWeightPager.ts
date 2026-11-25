@@ -19,6 +19,7 @@ import {
 } from './gguf';
 import {
   coalesceTensorExtents,
+  type ByteRange,
   type CoalescedExtent,
   type VramBackingKind,
   type VramBackingStore,
@@ -41,9 +42,21 @@ export interface LayerTensorInfoGroup {
   readonly attnOutput: GgufTensorInfo;
   readonly attnOutputBias?: GgufTensorInfo | null;
   readonly ffnNorm: GgufTensorInfo;
-  readonly ffnGate: GgufTensorInfo;
-  readonly ffnUp: GgufTensorInfo;
-  readonly ffnDown: GgufTensorInfo;
+  /** Dense SwiGLU projections (null on Sparse MoE layers). */
+  readonly ffnGate: GgufTensorInfo | null;
+  readonly ffnUp: GgufTensorInfo | null;
+  readonly ffnDown: GgufTensorInfo | null;
+  /** Sparse Mixture-of-Experts router + 3D packed expert tensors (`qwen3moe` / `qwen2moe` / `mixtral`). */
+  readonly ffnGateInp?: GgufTensorInfo | null;
+  readonly ffnGateExps?: GgufTensorInfo | null;
+  readonly ffnUpExps?: GgufTensorInfo | null;
+  readonly ffnDownExps?: GgufTensorInfo | null;
+}
+
+export interface PagedExpertWeights {
+  readonly gate: VTensorHandle;
+  readonly up: VTensorHandle;
+  readonly down: VTensorHandle;
 }
 
 export interface PagedLayerWeights {
@@ -59,9 +72,10 @@ export interface PagedLayerWeights {
   readonly attnOutput: VTensorHandle;
   readonly attnOutputBias: VTensorHandle | null;
   readonly ffnNorm: VTensorHandle;
-  readonly ffnGate: VTensorHandle;
-  readonly ffnUp: VTensorHandle;
-  readonly ffnDown: VTensorHandle;
+  readonly ffnGate: VTensorHandle | null;
+  readonly ffnUp: VTensorHandle | null;
+  readonly ffnDown: VTensorHandle | null;
+  readonly ffnGateInp: VTensorHandle | null;
 }
 
 export interface VramWeightPagerConfig {
@@ -72,6 +86,8 @@ export interface VramWeightPagerConfig {
   readonly lmHeadStripeRows?: number;
   /** Number of hot token embedding rows cached inside WASM linear memory when `streamEmbeddings` is active. */
   readonly hotEmbeddingCacheSlots?: number;
+  /** Number of Sparse MoE expert triples `(gate, up, down)` cached in WASM LRU memory (OPFS-paged MoE). */
+  readonly moeExpertCacheSlots?: number;
 }
 
 export interface VramWeightPagerTelemetry {
@@ -102,6 +118,12 @@ export interface VramWeightPagerTelemetry {
   readonly embdCacheMisses: number;
   readonly embdCacheBytes: number;
   readonly residentLayerBitsetHex: string;
+  readonly isMoe?: boolean;
+  readonly moeExpertCacheSlots?: number;
+  readonly moeExpertResidentCount?: number;
+  readonly moeExpertHits?: number;
+  readonly moeExpertMisses?: number;
+  readonly moeExpertCacheBytes?: number;
 }
 
 export interface LayerHotMetadata {
@@ -119,7 +141,7 @@ interface LayerExtentPlan {
   readonly extents: readonly CoalescedExtent[];
   readonly extentFrameOffsets: readonly number[];
   readonly totalFrameBytes: number;
-  /** Exact byte offset inside a frame slot for each of the 7 linear projection tensors. */
+  /** Exact byte offset inside a frame slot for each linear projection tensor in this layer. */
   readonly projOffsets: {
     readonly attnQ: number;
     readonly attnK: number;
@@ -128,7 +150,29 @@ interface LayerExtentPlan {
     readonly ffnGate: number;
     readonly ffnUp: number;
     readonly ffnDown: number;
+    readonly ffnGateInp: number;
   };
+}
+
+interface MoeLayerExpertGeometry {
+  readonly expertCount: number;
+  readonly gateInfo: GgufTensorInfo;
+  readonly upInfo: GgufTensorInfo;
+  readonly downInfo: GgufTensorInfo;
+  readonly gateSliceBytes: number;
+  readonly upSliceBytes: number;
+  readonly downSliceBytes: number;
+  readonly gateDims2D: readonly [number, number];
+  readonly upDims2D: readonly [number, number];
+  readonly downDims2D: readonly [number, number];
+}
+
+interface MoeExpertCacheSlot {
+  readonly slotIndex: number;
+  readonly baseOffset: number;
+  key: number;
+  lastTouch: number;
+  handles: PagedExpertWeights | null;
 }
 
 interface WeightFrameSlot {
@@ -181,6 +225,35 @@ export function computeLmHeadStripeRows(
   return Math.min(rows, aligned);
 }
 
+/**
+ * Collects all small permanently-resident metadata tensors (norms, biases, QK-norms, and
+ * optionally pinned embeddings/LM-head) needed to initialize `VramWeightPager` in `opfs-paged` mode.
+ */
+export function collectHotMetadataTensorInfos(
+  embdInfo: GgufTensorInfo,
+  outNormInfo: GgufTensorInfo,
+  outWeightInfo: GgufTensorInfo,
+  isTiedOutput: boolean,
+  layerInfos: readonly LayerTensorInfoGroup[],
+  options: { streamEmbeddings: boolean; streamLmHead: boolean },
+): GgufTensorInfo[] {
+  const list: GgufTensorInfo[] = [outNormInfo];
+  if (!options.streamEmbeddings) list.push(embdInfo);
+  if (!options.streamLmHead && !(isTiedOutput && !options.streamEmbeddings)) {
+    list.push(outWeightInfo);
+  }
+  for (const l of layerInfos) {
+    list.push(l.attnNorm, l.ffnNorm);
+    if (l.attnQBias) list.push(l.attnQBias);
+    if (l.attnQNorm) list.push(l.attnQNorm);
+    if (l.attnKBias) list.push(l.attnKBias);
+    if (l.attnKNorm) list.push(l.attnKNorm);
+    if (l.attnVBias) list.push(l.attnVBias);
+    if (l.attnOutputBias) list.push(l.attnOutputBias);
+  }
+  return list;
+}
+
 export class VramWeightPager {
   readonly residencyMode: WeightResidencyMode;
   readonly backingKind: VramBackingKind;
@@ -216,15 +289,18 @@ export class VramWeightPager {
   private readonly pinnedLayerCount: number;
   private readonly cachedStreamingPublications: Array<PagedLayerWeights | null>;
 
-  // Unified Store Hot Embedding Row Slab (Zipfian LRU cache inside WASM linear memory)
+  // Unified Store Hot Embedding Row Slab (O(1) intrusive TypedArray LRU in WASM linear memory)
   private readonly embdRowBuffer: VTensorBuffer | null;
   private readonly embdRowHandle: VTensorHandle | null;
   private readonly embdRowBytes: number;
   private readonly embdCacheSlots: number;
   private readonly embdSlotToToken: Int32Array;
-  private readonly embdSlotLastTouch: Uint32Array;
+  private readonly embdPrev: Int32Array;
+  private readonly embdNext: Int32Array;
+  private embdHead = -1;
+  private embdTail = -1;
+  private embdFreeCursor = 0;
   private readonly embdTokenToSlot = new Map<number, number>();
-  private embdCacheClock = 0;
   private embdCacheHits = 0;
   private embdCacheMisses = 0;
   private readonly lmHeadTileBuffer: VTensorBuffer | null;
@@ -232,6 +308,27 @@ export class VramWeightPager {
   private readonly lmHeadRowBytes: number;
   private readonly lmHeadFullStripeView: VTensorHandle | null;
   private readonly lmHeadTailStripeView: VTensorHandle | null;
+
+  // Sparse Mixture-of-Experts (qwen3moe / qwen2moe / mixtral) O(1) Frequency-Protected WASM Expert Cache
+  readonly isMoe: boolean;
+  private readonly moeLayerGeo: Array<MoeLayerExpertGeometry | null>;
+  private readonly moeMaxExperts: number;
+  private readonly residentMoeExperts: Array<Array<PagedExpertWeights> | null>;
+  private readonly moeCacheBuffer: VTensorBuffer | null;
+  private readonly moeCacheSlots: MoeExpertCacheSlot[];
+  private readonly moePrev: Int32Array;
+  private readonly moeNext: Int32Array;
+  private readonly moeSlotFreq: Uint8Array;
+  private moeHead = -1;
+  private moeTail = -1;
+  private moeFreeCursor = 0;
+  private readonly moeKeyToSlot = new Map<number, number>();
+  private readonly moeGateOffsetInSlot: number;
+  private readonly moeUpOffsetInSlot: number;
+  private readonly moeDownOffsetInSlot: number;
+  private moeClock = 0;
+  private moeExpertHits = 0;
+  private moeExpertMisses = 0;
 
   // Live telemetry counters
   private layerHits = 0;
@@ -251,6 +348,7 @@ export class VramWeightPager {
     layerInfos: readonly LayerTensorInfoGroup[],
     config: VramWeightPagerConfig,
     allocBuffer: (id: string, usage: 'weights' | 'compute', capacityBytes: number) => VTensorBuffer,
+    preloadedHotTensors?: ReadonlyMap<string, Uint8Array>,
   ) {
     this.parsed = parsed;
     this.backing = backing;
@@ -267,8 +365,15 @@ export class VramWeightPager {
     const outTrait = getGgmlTypeTrait(outWeightInfo.type);
     this.lmHeadRowBytes = ((outWeightInfo.dims[0] ?? 1) / outTrait.blockSize) * outTrait.typeSizeBytes;
 
-    // Exact total logical weight footprint across all model tensors
+    // Exact total logical weight footprint across all model tensors + Sparse MoE expert geometry
     let logicalBytes = embdInfo.byteSize + outNormInfo.byteSize + (isTiedOutput ? 0 : outWeightInfo.byteSize);
+    const moeLayerGeo: Array<MoeLayerExpertGeometry | null> = [];
+    let anyMoe = false;
+    let maxExperts = 0;
+    let maxGateSlice = 0;
+    let maxUpSlice = 0;
+    let maxDownSlice = 0;
+
     for (const l of layerInfos) {
       logicalBytes +=
         l.attnNorm.byteSize +
@@ -283,27 +388,64 @@ export class VramWeightPager {
         l.attnOutput.byteSize +
         (l.attnOutputBias?.byteSize ?? 0) +
         l.ffnNorm.byteSize +
-        l.ffnGate.byteSize +
-        l.ffnUp.byteSize +
-        l.ffnDown.byteSize;
+        (l.ffnGate?.byteSize ?? 0) +
+        (l.ffnUp?.byteSize ?? 0) +
+        (l.ffnDown?.byteSize ?? 0) +
+        (l.ffnGateInp?.byteSize ?? 0) +
+        (l.ffnGateExps?.byteSize ?? 0) +
+        (l.ffnUpExps?.byteSize ?? 0) +
+        (l.ffnDownExps?.byteSize ?? 0);
+
+      if (l.ffnGateInp && l.ffnGateExps && l.ffnUpExps && l.ffnDownExps) {
+        anyMoe = true;
+        const nExps = Math.max(1, l.ffnGateExps.dims[2] ?? parsed.hparams.expertCount ?? 1);
+        maxExperts = Math.max(maxExperts, nExps);
+        const gateSliceBytes = Math.floor(l.ffnGateExps.byteSize / nExps);
+        const upSliceBytes = Math.floor(l.ffnUpExps.byteSize / nExps);
+        const downSliceBytes = Math.floor(l.ffnDownExps.byteSize / nExps);
+        maxGateSlice = Math.max(maxGateSlice, gateSliceBytes);
+        maxUpSlice = Math.max(maxUpSlice, upSliceBytes);
+        maxDownSlice = Math.max(maxDownSlice, downSliceBytes);
+        moeLayerGeo.push({
+          expertCount: nExps,
+          gateInfo: l.ffnGateExps,
+          upInfo: l.ffnUpExps,
+          downInfo: l.ffnDownExps,
+          gateSliceBytes,
+          upSliceBytes,
+          downSliceBytes,
+          gateDims2D: [l.ffnGateExps.dims[0] ?? 1, l.ffnGateExps.dims[1] ?? 1],
+          upDims2D: [l.ffnUpExps.dims[0] ?? 1, l.ffnUpExps.dims[1] ?? 1],
+          downDims2D: [l.ffnDownExps.dims[0] ?? 1, l.ffnDownExps.dims[1] ?? 1],
+        });
+      } else {
+        moeLayerGeo.push(null);
+      }
     }
     this.logicalWeightBytes = logicalBytes;
+    this.isMoe = anyMoe;
+    this.moeLayerGeo = moeLayerGeo;
+    this.moeMaxExperts = Math.max(1, maxExperts);
 
     // Precompute coalesced extent plans for every layer (b0d40626)
+    // For MoE layers, frame slots hold attention projections + tiny router gate (`ffnGateInp`),
+    // while 3D packed experts demand-page through the bounded WASM Sparse Expert Cache!
     const plans: LayerExtentPlan[] = [];
     let totalExtents = 0;
     let maxLayerFrameBytes = 0;
     for (const l of layerInfos) {
-      const linearTensors = [
+      const linearTensors: GgufTensorInfo[] = [
         l.attnQ,
         l.attnK,
         l.attnV,
         l.attnOutput,
-        l.ffnGate,
-        l.ffnUp,
-        l.ffnDown,
       ];
-      // Coalesce across <= 32 KiB gaps (tiny interleaved norm/bias vectors) -> 1.0 ext/L on 135M–3B!
+      if (l.ffnGate) linearTensors.push(l.ffnGate);
+      if (l.ffnUp) linearTensors.push(l.ffnUp);
+      if (l.ffnDown) linearTensors.push(l.ffnDown);
+      if (l.ffnGateInp) linearTensors.push(l.ffnGateInp);
+
+      // Coalesce across <= 32 KiB gaps (tiny interleaved norm/bias vectors) -> 1.0 ext/L on dense!
       const extents = coalesceTensorExtents(linearTensors, parsed.dataOffset, 32768);
       totalExtents += extents.length;
       const extentFrameOffsets: number[] = [];
@@ -330,9 +472,10 @@ export class VramWeightPager {
           attnK: offsetByName.get(l.attnK.name)!,
           attnV: offsetByName.get(l.attnV.name)!,
           attnOutput: offsetByName.get(l.attnOutput.name)!,
-          ffnGate: offsetByName.get(l.ffnGate.name)!,
-          ffnUp: offsetByName.get(l.ffnUp.name)!,
-          ffnDown: offsetByName.get(l.ffnDown.name)!,
+          ffnGate: l.ffnGate ? (offsetByName.get(l.ffnGate.name) ?? -1) : -1,
+          ffnUp: l.ffnUp ? (offsetByName.get(l.ffnUp.name) ?? -1) : -1,
+          ffnDown: l.ffnDown ? (offsetByName.get(l.ffnDown.name) ?? -1) : -1,
+          ffnGateInp: l.ffnGateInp ? (offsetByName.get(l.ffnGateInp.name) ?? -1) : -1,
         },
       });
     }
@@ -340,10 +483,17 @@ export class VramWeightPager {
     this.avgCoalescedExtentsPerLayer =
       layerInfos.length > 0 ? Number((totalExtents / layerInfos.length).toFixed(2)) : 0;
 
-    // Helper: read a single GGUF tensor directly from backing straight into WASM linear memory
+    // Helper: read a single GGUF tensor directly from preloaded buffer or backing straight into WASM linear memory
     const uploadFromBacking = (buf: VTensorBuffer, info: GgufTensorInfo): VTensorHandle => {
       const handle = buf.allocTensor(info.name, info.type, info.dims);
       const raw = buf.rawBytes();
+      const preloaded = preloadedHotTensors?.get(info.name);
+      if (preloaded && preloaded.byteLength === info.byteSize) {
+        raw.set(preloaded, handle.byteOffset);
+        this.coalescedReads += 1;
+        this.bytesRestoredFromBacking += info.byteSize;
+        return handle;
+      }
       const t0 = performance.now();
       const n = this.backing.readRange(
         this.parsed.dataOffset + info.offset,
@@ -369,7 +519,14 @@ export class VramWeightPager {
       const allInfos: GgufTensorInfo[] = [embdInfo, outNormInfo];
       if (!isTiedOutput) allInfos.push(outWeightInfo);
       for (const l of layerInfos) {
-        allInfos.push(l.attnNorm, l.attnQ, l.attnK, l.attnV, l.attnOutput, l.ffnNorm, l.ffnGate, l.ffnUp, l.ffnDown);
+        allInfos.push(l.attnNorm, l.attnQ, l.attnK, l.attnV, l.attnOutput, l.ffnNorm);
+        if (l.ffnGate) allInfos.push(l.ffnGate);
+        if (l.ffnUp) allInfos.push(l.ffnUp);
+        if (l.ffnDown) allInfos.push(l.ffnDown);
+        if (l.ffnGateInp) allInfos.push(l.ffnGateInp);
+        if (l.ffnGateExps) allInfos.push(l.ffnGateExps);
+        if (l.ffnUpExps) allInfos.push(l.ffnUpExps);
+        if (l.ffnDownExps) allInfos.push(l.ffnDownExps);
         if (l.attnQBias) allInfos.push(l.attnQBias);
         if (l.attnQNorm) allInfos.push(l.attnQNorm);
         if (l.attnKBias) allInfos.push(l.attnKBias);
@@ -413,7 +570,6 @@ export class VramWeightPager {
         }
         cursor = base + ext.byteLength;
       }
-      // Advance buffer cursor bookkeeping via a zero-overhead telemetry marker if needed
       this.pinnedTokenEmbd = handleByName.get(embdInfo.name)!;
       this.outputNorm = handleByName.get(outNormInfo.name)!;
       this.pinnedOutputWeight = isTiedOutput
@@ -433,10 +589,51 @@ export class VramWeightPager {
         attnOutput: handleByName.get(l.attnOutput.name)!,
         attnOutputBias: l.attnOutputBias ? handleByName.get(l.attnOutputBias.name)! : null,
         ffnNorm: handleByName.get(l.ffnNorm.name)!,
-        ffnGate: handleByName.get(l.ffnGate.name)!,
-        ffnUp: handleByName.get(l.ffnUp.name)!,
-        ffnDown: handleByName.get(l.ffnDown.name)!,
+        ffnGate: l.ffnGate ? handleByName.get(l.ffnGate.name)! : null,
+        ffnUp: l.ffnUp ? handleByName.get(l.ffnUp.name)! : null,
+        ffnDown: l.ffnDown ? handleByName.get(l.ffnDown.name)! : null,
+        ffnGateInp: l.ffnGateInp ? handleByName.get(l.ffnGateInp.name)! : null,
       }));
+
+      // Build zero-copy 2D expert slice views inside `vtensor.weights` for resident-all MoE models
+      this.residentMoeExperts = moeLayerGeo.map((geo, lIdx) => {
+        if (!geo) return null;
+        const gBase = handleByName.get(geo.gateInfo.name)!.byteOffset;
+        const uBase = handleByName.get(geo.upInfo.name)!.byteOffset;
+        const dBase = handleByName.get(geo.downInfo.name)!.byteOffset;
+        const slices: PagedExpertWeights[] = [];
+        for (let e = 0; e < geo.expertCount; e++) {
+          slices.push({
+            gate: weightsBuf.createViewTensor(
+              `blk.${lIdx}.ffn_gate_exp.${e}`,
+              geo.gateInfo.type,
+              geo.gateDims2D,
+              gBase + e * geo.gateSliceBytes,
+            ),
+            up: weightsBuf.createViewTensor(
+              `blk.${lIdx}.ffn_up_exp.${e}`,
+              geo.upInfo.type,
+              geo.upDims2D,
+              uBase + e * geo.upSliceBytes,
+            ),
+            down: weightsBuf.createViewTensor(
+              `blk.${lIdx}.ffn_down_exp.${e}`,
+              geo.downInfo.type,
+              geo.downDims2D,
+              dBase + e * geo.downSliceBytes,
+            ),
+          });
+        }
+        return slices;
+      });
+      this.moeCacheBuffer = null;
+      this.moeCacheSlots = [];
+      this.moePrev = new Int32Array(0);
+      this.moeNext = new Int32Array(0);
+      this.moeSlotFreq = new Uint8Array(0);
+      this.moeGateOffsetInSlot = 0;
+      this.moeUpOffsetInSlot = 0;
+      this.moeDownOffsetInSlot = 0;
 
       this.residentLayers = residentLayers;
       this.hotLayers = [];
@@ -451,7 +648,8 @@ export class VramWeightPager {
       this.embdRowHandle = null;
       this.embdCacheSlots = 0;
       this.embdSlotToToken = new Int32Array(0);
-      this.embdSlotLastTouch = new Uint32Array(0);
+      this.embdPrev = new Int32Array(0);
+      this.embdNext = new Int32Array(0);
       this.lmHeadTileBuffer = null;
       this.lmHeadStripeRows = outWeightInfo.dims[1] ?? 1;
       this.lmHeadFullStripeView = null;
@@ -535,14 +733,17 @@ export class VramWeightPager {
 
     let totalResident = hotBuf.capacityBytes + frameBuf.capacityBytes;
 
-    // 3. Unified Store Hot Embedding Row Slab (Zipfian LRU cache in WASM linear memory)
+    // 3. Unified Store Hot Embedding Row Slab (O(1) intrusive TypedArray LRU in WASM linear memory)
     if (this.streamEmbeddings) {
       const vocabRows = Math.max(1, embdInfo.dims[1] ?? 1);
       const requestedSlots = config.hotEmbeddingCacheSlots ?? 256;
       this.embdCacheSlots = Math.max(1, Math.min(vocabRows, requestedSlots));
       this.embdSlotToToken = new Int32Array(this.embdCacheSlots);
       this.embdSlotToToken.fill(-1);
-      this.embdSlotLastTouch = new Uint32Array(this.embdCacheSlots);
+      this.embdPrev = new Int32Array(this.embdCacheSlots);
+      this.embdPrev.fill(-1);
+      this.embdNext = new Int32Array(this.embdCacheSlots);
+      this.embdNext.fill(-1);
 
       const embdBuf = allocBuffer(
         'vtensor.vram_embd_cache',
@@ -560,7 +761,8 @@ export class VramWeightPager {
       this.embdRowHandle = null;
       this.embdCacheSlots = 0;
       this.embdSlotToToken = new Int32Array(0);
-      this.embdSlotLastTouch = new Uint32Array(0);
+      this.embdPrev = new Int32Array(0);
+      this.embdNext = new Int32Array(0);
     }
 
     // 4. Row-striped LM-head streaming tile buffer if LM head is streamed from OPFS
@@ -589,6 +791,51 @@ export class VramWeightPager {
       this.lmHeadStripeRows = outWeightInfo.dims[1] ?? 1;
       this.lmHeadFullStripeView = null;
       this.lmHeadTailStripeView = null;
+    }
+
+    // 5. Bounded WASM LRU Sparse Expert Cache (`vtensor.vram_moe_experts`) for 30B-A3B MoE!
+    this.residentMoeExperts = new Array<Array<PagedExpertWeights> | null>(layerInfos.length).fill(null);
+    if (this.isMoe) {
+      const gateOff = 0;
+      const upOff = alignUp32(maxGateSlice);
+      const downOff = alignUp32(upOff + maxUpSlice);
+      const slotStride = alignUp32(Math.max(64, downOff + maxDownSlice));
+      const requestedSlots = Math.max(
+        2,
+        config.moeExpertCacheSlots ?? Math.max(16, (parsed.hparams.expertUsedCount ?? 8) * 4),
+      );
+      const totalPossibleExperts = moeLayerGeo.reduce((acc, g) => acc + (g?.expertCount ?? 0), 0);
+      const slotCount = Math.max(1, Math.min(totalPossibleExperts, requestedSlots));
+      const moeBuf = allocBuffer('vtensor.vram_moe_experts', 'weights', slotStride * slotCount);
+      this.moeCacheBuffer = moeBuf;
+      this.moeGateOffsetInSlot = gateOff;
+      this.moeUpOffsetInSlot = upOff;
+      this.moeDownOffsetInSlot = downOff;
+      this.moeCacheSlots = [];
+      for (let s = 0; s < slotCount; s++) {
+        this.moeCacheSlots.push({
+          slotIndex: s,
+          baseOffset: s * slotStride,
+          key: -1,
+          lastTouch: 0,
+          handles: null,
+        });
+      }
+      this.moePrev = new Int32Array(slotCount);
+      this.moePrev.fill(-1);
+      this.moeNext = new Int32Array(slotCount);
+      this.moeNext.fill(-1);
+      this.moeSlotFreq = new Uint8Array(slotCount);
+      totalResident += moeBuf.capacityBytes;
+    } else {
+      this.moeCacheBuffer = null;
+      this.moeCacheSlots = [];
+      this.moePrev = new Int32Array(0);
+      this.moeNext = new Int32Array(0);
+      this.moeSlotFreq = new Uint8Array(0);
+      this.moeGateOffsetInSlot = 0;
+      this.moeUpOffsetInSlot = 0;
+      this.moeDownOffsetInSlot = 0;
     }
 
     this.residentWeightBytes = totalResident;
@@ -672,19 +919,42 @@ export class VramWeightPager {
         ),
         attnOutputBias: hot.attnOutputBias,
         ffnNorm: hot.ffnNorm,
-        ffnGate: frameBuf.createViewTensor(
-          info.ffnGate.name,
-          info.ffnGate.type,
-          info.ffnGate.dims,
-          base + p.ffnGate,
-        ),
-        ffnUp: frameBuf.createViewTensor(info.ffnUp.name, info.ffnUp.type, info.ffnUp.dims, base + p.ffnUp),
-        ffnDown: frameBuf.createViewTensor(
-          info.ffnDown.name,
-          info.ffnDown.type,
-          info.ffnDown.dims,
-          base + p.ffnDown,
-        ),
+        ffnGate:
+          info.ffnGate && p.ffnGate >= 0
+            ? frameBuf.createViewTensor(
+                info.ffnGate.name,
+                info.ffnGate.type,
+                info.ffnGate.dims,
+                base + p.ffnGate,
+              )
+            : null,
+        ffnUp:
+          info.ffnUp && p.ffnUp >= 0
+            ? frameBuf.createViewTensor(
+                info.ffnUp.name,
+                info.ffnUp.type,
+                info.ffnUp.dims,
+                base + p.ffnUp,
+              )
+            : null,
+        ffnDown:
+          info.ffnDown && p.ffnDown >= 0
+            ? frameBuf.createViewTensor(
+                info.ffnDown.name,
+                info.ffnDown.type,
+                info.ffnDown.dims,
+                base + p.ffnDown,
+              )
+            : null,
+        ffnGateInp:
+          info.ffnGateInp && p.ffnGateInp >= 0
+            ? frameBuf.createViewTensor(
+                info.ffnGateInp.name,
+                info.ffnGateInp.type,
+                info.ffnGateInp.dims,
+                base + p.ffnGateInp,
+              )
+            : null,
       };
       if (!isPinnedLayer) {
         this.cachedStreamingPublications[layerIdx] = publication;
@@ -700,10 +970,170 @@ export class VramWeightPager {
     return publication;
   }
 
+  /** O(1) intrusive doubly-linked list promotion to MRU head for MoE expert cache slots. */
+  private promoteMoeSlot(idx: number): void {
+    if (this.moeHead === idx) return;
+    const prev = this.moePrev[idx];
+    const next = this.moeNext[idx];
+    if (prev >= 0) this.moeNext[prev] = next;
+    if (next >= 0) this.moePrev[next] = prev;
+    if (this.moeTail === idx) this.moeTail = prev;
+    this.moePrev[idx] = -1;
+    this.moeNext[idx] = this.moeHead;
+    if (this.moeHead >= 0) this.moePrev[this.moeHead] = idx;
+    this.moeHead = idx;
+    if (this.moeTail < 0) this.moeTail = idx;
+  }
+
+  /** O(1) intrusive doubly-linked list promotion to MRU head for embedding row cache slots. */
+  private promoteEmbdSlot(idx: number): void {
+    if (this.embdHead === idx) return;
+    const prev = this.embdPrev[idx];
+    const next = this.embdNext[idx];
+    if (prev >= 0) this.embdNext[prev] = next;
+    if (next >= 0) this.embdPrev[next] = prev;
+    if (this.embdTail === idx) this.embdTail = prev;
+    this.embdPrev[idx] = -1;
+    this.embdNext[idx] = this.embdHead;
+    if (this.embdHead >= 0) this.embdPrev[this.embdHead] = idx;
+    this.embdHead = idx;
+    if (this.embdTail < 0) this.embdTail = idx;
+  }
+
+  /**
+   * Acquires the 2D `(gate, up, down)` weight slices for routed expert `(layerIdx, expertIdx)`.
+   * - In `resident-all` mode: returns the prebuilt zero-copy slice views inside `vtensor.weights`.
+   * - In `opfs-paged` mode: checks the O(1) frequency-protected WASM Sparse Expert Cache
+   *   (`vtensor.vram_moe_experts`) first; on miss, demand-pages ONLY this expert's 3 slices from
+   *   OPFS directly into WASM memory with zero JS heap allocations on slot handle reuse!
+   */
+  acquireExpertSlice(layerIdx: number, expertIdx: number): PagedExpertWeights {
+    const residentLayer = this.residentMoeExperts[layerIdx];
+    if (residentLayer) {
+      this.moeExpertHits += 1;
+      return residentLayer[expertIdx];
+    }
+
+    const geo = this.moeLayerGeo[layerIdx];
+    if (!geo) {
+      throw new Error(`Layer ${layerIdx} is not configured as a Sparse MoE layer.`);
+    }
+
+    const key = layerIdx * this.moeMaxExperts + expertIdx;
+    const cachedSlotIdx = this.moeKeyToSlot.get(key);
+    if (cachedSlotIdx !== undefined) {
+      const slot = this.moeCacheSlots[cachedSlotIdx];
+      slot.lastTouch = ++this.moeClock;
+      if (this.moeSlotFreq[cachedSlotIdx] < 15) {
+        this.moeSlotFreq[cachedSlotIdx] += 1;
+      }
+      this.promoteMoeSlot(cachedSlotIdx);
+      this.moeExpertHits += 1;
+      return slot.handles!;
+    }
+
+    // O(1) free slot allocation or frequency-protected second-chance LRU eviction from tail
+    let targetIdx: number;
+    if (this.moeFreeCursor < this.moeCacheSlots.length) {
+      targetIdx = this.moeFreeCursor++;
+    } else {
+      const maxSecondChances = Math.min(8, this.moeCacheSlots.length - 1);
+      let passes = 0;
+      while (passes < maxSecondChances && this.moeTail >= 0 && this.moeSlotFreq[this.moeTail] > 0) {
+        const saved = this.moeTail;
+        this.moeSlotFreq[saved] -= 1;
+        this.promoteMoeSlot(saved);
+        passes++;
+      }
+      targetIdx = this.moeTail >= 0 ? this.moeTail : 0;
+    }
+
+    const targetSlot = this.moeCacheSlots[targetIdx];
+    if (targetSlot.key >= 0) {
+      this.moeKeyToSlot.delete(targetSlot.key);
+      this.slotReclaims += 1;
+    }
+
+    const buf = this.moeCacheBuffer!;
+    const raw = buf.rawBytes();
+    const base = targetSlot.baseOffset;
+    const gateDst = base + this.moeGateOffsetInSlot;
+    const upDst = base + this.moeUpOffsetInSlot;
+    const downDst = base + this.moeDownOffsetInSlot;
+
+    const gateFileOff = this.parsed.dataOffset + geo.gateInfo.offset + expertIdx * geo.gateSliceBytes;
+    const upFileOff = this.parsed.dataOffset + geo.upInfo.offset + expertIdx * geo.upSliceBytes;
+    const downFileOff = this.parsed.dataOffset + geo.downInfo.offset + expertIdx * geo.downSliceBytes;
+
+    const t0 = performance.now();
+    const rGate = this.backing.readRange(gateFileOff, raw, gateDst, geo.gateSliceBytes);
+    const rUp = this.backing.readRange(upFileOff, raw, upDst, geo.upSliceBytes);
+    const rDown = this.backing.readRange(downFileOff, raw, downDst, geo.downSliceBytes);
+    this.backingReadMs += performance.now() - t0;
+
+    if (rGate !== geo.gateSliceBytes || rUp !== geo.upSliceBytes || rDown !== geo.downSliceBytes) {
+      throw new Error(
+        `vRAM MoE expert (L${layerIdx}, E${expertIdx}) short OPFS restore.`,
+      );
+    }
+
+    this.coalescedReads += 3;
+    this.bytesRestoredFromBacking += geo.gateSliceBytes + geo.upSliceBytes + geo.downSliceBytes;
+    this.moeExpertMisses += 1;
+
+    // Zero-allocation reuse of slot VTensorHandles whenever expert shapes & types match (100% on uniform MoE)
+    const existing = targetSlot.handles;
+    let handles: PagedExpertWeights;
+    if (
+      existing &&
+      existing.gate.type === geo.gateInfo.type &&
+      existing.up.type === geo.upInfo.type &&
+      existing.down.type === geo.downInfo.type &&
+      existing.gate.dims[0] === geo.gateDims2D[0] &&
+      existing.gate.dims[1] === geo.gateDims2D[1] &&
+      existing.up.dims[0] === geo.upDims2D[0] &&
+      existing.up.dims[1] === geo.upDims2D[1] &&
+      existing.down.dims[0] === geo.downDims2D[0] &&
+      existing.down.dims[1] === geo.downDims2D[1]
+    ) {
+      handles = existing;
+    } else {
+      handles = {
+        gate: buf.createViewTensor(
+          `vram.moe_g_s${targetSlot.slotIndex}`,
+          geo.gateInfo.type,
+          geo.gateDims2D,
+          gateDst,
+        ),
+        up: buf.createViewTensor(
+          `vram.moe_u_s${targetSlot.slotIndex}`,
+          geo.upInfo.type,
+          geo.upDims2D,
+          upDst,
+        ),
+        down: buf.createViewTensor(
+          `vram.moe_d_s${targetSlot.slotIndex}`,
+          geo.downInfo.type,
+          geo.downDims2D,
+          downDst,
+        ),
+      };
+      targetSlot.handles = handles;
+    }
+
+    targetSlot.key = key;
+    targetSlot.lastTouch = ++this.moeClock;
+    this.moeSlotFreq[targetIdx] = 0;
+    this.promoteMoeSlot(targetIdx);
+    this.moeKeyToSlot.set(key, targetIdx);
+    return handles;
+  }
+
   /**
    * Returns a `VTensorHandle` + local row index for embedding token `tokenId`.
    * When `streamEmbeddings` is active, checks the Unified Store Hot Embedding Row Slab
-   * (Zipfian LRU cache in WASM linear memory) first so repeated tokens resolve in 0 OPFS reads!
+   * (O(1) intrusive TypedArray LRU cache in WASM linear memory) first so repeated tokens
+   * resolve in 0 OPFS reads!
    */
   acquireEmbeddingRow(tokenId: number): { handle: VTensorHandle; rowIndex: number } {
     if (this.pinnedTokenEmbd) {
@@ -716,25 +1146,18 @@ export class VramWeightPager {
     // Fast O(1) Zipfian cache hit inside WASM linear memory
     const cachedSlot = this.embdTokenToSlot.get(tokenId);
     if (cachedSlot !== undefined) {
-      this.embdSlotLastTouch[cachedSlot] = ++this.embdCacheClock;
+      this.promoteEmbdSlot(cachedSlot);
       this.embdCacheHits += 1;
       return { handle, rowIndex: cachedSlot };
     }
 
-    // Cache miss: select an empty slot first, otherwise evict the LRU hot-embedding slot
-    let targetSlot = 0;
-    let oldestTouch = 0xffffffff;
-    for (let s = 0; s < this.embdCacheSlots; s++) {
-      if (this.embdSlotToToken[s] < 0) {
-        targetSlot = s;
-        break;
-      }
-      const touch = this.embdSlotLastTouch[s];
-      if (touch < oldestTouch) {
-        oldestTouch = touch;
-        targetSlot = s;
-      }
-    }
+    // O(1) free slot selection or LRU tail eviction
+    const targetSlot =
+      this.embdFreeCursor < this.embdCacheSlots
+        ? this.embdFreeCursor++
+        : this.embdTail >= 0
+          ? this.embdTail
+          : 0;
 
     const evictedToken = this.embdSlotToToken[targetSlot];
     if (evictedToken >= 0) {
@@ -751,7 +1174,7 @@ export class VramWeightPager {
     }
 
     this.embdSlotToToken[targetSlot] = tokenId;
-    this.embdSlotLastTouch[targetSlot] = ++this.embdCacheClock;
+    this.promoteEmbdSlot(targetSlot);
     this.embdTokenToSlot.set(tokenId, targetSlot);
     this.embdCacheMisses += 1;
     this.coalescedReads += 1;
@@ -804,6 +1227,136 @@ export class VramWeightPager {
               );
       callback(view, rowStart, rowCount);
     }
+  }
+
+  /**
+   * Loads a single LM-head row stripe `[rowStart, rowStart + rowCount)` from backing into the
+   * bounded LM-head tile buffer (used by async demand-paged LM-head streaming).
+   */
+  acquireLmHeadStripe(rowStart: number, rowCount: number): VTensorHandle {
+    if (this.pinnedOutputWeight) {
+      return this.pinnedOutputWeight;
+    }
+    const tileBuf = this.lmHeadTileBuffer!;
+    const raw = tileBuf.rawBytes();
+    const cols = this.outWeightInfo.dims[0] ?? 1;
+    const baseFileOffset = this.parsed.dataOffset + this.outWeightInfo.offset;
+    const stripeBytes = rowCount * this.lmHeadRowBytes;
+    const fileOffset = baseFileOffset + rowStart * this.lmHeadRowBytes;
+
+    const t0 = performance.now();
+    const read = this.backing.readRange(fileOffset, raw, 0, stripeBytes);
+    this.backingReadMs += performance.now() - t0;
+    if (read !== stripeBytes) {
+      throw new Error(`vRAM LM-head stripe [${rowStart}, ${rowStart + rowCount}) short read.`);
+    }
+    this.coalescedReads += 1;
+    this.bytesRestoredFromBacking += stripeBytes;
+
+    return rowCount === this.lmHeadStripeRows && this.lmHeadFullStripeView
+      ? this.lmHeadFullStripeView
+      : this.lmHeadTailStripeView && this.lmHeadTailStripeView.dims[1] === rowCount
+        ? this.lmHeadTailStripeView
+        : tileBuf.createViewTensor(
+            `vram.lmhead_${rowStart}`,
+            this.outWeightInfo.type,
+            [cols, rowCount],
+            0,
+          );
+  }
+
+  /** Returns backing byte ranges required to fault `layerIdx`, or `[]` if already resident in WASM. */
+  getLayerMissingRanges(layerIdx: number): ByteRange[] {
+    if (this.residentLayers || this.layerToSlot[layerIdx] >= 0) {
+      return [];
+    }
+    const plan = this.layerPlans[layerIdx];
+    const ranges: ByteRange[] = [];
+    for (let e = 0; e < plan.extents.length; e++) {
+      const ext = plan.extents[e];
+      ranges.push({ fileOffset: ext.fileOffset, byteLength: ext.byteLength });
+    }
+    return ranges;
+  }
+
+  /**
+   * Returns backing byte ranges for all routed `(layerIdx, expertIdx)` triples NOT currently
+   * resident in the WASM Sparse Expert Cache.
+   */
+  getExpertMissingRanges(layerIdx: number, expertIds: readonly number[]): ByteRange[] {
+    if (this.residentMoeExperts[layerIdx]) {
+      return [];
+    }
+    const geo = this.moeLayerGeo[layerIdx];
+    if (!geo) return [];
+    const ranges: ByteRange[] = [];
+    for (let i = 0; i < expertIds.length; i++) {
+      const expId = expertIds[i];
+      if (expId < 0 || expId >= geo.expertCount) continue;
+      const key = layerIdx * this.moeMaxExperts + expId;
+      if (this.moeKeyToSlot.has(key)) continue;
+      ranges.push(
+        {
+          fileOffset: this.parsed.dataOffset + geo.gateInfo.offset + expId * geo.gateSliceBytes,
+          byteLength: geo.gateSliceBytes,
+        },
+        {
+          fileOffset: this.parsed.dataOffset + geo.upInfo.offset + expId * geo.upSliceBytes,
+          byteLength: geo.upSliceBytes,
+        },
+        {
+          fileOffset: this.parsed.dataOffset + geo.downInfo.offset + expId * geo.downSliceBytes,
+          byteLength: geo.downSliceBytes,
+        },
+      );
+    }
+    return ranges;
+  }
+
+  /** Returns backing byte ranges for embedding token IDs not yet resident in the WASM hot row cache. */
+  getEmbeddingMissingRanges(tokenIds: readonly number[]): ByteRange[] {
+    if (this.pinnedTokenEmbd) return [];
+    const ranges: ByteRange[] = [];
+    const seen = new Set<number>();
+    const base = this.parsed.dataOffset + this.embdInfo.offset;
+    for (let i = 0; i < tokenIds.length; i++) {
+      const tid = tokenIds[i];
+      if (tid < 0 || seen.has(tid) || this.embdTokenToSlot.has(tid)) continue;
+      seen.add(tid);
+      ranges.push({
+        fileOffset: base + tid * this.embdRowBytes,
+        byteLength: this.embdRowBytes,
+      });
+    }
+    return ranges;
+  }
+
+  /** Returns the row-stripe byte descriptors for streaming LM-head evaluation (`[]` if pinned). */
+  getLmHeadStripeSpecs(): Array<{
+    rowStart: number;
+    rowCount: number;
+    fileOffset: number;
+    byteLength: number;
+  }> {
+    if (this.pinnedOutputWeight) return [];
+    const vocabSize = this.outWeightInfo.dims[1] ?? 1;
+    const baseFileOffset = this.parsed.dataOffset + this.outWeightInfo.offset;
+    const specs: Array<{
+      rowStart: number;
+      rowCount: number;
+      fileOffset: number;
+      byteLength: number;
+    }> = [];
+    for (let rowStart = 0; rowStart < vocabSize; rowStart += this.lmHeadStripeRows) {
+      const rowCount = Math.min(this.lmHeadStripeRows, vocabSize - rowStart);
+      specs.push({
+        rowStart,
+        rowCount,
+        fileOffset: baseFileOffset + rowStart * this.lmHeadRowBytes,
+        byteLength: rowCount * this.lmHeadRowBytes,
+      });
+    }
+    return specs;
   }
 
   /** Returns all resident layer handles when in `resident-all` mode (for compiled graph fast path). */
@@ -865,6 +1418,12 @@ export class VramWeightPager {
       embdCacheMisses: this.embdCacheMisses,
       embdCacheBytes: this.embdRowBuffer?.capacityBytes ?? 0,
       residentLayerBitsetHex: `0x${this.residentLayerBitset.toString(16).padStart(16, '0')}`,
+      isMoe: this.isMoe,
+      moeExpertCacheSlots: this.moeCacheSlots.length,
+      moeExpertResidentCount: this.moeKeyToSlot.size,
+      moeExpertHits: this.moeExpertHits,
+      moeExpertMisses: this.moeExpertMisses,
+      moeExpertCacheBytes: this.moeCacheBuffer?.capacityBytes ?? 0,
     };
   }
 }

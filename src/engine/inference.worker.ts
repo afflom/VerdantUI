@@ -237,17 +237,17 @@ function formatStreamProgressDetail(
     return p.note;
   }
   if (p.stage === 'verifying') {
-    return p.note ?? 'Verifying GGUF integrity in OPFS vRAM…';
+    return p.note ?? 'Verifying model file integrity…';
   }
   const baseLabel = isLocalFile
-    ? p.backingKind === 'opfs-sync'
-      ? 'Streaming local GGUF to OPFS vRAM'
-      : 'Reading local GGUF'
-    : p.backingKind === 'opfs-sync'
-      ? p.resumedFromBytes && p.resumedFromBytes > 0
-        ? 'Resuming OPFS vRAM stream'
-        : 'Streaming to OPFS vRAM'
-      : 'Downloading';
+    ? p.backingKind === 'local-file-sync'
+      ? 'Opening local model'
+      : 'Importing local model'
+    : p.backingKind === 'opfs-demand'
+      ? p.note ?? 'Preparing on-demand model cache'
+      : p.resumedFromBytes && p.resumedFromBytes > 0
+        ? 'Resuming download'
+        : 'Downloading';
 
   const sizePart =
     p.totalBytes > 0
@@ -303,9 +303,10 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           runtime.unload();
           modelUnloaded = true;
         }
-        const preStorage = await inspectOpfsVramStorage();
+        const activeIdBeforeLoad = runtime.getModelSummary()?.id;
         const backing = await streamUrlToVramBacking(req.id, req.url, {
           skipOpfs: req.skipOpfs,
+          activeModelId: activeIdBeforeLoad,
           signal: controller.signal,
           onProgress: (p) => {
             post({
@@ -324,20 +325,36 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           type: 'progress',
           requestId: req.requestId,
           percent: 97,
-          detail:
-            backing.kind === 'opfs-sync'
-              ? `Binding OPFS vRAM & Prism contract for ${req.displayName}`
-              : `Allocating vTensor buffers for ${req.displayName}`,
+          detail: `Loading ${req.displayName}`,
           receivedBytes: backing.byteLength,
           totalBytes: backing.byteLength,
           backingKind: backing.kind,
         });
 
-        const summary = runtime.loadFromBacking(req.id, req.displayName, req.url, backing, {
-          maxContextCap: req.maxContextCap,
-          weightResidencyPolicy: req.weightResidencyPolicy,
-          backingQuotaBytes: preStorage.quotaBytes > 0 ? preStorage.quotaBytes : undefined,
-        });
+        const preStorage = await inspectOpfsVramStorage();
+        const summary = await runtime.loadFromBackingAsync(
+          req.id,
+          req.displayName,
+          req.url,
+          backing,
+          {
+            maxContextCap: req.maxContextCap,
+            weightResidencyPolicy: req.weightResidencyPolicy,
+            backingQuotaBytes: preStorage.quotaBytes > 0 ? preStorage.quotaBytes : undefined,
+            signal: controller.signal,
+            onProgress: (p) => {
+              post({
+                type: 'progress',
+                requestId: req.requestId,
+                percent: p.percent,
+                detail: p.detail,
+                receivedBytes: backing.byteLength,
+                totalBytes: backing.byteLength,
+                backingKind: backing.kind,
+              });
+            },
+          },
+        );
         await runtime.hydrateUnifiedStoreFromOpfs().catch(() => 0);
         const opfsStorage = await inspectOpfsVramStorage();
         post({
@@ -402,17 +419,35 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           type: 'progress',
           requestId: req.requestId,
           percent: 97,
-          detail: `Binding OPFS vRAM & Prism contract for ${req.displayName}`,
+          detail: `Loading ${req.displayName}`,
           receivedBytes: backing.byteLength,
           totalBytes: backing.byteLength,
           backingKind: backing.kind,
         });
 
-        const summary = runtime.loadFromBacking(req.id, req.displayName, req.source, backing, {
-          maxContextCap: req.maxContextCap,
-          weightResidencyPolicy: req.weightResidencyPolicy,
-          backingQuotaBytes: preStorage.quotaBytes > 0 ? preStorage.quotaBytes : undefined,
-        });
+        const summary = await runtime.loadFromBackingAsync(
+          req.id,
+          req.displayName,
+          req.source,
+          backing,
+          {
+            maxContextCap: req.maxContextCap,
+            weightResidencyPolicy: req.weightResidencyPolicy,
+            backingQuotaBytes: preStorage.quotaBytes > 0 ? preStorage.quotaBytes : undefined,
+            signal: controller.signal,
+            onProgress: (p) => {
+              post({
+                type: 'progress',
+                requestId: req.requestId,
+                percent: p.percent,
+                detail: p.detail,
+                receivedBytes: backing.byteLength,
+                totalBytes: backing.byteLength,
+                backingKind: backing.kind,
+              });
+            },
+          },
+        );
         await runtime.hydrateUnifiedStoreFromOpfs().catch(() => 0);
         const opfsStorage = await inspectOpfsVramStorage();
         post({
@@ -538,7 +573,8 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       await preemptSpeculativePrefill();
       const activeId = runtime.getModelSummary()?.id;
       const before = await inspectOpfsVramStorage();
-      const canWipeDir = !activeId || runtime.getModelSummary()?.backingKind !== 'opfs-sync';
+      const activeKind = runtime.getModelSummary()?.backingKind;
+      const canWipeDir = !activeId || (activeKind !== 'opfs-sync' && activeKind !== 'opfs-demand');
       if (canWipeDir) {
         await clearAllOpfsModels();
       } else {
@@ -563,11 +599,19 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     }
 
     if (req.type === 'speculative_prefill') {
-      if (activeGenerationCount > 0 || !runtime.isLoaded) {
+      if (
+        activeGenerationCount > 0 ||
+        !runtime.isLoaded ||
+        runtime.getModelSummary()?.backingKind === 'opfs-demand'
+      ) {
         return;
       }
       await preemptSpeculativePrefill();
-      if (activeGenerationCount > 0 || !runtime.isLoaded) {
+      if (
+        activeGenerationCount > 0 ||
+        !runtime.isLoaded ||
+        runtime.getModelSummary()?.backingKind === 'opfs-demand'
+      ) {
         return;
       }
 
@@ -625,6 +669,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       try {
         let count = 0;
         let lastPrefillPost = 0;
+        let lastPrefillDetail: string | undefined;
         let lastTelemetryPost = 0;
         runtime.beginGenerationSlice();
         let lastStepMs = performance.now();
@@ -634,12 +679,17 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           controller.signal,
           (progress) => {
             const now = performance.now();
+            const detailChanged =
+              progress.detail !== undefined && progress.detail !== lastPrefillDetail;
             if (
+              lastPrefillPost === 0 ||
               progress.completedTokens === 1 ||
               progress.completedTokens === progress.totalTokens ||
+              (detailChanged && now - lastPrefillPost >= 100) ||
               now - lastPrefillPost > 120
             ) {
               lastPrefillPost = now;
+              lastPrefillDetail = progress.detail;
               post({
                 type: 'prefill',
                 requestId: req.requestId,

@@ -76,12 +76,22 @@ export interface ModelGeometrySpec {
   readonly lmHeadWeightBytes: number;
   /** Total active weight parameter count evaluated per decode token. */
   readonly activeParamCount: number;
-  /** Total model file / buffer weight bytes (including embeddings). */
+  /** Total model file / buffer weight bytes (including embeddings and inactive MoE experts). */
   readonly totalWeightBufferBytes: number;
   /** Dominant weight storage type across transformer linear projections. */
   readonly dominantWeightType: GgmlType;
   /** Fraction of linear-projection weights stored in quantized integer block formats. */
   readonly quantizedWeightFraction: number;
+  /** True when FFN uses Sparse Mixture-of-Experts (`qwen3moe` / `qwen2moe` / `mixtral`). */
+  readonly isMoe?: boolean;
+  /** Total routed experts per layer (e.g. 128 on Qwen3-30B-A3B). */
+  readonly expertCount?: number;
+  /** Active routed experts evaluated per token (e.g. 8 on Qwen3-30B-A3B). */
+  readonly expertUsedCount?: number;
+  /** Average per-layer bytes for attention + router (pinned/paged via layer frames). */
+  readonly moeAttentionLayerBytes?: number;
+  /** Byte size of a single routed expert triple `(gate, up, down)`. */
+  readonly moeSingleExpertTripleBytes?: number;
 }
 
 export interface RowStripePartition {
@@ -145,6 +155,12 @@ export interface PerformanceContract {
   readonly projectedResidentWeightBytes: number;
   readonly vramLogicalCapacityCeilingBytes: number;
   readonly opfsIoOverheadMsPerToken: number;
+  /** Tokens amortized per OPFS layer acquire during Layer-Major Chunked Prefill (32 when paged, B* when resident). */
+  readonly prefillChunkTokens: number;
+  /** Sparse MoE bounded WASM LRU expert cache sizing (0 for dense models). */
+  readonly isMoe: boolean;
+  readonly moeExpertCacheSlots: number;
+  readonly moeResidentExpertBytes: number;
 
   // Theorem T5: Live Compliance Observation (updated after each generation turn)
   readonly observedDecodeTokSec: number;
@@ -175,6 +191,8 @@ export const INTEGER_DOT_COMPATIBLE_TYPES: ReadonlySet<GgmlType> = new Set<GgmlT
   GgmlType.Q5_0,
   GgmlType.Q5_1,
   GgmlType.Q8_0,
+  GgmlType.Q2_K,
+  GgmlType.Q3_K,
   GgmlType.Q4_K,
   GgmlType.Q5_K,
   GgmlType.Q6_K,
@@ -312,7 +330,12 @@ export function derivePerformanceContract(
   const backingQuotaBytes =
     options?.backingQuotaBytes ?? Math.max(model.totalWeightBufferBytes * 2, 16 * 1024 * 1024 * 1024);
   const backingBandwidthMBs =
-    options?.backingBandwidthMBs ?? (backingKind === 'opfs-sync' ? 3200 : 4500);
+    options?.backingBandwidthMBs ??
+    (backingKind === 'opfs-demand'
+      ? 1800
+      : backingKind === 'opfs-sync' || backingKind === 'local-file-sync'
+        ? 3200
+        : 4500);
 
   // --- Theorem T2: Activation Quantization & Spill-Free Optimal Prefill Batch Width ---
   const canUseInt8Dots =
@@ -324,7 +347,9 @@ export function derivePerformanceContract(
 
   const usesQ8KNarrowLane =
     useQ8Activations &&
-    (model.dominantWeightType === GgmlType.Q4_K ||
+    (model.dominantWeightType === GgmlType.Q2_K ||
+      model.dominantWeightType === GgmlType.Q3_K ||
+      model.dominantWeightType === GgmlType.Q4_K ||
       model.dominantWeightType === GgmlType.Q5_K ||
       model.dominantWeightType === GgmlType.Q6_K) &&
     (hp.embeddingLength & 255) === 0;
@@ -447,8 +472,25 @@ export function derivePerformanceContract(
     backingQuotaBytes,
   );
 
+  const isMoe = Boolean(model.isMoe && (model.expertCount ?? hp.expertCount ?? 0) > 0);
+  const expertCount = isMoe ? (model.expertCount ?? hp.expertCount ?? 1) : 0;
+  const expertUsedCount = isMoe ? Math.max(1, model.expertUsedCount ?? hp.expertUsedCount ?? 2) : 0;
+
   const bodyWeightBytes = Math.max(1, model.activeWeightBytes - model.lmHeadWeightBytes);
-  const avgLayerBytes = bodyWeightBytes / Math.max(1, hp.blockCount);
+  const avgLayerBytes = isMoe && model.moeAttentionLayerBytes && model.moeAttentionLayerBytes > 0
+    ? model.moeAttentionLayerBytes
+    : bodyWeightBytes / Math.max(1, hp.blockCount);
+  const moeSingleExpertTripleBytes = isMoe
+    ? Math.max(
+        64 * 1024,
+        model.moeSingleExpertTripleBytes ??
+          Math.floor(
+            Math.max(1, bodyWeightBytes - avgLayerBytes * hp.blockCount) /
+              Math.max(1, hp.blockCount * expertUsedCount),
+          ),
+      )
+    : 0;
+
   const mustPageWeights = model.totalWeightBufferBytes > physicalWeightBudgetBytes;
   const weightResidencyMode: WeightResidencyMode =
     mustPageWeights || weightResidencyPolicy === 'paged' ? 'opfs-paged' : 'resident-all';
@@ -459,6 +501,8 @@ export function derivePerformanceContract(
   let lmHeadTileTargetBytes = VRAM_LM_HEAD_TILE_TARGET_BYTES;
   let projectedResidentWeightBytes = model.totalWeightBufferBytes;
   let opfsIoTimeSec = 0;
+  let moeExpertCacheSlots = 0;
+  let moeResidentExpertBytes = 0;
 
   if (weightResidencyMode === 'opfs-paged') {
     streamEmbeddings = true;
@@ -474,35 +518,91 @@ export function derivePerformanceContract(
     const lmTileEstimate = streamLmHead
       ? Math.min(model.lmHeadWeightBytes, lmHeadTileTargetBytes)
       : model.lmHeadWeightBytes;
-    const frameBudgetBytes = mustPageWeights
-      ? Math.max(avgLayerBytes, physicalWeightBudgetBytes - hotNormsEstimate - lmTileEstimate)
-      : Math.max(2 * avgLayerBytes, Math.min(physicalWeightBudgetBytes, Math.floor(bodyWeightBytes * 0.25)));
-
-    const maxSlotsByBudget = Math.max(1, Math.floor(frameBudgetBytes / Math.max(1, avgLayerBytes)));
-    // Cap forced-paged mode to <= 4 slots (when L > 4) so bounded-RAM compression is exercised clearly
-    const forcedCap =
-      !mustPageWeights && hp.blockCount > 4
-        ? Math.min(4, Math.max(2, Math.floor(hp.blockCount / 4)))
-        : Math.max(1, hp.blockCount - 1);
-    const hardCap = options?.maxLayerFrameSlotsCap ?? Number.POSITIVE_INFINITY;
-    weightLayerFrameSlots = Math.max(
-      1,
-      Math.min(Math.max(1, hp.blockCount - 1), maxSlotsByBudget, forcedCap, hardCap),
-    );
-    projectedResidentWeightBytes = Math.round(
-      hotNormsEstimate + weightLayerFrameSlots * avgLayerBytes + lmTileEstimate + 64 * 1024,
+    const availableForFramesAndExperts = Math.max(
+      avgLayerBytes,
+      physicalWeightBudgetBytes - hotNormsEstimate - lmTileEstimate,
     );
 
-    // Belady-Optimal Cyclic Pinning: layers [0 .. K-2] stay permanently pinned (0 OPFS faults);
-    // only tail layers [K-1 .. L-1] stream through slot K-1, cutting I/O by L / (L - K + 1).
-    const beladyPinnedLayers =
-      hp.blockCount > weightLayerFrameSlots ? Math.max(0, weightLayerFrameSlots - 1) : hp.blockCount;
-    const faultedLayerFraction =
-      hp.blockCount > 0 ? Math.max(0, hp.blockCount - beladyPinnedLayers) / hp.blockCount : 0;
-    const faultedBytesPerToken =
-      bodyWeightBytes * faultedLayerFraction +
-      (streamLmHead ? model.lmHeadWeightBytes : 0);
-    opfsIoTimeSec = faultedBytesPerToken / Math.max(1e6, backingBandwidthMBs * 1e6);
+    if (isMoe) {
+      // Sparse MoE (e.g. Qwen3-Coder-30B-A3B): attention + router frames are tiny (~16 MB/layer),
+      // so pin as many attention frames as possible (up to 45% of weight budget) and dedicate
+      // the remaining physical weight budget to the bounded WASM LRU Sparse Expert Cache!
+      const attnTotalBytes = avgLayerBytes * hp.blockCount;
+      const attnBudgetBytes = Math.min(
+        attnTotalBytes,
+        Math.max(avgLayerBytes, Math.floor(availableForFramesAndExperts * 0.45)),
+      );
+      const maxAttnSlots = Math.max(1, Math.floor(attnBudgetBytes / Math.max(1, avgLayerBytes)));
+      const hardCap = options?.maxLayerFrameSlotsCap ?? Number.POSITIVE_INFINITY;
+      weightLayerFrameSlots = Math.max(
+        1,
+        Math.min(hp.blockCount, maxAttnSlots, hardCap),
+      );
+      const attnResidentBytes = weightLayerFrameSlots * avgLayerBytes;
+      const expertBudgetBytes = Math.max(
+        moeSingleExpertTripleBytes * Math.min(expertUsedCount, 4),
+        availableForFramesAndExperts - attnResidentBytes,
+      );
+      const totalExpertsAcrossLayers = hp.blockCount * expertCount;
+      const rawExpertSlots = Math.floor(expertBudgetBytes / Math.max(1, moeSingleExpertTripleBytes));
+      moeExpertCacheSlots = Math.max(
+        Math.min(totalExpertsAcrossLayers, Math.max(2, expertUsedCount)),
+        Math.min(totalExpertsAcrossLayers, rawExpertSlots),
+      );
+      moeResidentExpertBytes = moeExpertCacheSlots * moeSingleExpertTripleBytes;
+      projectedResidentWeightBytes = Math.round(
+        hotNormsEstimate + attnResidentBytes + moeResidentExpertBytes + lmTileEstimate + 64 * 1024,
+      );
+
+      // Expected per-token OPFS fault traffic for Sparse MoE:
+      // 1) Any unpinned attention+router layers (0 when all L attention frames fit!)
+      const beladyPinnedLayers =
+        hp.blockCount > weightLayerFrameSlots ? Math.max(0, weightLayerFrameSlots - 1) : hp.blockCount;
+      const faultedAttnBytes = Math.max(0, hp.blockCount - beladyPinnedLayers) * avgLayerBytes;
+      // 2) Active routed experts per token that miss the WASM LRU Expert Cache (Zipfian routing)
+      const cacheCoverage = Math.min(
+        1,
+        moeExpertCacheSlots / Math.max(1, totalExpertsAcrossLayers),
+      );
+      // Empirical Zipfian expert locality: caching fraction f of experts captures ~min(0.92, sqrt(f)*0.85) hits
+      const estimatedExpertHitRate =
+        cacheCoverage >= 1 ? 1 : Math.min(0.92, Math.sqrt(cacheCoverage) * 0.85);
+      const activeExpertBytesPerToken = hp.blockCount * expertUsedCount * moeSingleExpertTripleBytes;
+      const faultedExpertBytes = activeExpertBytesPerToken * (1 - estimatedExpertHitRate);
+      const faultedBytesPerToken =
+        faultedAttnBytes + faultedExpertBytes + (streamLmHead ? model.lmHeadWeightBytes : 0);
+      opfsIoTimeSec = faultedBytesPerToken / Math.max(1e6, backingBandwidthMBs * 1e6);
+    } else {
+      const frameBudgetBytes = mustPageWeights
+        ? availableForFramesAndExperts
+        : Math.max(2 * avgLayerBytes, Math.min(physicalWeightBudgetBytes, Math.floor(bodyWeightBytes * 0.25)));
+
+      const maxSlotsByBudget = Math.max(1, Math.floor(frameBudgetBytes / Math.max(1, avgLayerBytes)));
+      // Cap forced-paged mode to <= 4 slots (when L > 4) so bounded-RAM compression is exercised clearly
+      const forcedCap =
+        !mustPageWeights && hp.blockCount > 4
+          ? Math.min(4, Math.max(2, Math.floor(hp.blockCount / 4)))
+          : Math.max(1, hp.blockCount - 1);
+      const hardCap = options?.maxLayerFrameSlotsCap ?? Number.POSITIVE_INFINITY;
+      weightLayerFrameSlots = Math.max(
+        1,
+        Math.min(Math.max(1, hp.blockCount - 1), maxSlotsByBudget, forcedCap, hardCap),
+      );
+      projectedResidentWeightBytes = Math.round(
+        hotNormsEstimate + weightLayerFrameSlots * avgLayerBytes + lmTileEstimate + 64 * 1024,
+      );
+
+      // Belady-Optimal Cyclic Pinning: layers [0 .. K-2] stay permanently pinned (0 OPFS faults);
+      // only tail layers [K-1 .. L-1] stream through slot K-1, cutting I/O by L / (L - K + 1).
+      const beladyPinnedLayers =
+        hp.blockCount > weightLayerFrameSlots ? Math.max(0, weightLayerFrameSlots - 1) : hp.blockCount;
+      const faultedLayerFraction =
+        hp.blockCount > 0 ? Math.max(0, hp.blockCount - beladyPinnedLayers) / hp.blockCount : 0;
+      const faultedBytesPerToken =
+        bodyWeightBytes * faultedLayerFraction +
+        (streamLmHead ? model.lmHeadWeightBytes : 0);
+      opfsIoTimeSec = faultedBytesPerToken / Math.max(1e6, backingBandwidthMBs * 1e6);
+    }
   }
 
   const rooflineDecodeSec =
@@ -521,9 +621,20 @@ export function derivePerformanceContract(
     hp.blockCount > weightLayerFrameSlots ? Math.max(0, weightLayerFrameSlots - 1) : hp.blockCount;
   const prefillFaultFraction =
     hp.blockCount > 0 ? Math.max(0, hp.blockCount - beladyPinnedForPrefill) / hp.blockCount : 0;
+  // Layer-Major Chunked Prefill amortizes OPFS layer restores across 32 tokens (8 x Batch-4)
+  // while Expert-Grouped Batch-4 Sparse MoE amortizes shared routed experts across the chunk.
+  const prefillChunkTokens =
+    weightResidencyMode === 'opfs-paged'
+      ? SPILL_FREE_BATCH_WIDTH * 8
+      : optimalPrefillBatchSize;
   const prefillOpfsIoPerTok =
-    weightResidencyMode === 'opfs-paged' && hp.blockCount > weightLayerFrameSlots
-      ? (bodyWeightBytes * prefillFaultFraction) / Math.max(1e6, optimalPrefillBatchSize * backingBandwidthMBs * 1e6)
+    weightResidencyMode === 'opfs-paged'
+      ? isMoe
+        ? opfsIoTimeSec / Math.max(1, optimalPrefillBatchSize * 1.45)
+        : hp.blockCount > weightLayerFrameSlots
+          ? (bodyWeightBytes * prefillFaultFraction) /
+            Math.max(1e6, prefillChunkTokens * backingBandwidthMBs * 1e6)
+          : 0
       : 0;
   const rooflinePrefillSecPerTok =
     Math.max(prefillMemTimePerTok, prefillCmpTimePerTok) + prefillOpfsIoPerTok + nonGemmOverheadSec;
@@ -625,7 +736,11 @@ export function derivePerformanceContract(
     `T1 ${rooflineDecodeTokSec.toFixed(1)} tok/s* (${decodeRegime}) · ` +
     `T2 B*=${optimalPrefillBatchSize} · ` +
     `T4 ${hotFrameLimit}H/${warmQ8Limit}W${coldQ4Enabled ? (swapQ4Enabled ? '/Q4+Swap' : '/Q4') : ''} @ ${effectiveMaxContext}ctx` +
-    (weightResidencyMode === 'opfs-paged' ? ` · vRAM ${weightLayerFrameSlots}/${hp.blockCount}L` : '');
+    (isMoe
+      ? ` · MoE ${expertUsedCount}/${expertCount}E (${moeExpertCacheSlots > 0 ? `${moeExpertCacheSlots} cached` : 'resident'})`
+      : weightResidencyMode === 'opfs-paged'
+        ? ` · vRAM ${weightLayerFrameSlots}/${hp.blockCount}L`
+        : '');
 
   return {
     env,
@@ -672,6 +787,10 @@ export function derivePerformanceContract(
     projectedResidentWeightBytes,
     vramLogicalCapacityCeilingBytes,
     opfsIoOverheadMsPerToken: Number((opfsIoTimeSec * 1000).toFixed(2)),
+    prefillChunkTokens,
+    isMoe,
+    moeExpertCacheSlots,
+    moeResidentExpertBytes,
     observedDecodeTokSec: 0,
     observedPrefillTokSec: 0,
     rooflineEfficiencyPct: 0,

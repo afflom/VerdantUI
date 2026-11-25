@@ -120,6 +120,16 @@ export interface LlamaHyperParams {
   readonly preTokenizer: string;
   readonly chatTemplate: string | null;
   readonly primaryQuantization: string;
+  /** Number of routed experts per layer (0 for dense models, e.g. 128 for Qwen3-30B-A3B). */
+  readonly expertCount?: number;
+  /** Number of active experts selected per token (0 for dense models, e.g. 8 for Qwen3-30B-A3B). */
+  readonly expertUsedCount?: number;
+  /** Intermediate FFN width per routed expert (defaults to feedForwardLength). */
+  readonly expertFeedForwardLength?: number;
+  /** Number of always-active shared experts (0 when none). */
+  readonly expertSharedCount?: number;
+  /** Whether Top-K router softmax weights are renormalized to sum to 1 (true on Qwen3-MoE). */
+  readonly expertWeightsNorm?: boolean;
 }
 
 export interface ParsedGgufModel {
@@ -353,7 +363,9 @@ export function parseGGUF(buffer: ArrayBuffer | Uint8Array): ParsedGgufModel {
 
   const NEOX_ROPE_ARCHS = new Set([
     'qwen2',
+    'qwen2moe',
     'qwen3',
+    'qwen3moe',
     'phi3',
     'gemma',
     'gemma2',
@@ -369,13 +381,24 @@ export function parseGGUF(buffer: ArrayBuffer | Uint8Array): ParsedGgufModel {
   const ropeFreqScale =
     ropeScalingFactor > 0 && Number.isFinite(ropeScalingFactor) ? 1.0 / ropeScalingFactor : 1.0;
 
+  const feedForwardLength = getNum(`${arch}.feed_forward_length`, embeddingLength * 4);
+  const expertCount = getNum(`${arch}.expert_count`, 0);
+  const expertUsedCount = getNum(`${arch}.expert_used_count`, expertCount > 0 ? Math.min(2, expertCount) : 0);
+  const expertFeedForwardLength = getNum(`${arch}.expert_feed_forward_length`, feedForwardLength);
+  const expertSharedCount = getNum(`${arch}.expert_shared_count`, 0);
+  const expertWeightsNormMeta = metadata[`${arch}.expert_weights_norm`];
+  const expertWeightsNorm =
+    typeof expertWeightsNormMeta === 'boolean'
+      ? expertWeightsNormMeta
+      : arch === 'qwen3moe' || arch === 'mixtral';
+
   const hparams: LlamaHyperParams = {
     architecture: arch,
     name: typeof metadata['general.name'] === 'string' ? (metadata['general.name'] as string) : arch,
     vocabSize,
     contextLength: getNum(`${arch}.context_length`, 2048),
     embeddingLength,
-    feedForwardLength: getNum(`${arch}.feed_forward_length`, embeddingLength * 4),
+    feedForwardLength,
     headCount,
     headCountKv,
     headDim,
@@ -393,6 +416,11 @@ export function parseGGUF(buffer: ArrayBuffer | Uint8Array): ParsedGgufModel {
     preTokenizer,
     chatTemplate,
     primaryQuantization,
+    expertCount,
+    expertUsedCount,
+    expertFeedForwardLength,
+    expertSharedCount,
+    expertWeightsNorm,
   };
 
   return {
@@ -448,6 +476,115 @@ export function parseGgufFromBacking(backing: {
         ...parsed,
         fileByteLength: totalBytes,
         // Drop reference to header buffer so only parsed metadata + tensor directory stay in JS heap
+        rawBytes: new Uint8Array(0),
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isTruncated =
+        !msg.startsWith('Truncated GGUF backing:') &&
+        (err instanceof RangeError ||
+          msg.includes('Unexpected EOF') ||
+          msg.includes('Offset is outside the bounds'));
+      if (isTruncated && windowBytes < maxHeaderCap) {
+        windowBytes = Math.min(maxHeaderCap, windowBytes * 2);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+/**
+ * Async header-only GGUF parser for demand-paged remote backings (`opfs-demand`).
+ * Prefetches GGUF header slabs in parallel via `backing.prefetchRanges` with `AbortSignal`
+ * before parsing, avoiding blocking synchronous XHR stalls on large 150K-vocab headers.
+ */
+export async function parseGgufFromBackingAsync(
+  backing: {
+    readonly byteLength: number;
+    readRange(fileOffset: number, dst: Uint8Array, dstOffset?: number, length?: number): number;
+    prefetchRanges?(
+      ranges: readonly { readonly fileOffset: number; readonly byteLength: number }[],
+      options?: {
+        readonly signal?: AbortSignal;
+        readonly concurrency?: number;
+        readonly onProgress?: (doneSlabs: number, totalSlabs: number, bytesFetched: number) => void;
+      },
+    ): Promise<void>;
+    readRangesDirectAsync?(
+      ranges: readonly { readonly fileOffset: number; readonly byteLength: number }[],
+      options?: {
+        readonly signal?: AbortSignal;
+        readonly concurrency?: number;
+        readonly maxGapBytes?: number;
+        readonly onProgress?: (doneGroups: number, totalGroups: number) => void;
+      },
+    ): Promise<Uint8Array[]>;
+  },
+  options?: {
+    readonly signal?: AbortSignal;
+    readonly onProgress?: (detail: string) => void;
+  },
+): Promise<ParsedGgufModel> {
+  if (!backing.readRangesDirectAsync && !backing.prefetchRanges) {
+    return parseGgufFromBacking(backing);
+  }
+  const totalBytes = backing.byteLength;
+  if (totalBytes < 24) {
+    throw new Error('Invalid GGUF backing: shorter than 24-byte header.');
+  }
+
+  let windowBytes = Math.min(totalBytes, 2 * 1024 * 1024);
+  const maxHeaderCap = Math.min(totalBytes, 128 * 1024 * 1024);
+  let loadedBuf = new Uint8Array(0);
+
+  while (true) {
+    if (options?.signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    if (windowBytes > loadedBuf.byteLength) {
+      options?.onProgress?.(
+        `Reading model header (${(windowBytes / (1024 * 1024)).toFixed(1)} MB)`,
+      );
+      const deltaOffset = loadedBuf.byteLength;
+      const deltaLen = windowBytes - deltaOffset;
+      if (backing.readRangesDirectAsync) {
+        const [chunk] = await backing.readRangesDirectAsync(
+          [{ fileOffset: deltaOffset, byteLength: deltaLen }],
+          { signal: options?.signal },
+        );
+        const nextBuf = new Uint8Array(deltaOffset + chunk.byteLength);
+        nextBuf.set(loadedBuf, 0);
+        nextBuf.set(chunk, deltaOffset);
+        loadedBuf = nextBuf;
+      } else {
+        await backing.prefetchRanges!(
+          [{ fileOffset: deltaOffset, byteLength: deltaLen }],
+          { signal: options?.signal },
+        );
+        const nextBuf = new Uint8Array(windowBytes);
+        const read = backing.readRange(0, nextBuf, 0, windowBytes);
+        loadedBuf = read === windowBytes ? nextBuf : nextBuf.subarray(0, read);
+      }
+    }
+
+    if (loadedBuf.byteLength < 24) {
+      throw new Error('Failed to read GGUF header from vRAM backing store.');
+    }
+    try {
+      const parsed = parseGGUF(loadedBuf);
+      for (let i = 0; i < parsed.tensors.length; i++) {
+        const t = parsed.tensors[i];
+        const end = parsed.dataOffset + t.offset + t.byteSize;
+        if (end > totalBytes) {
+          throw new Error(
+            `Truncated GGUF backing: tensor "${t.name}" requires byte ${end}, but backing size is ${totalBytes}.`,
+          );
+        }
+      }
+      return {
+        ...parsed,
+        fileByteLength: totalBytes,
         rawBytes: new Uint8Array(0),
       };
     } catch (err) {

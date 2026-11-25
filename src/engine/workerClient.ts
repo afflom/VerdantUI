@@ -1,11 +1,17 @@
 /**
- * Main-thread client managing the llama.cpp + vTensor Web Worker,
+ * Main-thread client managing the Verdant inference Web Worker,
  * OPFS-backed vRAM persistence for downloaded & imported multi-GB GGUF weights,
- * download cancellation, prefill progress reporting, and reactive state subscriptions.
+ * imported ModelContext harness state, download cancellation, prefill progress reporting,
+ * and reactive state subscriptions.
  */
 
 import type { ThreadMessage } from '@assistant-ui/react';
 import { formatSpeculativePrefixForLlama } from './assistantAdapter';
+import {
+  loadSavedHarness,
+  saveHarnessToStorage,
+  type ImportedHarnessSpec,
+} from './harnessConfig';
 import type { WorkerRequest, WorkerResponse } from './inference.worker';
 import {
   DEFAULT_SAMPLING_CONFIG,
@@ -15,7 +21,7 @@ import {
   type TokenStreamEvent,
 } from './llamaRuntime';
 import {
-  BUNDLED_DEFAULT_MODEL,
+  INTERNAL_BOOTSTRAP_MODEL,
   MODEL_CATALOG,
   formatBytes,
   type CatalogModel,
@@ -61,6 +67,7 @@ export interface EngineState {
   readonly promptMode: PromptFormatMode;
   readonly precisionMode: PrecisionContractMode;
   readonly weightResidencyPolicy: WeightResidencyPolicy;
+  readonly importedHarness: ImportedHarnessSpec | null;
   readonly cachedModelIds: readonly string[];
   readonly opfsStorage: OpfsQuotaSnapshot;
   readonly conformanceReport: ConformanceSuiteReport | null;
@@ -181,7 +188,12 @@ function savePrefs(
   try {
     window.localStorage.setItem(
       PREFS_STORAGE_KEY,
-      JSON.stringify({ sampling, promptMode, precisionMode, weightResidencyPolicy }),
+      JSON.stringify({
+        sampling,
+        promptMode,
+        precisionMode,
+        weightResidencyPolicy,
+      }),
     );
   } catch {
     // Ignore storage errors
@@ -207,7 +219,7 @@ function saveLastModelId(id: string): void {
 }
 
 function computeCachedIds(opfsStorage: OpfsQuotaSnapshot): string[] {
-  const ids = new Set<string>(MODEL_CATALOG.filter((m) => m.bundled).map((m) => m.id));
+  const ids = new Set<string>();
   for (const entry of opfsStorage.storedModels) {
     ids.add(entry.modelId);
   }
@@ -235,10 +247,11 @@ export class LlamaVTensorWorkerClient {
 
   constructor() {
     const saved = loadSavedPrefs();
+    const savedHarness = loadSavedHarness();
     this.state = {
       status: 'idle',
       progressPercent: 0,
-      statusDetail: 'Initializing vTensor GGML provider',
+      statusDetail: 'Initializing runtime',
       errorMessage: null,
       model: null,
       telemetry: INITIAL_TELEMETRY,
@@ -252,7 +265,8 @@ export class LlamaVTensorWorkerClient {
       promptMode: saved.promptMode,
       precisionMode: saved.precisionMode,
       weightResidencyPolicy: saved.weightResidencyPolicy,
-      cachedModelIds: MODEL_CATALOG.filter((m) => m.bundled).map((m) => m.id),
+      importedHarness: savedHarness,
+      cachedModelIds: [],
       opfsStorage: INITIAL_OPFS_STORAGE,
       conformanceReport: null,
       conformanceRunning: false,
@@ -304,7 +318,7 @@ export class LlamaVTensorWorkerClient {
 
   /**
    * Boots the user's previously persisted OPFS catalog model if available,
-   * otherwise falls back to the instant offline bundled GGUF model.
+   * otherwise initializes the internal offline bootstrap checkpoint silently.
    */
   async bootInitialModel(): Promise<LoadedModelSummary> {
     const storage = await this.refreshOpfsStorage().catch(() => INITIAL_OPFS_STORAGE);
@@ -316,7 +330,48 @@ export class LlamaVTensorWorkerClient {
         return this.loadCatalogModel(remembered);
       }
     }
-    return this.loadCatalogModel(BUNDLED_DEFAULT_MODEL);
+    return this.loadCatalogModel(INTERNAL_BOOTSTRAP_MODEL);
+  }
+
+  /**
+   * Imports a validated standard harness specification (mapped to Assistant-UI's ModelContext).
+   * Applies any explicitly provided model parameters from the harness without fabricating defaults.
+   */
+  setImportedHarness(harness: ImportedHarnessSpec | null): void {
+    saveHarnessToStorage(harness);
+    const nextSampling: SamplingConfig = harness
+      ? {
+          ...this.state.sampling,
+          ...(typeof harness.callSettings?.temperature === 'number'
+            ? { temperature: harness.callSettings.temperature }
+            : {}),
+          ...(typeof harness.callSettings?.topP === 'number'
+            ? { topP: harness.callSettings.topP }
+            : {}),
+          ...(typeof harness.topK === 'number' ? { topK: harness.topK } : {}),
+          ...(typeof harness.repeatPenalty === 'number'
+            ? { repeatPenalty: harness.repeatPenalty }
+            : {}),
+          ...(typeof harness.callSettings?.maxTokens === 'number'
+            ? { maxTokens: harness.callSettings.maxTokens, fullContextOutput: false }
+            : {}),
+        }
+      : this.state.sampling;
+
+    const nextPromptMode = harness?.promptMode ?? this.state.promptMode;
+
+    savePrefs(
+      nextSampling,
+      nextPromptMode,
+      this.state.precisionMode,
+      this.state.weightResidencyPolicy,
+    );
+    this.lastSpeculativePrompt = '';
+    this.patchState({
+      importedHarness: harness,
+      sampling: nextSampling,
+      promptMode: nextPromptMode,
+    });
   }
 
   updateSampling(patch: Partial<SamplingConfig>): void {
@@ -365,7 +420,12 @@ export class LlamaVTensorWorkerClient {
   async updateWeightResidencyPolicy(
     policy: WeightResidencyPolicy,
   ): Promise<VTensorTelemetrySnapshot> {
-    savePrefs(this.state.sampling, this.state.promptMode, this.state.precisionMode, policy);
+    savePrefs(
+      this.state.sampling,
+      this.state.promptMode,
+      this.state.precisionMode,
+      policy,
+    );
     this.patchState({ weightResidencyPolicy: policy });
     const requestId = this.nextRequestId('wres');
     return new Promise<VTensorTelemetrySnapshot>((resolve, reject) => {
@@ -463,7 +523,6 @@ export class LlamaVTensorWorkerClient {
   }
 
   async clearModelCache(): Promise<void> {
-    // Also clean up any legacy Cache API entries from earlier sessions
     if (typeof caches !== 'undefined') {
       try {
         await caches.delete(LEGACY_GGUF_CACHE_NAME);
@@ -506,6 +565,7 @@ export class LlamaVTensorWorkerClient {
 
   private dispatchSpeculativePrefill(prompt: string): void {
     if (this.state.status !== 'ready' || !this.state.model || !prompt) return;
+    if (this.state.model.backingKind === 'opfs-demand') return;
     if (prompt === this.lastSpeculativePrompt) return;
     this.lastSpeculativePrompt = prompt;
     const requestId = this.nextRequestId('spec');
@@ -518,19 +578,29 @@ export class LlamaVTensorWorkerClient {
 
   /**
    * Schedules cooperative Continuous Speculative Prefill for the active thread and live composer draft.
-   * Debounces cleanly at word boundaries (~160 ms) and idle pause tail (~460 ms) so prefill runs
-   * continuously while the user composes without delaying typing or submission.
    */
-  scheduleSpeculativePrefill(messages: readonly ThreadMessage[], draftText: string): void {
+  scheduleSpeculativePrefill(
+    messages: readonly ThreadMessage[],
+    draftText: string,
+    systemMessage?: string,
+  ): void {
     this.clearSpeculativeTimers();
     if (this.state.status !== 'ready' || !this.state.model) return;
+    if (this.state.model.backingKind === 'opfs-demand') return;
 
     const model = this.state.model;
-    const mode = this.state.promptMode;
+    const mode = this.state.importedHarness?.promptMode ?? this.state.promptMode;
+    const systemPrompt = systemMessage ?? this.state.importedHarness?.system;
     const stableWordDraft = trimToStableSpeculativePrefix(draftText, false);
     const fullDraft = trimToStableSpeculativePrefix(draftText, true);
 
-    const wordPrompt = formatSpeculativePrefixForLlama(messages, stableWordDraft, model, mode);
+    const wordPrompt = formatSpeculativePrefixForLlama(
+      messages,
+      stableWordDraft,
+      model,
+      mode,
+      systemPrompt,
+    );
     if (wordPrompt && wordPrompt !== this.lastSpeculativePrompt) {
       const delayMs = draftText.trim().length === 0 ? 60 : 160;
       this.speculativeWordTimer = setTimeout(() => {
@@ -540,7 +610,13 @@ export class LlamaVTensorWorkerClient {
     }
 
     if (fullDraft !== stableWordDraft && fullDraft.length > 0) {
-      const tailPrompt = formatSpeculativePrefixForLlama(messages, fullDraft, model, mode);
+      const tailPrompt = formatSpeculativePrefixForLlama(
+        messages,
+        fullDraft,
+        model,
+        mode,
+        systemPrompt,
+      );
       if (tailPrompt && tailPrompt !== this.lastSpeculativePrompt) {
         this.speculativeTailTimer = setTimeout(() => {
           this.speculativeTailTimer = null;
@@ -588,7 +664,7 @@ export class LlamaVTensorWorkerClient {
       this.patchState({
         status: 'ready',
         progressPercent: 100,
-        statusDetail: `${msg.summary.displayName} bound to vTensor`,
+        statusDetail: `${msg.summary.displayName} ready`,
         errorMessage: null,
         prefillProgress: null,
         speculativePrefill: { active: false, readyTokens: 0, targetTokens: 0 },
@@ -597,10 +673,18 @@ export class LlamaVTensorWorkerClient {
         opfsStorage: msg.opfsStorage,
         cachedModelIds: computeCachedIds(msg.opfsStorage),
       });
-      // Immediately warm the active template's system prompt into Unified Store / KV cache
-      const bootPrefix = formatSpeculativePrefixForLlama([], '', msg.summary, this.state.promptMode);
-      if (bootPrefix) {
-        this.dispatchSpeculativePrefill(bootPrefix);
+      // Warm initial prompt prefix for local/resident models (skip on network demand-paged models)
+      if (msg.summary.backingKind !== 'opfs-demand') {
+        const bootPrefix = formatSpeculativePrefixForLlama(
+          [],
+          '',
+          msg.summary,
+          this.state.importedHarness?.promptMode ?? this.state.promptMode,
+          this.state.importedHarness?.system,
+        );
+        if (bootPrefix) {
+          this.dispatchSpeculativePrefill(bootPrefix);
+        }
       }
       entry.resolve(msg.summary);
       return;
@@ -609,9 +693,16 @@ export class LlamaVTensorWorkerClient {
     if (msg.type === 'prefill') {
       const p = msg.progress;
       const prefixNote = p.reusedPrefixTokens > 0 ? ` (reused ${p.reusedPrefixTokens} KV)` : '';
+      const detailSuffix = p.detail ? ` · ${p.detail}` : '';
+      const statusDetail =
+        p.totalTokens > 0 && p.completedTokens < p.totalTokens
+          ? `Prefilling prompt ${p.completedTokens}/${p.totalTokens}${prefixNote}${detailSuffix}`
+          : p.detail
+            ? p.detail
+            : `Prefilling prompt ${p.completedTokens}/${p.totalTokens}${prefixNote}`;
       this.patchState({
         prefillProgress: p,
-        statusDetail: `Prefilling prompt ${p.completedTokens}/${p.totalTokens}${prefixNote}`,
+        statusDetail,
       });
       return;
     }
@@ -619,7 +710,7 @@ export class LlamaVTensorWorkerClient {
     if (msg.type === 'token') {
       this.patchState({
         prefillProgress: null,
-        statusDetail: 'Generating tokens on vTensor',
+        statusDetail: 'Generating response',
         lastTokensPerSec: msg.event.tokensPerSecond,
         lastGeneratedTokens: msg.event.generatedTokens,
         lastPromptTokens: msg.event.promptTokens,
@@ -691,7 +782,7 @@ export class LlamaVTensorWorkerClient {
         progressPercent: 0,
         prefillProgress: null,
         errorMessage: isCancelled ? null : msg.message,
-        statusDetail: isCancelled ? 'Download paused (resumable in OPFS)' : 'Inference error',
+        statusDetail: isCancelled ? 'Download paused' : 'Model error',
         ...(msg.opfsStorage
           ? {
               opfsStorage: msg.opfsStorage,
@@ -707,10 +798,6 @@ export class LlamaVTensorWorkerClient {
     return this.loadFromUrl(model.id, model.name, model.url, model.bundled);
   }
 
-  /**
-   * Streams a GGUF URL directly into OPFS inside the Web Worker (zero main-thread full-file
-   * ArrayBuffer copy, enabling 1B–3B+ models to download and run within bounded memory).
-   */
   async loadFromUrl(
     id: string,
     displayName: string,
@@ -725,9 +812,7 @@ export class LlamaVTensorWorkerClient {
       status: 'downloading',
       progressPercent: 2,
       errorMessage: null,
-      statusDetail: skipOpfs
-        ? `Loading bundled ${displayName}`
-        : `Opening OPFS vRAM stream for ${displayName}`,
+      statusDetail: `Loading ${displayName}`,
     });
 
     return new Promise<LoadedModelSummary>((resolve, reject) => {
@@ -747,10 +832,6 @@ export class LlamaVTensorWorkerClient {
     });
   }
 
-  /**
-   * Streams a local `.gguf` File handle directly into OPFS inside the Web Worker in 4 MiB slices
-   * (supporting 2 GB–4 GB+ local models with ~4 MiB peak JS heap).
-   */
   async loadFromFile(file: File): Promise<LoadedModelSummary> {
     if (!file.name.toLowerCase().endsWith('.gguf')) {
       const err = new Error('Please select a valid .gguf model file.');
@@ -765,7 +846,7 @@ export class LlamaVTensorWorkerClient {
       status: 'downloading',
       progressPercent: 3,
       errorMessage: null,
-      statusDetail: `Streaming ${file.name} (${formatBytes(file.size)}) into OPFS vRAM`,
+      statusDetail: `Opening ${file.name} (${formatBytes(file.size)})`,
     });
 
     return new Promise<LoadedModelSummary>((resolve, reject) => {
@@ -795,7 +876,7 @@ export class LlamaVTensorWorkerClient {
       status: 'loading',
       progressPercent: 95,
       errorMessage: null,
-      statusDetail: `Allocating vTensor buffers for ${displayName}`,
+      statusDetail: `Loading ${displayName}`,
     });
 
     const requestId = this.nextRequestId('load');
@@ -819,9 +900,10 @@ export class LlamaVTensorWorkerClient {
   async *streamGenerate(
     prompt: string,
     signal?: AbortSignal,
+    samplingOverride?: SamplingConfig,
   ): AsyncGenerator<TokenStreamEvent, void, unknown> {
     if (!this.state.model) {
-      throw new Error('Wait for the GGUF model to finish loading into vTensor buffers.');
+      throw new Error('Wait for the model to finish loading before sending a message.');
     }
 
     const requestId = this.nextRequestId('gen');
@@ -857,7 +939,7 @@ export class LlamaVTensorWorkerClient {
       prefillProgress: null,
       speculativePrefill: { ...this.state.speculativePrefill, active: false },
       errorMessage: null,
-      statusDetail: 'Prefilling prompt on vTensor',
+      statusDetail: 'Preparing response',
     });
 
     this.pending.set(requestId, {
@@ -880,7 +962,7 @@ export class LlamaVTensorWorkerClient {
       type: 'generate',
       requestId,
       prompt,
-      sampling: this.state.sampling,
+      sampling: samplingOverride ?? this.state.sampling,
     };
     this.worker.postMessage(req);
 

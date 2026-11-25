@@ -15,7 +15,7 @@
  */
 
 import { GgmlType } from './gguf';
-import { f16ToF32, verdantMulMat } from './verdantKernels';
+import { f16ToF32 } from './verdantKernels';
 
 /** Fixed low-memory reserved layout inside the WASM linear arena (512 KiB total). */
 export const WASM_F16_LUT_OFFSET = 0; // 65536 * 4 = 262,144 bytes
@@ -23,6 +23,7 @@ export const WASM_BLOCK_SUM_X_OFFSET = 262_144; // 8192 * 8 = 65,536 bytes (up t
 export const WASM_SCRATCH_BASE_OFFSET = 327_680; // 196,608 bytes reserved internal scratch
 export const WASM_ATTN_SCORES_OFFSET = WASM_SCRATCH_BASE_OFFSET; // 64 bytes (16 x f32)
 export const WASM_ATTN_WEIGHTS_OFFSET = WASM_SCRATCH_BASE_OFFSET + 64; // 64 bytes (16 x f32)
+export const WASM_KV_QUANT_ERR_OFFSET = WASM_SCRATCH_BASE_OFFSET + 128; // 16 bytes (f32 maxErr, f32 maxSig)
 export const WASM_TOPK_IDS_OFFSET = WASM_SCRATCH_BASE_OFFSET + 256; // up to 1024 x i32 (4 KiB)
 export const WASM_TOPK_VALS_OFFSET = WASM_SCRATCH_BASE_OFFSET + 4352; // up to 1024 x f32 (4 KiB)
 /** Per-worker 128-byte attention scratch (64B scores + 64B weights, 2 full cache lines) for up to 32 threads. */
@@ -1770,26 +1771,246 @@ function buildMulMatQ6_K(): FuncBuilder {
 }
 
 /**
- * Builds `rms_norm_f32(xPtr, wPtr, outPtr, n, eps)` with F64 sum-of-squares (exact VT-46 semantics).
+ * Builds lock-free strict F32-activation `mul_mat_q2_k(wPtr, xPtr, outPtr, cols, rows)`
+ * (256-elem super-blocks = 84 bytes: scales[16], qs[64], d f16, dmin f16).
+ * Accumulates in F64 with zero shared scratch -> 100% multi-core parallel-safe.
+ */
+function buildMulMatQ2_K(): FuncBuilder {
+  const f = new FuncBuilder([I32, I32, I32, I32, I32]);
+  const r = f.local(I32);
+  const b = f.local(I32);
+  const numBlocks = f.local(I32);
+  const rowBytes = f.local(I32);
+  const p = f.local(I32);
+  const xp = f.local(I32);
+  const sc = f.local(I32);
+  const acc = f.local(F64);
+  const d = f.local(F64);
+  const dmin = f.local(F64);
+
+  const mask03 = f.local(V128);
+  const q0 = f.local(V128);
+  const q1 = f.local(V128);
+  const qv = f.local(V128);
+  const vsum = f.local(V128);
+  const vsumX = f.local(V128);
+  const tmp16 = f.local(V128);
+
+  f.get(3).i32Const(8).i32ShrU().tee(numBlocks).i32Const(84).i32Mul().set(rowBytes);
+  f.i32Const(0x03).i8x16Splat().set(mask03);
+  f.i32Const(0).set(r);
+
+  const emitSub16 = (qSrc: number, shift: number, scOff: number) => {
+    f.get(qSrc);
+    if (shift > 0) f.i32Const(shift).i8x16ShrU();
+    f.get(mask03).v128And().set(qv);
+    f.v128Const(ZERO_16).set(vsum);
+    f.dotU8x16WithX(qv, xp, 0, vsum, tmp16);
+    // Sum 16 floats at xp for exact dmin subtraction
+    f.get(xp).v128Load(0).get(xp).v128Load(16).f32x4Add()
+      .get(xp).v128Load(32).f32x4Add().get(xp).v128Load(48).f32x4Add().set(vsumX);
+    f.get(p).i32Load8U(scOff).set(sc);
+    f.get(acc)
+      .get(d).get(sc).i32Const(0x0f).i32And().f64ConvertI32S().f64Mul()
+      .hsumF32x4ToF64(vsum).f64Mul().f64Add()
+      .get(dmin).get(sc).i32Const(4).i32ShrU().f64ConvertI32S().f64Mul()
+      .hsumF32x4ToF64(vsumX).f64Mul().f64Sub()
+      .set(acc);
+    f.get(xp).i32Const(64).i32Add().set(xp);
+  };
+
+  f.block().loop();
+  f.get(r).get(4).i32GeS().brIf(1);
+  f.get(0).get(r).get(rowBytes).i32Mul().i32Add().set(p);
+  f.get(1).set(xp);
+  f.f64Const(0).set(acc);
+  f.i32Const(0).set(b);
+
+  f.block().loop();
+  f.get(b).get(numBlocks).i32GeS().brIf(1);
+  f.loadF16AsF64(p, 80).set(d);
+  f.loadF16AsF64(p, 82).set(dmin);
+
+  for (let h = 0; h < 2; h++) {
+    f.get(p).v128Load(16 + h * 32).set(q0);
+    f.get(p).v128Load(32 + h * 32).set(q1);
+    for (let s = 0; s < 4; s++) {
+      emitSub16(q0, s * 2, h * 8 + s * 2);
+      emitSub16(q1, s * 2, h * 8 + s * 2 + 1);
+    }
+  }
+
+  f.get(p).i32Const(84).i32Add().set(p);
+  f.get(b).i32Const(1).i32Add().set(b);
+  f.br(0).end().end();
+
+  f.get(2).get(r).i32Const(2).i32Shl().i32Add().get(acc).f32DemoteF64().f32Store(0);
+  f.get(r).i32Const(1).i32Add().set(r);
+  f.br(0).end().end();
+  return f;
+}
+
+/**
+ * Builds lock-free strict F32-activation `mul_mat_q3_k(wPtr, xPtr, outPtr, cols, rows)`
+ * (256-elem super-blocks = 110 bytes: hmask[32], qs[64], scales[12], d f16).
+ * Accumulates in F64 with zero shared scratch -> 100% multi-core parallel-safe.
+ */
+function buildMulMatQ3_K(): FuncBuilder {
+  const f = new FuncBuilder([I32, I32, I32, I32, I32]);
+  const r = f.local(I32);
+  const b = f.local(I32);
+  const numBlocks = f.local(I32);
+  const rowBytes = f.local(I32);
+  const p = f.local(I32);
+  const xp = f.local(I32);
+  const a0 = f.local(I32);
+  const a1 = f.local(I32);
+  const tmp = f.local(I32);
+  const u0 = f.local(I32);
+  const u1 = f.local(I32);
+  const u2 = f.local(I32);
+  const u3 = f.local(I32);
+  const acc = f.local(F64);
+  const blockSum = f.local(F64);
+
+  const mask03 = f.local(V128);
+  const mask04 = f.local(V128);
+  const val4 = f.local(V128);
+  const hm0 = f.local(V128);
+  const hm1 = f.local(V128);
+  const q0 = f.local(V128);
+  const q1 = f.local(V128);
+  const qv = f.local(V128);
+  const vsum = f.local(V128);
+  const tmp16 = f.local(V128);
+
+  f.get(3).i32Const(8).i32ShrU().tee(numBlocks).i32Const(110).i32Mul().set(rowBytes);
+  f.i32Const(0x03).i8x16Splat().set(mask03);
+  f.i32Const(0x04).i8x16Splat().set(mask04);
+  f.i32Const(4).i8x16Splat().set(val4);
+  f.i32Const(0).set(r);
+
+  const pushScaleF64 = (scIdx: number) => {
+    const uLoc = scIdx < 4 ? u0 : scIdx < 8 ? u1 : scIdx < 12 ? u2 : u3;
+    const byteIdx = scIdx & 3;
+    f.get(uLoc);
+    if (byteIdx > 0) f.i32Const(byteIdx * 8).i32ShrU();
+    if (byteIdx < 3) f.i32Const(0xff).i32And();
+    f.i32Const(32).i32Sub().f64ConvertI32S();
+  };
+
+  const emitSub16 = (qSrc: number, hmSrc: number, shift: number, bitIdx: number, scIdx: number) => {
+    f.get(qSrc);
+    if (shift > 0) f.i32Const(shift).i8x16ShrU();
+    f.get(mask03).v128And();
+    f.get(hmSrc);
+    if (bitIdx < 2) {
+      f.i32Const(2 - bitIdx).i8x16Shl();
+    } else if (bitIdx > 2) {
+      f.i32Const(bitIdx - 2).i8x16ShrU();
+    }
+    f.get(mask04).v128And().v128Or().get(val4).i8x16Sub().set(qv);
+    f.v128Const(ZERO_16).set(vsum);
+    f.dotS8x16WithX(qv, xp, 0, vsum, tmp16);
+    f.get(blockSum).hsumF32x4ToF64(vsum);
+    pushScaleF64(scIdx);
+    f.f64Mul().f64Add().set(blockSum);
+    f.get(xp).i32Const(64).i32Add().set(xp);
+  };
+
+  f.block().loop();
+  f.get(r).get(4).i32GeS().brIf(1);
+  f.get(0).get(r).get(rowBytes).i32Mul().i32Add().set(p);
+  f.get(1).set(xp);
+  f.f64Const(0).set(acc);
+  f.i32Const(0).set(b);
+
+  f.block().loop();
+  f.get(b).get(numBlocks).i32GeS().brIf(1);
+
+  // SWAR unpack 12-byte packed 6-bit Q3_K scales into u0..u3 (16 unsigned 6-bit values; -32 gives signed)
+  f.get(p).i32Load(96).set(a0);
+  f.get(p).i32Load(100).set(a1);
+  f.get(p).i32Load(104).set(tmp);
+  f.get(a0).i32Const(0x0f0f0f0f).i32And()
+    .get(tmp).i32Const(0x03030303).i32And().i32Const(4).i32Shl().i32Or().set(u0);
+  f.get(a1).i32Const(0x0f0f0f0f).i32And()
+    .get(tmp).i32Const(2).i32ShrU().i32Const(0x03030303).i32And().i32Const(4).i32Shl().i32Or().set(u1);
+  f.get(a0).i32Const(4).i32ShrU().i32Const(0x0f0f0f0f).i32And()
+    .get(tmp).i32Const(4).i32ShrU().i32Const(0x03030303).i32And().i32Const(4).i32Shl().i32Or().set(u2);
+  f.get(a1).i32Const(4).i32ShrU().i32Const(0x0f0f0f0f).i32And()
+    .get(tmp).i32Const(6).i32ShrU().i32Const(0x03030303).i32And().i32Const(4).i32Shl().i32Or().set(u3);
+
+  f.get(p).v128Load(0).set(hm0);
+  f.get(p).v128Load(16).set(hm1);
+  f.f64Const(0).set(blockSum);
+
+  for (let h = 0; h < 2; h++) {
+    f.get(p).v128Load(32 + h * 32).set(q0);
+    f.get(p).v128Load(48 + h * 32).set(q1);
+    for (let s = 0; s < 4; s++) {
+      const bitIdx = h * 4 + s;
+      emitSub16(q0, hm0, s * 2, bitIdx, h * 8 + s * 2);
+      emitSub16(q1, hm1, s * 2, bitIdx, h * 8 + s * 2 + 1);
+    }
+  }
+
+  f.get(acc).get(blockSum).loadF16AsF64(p, 108).f64Mul().f64Add().set(acc);
+  f.get(p).i32Const(110).i32Add().set(p);
+  f.get(b).i32Const(1).i32Add().set(b);
+  f.br(0).end().end();
+
+  f.get(2).get(r).i32Const(2).i32Shl().i32Add().get(acc).f32DemoteF64().f32Store(0);
+  f.get(r).i32Const(1).i32Add().set(r);
+  f.br(0).end().end();
+  return f;
+}
+
+/**
+ * Builds `rms_norm_f32(xPtr, wPtr, outPtr, n, eps)` with 4-way unrolled IEEE-754 F64
+ * sum-of-squares (exact VT-46 precision, breaking F64 latency chains 4x) and SIMD128 scaling.
  */
 function buildRmsNormF32(): FuncBuilder {
   // params: xPtr(0), wPtr(1), outPtr(2), n(3), eps(4: f64)
   const f = new FuncBuilder([I32, I32, I32, I32, F64]);
   const i = f.local(I32);
+  const xp = f.local(I32);
+  const s0 = f.local(F64);
+  const s1 = f.local(F64);
+  const s2 = f.local(F64);
+  const s3 = f.local(F64);
   const sumSq = f.local(F64);
   const v = f.local(F64);
   const scale = f.local(F32);
   const vscale = f.local(V128);
   const n4 = f.local(I32);
 
-  f.f64Const(0).set(sumSq);
+  f.get(3).i32Const(-4).i32And().set(n4);
+  f.f64Const(0).set(s0);
+  f.f64Const(0).set(s1);
+  f.f64Const(0).set(s2);
+  f.f64Const(0).set(s3);
+  f.get(0).set(xp);
   f.i32Const(0).set(i);
 
-  // Exact IEEE 754 F64 sum-of-squares accumulation
+  // 4-way unrolled IEEE-754 F64 sum-of-squares (hides F64 add latency while preserving F64 precision)
+  f.block().loop();
+  f.get(i).get(n4).i32GeS().brIf(1);
+  f.get(xp).f32Load(0).f64PromoteF32().tee(v).get(v).f64Mul().get(s0).f64Add().set(s0);
+  f.get(xp).f32Load(4).f64PromoteF32().tee(v).get(v).f64Mul().get(s1).f64Add().set(s1);
+  f.get(xp).f32Load(8).f64PromoteF32().tee(v).get(v).f64Mul().get(s2).f64Add().set(s2);
+  f.get(xp).f32Load(12).f64PromoteF32().tee(v).get(v).f64Mul().get(s3).f64Add().set(s3);
+  f.get(xp).i32Const(16).i32Add().set(xp);
+  f.get(i).i32Const(4).i32Add().set(i);
+  f.br(0).end().end();
+
+  f.get(s0).get(s1).f64Add().get(s2).get(s3).f64Add().f64Add().set(sumSq);
+
+  // Scalar tail
   f.block().loop();
   f.get(i).get(3).i32GeS().brIf(1);
-  f.get(0).get(i).i32Const(2).i32Shl().i32Add().f32Load(0).f64PromoteF32().tee(v).get(v).f64Mul()
-    .get(sumSq).f64Add().set(sumSq);
+  f.get(xp).f32Load(0).f64PromoteF32().tee(v).get(v).f64Mul().get(sumSq).f64Add().set(sumSq);
+  f.get(xp).i32Const(4).i32Add().set(xp);
   f.get(i).i32Const(1).i32Add().set(i);
   f.br(0).end().end();
 
@@ -1798,7 +2019,6 @@ function buildRmsNormF32(): FuncBuilder {
     .get(sumSq).get(3).f64ConvertI32S().f64Div().get(4).f64Add().f64Sqrt()
     .f64Div().f32DemoteF64().tee(scale).f32x4Splat().set(vscale);
 
-  f.get(3).i32Const(-4).i32And().set(n4);
   f.i32Const(0).set(i);
 
   // SIMD pass: out[i..i+3] = (x * scale) * w
@@ -1820,6 +2040,152 @@ function buildRmsNormF32(): FuncBuilder {
     .f32Store(0);
   f.get(i).i32Const(1).i32Add().set(i);
   f.br(0).end().end();
+
+  return f;
+}
+
+/**
+ * Builds `zero_bytes(dstPtr, byteLen)` via WASM bulk `memory.fill(0)` for zero-alloc buffer clears.
+ */
+function buildZeroBytes(): FuncBuilder {
+  const f = new FuncBuilder([I32, I32]);
+  f.get(0).i32Const(0).get(1).memoryFill();
+  return f;
+}
+
+/**
+ * Builds `quantize_kv_page_f32_to_q8(srcF32Ptr, dstQ8Ptr, dstScalePtr, totalVectors, headDim, errOutPtr)`.
+ * Vectorized 16-wide SIMD128 KV-cache page quantizer (eliminates JS hot-to-cold latency spikes on
+ * 7B–32B & 30B-A3B models) while tracking exact SIMD `maxErr` and `maxSig` for vRAM challenger admission.
+ * Requires `headDim >= 16 && (headDim & 15) === 0`.
+ */
+function buildQuantizeKvPageF32ToQ8(): FuncBuilder {
+  // params: srcF32Ptr(0), dstQ8Ptr(1), dstScalePtr(2), totalVectors(3), headDim(4), errOutPtr(5)
+  const f = new FuncBuilder([I32, I32, I32, I32, I32, I32]);
+  const vec = f.local(I32);
+  const d = f.local(I32);
+  const headBytesF32 = f.local(I32);
+  const srcBase = f.local(I32);
+  const dstBase = f.local(I32);
+  const sp = f.local(I32);
+  const dp = f.local(I32);
+  const vmax0 = f.local(V128);
+  const vmax1 = f.local(V128);
+  const vMax = f.local(F32);
+  const scale = f.local(F32);
+  const inv = f.local(F32);
+  const globalMaxSig = f.local(F32);
+  const globalMaxErrV = f.local(V128);
+  const vInv = f.local(V128);
+  const vScale = f.local(V128);
+  const vNeg127 = f.local(V128);
+  const vPos127 = f.local(V128);
+  const x0 = f.local(V128);
+  const qf = f.local(V128);
+  const q0 = f.local(V128);
+  const q1 = f.local(V128);
+  const q2 = f.local(V128);
+  const q3 = f.local(V128);
+
+  f.get(4).i32Const(2).i32Shl().set(headBytesF32);
+  f.f32Const(0).set(globalMaxSig);
+  f.f32Const(0).f32x4Splat().set(globalMaxErrV);
+  f.f32Const(-127.0).f32x4Splat().set(vNeg127);
+  f.f32Const(127.0).f32x4Splat().set(vPos127);
+  f.get(0).set(srcBase);
+  f.get(1).set(dstBase);
+  f.i32Const(0).set(vec);
+
+  const emitQuantChunk = (off: number, qiLoc: number) => {
+    f.get(sp).v128Load(off).tee(x0)
+      .get(vInv).f32x4Mul().f32x4Nearest()
+      .get(vNeg127).f32x4Pmax()
+      .get(vPos127).f32x4Pmin()
+      .tee(qf)
+      .i32x4TruncSatF32x4S().set(qiLoc);
+    // Track exact reconstruction error |x - q * scale|
+    f.get(globalMaxErrV)
+      .get(x0).get(qf).get(vScale).f32x4Mul().f32x4Sub().f32x4Abs()
+      .f32x4Pmax().set(globalMaxErrV);
+  };
+
+  f.block().loop();
+  f.get(vec).get(3).i32GeS().brIf(1);
+
+  // Pass 1: find maxAbs across `headDim` floats (16 floats per iteration)
+  f.f32Const(0).f32x4Splat().tee(vmax0).set(vmax1);
+  f.get(srcBase).set(sp);
+  f.i32Const(0).set(d);
+  f.block().loop();
+  f.get(d).get(4).i32GeS().brIf(1);
+  f.get(vmax0)
+    .get(sp).v128Load(0).f32x4Abs().f32x4Pmax()
+    .get(sp).v128Load(16).f32x4Abs().f32x4Pmax()
+    .set(vmax0);
+  f.get(vmax1)
+    .get(sp).v128Load(32).f32x4Abs().f32x4Pmax()
+    .get(sp).v128Load(48).f32x4Abs().f32x4Pmax()
+    .set(vmax1);
+  f.get(sp).i32Const(64).i32Add().set(sp);
+  f.get(d).i32Const(16).i32Add().set(d);
+  f.br(0).end().end();
+
+  f.get(vmax0).get(vmax1).f32x4Pmax().set(vmax0);
+  f.get(vmax0).f32x4Extract(0)
+    .get(vmax0).f32x4Extract(1).f32Max()
+    .get(vmax0).f32x4Extract(2).f32Max()
+    .get(vmax0).f32x4Extract(3).f32Max()
+    .set(vMax);
+
+  f.get(globalMaxSig).get(vMax).f32Max().set(globalMaxSig);
+
+  f.get(vMax).f32Const(0).f32Gt().if_();
+  f.get(vMax).f32Const(127.0).f32Div().set(scale);
+  f.f32Const(127.0).get(vMax).f32Div().set(inv);
+  f.else_();
+  f.f32Const(0).set(scale);
+  f.f32Const(0).set(inv);
+  f.end();
+
+  // Store per-vector scale
+  f.get(2).get(vec).i32Const(2).i32Shl().i32Add().get(scale).f32Store(0);
+
+  f.get(inv).f32x4Splat().set(vInv);
+  f.get(scale).f32x4Splat().set(vScale);
+
+  // Pass 2: quantize + narrow 16 f32 -> 16 i8 + accumulate SIMD maxErr
+  f.get(srcBase).set(sp);
+  f.get(dstBase).set(dp);
+  f.i32Const(0).set(d);
+  f.block().loop();
+  f.get(d).get(4).i32GeS().brIf(1);
+  emitQuantChunk(0, q0);
+  emitQuantChunk(16, q1);
+  emitQuantChunk(32, q2);
+  emitQuantChunk(48, q3);
+  f.get(dp)
+    .get(q0).get(q1).i16x8NarrowI32x4S()
+    .get(q2).get(q3).i16x8NarrowI32x4S()
+    .i8x16NarrowI16x8S()
+    .v128Store(0);
+  f.get(sp).i32Const(64).i32Add().set(sp);
+  f.get(dp).i32Const(16).i32Add().set(dp);
+  f.get(d).i32Const(16).i32Add().set(d);
+  f.br(0).end().end();
+
+  f.get(srcBase).get(headBytesF32).i32Add().set(srcBase);
+  f.get(dstBase).get(4).i32Add().set(dstBase);
+  f.get(vec).i32Const(1).i32Add().set(vec);
+  f.br(0).end().end();
+
+  // Write [maxErr, maxSig] to errOutPtr
+  f.get(5)
+    .get(globalMaxErrV).f32x4Extract(0)
+    .get(globalMaxErrV).f32x4Extract(1).f32Max()
+    .get(globalMaxErrV).f32x4Extract(2).f32Max()
+    .get(globalMaxErrV).f32x4Extract(3).f32Max()
+    .f32Store(0);
+  f.get(5).get(globalMaxSig).f32Store(4);
 
   return f;
 }
@@ -2288,8 +2654,9 @@ function buildMulMatQ4_0Q8(useRelaxed: boolean): FuncBuilder {
 }
 
 /**
- * 4-token batched Q4_0 × Q8_0_ACT VNNI/Int8 prefill kernel: (wPtr, q8BatchPtr, outBatchPtr, cols, rows)
- * Unpacks each Q4_0 weight block ONCE and evaluates all 4 prompt tokens with zero register spills.
+ * 4-token batched Q4_0 × Q8_0_ACT VNNI/Int8 prefill kernel: (wPtr, q8BatchPtr, outBatchPtr, cols, rows, oStrideBytes)
+ * Unpacks each Q4_0 weight block ONCE and evaluates all 4 prompt tokens with a single vectorized
+ * 4-lane horizontal-transpose epilogue (`hsum4RowsI32x4` + `f32x4RelaxedMadd`, zero scalar extracts!).
  */
 function buildMulMatQ4_0Q8Batch4(useRelaxed: boolean): FuncBuilder {
   const f = new FuncBuilder([I32, I32, I32, I32, I32, I32]);
@@ -2304,17 +2671,18 @@ function buildMulMatQ4_0Q8Batch4(useRelaxed: boolean): FuncBuilder {
   const qp2 = f.local(I32);
   const qp3 = f.local(I32);
   const b = f.local(I32);
-  const dw = f.local(F32);
-  const acc0 = f.local(F32);
-  const acc1 = f.local(F32);
-  const acc2 = f.local(F32);
-  const acc3 = f.local(F32);
   const mask0f = f.local(V128);
   const zero = f.local(V128);
   const wlo = f.local(V128);
   const whi = f.local(V128);
   const xtmp = f.local(V128);
-  const dotV = f.local(V128);
+  const dot0 = f.local(V128);
+  const dot1 = f.local(V128);
+  const dot2 = f.local(V128);
+  const dot3 = f.local(V128);
+  const t0 = f.local(V128);
+  const t1 = f.local(V128);
+  const acc4 = f.local(V128);
 
   f.i32Const(0x0f).i8x16Splat().set(mask0f);
   f.i32Const(0).i32x4Splat().set(zero);
@@ -2324,36 +2692,58 @@ function buildMulMatQ4_0Q8Batch4(useRelaxed: boolean): FuncBuilder {
   f.get(5).set(oStride);
   f.i32Const(0).set(r);
 
-  const emitTok = (qpLoc: number, accLoc: number) => {
-    f.get(zero).set(dotV);
+  const emitTokDot = (qpLoc: number, dotLoc: number) => {
+    f.get(zero).set(dotLoc);
     f.get(qpLoc).v128Load(16, 4).set(xtmp);
-    f.dotI8I7Add(xtmp, wlo, dotV, useRelaxed);
+    f.dotI8I7Add(xtmp, wlo, dotLoc, useRelaxed);
     f.get(qpLoc).v128Load(32, 4).set(xtmp);
-    f.dotI8I7Add(xtmp, whi, dotV, useRelaxed);
-    f.hsumI32x4(dotV).get(qpLoc).i32Load(12).i32Const(3).i32Shl().i32Sub().f32ConvertI32S();
-    f.get(dw).get(qpLoc).f32Load(0).f32Mul().f32Mul().get(accLoc).f32Add().set(accLoc);
+    f.dotI8I7Add(xtmp, whi, dotLoc, useRelaxed);
   };
 
   f.block().loop();
   f.get(r).get(4).i32GeS().brIf(1);
   f.get(0).get(r).get(rowBytes).i32Mul().i32Add().set(wp);
   f.get(1).tee(qp0).get(qStride).i32Add().tee(qp1).get(qStride).i32Add().tee(qp2).get(qStride).i32Add().set(qp3);
-  f.f32Const(0).set(acc0);
-  f.f32Const(0).set(acc1);
-  f.f32Const(0).set(acc2);
-  f.f32Const(0).set(acc3);
+  f.f32Const(0).f32x4Splat().set(acc4);
   f.i32Const(0).set(b);
 
   f.block().loop();
   f.get(b).get(nBlocks).i32GeS().brIf(1);
-  f.loadF16AsF32(wp, 0).set(dw);
   f.get(wp).v128Load(2).tee(xtmp).get(mask0f).v128And().set(wlo);
   f.get(xtmp).i32Const(4).i8x16ShrU().set(whi);
 
-  emitTok(qp0, acc0);
-  emitTok(qp1, acc1);
-  emitTok(qp2, acc2);
-  emitTok(qp3, acc3);
+  emitTokDot(qp0, dot0);
+  emitTokDot(qp1, dot1);
+  emitTokDot(qp2, dot2);
+  emitTokDot(qp3, dot3);
+
+  // Reduce all 4 tokens in 6 SIMD ops (zero scalar lane extracts!)
+  f.hsum4RowsI32x4(dot0, dot1, dot2, dot3, t0, t1, dot0);
+
+  // Subtract 8 * [sum_all0, sum_all1, sum_all2, sum_all3] and convert to f32x4
+  f.get(zero)
+    .get(qp0).i32Load(12).i32x4ReplaceLane(0)
+    .get(qp1).i32Load(12).i32x4ReplaceLane(1)
+    .get(qp2).i32Load(12).i32x4ReplaceLane(2)
+    .get(qp3).i32Load(12).i32x4ReplaceLane(3)
+    .i32Const(3).i32x4Shl()
+    .set(t0);
+  f.get(dot0).get(t0).i32x4Sub().f32x4ConvertI32x4S().set(dot0);
+
+  // Scale by dw * [dx0, dx1, dx2, dx3] and FMA into acc4
+  f.get(zero)
+    .get(qp0).f32Load(0).f32x4ReplaceLane(0)
+    .get(qp1).f32Load(0).f32x4ReplaceLane(1)
+    .get(qp2).f32Load(0).f32x4ReplaceLane(2)
+    .get(qp3).f32Load(0).f32x4ReplaceLane(3)
+    .loadF16AsF32(wp, 0).f32x4Splat().f32x4Mul()
+    .set(t1);
+
+  if (useRelaxed) {
+    f.get(dot0).get(t1).get(acc4).f32x4RelaxedMadd().set(acc4);
+  } else {
+    f.get(dot0).get(t1).f32x4Mul().get(acc4).f32x4Add().set(acc4);
+  }
 
   f.get(wp).i32Const(18).i32Add().set(wp);
   f.get(qp0).i32Const(Q8_0_ACT_BLOCK_BYTES).i32Add().set(qp0);
@@ -2363,10 +2753,10 @@ function buildMulMatQ4_0Q8Batch4(useRelaxed: boolean): FuncBuilder {
   f.get(b).i32Const(1).i32Add().set(b);
   f.br(0).end().end();
 
-  f.get(2).get(r).i32Const(2).i32Shl().i32Add().tee(wp).get(acc0).f32Store(0);
-  f.get(wp).get(oStride).i32Add().tee(wp).get(acc1).f32Store(0);
-  f.get(wp).get(oStride).i32Add().tee(wp).get(acc2).f32Store(0);
-  f.get(wp).get(oStride).i32Add().get(acc3).f32Store(0);
+  f.get(2).get(r).i32Const(2).i32Shl().i32Add().tee(wp).get(acc4).f32x4Extract(0).f32Store(0);
+  f.get(wp).get(oStride).i32Add().tee(wp).get(acc4).f32x4Extract(1).f32Store(0);
+  f.get(wp).get(oStride).i32Add().tee(wp).get(acc4).f32x4Extract(2).f32Store(0);
+  f.get(wp).get(oStride).i32Add().get(acc4).f32x4Extract(3).f32Store(0);
 
   f.get(r).i32Const(1).i32Add().set(r);
   f.br(0).end().end();
@@ -2734,8 +3124,11 @@ function buildMulMatQ8_0Q8(useRelaxed: boolean): FuncBuilder {
   return f;
 }
 
-/** 4-token batched Q8_0 × Q8_0_ACT prefill kernel. */
-function buildMulMatQ8_0Q8Batch4(): FuncBuilder {
+/**
+ * 4-token batched Q8_0 × Q8_0_ACT prefill kernel with vectorized 4-lane transpose epilogue
+ * (`hsum4RowsI32x4` + `f32x4RelaxedMadd`, zero scalar extracts inside the block loop).
+ */
+function buildMulMatQ8_0Q8Batch4(useRelaxed: boolean): FuncBuilder {
   const f = new FuncBuilder([I32, I32, I32, I32, I32, I32]);
   const r = f.local(I32);
   const nBlocks = f.local(I32);
@@ -2748,16 +3141,17 @@ function buildMulMatQ8_0Q8Batch4(): FuncBuilder {
   const qp2 = f.local(I32);
   const qp3 = f.local(I32);
   const b = f.local(I32);
-  const dw = f.local(F32);
-  const acc0 = f.local(F32);
-  const acc1 = f.local(F32);
-  const acc2 = f.local(F32);
-  const acc3 = f.local(F32);
   const zero = f.local(V128);
   const wlo = f.local(V128);
   const whi = f.local(V128);
   const xtmp = f.local(V128);
-  const dotV = f.local(V128);
+  const dot0 = f.local(V128);
+  const dot1 = f.local(V128);
+  const dot2 = f.local(V128);
+  const dot3 = f.local(V128);
+  const t0 = f.local(V128);
+  const t1 = f.local(V128);
+  const acc4 = f.local(V128);
 
   f.i32Const(0).i32x4Splat().set(zero);
   f.get(3).i32Const(5).i32ShrS().set(nBlocks);
@@ -2766,35 +3160,47 @@ function buildMulMatQ8_0Q8Batch4(): FuncBuilder {
   f.get(5).set(oStride);
   f.i32Const(0).set(r);
 
-  const emitTok = (qpLoc: number, accLoc: number) => {
-    f.get(zero).set(dotV);
+  const emitTokDot = (qpLoc: number, dotLoc: number) => {
+    f.get(zero).set(dotLoc);
     f.get(qpLoc).v128Load(16, 4).set(xtmp);
-    f.dotI8I8Add(xtmp, wlo, dotV);
+    f.dotI8I8Add(xtmp, wlo, dotLoc);
     f.get(qpLoc).v128Load(32, 4).set(xtmp);
-    f.dotI8I8Add(xtmp, whi, dotV);
-    f.hsumI32x4(dotV).f32ConvertI32S().get(dw).get(qpLoc).f32Load(0).f32Mul().f32Mul().get(accLoc).f32Add().set(accLoc);
+    f.dotI8I8Add(xtmp, whi, dotLoc);
   };
 
   f.block().loop();
   f.get(r).get(4).i32GeS().brIf(1);
   f.get(0).get(r).get(rowBytes).i32Mul().i32Add().set(wp);
   f.get(1).tee(qp0).get(qStride).i32Add().tee(qp1).get(qStride).i32Add().tee(qp2).get(qStride).i32Add().set(qp3);
-  f.f32Const(0).set(acc0);
-  f.f32Const(0).set(acc1);
-  f.f32Const(0).set(acc2);
-  f.f32Const(0).set(acc3);
+  f.f32Const(0).f32x4Splat().set(acc4);
   f.i32Const(0).set(b);
 
   f.block().loop();
   f.get(b).get(nBlocks).i32GeS().brIf(1);
-  f.loadF16AsF32(wp, 0).set(dw);
   f.get(wp).v128Load(2).set(wlo);
   f.get(wp).v128Load(18).set(whi);
 
-  emitTok(qp0, acc0);
-  emitTok(qp1, acc1);
-  emitTok(qp2, acc2);
-  emitTok(qp3, acc3);
+  emitTokDot(qp0, dot0);
+  emitTokDot(qp1, dot1);
+  emitTokDot(qp2, dot2);
+  emitTokDot(qp3, dot3);
+
+  f.hsum4RowsI32x4(dot0, dot1, dot2, dot3, t0, t1, dot0);
+  f.get(dot0).f32x4ConvertI32x4S().set(dot0);
+
+  f.get(zero)
+    .get(qp0).f32Load(0).f32x4ReplaceLane(0)
+    .get(qp1).f32Load(0).f32x4ReplaceLane(1)
+    .get(qp2).f32Load(0).f32x4ReplaceLane(2)
+    .get(qp3).f32Load(0).f32x4ReplaceLane(3)
+    .loadF16AsF32(wp, 0).f32x4Splat().f32x4Mul()
+    .set(t1);
+
+  if (useRelaxed) {
+    f.get(dot0).get(t1).get(acc4).f32x4RelaxedMadd().set(acc4);
+  } else {
+    f.get(dot0).get(t1).f32x4Mul().get(acc4).f32x4Add().set(acc4);
+  }
 
   f.get(wp).i32Const(34).i32Add().set(wp);
   f.get(qp0).i32Const(Q8_0_ACT_BLOCK_BYTES).i32Add().set(qp0);
@@ -2804,10 +3210,10 @@ function buildMulMatQ8_0Q8Batch4(): FuncBuilder {
   f.get(b).i32Const(1).i32Add().set(b);
   f.br(0).end().end();
 
-  f.get(2).get(r).i32Const(2).i32Shl().i32Add().tee(wp).get(acc0).f32Store(0);
-  f.get(wp).get(oStride).i32Add().tee(wp).get(acc1).f32Store(0);
-  f.get(wp).get(oStride).i32Add().tee(wp).get(acc2).f32Store(0);
-  f.get(wp).get(oStride).i32Add().get(acc3).f32Store(0);
+  f.get(2).get(r).i32Const(2).i32Shl().i32Add().tee(wp).get(acc4).f32x4Extract(0).f32Store(0);
+  f.get(wp).get(oStride).i32Add().tee(wp).get(acc4).f32x4Extract(1).f32Store(0);
+  f.get(wp).get(oStride).i32Add().tee(wp).get(acc4).f32x4Extract(2).f32Store(0);
+  f.get(wp).get(oStride).i32Add().get(acc4).f32x4Extract(3).f32Store(0);
 
   f.get(r).i32Const(1).i32Add().set(r);
   f.br(0).end().end();
@@ -6040,6 +6446,683 @@ function buildMulMatQ6KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
 }
 
 /**
+ * Verdant/Prism 4-row register-blocked `Q2_K × Q8_K` Narrow-Lane Integer Contraction:
+ * `(wPtr, q8kPtr, outPtr, cols, rows)`.
+ * - 12 live V128 registers (zero x86-64 XMM spills!)
+ * - Computes all 16 `dmin` sub-block terms in 2x `i32x4.dot_i16x8_s` against `Q8_K.bsums16`
+ * - Pure `i32x4` narrow-lane accumulation (1,467x i32 headroom, 43x i16 headroom)
+ * - Encodes to float ONCE per 256 weights via `hsum4RowsI32x4`!
+ */
+function buildMulMatQ2KQ8K(useRelaxed: boolean): FuncBuilder {
+  const f = new FuncBuilder([I32, I32, I32, I32, I32]);
+  const r = f.local(I32);
+  const nSuper = f.local(I32);
+  const rowBytes = f.local(I32);
+  const wp0 = f.local(I32);
+  const wp1 = f.local(I32);
+  const wp2 = f.local(I32);
+  const wp3 = f.local(I32);
+  const qp = f.local(I32);
+  const sb = f.local(I32);
+  const accS = f.local(F32);
+  const dxS = f.local(F32);
+
+  // Strictly 12 V128 locals -> 4 free XMM scratch registers (0 spills!)
+  const mask03 = f.local(V128);
+  const acc4 = f.local(V128);
+  const sumi0 = f.local(V128);
+  const sumi1 = f.local(V128);
+  const sumi2 = f.local(V128);
+  const sumi3 = f.local(V128);
+  const q0 = f.local(V128);
+  const q1 = f.local(V128);
+  const qv = f.local(V128);
+  const x0 = f.local(V128);
+  const x1 = f.local(V128);
+  const dotV = f.local(V128);
+
+  f.i32Const(0x03).i8x16Splat().set(mask03);
+  f.get(3).i32Const(8).i32ShrS().set(nSuper);
+  f.get(nSuper).i32Const(84).i32Mul().set(rowBytes);
+  f.i32Const(0).set(r);
+
+  // Compute dot(ml[0..15], bsums16[0..15]) where x0 = bsums16[0..7], x1 = bsums16[8..15]
+  const emitMinDot = (wpLoc: number, dstLoc: number) => {
+    f.get(wpLoc).v128Load(0).i32Const(4).i8x16ShrU().set(qv);
+    f.get(qv).i16x8ExtendLowI8x16U().get(x0).i32x4DotI16x8S()
+      .get(qv).i16x8ExtendHighI8x16U().get(x1).i32x4DotI16x8S()
+      .i32x4Add().set(dstLoc);
+  };
+
+  // Accumulate all 16 sub-blocks of one row `wpLoc` into `sumiLoc` (loads q0, q1 once per half)
+  const emitRowQ2 = (wpLoc: number, sumiLoc: number) => {
+    for (let h = 0; h < 2; h++) {
+      f.get(wpLoc).v128Load(16 + h * 32).set(q0);
+      f.get(wpLoc).v128Load(32 + h * 32).set(q1);
+      for (let s = 0; s < 4; s++) {
+        const shift = s * 2;
+        const xOff = 64 + h * 128 + s * 32;
+        const scIdx0 = h * 8 + s * 2;
+        f.get(qp).v128Load(xOff, 4).set(x0);
+        f.get(q0);
+        if (shift > 0) f.i32Const(shift).i8x16ShrU();
+        f.get(mask03).v128And().set(qv);
+        f.pushDotI8I7ToI16x8(x0, qv, useRelaxed);
+        f.get(wpLoc).i32Load8U(scIdx0).i32Const(0x0f).i32And().i16x8Splat()
+          .i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
+
+        f.get(qp).v128Load(xOff + 16, 4).set(x1);
+        f.get(q1);
+        if (shift > 0) f.i32Const(shift).i8x16ShrU();
+        f.get(mask03).v128And().set(qv);
+        f.pushDotI8I7ToI16x8(x1, qv, useRelaxed);
+        f.get(wpLoc).i32Load8U(scIdx0 + 1).i32Const(0x0f).i32And().i16x8Splat()
+          .i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
+      }
+    }
+  };
+
+  // 4-row register-blocked loop
+  f.block().loop();
+  f.get(r).i32Const(3).i32Add().get(4).i32GeS().brIf(1);
+  f.get(0).get(r).get(rowBytes).i32Mul().i32Add()
+    .tee(wp0).get(rowBytes).i32Add()
+    .tee(wp1).get(rowBytes).i32Add()
+    .tee(wp2).get(rowBytes).i32Add().set(wp3);
+  f.get(1).set(qp);
+  f.f32Const(0).f32x4Splat().set(acc4);
+  f.i32Const(0).set(sb);
+
+  f.block().loop();
+  f.get(sb).get(nSuper).i32GeS().brIf(1);
+
+  f.get(qp).f32Load(0).set(dxS);
+  f.get(qp).v128Load(16, 4).set(x0);
+  f.get(qp).v128Load(32, 4).set(x1);
+  emitMinDot(wp0, sumi0);
+  emitMinDot(wp1, sumi1);
+  emitMinDot(wp2, sumi2);
+  emitMinDot(wp3, sumi3);
+  f.hsum4RowsI32x4(sumi0, sumi1, sumi2, sumi3, q0, q1, dotV);
+  f.f32Const(0).f32x4Splat()
+    .loadF16AsF32(wp0, 82).f32x4ReplaceLane(0)
+    .loadF16AsF32(wp1, 82).f32x4ReplaceLane(1)
+    .loadF16AsF32(wp2, 82).f32x4ReplaceLane(2)
+    .loadF16AsF32(wp3, 82).f32x4ReplaceLane(3)
+    .get(dxS).f32x4Splat().f32x4Mul().set(q0);
+  f.get(acc4)
+    .get(dotV).f32x4ConvertI32x4S().get(q0).f32x4Mul()
+    .f32x4Sub().set(acc4);
+
+  f.i32Const(0).i32x4Splat().tee(sumi0).tee(sumi1).tee(sumi2).set(sumi3);
+  emitRowQ2(wp0, sumi0);
+  emitRowQ2(wp1, sumi1);
+  emitRowQ2(wp2, sumi2);
+  emitRowQ2(wp3, sumi3);
+
+  f.hsum4RowsI32x4(sumi0, sumi1, sumi2, sumi3, q0, q1, dotV);
+  f.f32Const(0).f32x4Splat()
+    .loadF16AsF32(wp0, 80).f32x4ReplaceLane(0)
+    .loadF16AsF32(wp1, 80).f32x4ReplaceLane(1)
+    .loadF16AsF32(wp2, 80).f32x4ReplaceLane(2)
+    .loadF16AsF32(wp3, 80).f32x4ReplaceLane(3)
+    .get(dxS).f32x4Splat().f32x4Mul().set(q0);
+  if (useRelaxed) {
+    f.get(dotV).f32x4ConvertI32x4S().get(q0).get(acc4).f32x4RelaxedMadd().set(acc4);
+  } else {
+    f.get(dotV).f32x4ConvertI32x4S().get(q0).f32x4Mul().get(acc4).f32x4Add().set(acc4);
+  }
+
+  f.get(wp0).i32Const(84).i32Add().set(wp0);
+  f.get(wp1).i32Const(84).i32Add().set(wp1);
+  f.get(wp2).i32Const(84).i32Add().set(wp2);
+  f.get(wp3).i32Const(84).i32Add().set(wp3);
+  f.get(qp).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Add().set(qp);
+  f.get(sb).i32Const(1).i32Add().set(sb);
+  f.br(0).end().end();
+
+  f.get(2).get(r).i32Const(2).i32Shl().i32Add().get(acc4).v128Store(0);
+  f.get(r).i32Const(4).i32Add().set(r);
+  f.br(0).end().end();
+
+  // Remainder rows (0..3)
+  f.block().loop();
+  f.get(r).get(4).i32GeS().brIf(1);
+  f.get(0).get(r).get(rowBytes).i32Mul().i32Add().set(wp0);
+  f.get(1).set(qp);
+  f.f32Const(0).set(accS);
+  f.i32Const(0).set(sb);
+
+  f.block().loop();
+  f.get(sb).get(nSuper).i32GeS().brIf(1);
+  f.get(qp).f32Load(0).set(dxS);
+  f.get(qp).v128Load(16, 4).set(x0);
+  f.get(qp).v128Load(32, 4).set(x1);
+  emitMinDot(wp0, sumi1);
+  f.i32Const(0).i32x4Splat().set(sumi0);
+  emitRowQ2(wp0, sumi0);
+  f.loadF16AsF32(wp0, 80).hsumI32x4(sumi0).f32ConvertI32S().f32Mul()
+    .loadF16AsF32(wp0, 82).hsumI32x4(sumi1).f32ConvertI32S().f32Mul()
+    .f32Sub().get(dxS).f32Mul().get(accS).f32Add().set(accS);
+
+  f.get(wp0).i32Const(84).i32Add().set(wp0);
+  f.get(qp).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Add().set(qp);
+  f.get(sb).i32Const(1).i32Add().set(sb);
+  f.br(0).end().end();
+
+  f.get(2).get(r).i32Const(2).i32Shl().i32Add().get(accS).f32Store(0);
+  f.get(r).i32Const(1).i32Add().set(r);
+  f.br(0).end().end();
+
+  return f;
+}
+
+/**
+ * Verdant/Prism 4-token batched prefill `Q2_K × Q8_K` Narrow-Lane Contraction:
+ * `(wPtr, q8kBatchPtr, outBatchPtr, cols, rows, oStrideBytes)`.
+ */
+function buildMulMatQ2KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
+  const f = new FuncBuilder([I32, I32, I32, I32, I32, I32]);
+  const r = f.local(I32);
+  const nSuper = f.local(I32);
+  const rowBytes = f.local(I32);
+  const qStride = f.local(I32);
+  const oStride = f.local(I32);
+  const wp = f.local(I32);
+  const qp0 = f.local(I32);
+  const qp1 = f.local(I32);
+  const qp2 = f.local(I32);
+  const qp3 = f.local(I32);
+  const op = f.local(I32);
+  const sb = f.local(I32);
+
+  const mask03 = f.local(V128);
+  const acc4 = f.local(V128);
+  const dx4 = f.local(V128);
+  const sumi0 = f.local(V128);
+  const sumi1 = f.local(V128);
+  const sumi2 = f.local(V128);
+  const sumi3 = f.local(V128);
+  const q0 = f.local(V128);
+  const q1 = f.local(V128);
+  const qv = f.local(V128);
+  const scV = f.local(V128);
+  const xtmp = f.local(V128);
+  const dotV = f.local(V128);
+
+  f.i32Const(0x03).i8x16Splat().set(mask03);
+  f.get(3).i32Const(8).i32ShrS().set(nSuper);
+  f.get(nSuper).i32Const(84).i32Mul().set(rowBytes);
+  f.get(nSuper).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Mul().set(qStride);
+  f.get(5).set(oStride);
+  f.i32Const(0).set(r);
+
+  const emitTokMin = (qpLoc: number, dstLoc: number) => {
+    f.get(q0).get(qpLoc).v128Load(16, 4).i32x4DotI16x8S()
+      .get(q1).get(qpLoc).v128Load(32, 4).i32x4DotI16x8S()
+      .i32x4Add().set(dstLoc);
+  };
+
+  const emitTokSub = (qpLoc: number, xOff: number, sumiLoc: number) => {
+    f.get(qpLoc).v128Load(xOff, 4).set(xtmp);
+    f.pushDotI8I7ToI16x8(xtmp, qv, useRelaxed);
+    f.get(scV).i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
+  };
+
+  f.block().loop();
+  f.get(r).get(4).i32GeS().brIf(1);
+  f.get(0).get(r).get(rowBytes).i32Mul().i32Add().set(wp);
+  f.get(1).tee(qp0)
+    .get(qStride).i32Add().tee(qp1)
+    .get(qStride).i32Add().tee(qp2)
+    .get(qStride).i32Add().set(qp3);
+  f.f32Const(0).f32x4Splat().set(acc4);
+  f.i32Const(0).set(sb);
+
+  f.block().loop();
+  f.get(sb).get(nSuper).i32GeS().brIf(1);
+
+  f.f32Const(0).f32x4Splat()
+    .get(qp0).f32Load(0).f32x4ReplaceLane(0)
+    .get(qp1).f32Load(0).f32x4ReplaceLane(1)
+    .get(qp2).f32Load(0).f32x4ReplaceLane(2)
+    .get(qp3).f32Load(0).f32x4ReplaceLane(3)
+    .set(dx4);
+
+  // Min term across all 4 tokens
+  f.get(wp).v128Load(0).i32Const(4).i8x16ShrU().set(qv);
+  f.get(qv).i16x8ExtendLowI8x16U().set(q0);
+  f.get(qv).i16x8ExtendHighI8x16U().set(q1);
+  emitTokMin(qp0, sumi0);
+  emitTokMin(qp1, sumi1);
+  emitTokMin(qp2, sumi2);
+  emitTokMin(qp3, sumi3);
+  f.hsum4RowsI32x4(sumi0, sumi1, sumi2, sumi3, q0, q1, dotV);
+  f.get(acc4)
+    .get(dotV).f32x4ConvertI32x4S()
+    .loadF16AsF32(wp, 82).f32x4Splat().get(dx4).f32x4Mul().f32x4Mul()
+    .f32x4Sub().set(acc4);
+
+  f.i32Const(0).i32x4Splat().tee(sumi0).tee(sumi1).tee(sumi2).set(sumi3);
+
+  for (let h = 0; h < 2; h++) {
+    f.get(wp).v128Load(16 + h * 32).set(q0);
+    f.get(wp).v128Load(32 + h * 32).set(q1);
+    for (let s = 0; s < 4; s++) {
+      const shift = s * 2;
+      const xOff = 64 + h * 128 + s * 32;
+      const scIdx0 = h * 8 + s * 2;
+
+      f.get(q0);
+      if (shift > 0) f.i32Const(shift).i8x16ShrU();
+      f.get(mask03).v128And().set(qv);
+      f.get(wp).i32Load8U(scIdx0).i32Const(0x0f).i32And().i16x8Splat().set(scV);
+      emitTokSub(qp0, xOff, sumi0);
+      emitTokSub(qp1, xOff, sumi1);
+      emitTokSub(qp2, xOff, sumi2);
+      emitTokSub(qp3, xOff, sumi3);
+
+      f.get(q1);
+      if (shift > 0) f.i32Const(shift).i8x16ShrU();
+      f.get(mask03).v128And().set(qv);
+      f.get(wp).i32Load8U(scIdx0 + 1).i32Const(0x0f).i32And().i16x8Splat().set(scV);
+      emitTokSub(qp0, xOff + 16, sumi0);
+      emitTokSub(qp1, xOff + 16, sumi1);
+      emitTokSub(qp2, xOff + 16, sumi2);
+      emitTokSub(qp3, xOff + 16, sumi3);
+    }
+  }
+
+  f.hsum4RowsI32x4(sumi0, sumi1, sumi2, sumi3, q0, q1, dotV);
+  f.loadF16AsF32(wp, 80).f32x4Splat().get(dx4).f32x4Mul().set(q0);
+  if (useRelaxed) {
+    f.get(dotV).f32x4ConvertI32x4S().get(q0).get(acc4).f32x4RelaxedMadd().set(acc4);
+  } else {
+    f.get(dotV).f32x4ConvertI32x4S().get(q0).f32x4Mul().get(acc4).f32x4Add().set(acc4);
+  }
+
+  f.get(wp).i32Const(84).i32Add().set(wp);
+  f.get(qp0).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Add().set(qp0);
+  f.get(qp1).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Add().set(qp1);
+  f.get(qp2).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Add().set(qp2);
+  f.get(qp3).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Add().set(qp3);
+  f.get(sb).i32Const(1).i32Add().set(sb);
+  f.br(0).end().end();
+
+  f.get(2).get(r).i32Const(2).i32Shl().i32Add().tee(op).get(acc4).f32x4Extract(0).f32Store(0);
+  f.get(op).get(oStride).i32Add().tee(op).get(acc4).f32x4Extract(1).f32Store(0);
+  f.get(op).get(oStride).i32Add().tee(op).get(acc4).f32x4Extract(2).f32Store(0);
+  f.get(op).get(oStride).i32Add().get(acc4).f32x4Extract(3).f32Store(0);
+
+  f.get(r).i32Const(1).i32Add().set(r);
+  f.br(0).end().end();
+
+  return f;
+}
+
+/**
+ * Verdant/Prism 2-row zero-spill `Q3_K × Q8_K` Narrow-Lane Integer Contraction:
+ * `(wPtr, q8kPtr, outPtr, cols, rows)`.
+ * - Factors `q = q_u3 - 4` (`q_u3 ∈ [0..7]`) so `-4 * sum_j(s_j * bsums16[j])` is absorbed up front
+ *   in 2x `i32x4.dot_i16x8_s` + `shl(2)`, allowing hardware unsigned-i7 VNNI dots!
+ * - Strictly 11 live V128 registers (zero x86-64 XMM spills!) & 295x i32 headroom.
+ */
+function buildMulMatQ3KQ8K(useRelaxed: boolean): FuncBuilder {
+  const f = new FuncBuilder([I32, I32, I32, I32, I32]);
+  const r = f.local(I32);
+  const nSuper = f.local(I32);
+  const rowBytes = f.local(I32);
+  const wp0 = f.local(I32);
+  const wp1 = f.local(I32);
+  const qp = f.local(I32);
+  const sb = f.local(I32);
+  const a0 = f.local(I32);
+  const a1 = f.local(I32);
+  const tmp = f.local(I32);
+  const u0 = f.local(I32);
+  const u1 = f.local(I32);
+  const u2 = f.local(I32);
+  const u3 = f.local(I32);
+  const acc0 = f.local(F32);
+  const acc1 = f.local(F32);
+  const dxS = f.local(F32);
+
+  // Strictly 11 V128 locals -> 5 free XMM scratch registers (0 spills!)
+  const mask03 = f.local(V128);
+  const mask04 = f.local(V128);
+  const sumi0 = f.local(V128);
+  const sumi1 = f.local(V128);
+  const hm0 = f.local(V128);
+  const hm1 = f.local(V128);
+  const q0 = f.local(V128);
+  const q1 = f.local(V128);
+  const qv = f.local(V128);
+  const x0 = f.local(V128);
+  const x1 = f.local(V128);
+
+  f.i32Const(0x03).i8x16Splat().set(mask03);
+  f.i32Const(0x04).i8x16Splat().set(mask04);
+  f.get(3).i32Const(8).i32ShrS().set(nSuper);
+  f.get(nSuper).i32Const(110).i32Mul().set(rowBytes);
+  f.i32Const(0).set(r);
+
+  const pushScaleSplat16 = (scIdx: number) => {
+    const uLoc = scIdx < 4 ? u0 : scIdx < 8 ? u1 : scIdx < 12 ? u2 : u3;
+    const byteIdx = scIdx & 3;
+    f.get(uLoc);
+    if (byteIdx > 0) f.i32Const(byteIdx * 8).i32ShrU();
+    if (byteIdx < 3) f.i32Const(0xff).i32And();
+    f.i32Const(32).i32Sub().i16x8Splat();
+  };
+
+  // Unpack scales of `wpLoc`, initialize `sumiLoc = -4 * sum_j(sc[j] * bsums16[j])`, and run all 16 sub-blocks
+  const emitRowQ3 = (wpLoc: number, sumiLoc: number) => {
+    f.get(wpLoc).i32Load(96).set(a0);
+    f.get(wpLoc).i32Load(100).set(a1);
+    f.get(wpLoc).i32Load(104).set(tmp);
+    f.get(a0).i32Const(0x0f0f0f0f).i32And()
+      .get(tmp).i32Const(0x03030303).i32And().i32Const(4).i32Shl().i32Or().set(u0);
+    f.get(a1).i32Const(0x0f0f0f0f).i32And()
+      .get(tmp).i32Const(2).i32ShrU().i32Const(0x03030303).i32And().i32Const(4).i32Shl().i32Or().set(u1);
+    f.get(a0).i32Const(4).i32ShrU().i32Const(0x0f0f0f0f).i32And()
+      .get(tmp).i32Const(4).i32ShrU().i32Const(0x03030303).i32And().i32Const(4).i32Shl().i32Or().set(u2);
+    f.get(a1).i32Const(4).i32ShrU().i32Const(0x0f0f0f0f).i32And()
+      .get(tmp).i32Const(6).i32ShrU().i32Const(0x03030303).i32And().i32Const(4).i32Shl().i32Or().set(u3);
+
+    // Pack signed i8 scales [-32..31] into qv and absorb -4 * dot(sc, bsums16)
+    f.i32Const(0).i32x4Splat()
+      .get(u0).i32x4ReplaceLane(0)
+      .get(u1).i32x4ReplaceLane(1)
+      .get(u2).i32x4ReplaceLane(2)
+      .get(u3).i32x4ReplaceLane(3)
+      .i32Const(32).i8x16Splat().i8x16Sub().set(qv);
+    f.i32Const(0).i32x4Splat()
+      .get(qv).i16x8ExtendLowI8x16S().get(qp).v128Load(16, 4).i32x4DotI16x8S()
+      .get(qv).i16x8ExtendHighI8x16S().get(qp).v128Load(32, 4).i32x4DotI16x8S()
+      .i32x4Add().i32Const(2).i32x4Shl()
+      .i32x4Sub().set(sumiLoc);
+
+    f.get(wpLoc).v128Load(0).set(hm0);
+    f.get(wpLoc).v128Load(16).set(hm1);
+
+    for (let h = 0; h < 2; h++) {
+      f.get(wpLoc).v128Load(32 + h * 32).set(q0);
+      f.get(wpLoc).v128Load(48 + h * 32).set(q1);
+      for (let s = 0; s < 4; s++) {
+        const shift = s * 2;
+        const bitIdx = h * 4 + s;
+        const xOff = 64 + h * 128 + s * 32;
+        const scIdx0 = h * 8 + s * 2;
+
+        // First 16 elements
+        f.get(qp).v128Load(xOff, 4).set(x0);
+        f.get(q0);
+        if (shift > 0) f.i32Const(shift).i8x16ShrU();
+        f.get(mask03).v128And();
+        f.get(hm0);
+        if (bitIdx < 2) f.i32Const(2 - bitIdx).i8x16Shl();
+        else if (bitIdx > 2) f.i32Const(bitIdx - 2).i8x16ShrU();
+        f.get(mask04).v128And().v128Or().set(qv);
+        f.pushDotI8I7ToI16x8(x0, qv, useRelaxed);
+        pushScaleSplat16(scIdx0);
+        f.i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
+
+        // Next 16 elements
+        f.get(qp).v128Load(xOff + 16, 4).set(x1);
+        f.get(q1);
+        if (shift > 0) f.i32Const(shift).i8x16ShrU();
+        f.get(mask03).v128And();
+        f.get(hm1);
+        if (bitIdx < 2) f.i32Const(2 - bitIdx).i8x16Shl();
+        else if (bitIdx > 2) f.i32Const(bitIdx - 2).i8x16ShrU();
+        f.get(mask04).v128And().v128Or().set(qv);
+        f.pushDotI8I7ToI16x8(x1, qv, useRelaxed);
+        pushScaleSplat16(scIdx0 + 1);
+        f.i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
+      }
+    }
+  };
+
+  // 2-row zero-spill main loop
+  f.block().loop();
+  f.get(r).i32Const(1).i32Add().get(4).i32GeS().brIf(1);
+  f.get(0).get(r).get(rowBytes).i32Mul().i32Add().tee(wp0).get(rowBytes).i32Add().set(wp1);
+  f.get(1).set(qp);
+  f.f32Const(0).tee(acc0).set(acc1);
+  f.i32Const(0).set(sb);
+
+  f.block().loop();
+  f.get(sb).get(nSuper).i32GeS().brIf(1);
+  f.get(qp).f32Load(0).set(dxS);
+  emitRowQ3(wp0, sumi0);
+  emitRowQ3(wp1, sumi1);
+
+  f.hsumI32x4(sumi0).f32ConvertI32S().loadF16AsF32(wp0, 108).get(dxS).f32Mul().f32Mul()
+    .get(acc0).f32Add().set(acc0);
+  f.hsumI32x4(sumi1).f32ConvertI32S().loadF16AsF32(wp1, 108).get(dxS).f32Mul().f32Mul()
+    .get(acc1).f32Add().set(acc1);
+
+  f.get(wp0).i32Const(110).i32Add().set(wp0);
+  f.get(wp1).i32Const(110).i32Add().set(wp1);
+  f.get(qp).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Add().set(qp);
+  f.get(sb).i32Const(1).i32Add().set(sb);
+  f.br(0).end().end();
+
+  f.get(2).get(r).i32Const(2).i32Shl().i32Add().get(acc0).f32Store(0);
+  f.get(2).get(r).i32Const(2).i32Shl().i32Add().get(acc1).f32Store(4);
+  f.get(r).i32Const(2).i32Add().set(r);
+  f.br(0).end().end();
+
+  // Odd trailing row (0..1)
+  f.block();
+  f.get(r).get(4).i32GeS().brIf(0);
+  f.get(0).get(r).get(rowBytes).i32Mul().i32Add().set(wp0);
+  f.get(1).set(qp);
+  f.f32Const(0).set(acc0);
+  f.i32Const(0).set(sb);
+
+  f.block().loop();
+  f.get(sb).get(nSuper).i32GeS().brIf(1);
+  f.get(qp).f32Load(0).set(dxS);
+  emitRowQ3(wp0, sumi0);
+  f.hsumI32x4(sumi0).f32ConvertI32S().loadF16AsF32(wp0, 108).get(dxS).f32Mul().f32Mul()
+    .get(acc0).f32Add().set(acc0);
+
+  f.get(wp0).i32Const(110).i32Add().set(wp0);
+  f.get(qp).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Add().set(qp);
+  f.get(sb).i32Const(1).i32Add().set(sb);
+  f.br(0).end().end();
+
+  f.get(2).get(r).i32Const(2).i32Shl().i32Add().get(acc0).f32Store(0);
+  f.end();
+
+  return f;
+}
+
+/**
+ * Verdant/Prism 4-token batched prefill `Q3_K × Q8_K` Narrow-Lane Contraction:
+ * `(wPtr, q8kBatchPtr, outBatchPtr, cols, rows, oStrideBytes)`.
+ */
+function buildMulMatQ3KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
+  const f = new FuncBuilder([I32, I32, I32, I32, I32, I32]);
+  const r = f.local(I32);
+  const nSuper = f.local(I32);
+  const rowBytes = f.local(I32);
+  const qStride = f.local(I32);
+  const oStride = f.local(I32);
+  const wp = f.local(I32);
+  const qp0 = f.local(I32);
+  const qp1 = f.local(I32);
+  const qp2 = f.local(I32);
+  const qp3 = f.local(I32);
+  const op = f.local(I32);
+  const sb = f.local(I32);
+  const a0 = f.local(I32);
+  const a1 = f.local(I32);
+  const tmp = f.local(I32);
+  const u0 = f.local(I32);
+  const u1 = f.local(I32);
+  const u2 = f.local(I32);
+  const u3 = f.local(I32);
+
+  const mask03 = f.local(V128);
+  const mask04 = f.local(V128);
+  const acc4 = f.local(V128);
+  const sumi0 = f.local(V128);
+  const sumi1 = f.local(V128);
+  const sumi2 = f.local(V128);
+  const sumi3 = f.local(V128);
+  const hm0 = f.local(V128);
+  const hm1 = f.local(V128);
+  const q0 = f.local(V128);
+  const q1 = f.local(V128);
+  const qv = f.local(V128);
+  const scV = f.local(V128);
+  const xtmp = f.local(V128);
+  const dotV = f.local(V128);
+
+  f.i32Const(0x03).i8x16Splat().set(mask03);
+  f.i32Const(0x04).i8x16Splat().set(mask04);
+  f.get(3).i32Const(8).i32ShrS().set(nSuper);
+  f.get(nSuper).i32Const(110).i32Mul().set(rowBytes);
+  f.get(nSuper).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Mul().set(qStride);
+  f.get(5).set(oStride);
+  f.i32Const(0).set(r);
+
+  const initTokOffset = (qpLoc: number, sumiLoc: number) => {
+    f.i32Const(0).i32x4Splat()
+      .get(q0).get(qpLoc).v128Load(16, 4).i32x4DotI16x8S()
+      .get(q1).get(qpLoc).v128Load(32, 4).i32x4DotI16x8S()
+      .i32x4Add().i32Const(2).i32x4Shl()
+      .i32x4Sub().set(sumiLoc);
+  };
+
+  const setScaleSplat16 = (scIdx: number) => {
+    const uLoc = scIdx < 4 ? u0 : scIdx < 8 ? u1 : scIdx < 12 ? u2 : u3;
+    const byteIdx = scIdx & 3;
+    f.get(uLoc);
+    if (byteIdx > 0) f.i32Const(byteIdx * 8).i32ShrU();
+    if (byteIdx < 3) f.i32Const(0xff).i32And();
+    f.i32Const(32).i32Sub().i16x8Splat().set(scV);
+  };
+
+  const emitTokQ3 = (qpLoc: number, xOff: number, sumiLoc: number) => {
+    f.get(qpLoc).v128Load(xOff, 4).set(xtmp);
+    f.pushDotI8I7ToI16x8(xtmp, qv, useRelaxed);
+    f.get(scV).i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
+  };
+
+  f.block().loop();
+  f.get(r).get(4).i32GeS().brIf(1);
+  f.get(0).get(r).get(rowBytes).i32Mul().i32Add().set(wp);
+  f.get(1).tee(qp0)
+    .get(qStride).i32Add().tee(qp1)
+    .get(qStride).i32Add().tee(qp2)
+    .get(qStride).i32Add().set(qp3);
+  f.f32Const(0).f32x4Splat().set(acc4);
+  f.i32Const(0).set(sb);
+
+  f.block().loop();
+  f.get(sb).get(nSuper).i32GeS().brIf(1);
+
+  f.get(wp).i32Load(96).set(a0);
+  f.get(wp).i32Load(100).set(a1);
+  f.get(wp).i32Load(104).set(tmp);
+  f.get(a0).i32Const(0x0f0f0f0f).i32And()
+    .get(tmp).i32Const(0x03030303).i32And().i32Const(4).i32Shl().i32Or().set(u0);
+  f.get(a1).i32Const(0x0f0f0f0f).i32And()
+    .get(tmp).i32Const(2).i32ShrU().i32Const(0x03030303).i32And().i32Const(4).i32Shl().i32Or().set(u1);
+  f.get(a0).i32Const(4).i32ShrU().i32Const(0x0f0f0f0f).i32And()
+    .get(tmp).i32Const(4).i32ShrU().i32Const(0x03030303).i32And().i32Const(4).i32Shl().i32Or().set(u2);
+  f.get(a1).i32Const(4).i32ShrU().i32Const(0x0f0f0f0f).i32And()
+    .get(tmp).i32Const(6).i32ShrU().i32Const(0x03030303).i32And().i32Const(4).i32Shl().i32Or().set(u3);
+
+  f.i32Const(0).i32x4Splat()
+    .get(u0).i32x4ReplaceLane(0)
+    .get(u1).i32x4ReplaceLane(1)
+    .get(u2).i32x4ReplaceLane(2)
+    .get(u3).i32x4ReplaceLane(3)
+    .i32Const(32).i8x16Splat().i8x16Sub().set(qv);
+  f.get(qv).i16x8ExtendLowI8x16S().set(q0);
+  f.get(qv).i16x8ExtendHighI8x16S().set(q1);
+  initTokOffset(qp0, sumi0);
+  initTokOffset(qp1, sumi1);
+  initTokOffset(qp2, sumi2);
+  initTokOffset(qp3, sumi3);
+
+  f.get(wp).v128Load(0).set(hm0);
+  f.get(wp).v128Load(16).set(hm1);
+
+  for (let h = 0; h < 2; h++) {
+    f.get(wp).v128Load(32 + h * 32).set(q0);
+    f.get(wp).v128Load(48 + h * 32).set(q1);
+    for (let s = 0; s < 4; s++) {
+      const shift = s * 2;
+      const bitIdx = h * 4 + s;
+      const xOff = 64 + h * 128 + s * 32;
+      const scIdx0 = h * 8 + s * 2;
+
+      f.get(q0);
+      if (shift > 0) f.i32Const(shift).i8x16ShrU();
+      f.get(mask03).v128And();
+      f.get(hm0);
+      if (bitIdx < 2) f.i32Const(2 - bitIdx).i8x16Shl();
+      else if (bitIdx > 2) f.i32Const(bitIdx - 2).i8x16ShrU();
+      f.get(mask04).v128And().v128Or().set(qv);
+      setScaleSplat16(scIdx0);
+      emitTokQ3(qp0, xOff, sumi0);
+      emitTokQ3(qp1, xOff, sumi1);
+      emitTokQ3(qp2, xOff, sumi2);
+      emitTokQ3(qp3, xOff, sumi3);
+
+      f.get(q1);
+      if (shift > 0) f.i32Const(shift).i8x16ShrU();
+      f.get(mask03).v128And();
+      f.get(hm1);
+      if (bitIdx < 2) f.i32Const(2 - bitIdx).i8x16Shl();
+      else if (bitIdx > 2) f.i32Const(bitIdx - 2).i8x16ShrU();
+      f.get(mask04).v128And().v128Or().set(qv);
+      setScaleSplat16(scIdx0 + 1);
+      emitTokQ3(qp0, xOff + 16, sumi0);
+      emitTokQ3(qp1, xOff + 16, sumi1);
+      emitTokQ3(qp2, xOff + 16, sumi2);
+      emitTokQ3(qp3, xOff + 16, sumi3);
+    }
+  }
+
+  f.hsum4RowsI32x4(sumi0, sumi1, sumi2, sumi3, q0, q1, dotV);
+  f.f32Const(0).f32x4Splat()
+    .get(qp0).f32Load(0).f32x4ReplaceLane(0)
+    .get(qp1).f32Load(0).f32x4ReplaceLane(1)
+    .get(qp2).f32Load(0).f32x4ReplaceLane(2)
+    .get(qp3).f32Load(0).f32x4ReplaceLane(3)
+    .loadF16AsF32(wp, 108).f32x4Splat().f32x4Mul().set(q0);
+  if (useRelaxed) {
+    f.get(dotV).f32x4ConvertI32x4S().get(q0).get(acc4).f32x4RelaxedMadd().set(acc4);
+  } else {
+    f.get(dotV).f32x4ConvertI32x4S().get(q0).f32x4Mul().get(acc4).f32x4Add().set(acc4);
+  }
+
+  f.get(wp).i32Const(110).i32Add().set(wp);
+  f.get(qp0).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Add().set(qp0);
+  f.get(qp1).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Add().set(qp1);
+  f.get(qp2).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Add().set(qp2);
+  f.get(qp3).i32Const(Q8_K_ACT_BLOCK_BYTES).i32Add().set(qp3);
+  f.get(sb).i32Const(1).i32Add().set(sb);
+  f.br(0).end().end();
+
+  f.get(2).get(r).i32Const(2).i32Shl().i32Add().tee(op).get(acc4).f32x4Extract(0).f32Store(0);
+  f.get(op).get(oStride).i32Add().tee(op).get(acc4).f32x4Extract(1).f32Store(0);
+  f.get(op).get(oStride).i32Add().tee(op).get(acc4).f32x4Extract(2).f32Store(0);
+  f.get(op).get(oStride).i32Add().get(acc4).f32x4Extract(3).f32Store(0);
+
+  f.get(r).i32Const(1).i32Add().set(r);
+  f.br(0).end().end();
+
+  return f;
+}
+
+/**
  * Exact WASM SIMD port of `UOR-Foundation/uor-matmul/crates/uor-matmul-kernels/src/isa/wasm.rs::simd_build_v4`:
  * `(space, block, bookPtr, actsPtr, outPtr)` where `rows = 16` (`V = 4` v128 registers of `i32x4`).
  * Precomputes the L1-resident partial-sum codebook table for every code `c ∈ [0..space)` across
@@ -6173,6 +7256,8 @@ export function buildVerdantSimdModuleBytes(
   add('mul_mat_q4_1', buildMulMatQ4_1(precomputeIdx));
   add('mul_mat_q5_0', buildMulMatQ5_0(precomputeIdx));
   add('mul_mat_q5_1', buildMulMatQ5_1(precomputeIdx));
+  add('mul_mat_q2_k', buildMulMatQ2_K());
+  add('mul_mat_q3_k', buildMulMatQ3_K());
   add('mul_mat_q4_k', buildMulMatQ4_K(precomputeIdx));
   add('mul_mat_q5_k', buildMulMatQ5_K(precomputeIdx));
   add('mul_mat_q6_k', buildMulMatQ6_K());
@@ -6185,7 +7270,7 @@ export function buildVerdantSimdModuleBytes(
   add('mul_mat_q5_0_q8', buildMulMatQ5Q8(false, useRelaxed));
   add('mul_mat_q5_1_q8', buildMulMatQ5Q8(true, useRelaxed));
   add('mul_mat_q8_0_q8', buildMulMatQ8_0Q8(useRelaxed));
-  add('mul_mat_q8_0_q8_batch4', buildMulMatQ8_0Q8Batch4());
+  add('mul_mat_q8_0_q8_batch4', buildMulMatQ8_0Q8Batch4(useRelaxed));
   add('mul_mat_q4_k_q8', buildMulMatQ4KQ8(useRelaxed));
   add('mul_mat_q4_k_q8_batch4', buildMulMatQ4KQ8Batch4(useRelaxed));
   add('mul_mat_q5_k_q8', buildMulMatQ5KQ8(useRelaxed));
@@ -6196,6 +7281,10 @@ export function buildVerdantSimdModuleBytes(
   // Verdant/Prism Q8_K super-block narrow-lane integer contraction ("encode once per 256 weights")
   // + uor-matmul tabulated zero-multiply TableBuild / TableGatherCodesU8 kernels
   add('quantize_f32_to_q8_k', buildQuantizeF32ToQ8K());
+  add('mul_mat_q2_k_q8k', buildMulMatQ2KQ8K(useRelaxed));
+  add('mul_mat_q2_k_q8k_batch4', buildMulMatQ2KQ8KBatch4(useRelaxed));
+  add('mul_mat_q3_k_q8k', buildMulMatQ3KQ8K(useRelaxed));
+  add('mul_mat_q3_k_q8k_batch4', buildMulMatQ3KQ8KBatch4(useRelaxed));
   add('mul_mat_q4_k_q8k', buildMulMatQ4KQ8K(useRelaxed));
   add('mul_mat_q4_k_q8k_batch4', buildMulMatQ4KQ8KBatch4(useRelaxed));
   add('mul_mat_q5_k_q8k', buildMulMatQ5KQ8K(useRelaxed));
@@ -6205,12 +7294,14 @@ export function buildVerdantSimdModuleBytes(
   add('uor_table_build_i8_v4', buildUorTableBuildI8V4());
   add('uor_table_gather_u8_v4', buildUorTableGatherU8V4());
 
-  // Normalization, activations, RoPE, bulk copy & 3-tier vRAM attention primitives
+  // Normalization, activations, RoPE, bulk copy/zero & 3-tier vRAM attention + KV quantization primitives
   const rmsNormIdx = add('rms_norm_f32', buildRmsNormF32());
   add('rms_norm_per_head_f32', buildRmsNormPerHeadF32(rmsNormIdx));
   add('add_f32', buildAddF32());
   add('swiglu_f32', buildSwigluF32(useRelaxed));
   add('copy_bytes', buildCopyBytes());
+  add('zero_bytes', buildZeroBytes());
+  add('quantize_kv_page_f32_to_q8', buildQuantizeKvPageF32ToQ8());
   add('decode_row_f16', buildDecodeRowF16());
   add('rope_f32', buildRopeF32());
   const fastExpIdx = add('fast_exp_f32', buildFastExpF32());
@@ -6317,6 +7408,8 @@ export interface VerdantSimdExports {
   mul_mat_q4_1(wPtr: number, xPtr: number, outPtr: number, cols: number, rows: number): void;
   mul_mat_q5_0(wPtr: number, xPtr: number, outPtr: number, cols: number, rows: number): void;
   mul_mat_q5_1(wPtr: number, xPtr: number, outPtr: number, cols: number, rows: number): void;
+  mul_mat_q2_k(wPtr: number, xPtr: number, outPtr: number, cols: number, rows: number): void;
+  mul_mat_q3_k(wPtr: number, xPtr: number, outPtr: number, cols: number, rows: number): void;
   mul_mat_q4_k(wPtr: number, xPtr: number, outPtr: number, cols: number, rows: number): void;
   mul_mat_q5_k(wPtr: number, xPtr: number, outPtr: number, cols: number, rows: number): void;
   mul_mat_q6_k(wPtr: number, xPtr: number, outPtr: number, cols: number, rows: number): void;
@@ -6339,6 +7432,15 @@ export interface VerdantSimdExports {
   add_f32(aPtr: number, bPtr: number, outPtr: number, n: number): void;
   swiglu_f32(gatePtr: number, upPtr: number, outPtr: number, n: number): void;
   copy_bytes(dstPtr: number, srcPtr: number, byteLen: number): void;
+  zero_bytes(dstPtr: number, byteLen: number): void;
+  quantize_kv_page_f32_to_q8(
+    srcF32Ptr: number,
+    dstQ8Ptr: number,
+    dstScalePtr: number,
+    totalVectors: number,
+    headDim: number,
+    errOutPtr: number,
+  ): void;
   decode_row_f16(srcPtr: number, dstPtr: number, n: number): void;
   rope_f32(vecPtr: number, cosPtr: number, sinPtr: number, nHeads: number, headDim: number, isNeox: number): void;
   fast_exp_f32(x: number): number;
@@ -6418,6 +7520,10 @@ export interface VerdantSimdExports {
   argmax_f32(logitsPtr: number, n: number): number;
   topk_f32(logitsPtr: number, n: number, k: number, outIdsPtr: number, outValsPtr: number): number;
   quantize_f32_to_q8_k(xPtr: number, q8kPtr: number, cols: number): void;
+  mul_mat_q2_k_q8k(wPtr: number, q8kPtr: number, outPtr: number, cols: number, rows: number): void;
+  mul_mat_q2_k_q8k_batch4(wPtr: number, q8kBatchPtr: number, outBatchPtr: number, cols: number, rows: number, oStrideBytes: number): void;
+  mul_mat_q3_k_q8k(wPtr: number, q8kPtr: number, outPtr: number, cols: number, rows: number): void;
+  mul_mat_q3_k_q8k_batch4(wPtr: number, q8kBatchPtr: number, outBatchPtr: number, cols: number, rows: number, oStrideBytes: number): void;
   mul_mat_q4_k_q8k(wPtr: number, q8kPtr: number, outPtr: number, cols: number, rows: number): void;
   mul_mat_q4_k_q8k_batch4(wPtr: number, q8kBatchPtr: number, outBatchPtr: number, cols: number, rows: number, oStrideBytes: number): void;
   mul_mat_q5_k_q8k(wPtr: number, q8kPtr: number, outPtr: number, cols: number, rows: number): void;
@@ -6553,6 +7659,12 @@ export function executeWasmMatStripe(
 ): void {
   if (op === ParallelMatOp.MUL_MAT_BATCH4_Q8K) {
     switch (weightType) {
+      case GgmlType.Q2_K:
+        kernels.mul_mat_q2_k_q8k_batch4(wPtr, xOrQ8Ptr, outPtr, cols, rows, oStrideBytes);
+        return;
+      case GgmlType.Q3_K:
+        kernels.mul_mat_q3_k_q8k_batch4(wPtr, xOrQ8Ptr, outPtr, cols, rows, oStrideBytes);
+        return;
       case GgmlType.Q4_K:
         kernels.mul_mat_q4_k_q8k_batch4(wPtr, xOrQ8Ptr, outPtr, cols, rows, oStrideBytes);
         return;
@@ -6570,6 +7682,12 @@ export function executeWasmMatStripe(
     }
   } else if (op === ParallelMatOp.MUL_MAT_Q8K) {
     switch (weightType) {
+      case GgmlType.Q2_K:
+        kernels.mul_mat_q2_k_q8k(wPtr, xOrQ8Ptr, outPtr, cols, rows);
+        return;
+      case GgmlType.Q3_K:
+        kernels.mul_mat_q3_k_q8k(wPtr, xOrQ8Ptr, outPtr, cols, rows);
+        return;
       case GgmlType.Q4_K:
         kernels.mul_mat_q4_k_q8k(wPtr, xOrQ8Ptr, outPtr, cols, rows);
         return;
@@ -6638,6 +7756,8 @@ export function executeWasmMatStripe(
     case GgmlType.Q4_1: kernels.mul_mat_q4_1(wPtr, xp, outPtr, cols, rows); return;
     case GgmlType.Q5_0: kernels.mul_mat_q5_0(wPtr, xp, outPtr, cols, rows); return;
     case GgmlType.Q5_1: kernels.mul_mat_q5_1(wPtr, xp, outPtr, cols, rows); return;
+    case GgmlType.Q2_K: kernels.mul_mat_q2_k(wPtr, xp, outPtr, cols, rows); return;
+    case GgmlType.Q3_K: kernels.mul_mat_q3_k(wPtr, xp, outPtr, cols, rows); return;
     case GgmlType.Q4_K: kernels.mul_mat_q4_k(wPtr, xp, outPtr, cols, rows); return;
     case GgmlType.Q5_K: kernels.mul_mat_q5_k(wPtr, xp, outPtr, cols, rows); return;
     case GgmlType.Q6_K: kernels.mul_mat_q6_k(wPtr, xp, outPtr, cols, rows); return;
@@ -7010,6 +8130,8 @@ export class VerdantWasmArena {
       weightType === GgmlType.F16 ||
       weightType === GgmlType.BF16 ||
       weightType === GgmlType.Q8_0 ||
+      weightType === GgmlType.Q2_K ||
+      weightType === GgmlType.Q3_K ||
       weightType === GgmlType.Q6_K
     );
   }
@@ -7060,13 +8182,6 @@ export class VerdantWasmArena {
       return;
     }
 
-    if (weightType === GgmlType.Q2_K || weightType === GgmlType.Q3_K) {
-      const raw = new Uint8Array(this.memory.buffer);
-      const xView = new Float32Array(this.memory.buffer, xPtr, cols);
-      const outView = new Float32Array(this.memory.buffer, outPtr, rows);
-      verdantMulMat(raw, wPtr, weightType, cols, rows, xView, outView);
-      return;
-    }
     executeWasmMatStripe(this.kernels, ParallelMatOp.MUL_MAT, weightType, wPtr, xPtr, xPtr, outPtr, cols, rows, rows * 4);
   }
 
@@ -7426,6 +8541,8 @@ export class VerdantWasmArena {
   /** Returns true if `weightType` supports Verdant/Prism Q8_K super-block narrow-lane contraction. */
   supportsQ8KActivation(weightType: GgmlType): boolean {
     return (
+      weightType === GgmlType.Q2_K ||
+      weightType === GgmlType.Q3_K ||
       weightType === GgmlType.Q4_K ||
       weightType === GgmlType.Q5_K ||
       weightType === GgmlType.Q6_K

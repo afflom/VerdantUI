@@ -1,6 +1,7 @@
-import { useEffect, useState, type FC } from 'react';
+import { createContext, useContext, useEffect, useMemo, useState, type FC } from 'react';
 import {
   ActionBarPrimitive,
+  AttachmentPrimitive,
   AuiIf,
   BranchPickerPrimitive,
   ComposerPrimitive,
@@ -8,6 +9,7 @@ import {
   MessagePrimitive,
   ThreadPrimitive,
   useAuiState,
+  type ReasoningMessagePartProps,
   type ThreadMessage,
 } from '@assistant-ui/react';
 import { MarkdownTextPrimitive } from '@assistant-ui/react-markdown';
@@ -16,26 +18,35 @@ import {
   ArrowDown,
   ArrowUp,
   Check,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Copy,
-  Download,
+  FileJson,
+  FileText,
+  Layers,
+  Paperclip,
   Pencil,
   RefreshCw,
   SlidersHorizontal,
   Square,
+  X,
 } from 'lucide-react';
 import { detectChatTemplate, formatMessagesForLlama } from '../engine/assistantAdapter';
-import { RECOMMENDED_INSTRUCT_MODEL } from '../engine/modelCatalog';
+import { isInternalBootstrapModel } from '../engine/modelCatalog';
 import type { EngineState } from '../engine/workerClient';
 
 interface ThreadViewProps {
   engineState: EngineState;
   onOpenModels: () => void;
-  onDownloadRecommended: () => void;
+  onOpenHarness: () => void;
   onCancelDownload: () => void;
   onToggleInspector: () => void;
-  onSpeculativeDraftChange?: (messages: readonly ThreadMessage[], draftText: string) => void;
+  onSpeculativeDraftChange?: (
+    messages: readonly ThreadMessage[],
+    draftText: string,
+    systemMessage?: string,
+  ) => void;
   onCountTokens?: (prompt: string) => Promise<{ tokenCount: number; maxContextWindow: number }>;
 }
 
@@ -43,16 +54,30 @@ const SpeculativePrefillDriver: FC<{
   modelId: string | null;
   modelReady: boolean;
   promptMode: EngineState['promptMode'];
-  onSpeculativeDraftChange?: (messages: readonly ThreadMessage[], draftText: string) => void;
-}> = ({ modelId, modelReady, promptMode, onSpeculativeDraftChange }) => {
+  systemMessage: string | undefined;
+  onSpeculativeDraftChange?: (
+    messages: readonly ThreadMessage[],
+    draftText: string,
+    systemMessage?: string,
+  ) => void;
+}> = ({ modelId, modelReady, promptMode, systemMessage, onSpeculativeDraftChange }) => {
   const composerText = useAuiState((s) => s.composer.text);
   const messages = useAuiState((s) => s.thread.messages);
   const isRunning = useAuiState((s) => s.thread.isRunning);
 
   useEffect(() => {
     if (!modelReady || !modelId || isRunning || !onSpeculativeDraftChange) return;
-    onSpeculativeDraftChange(messages, composerText);
-  }, [modelId, modelReady, promptMode, isRunning, messages, composerText, onSpeculativeDraftChange]);
+    onSpeculativeDraftChange(messages, composerText, systemMessage);
+  }, [
+    modelId,
+    modelReady,
+    promptMode,
+    systemMessage,
+    isRunning,
+    messages,
+    composerText,
+    onSpeculativeDraftChange,
+  ]);
 
   return null;
 };
@@ -68,9 +93,12 @@ const ComposerContextMeter: FC<{
 
   const model = engineState.model;
   const maxCtx = model?.maxContextWindow ?? 0;
+  const isBootstrapUnbound = isInternalBootstrapModel(model?.id);
+  const systemMessage = engineState.importedHarness?.system;
+  const effectivePromptMode = engineState.importedHarness?.promptMode ?? engineState.promptMode;
 
   useEffect(() => {
-    if (!modelReady || !model || !onCountTokens) {
+    if (!modelReady || !model || isBootstrapUnbound || !onCountTokens) {
       setTokenCount(0);
       return;
     }
@@ -95,7 +123,12 @@ const ComposerContextMeter: FC<{
               } as ThreadMessage,
             ]
           : [...messages];
-      const formatted = formatMessagesForLlama(syntheticMessages, model, engineState.promptMode);
+      const formatted = formatMessagesForLlama(
+        syntheticMessages,
+        model,
+        effectivePromptMode,
+        systemMessage,
+      );
       void onCountTokens(formatted)
         .then((res) => {
           if (!cancelled) setTokenCount(res.tokenCount);
@@ -109,13 +142,24 @@ const ComposerContextMeter: FC<{
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [composerText, messages, model, modelReady, engineState.promptMode, onCountTokens]);
+  }, [
+    composerText,
+    messages,
+    model,
+    modelReady,
+    isBootstrapUnbound,
+    effectivePromptMode,
+    systemMessage,
+    onCountTokens,
+  ]);
 
-  if (!model || maxCtx <= 0) return null;
+  if (!model || isBootstrapUnbound || maxCtx <= 0) return null;
 
   const isOverContext = tokenCount > maxCtx;
   const displayTokens =
-    tokenCount > 0 ? `${tokenCount.toLocaleString()} / ${maxCtx.toLocaleString()} ctx` : `${maxCtx.toLocaleString()} ctx`;
+    tokenCount > 0
+      ? `${tokenCount.toLocaleString()} / ${maxCtx.toLocaleString()} ctx`
+      : `${maxCtx.toLocaleString()} ctx`;
 
   return (
     <>
@@ -139,56 +183,74 @@ const ComposerContextMeter: FC<{
   );
 };
 
-const INSTRUCT_STARTER_PROMPTS = [
-  {
-    title: 'Explain an engineering concept',
-    description: 'Clear summary formatted via native ChatML',
-    prompt: 'Explain how rotary position embeddings (RoPE) work in transformers in 3 concise bullet points.',
-  },
-  {
-    title: 'Write a Python utility',
-    description: 'Generate clean code locally in Web Worker',
-    prompt: 'Write a clean Python function to check whether a string is a palindrome, ignoring case and spaces.',
-  },
-  {
-    title: 'Quick factual Q&A',
-    description: 'Verify instruction-following accuracy on vTensor',
-    prompt: 'What is the capital of France, and what river runs through it? Answer in two short sentences.',
-  },
-  {
-    title: 'Compare two data structures',
-    description: 'Structured reasoning with KV-cache prefix reuse',
-    prompt: 'Briefly compare a hash table and a binary search tree for lookup speed and ordering.',
-  },
-] as const;
-
-const STORY_STARTER_PROMPTS = [
-  {
-    title: 'Continue a classic story',
-    description: 'Run 5-layer GQA inference via vTensor',
-    prompt: 'Once upon a time, a small silver bird found a glowing key in the garden',
-  },
-  {
-    title: 'Test greedy determinism',
-    description: 'Verify F64-accumulated RMS_NORM & RoPE',
-    prompt: 'One sunny morning, Tom and his dog walked down the quiet forest path',
-  },
-  {
-    title: 'Explore multi-turn context',
-    description: 'Exercise vTensor KV-cache SET_ROWS writes',
-    prompt: 'Lily built a wooden boat out of sticks and leaves because she wanted to sail',
-  },
-  {
-    title: 'Short fable opening',
-    description: 'Stream tokens live from Web Worker',
-    prompt: 'Long ago in a quiet valley, a curious fox discovered an old clockmaker',
-  },
-] as const;
-
 const MarkdownText: FC = () => (
   <div className="aui-md">
     <MarkdownTextPrimitive remarkPlugins={[remarkGfm]} />
   </div>
+);
+
+/**
+ * Official Assistant-UI `ReasoningMessagePart` renderer.
+ * Displays model chain-of-thought (`<think>...</think>`) in a clean, collapsible disclosure
+ * separate from the visible assistant reply. Collapsed by default once complete.
+ */
+const ReasoningPart: FC<ReasoningMessagePartProps> = ({ text, status }) => {
+  const isStreaming = status?.type === 'running';
+  const [expanded, setExpanded] = useState(false);
+
+  if (!text.trim()) return null;
+
+  return (
+    <div className="mb-3 rounded-lg border border-slate-200/80 bg-slate-50/70 dark:border-slate-800 dark:bg-[#0F141C]">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((prev) => !prev)}
+        className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-xs font-medium text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200 transition-colors"
+      >
+        <span className="inline-flex items-center gap-1.5">
+          {expanded ? (
+            <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+          ) : (
+            <ChevronRight className="h-3.5 w-3.5 shrink-0" />
+          )}
+          <span>{isStreaming ? 'Thinking...' : 'Thought process'}</span>
+        </span>
+        <span className="font-mono text-[11px] text-slate-400 dark:text-slate-500 tabular-nums">
+          {expanded ? 'Hide' : 'Show'}
+        </span>
+      </button>
+      {expanded && (
+        <div className="border-t border-slate-200/80 px-3 py-2.5 text-xs leading-relaxed whitespace-pre-wrap text-slate-600 dark:border-slate-800 dark:text-slate-400">
+          {text}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const ComposerAttachmentItem: FC = () => (
+  <AttachmentPrimitive.Root className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-slate-700 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-300">
+    <FileText className="h-3.5 w-3.5 shrink-0 text-slate-500 dark:text-slate-400" />
+    <span className="max-w-[160px] truncate">
+      <AttachmentPrimitive.Name />
+    </span>
+    <AttachmentPrimitive.Remove
+      aria-label="Remove attachment"
+      className="inline-flex h-4 w-4 items-center justify-center rounded text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+    >
+      <X className="h-3 w-3" />
+    </AttachmentPrimitive.Remove>
+  </AttachmentPrimitive.Root>
+);
+
+const UserAttachmentItem: FC = () => (
+  <AttachmentPrimitive.Root className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs text-slate-600 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-300">
+    <FileText className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+    <span className="max-w-[200px] truncate">
+      <AttachmentPrimitive.Name />
+    </span>
+  </AttachmentPrimitive.Root>
 );
 
 const BranchPicker: FC = () => (
@@ -217,6 +279,9 @@ const BranchPicker: FC = () => (
 const UserMessage: FC = () => (
   <MessagePrimitive.Root className="group mx-auto w-full max-w-3xl px-4 py-3 sm:px-6">
     <div className="flex flex-col items-end gap-1.5">
+      <div className="flex flex-wrap justify-end gap-1.5">
+        <MessagePrimitive.Attachments components={{ Attachment: UserAttachmentItem }} />
+      </div>
       <div className="max-w-[85%] rounded-2xl bg-slate-900 px-4 py-3 text-[15px] leading-relaxed text-white dark:bg-slate-100 dark:text-slate-950">
         <MessagePrimitive.Parts />
       </div>
@@ -260,66 +325,84 @@ const EditComposer: FC = () => (
   </div>
 );
 
-const AssistantMessage: FC = () => (
-  <MessagePrimitive.Root className="group mx-auto w-full max-w-3xl px-4 py-3 sm:px-6">
-    <div className="flex flex-col gap-2">
-      <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
-        <span className="font-semibold text-slate-800 dark:text-slate-200">vTensor Assistant</span>
-        <span aria-hidden="true">·</span>
-        <span className="font-mono text-[11px]">llama.cpp / vTensor</span>
-      </div>
+interface AssistantMessageContextValue {
+  readonly senderLabel: string;
+  readonly statusDetail: string;
+}
 
-      <div className="rounded-xl border border-slate-200/90 bg-white px-4 py-3.5 text-slate-800 dark:border-slate-800 dark:bg-[#121821] dark:text-slate-100">
-        <MessagePrimitive.Parts
-          components={{
-            Text: MarkdownText,
-          }}
-        />
-        <MessagePrimitive.Error>
-          <ErrorPrimitive.Root className="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300">
-            <ErrorPrimitive.Message />
-          </ErrorPrimitive.Root>
-        </MessagePrimitive.Error>
-      </div>
+const AssistantMessageContext = createContext<AssistantMessageContextValue>({
+  senderLabel: 'VerdantUI',
+  statusDetail: '',
+});
 
-      <div className="flex items-center gap-2">
-        <BranchPicker />
-        <ActionBarPrimitive.Root
-          hideWhenRunning
-          autohide="not-last"
-          className="flex items-center gap-1 text-slate-500 dark:text-slate-400"
-        >
-          <ActionBarPrimitive.Copy
-            aria-label="Copy response"
-            className="inline-flex h-8 items-center gap-1.5 rounded-md px-2 text-xs font-medium hover:bg-slate-100 hover:text-slate-900 dark:hover:bg-slate-800 dark:hover:text-slate-100 transition-colors whitespace-nowrap"
+const AssistantMessage: FC = () => {
+  const { senderLabel, statusDetail } = useContext(AssistantMessageContext);
+  return (
+    <MessagePrimitive.Root className="group mx-auto w-full max-w-3xl px-4 py-3 sm:px-6">
+      <div className="flex flex-col gap-2">
+        <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+          <span className="font-semibold text-slate-800 dark:text-slate-200">{senderLabel}</span>
+        </div>
+
+        <div className="rounded-xl border border-slate-200/90 bg-white px-4 py-3.5 text-slate-800 dark:border-slate-800 dark:bg-[#121821] dark:text-slate-100">
+          <AuiIf condition={(s) => s.message.isLast && s.thread.isRunning && s.message.parts.length === 0}>
+            <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+              <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[#0F5132] dark:bg-emerald-400" />
+              <span>{statusDetail || 'Preparing response...'}</span>
+            </div>
+          </AuiIf>
+          <MessagePrimitive.Parts
+            components={{
+              Text: MarkdownText,
+              Reasoning: ReasoningPart,
+            }}
+          />
+          <MessagePrimitive.Error>
+            <ErrorPrimitive.Root className="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300">
+              <ErrorPrimitive.Message />
+            </ErrorPrimitive.Root>
+          </MessagePrimitive.Error>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <BranchPicker />
+          <ActionBarPrimitive.Root
+            hideWhenRunning
+            autohide="not-last"
+            className="flex items-center gap-1 text-slate-500 dark:text-slate-400"
           >
-            <AuiIf condition={(s) => s.message.isCopied}>
-              <Check className="h-3.5 w-3.5 text-emerald-700 dark:text-emerald-400" />
-              <span>Copied</span>
-            </AuiIf>
-            <AuiIf condition={(s) => !s.message.isCopied}>
-              <Copy className="h-3.5 w-3.5" />
-              <span>Copy</span>
-            </AuiIf>
-          </ActionBarPrimitive.Copy>
+            <ActionBarPrimitive.Copy
+              aria-label="Copy response"
+              className="inline-flex h-8 items-center gap-1.5 rounded-md px-2 text-xs font-medium hover:bg-slate-100 hover:text-slate-900 dark:hover:bg-slate-800 dark:hover:text-slate-100 transition-colors whitespace-nowrap"
+            >
+              <AuiIf condition={(s) => s.message.isCopied}>
+                <Check className="h-3.5 w-3.5 text-emerald-700 dark:text-emerald-400" />
+                <span>Copied</span>
+              </AuiIf>
+              <AuiIf condition={(s) => !s.message.isCopied}>
+                <Copy className="h-3.5 w-3.5" />
+                <span>Copy</span>
+              </AuiIf>
+            </ActionBarPrimitive.Copy>
 
-          <ActionBarPrimitive.Reload
-            aria-label="Regenerate response"
-            className="inline-flex h-8 items-center gap-1.5 rounded-md px-2 text-xs font-medium hover:bg-slate-100 hover:text-slate-900 dark:hover:bg-slate-800 dark:hover:text-slate-100 transition-colors whitespace-nowrap"
-          >
-            <RefreshCw className="h-3.5 w-3.5" />
-            <span>Regenerate</span>
-          </ActionBarPrimitive.Reload>
-        </ActionBarPrimitive.Root>
+            <ActionBarPrimitive.Reload
+              aria-label="Regenerate response"
+              className="inline-flex h-8 items-center gap-1.5 rounded-md px-2 text-xs font-medium hover:bg-slate-100 hover:text-slate-900 dark:hover:bg-slate-800 dark:hover:text-slate-100 transition-colors whitespace-nowrap"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              <span>Regenerate</span>
+            </ActionBarPrimitive.Reload>
+          </ActionBarPrimitive.Root>
+        </div>
       </div>
-    </div>
-  </MessagePrimitive.Root>
-);
+    </MessagePrimitive.Root>
+  );
+};
 
 export const ThreadView: FC<ThreadViewProps> = ({
   engineState,
   onOpenModels,
-  onDownloadRecommended,
+  onOpenHarness,
   onCancelDownload,
   onToggleInspector,
   onSpeculativeDraftChange,
@@ -328,105 +411,121 @@ export const ThreadView: FC<ThreadViewProps> = ({
   const isDownloading = engineState.status === 'downloading';
   const isModelLoading = isDownloading || engineState.status === 'loading';
   const modelReady = engineState.model !== null && !isModelLoading;
+  const isBootstrapUnbound = isInternalBootstrapModel(engineState.model?.id);
+  const importedHarness = engineState.importedHarness;
   const detectedTemplate = detectChatTemplate(engineState.model);
-  const isStoryModel = detectedTemplate === 'continuation';
-  const starterPrompts = isStoryModel ? STORY_STARTER_PROMPTS : INSTRUCT_STARTER_PROMPTS;
-  const recommendedCached = engineState.cachedModelIds.includes(RECOMMENDED_INSTRUCT_MODEL.id);
+
+  const senderLabel =
+    !isBootstrapUnbound && engineState.model?.displayName
+      ? engineState.model.displayName
+      : 'VerdantUI';
+
+  const assistantContextValue = useMemo<AssistantMessageContextValue>(
+    () => ({
+      senderLabel,
+      statusDetail: engineState.statusDetail,
+    }),
+    [senderLabel, engineState.statusDetail],
+  );
 
   return (
-    <ThreadPrimitive.Root className="relative flex h-full flex-col overflow-hidden bg-[#F8F9FA] dark:bg-[#0B0F14]">
+    <AssistantMessageContext.Provider value={assistantContextValue}>
+      <ThreadPrimitive.Root className="relative flex h-full flex-col overflow-hidden bg-[#F8F9FA] dark:bg-[#0B0F14]">
       <SpeculativePrefillDriver
         modelId={engineState.model?.id ?? null}
         modelReady={modelReady}
-        promptMode={engineState.promptMode}
+        promptMode={importedHarness?.promptMode ?? engineState.promptMode}
+        systemMessage={importedHarness?.system}
         onSpeculativeDraftChange={onSpeculativeDraftChange}
       />
       <ThreadPrimitive.Viewport className="flex flex-1 flex-col overflow-y-auto scroll-smooth">
         <div className="flex-1">
           <ThreadPrimitive.Empty>
-            <div className="mx-auto flex max-w-3xl flex-col px-4 pt-10 pb-8 sm:px-6 sm:pt-14">
+            <div className="mx-auto flex max-w-3xl flex-col px-4 pt-12 pb-8 sm:px-6 sm:pt-16">
               <div className="mb-7">
-                <p className="text-xs font-medium text-emerald-800 dark:text-emerald-400">
-                  Client-side assistant-ui · llama.cpp · afflom/vTensor
-                </p>
                 <h1
-                  className="mt-2 text-2xl font-bold tracking-tight text-slate-900 sm:text-3xl dark:text-slate-50"
+                  className="text-2xl font-bold tracking-tight text-slate-900 sm:text-3xl dark:text-slate-50"
                   style={{ textWrap: 'balance' }}
                 >
-                  Local GGUF inference on the vTensor GGML provider
+                  VerdantUI
                 </h1>
-                <p className="mt-3 max-w-2xl text-[15px] leading-relaxed text-slate-600 dark:text-slate-400">
-                  Every transformer graph executes inside your browser Web Worker using{' '}
-                  <span className="font-medium text-slate-800 dark:text-slate-200">
-                    Verdant Tensor
-                  </span>{' '}
-                  primitives through the vTensor GGML v3 backend contract, with default GGML CPU,
-                  BLAS, and WebGPU providers disabled.
+                <p className="mt-2.5 max-w-2xl text-[15px] leading-relaxed text-slate-600 dark:text-slate-400">
+                  Run open-weight GGUF models directly in your browser. Models run unmodified by
+                  default, or with an imported harness configuration.
                 </p>
 
                 <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500 dark:text-slate-400 tabular-nums">
                   <span>
                     Model:{' '}
                     <strong className="font-medium text-slate-800 dark:text-slate-200">
-                      {engineState.model?.displayName ?? 'Loading stories260K.gguf'}
+                      {isBootstrapUnbound
+                        ? 'None selected'
+                        : (engineState.model?.displayName ?? 'Loading...')}
                     </strong>
                   </span>
+                  {!isBootstrapUnbound && engineState.model && (
+                    <>
+                      <span aria-hidden="true">·</span>
+                      <span>
+                        Format:{' '}
+                        <span className="font-mono">
+                          {engineState.model.hparams.primaryQuantization}
+                        </span>
+                      </span>
+                      <span aria-hidden="true">·</span>
+                      <span>
+                        Context:{' '}
+                        <span className="font-mono">
+                          {engineState.model.maxContextWindow.toLocaleString()} tok
+                        </span>
+                      </span>
+                      <span aria-hidden="true">·</span>
+                      <span>
+                        Template: <span className="font-mono">{detectedTemplate}</span>
+                      </span>
+                    </>
+                  )}
                   <span aria-hidden="true">·</span>
                   <span>
-                    Quantization:{' '}
-                    <span className="font-mono">
-                      {engineState.model?.hparams.primaryQuantization ?? 'F32'}
-                    </span>
-                  </span>
-                  <span aria-hidden="true">·</span>
-                  <span>
-                    Context:{' '}
-                    <span className="font-mono">
-                      {engineState.model?.maxContextWindow.toLocaleString() ?? '2,048'} tok
-                    </span>
-                  </span>
-                  <span aria-hidden="true">·</span>
-                  <span>
-                    Template: <span className="font-mono">{detectedTemplate}</span>
-                  </span>
-                  <span aria-hidden="true">·</span>
-                  <span>
-                    Provider: <span className="font-mono">vTensor (0 CPU fallbacks)</span>
+                    Harness:{' '}
+                    <strong className="font-medium text-slate-800 dark:text-slate-200">
+                      {importedHarness ? importedHarness.name : 'None'}
+                    </strong>
                   </span>
                 </div>
               </div>
 
-              {isStoryModel && !isModelLoading && (
-                <div className="mb-6 flex flex-col gap-3 rounded-xl border border-slate-200 bg-white p-4 sm:flex-row sm:items-center sm:justify-between dark:border-slate-800 dark:bg-[#121821]">
+              {isBootstrapUnbound && !isModelLoading && (
+                <div
+                  data-testid="model-selection-banner"
+                  className="mb-6 flex flex-col gap-3 rounded-xl border border-slate-200 bg-white p-4 sm:flex-row sm:items-center sm:justify-between dark:border-slate-800 dark:bg-[#121821]"
+                >
                   <div className="min-w-0">
                     <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                      Upgrade to {RECOMMENDED_INSTRUCT_MODEL.name}
+                      Select a model to get started
                     </div>
                     <p className="mt-0.5 text-xs leading-relaxed text-slate-600 dark:text-slate-400">
-                      TinyLLaMA Stories 260K is bundled for instant boot. Download a full
-                      instruction-tuned ChatML assistant ({RECOMMENDED_INSTRUCT_MODEL.sizeLabel})
-                      or pick SmolLM2-360M / Qwen2.5-0.5B from Models.
+                      Download a model from the catalog, open a local{' '}
+                      <code className="font-mono">.gguf</code> file directly from disk, or import a
+                      JSON harness configuration.
                     </p>
                   </div>
                   <div className="flex shrink-0 items-center gap-2">
                     <button
                       type="button"
-                      onClick={onDownloadRecommended}
+                      onClick={onOpenModels}
                       className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-[#0F5132] px-3.5 text-xs font-medium text-white hover:bg-[#0B3D25] transition-colors whitespace-nowrap"
                     >
-                      <Download className="h-3.5 w-3.5" />
-                      <span>
-                        {recommendedCached
-                          ? 'Load SmolLM2 135M'
-                          : `Download (${RECOMMENDED_INSTRUCT_MODEL.sizeLabel})`}
-                      </span>
+                      <Layers className="h-3.5 w-3.5" />
+                      <span>Browse Models</span>
                     </button>
                     <button
                       type="button"
-                      onClick={onOpenModels}
-                      className="inline-flex h-9 items-center rounded-lg border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
+                      onClick={onOpenHarness}
+                      className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
                     >
-                      All Models
+                      <FileJson className="h-3.5 w-3.5" />
+                      <span>Import Harness</span>
                     </button>
                   </div>
                 </div>
@@ -440,9 +539,9 @@ export const ThreadView: FC<ThreadViewProps> = ({
                 >
                   <div className="flex items-center justify-between gap-3 text-xs text-slate-600 dark:text-slate-300">
                     <span className="truncate">{engineState.statusDetail}</span>
-                    <div className="flex items-center gap-2 shrink-0">
+                    <div className="flex shrink-0 items-center gap-2">
                       <span className="font-mono tabular-nums">{engineState.progressPercent}%</span>
-                      {isDownloading && (
+                      {isModelLoading && (
                         <button
                           type="button"
                           onClick={onCancelDownload}
@@ -475,24 +574,29 @@ export const ThreadView: FC<ThreadViewProps> = ({
                 </div>
               )}
 
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                {starterPrompts.map((item) => (
-                  <ThreadPrimitive.Suggestion
-                    key={item.title}
-                    prompt={item.prompt}
-                    method="replace"
-                    autoSend={modelReady}
-                    className="flex flex-col items-start rounded-xl border border-slate-200 bg-white p-4 text-left hover:border-slate-300 hover:bg-slate-50/70 dark:border-slate-800 dark:bg-[#121821] dark:hover:border-slate-700 dark:hover:bg-[#161E29] transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-700"
-                  >
-                    <span className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                      {item.title}
-                    </span>
-                    <span className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                      {item.description}
-                    </span>
-                  </ThreadPrimitive.Suggestion>
-                ))}
-              </div>
+              {/* Only render starter suggestions if explicitly provided by an imported harness */}
+              {importedHarness?.suggestions && importedHarness.suggestions.length > 0 && (
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  {importedHarness.suggestions.map((item) => (
+                    <ThreadPrimitive.Suggestion
+                      key={item.prompt}
+                      prompt={item.prompt}
+                      method="replace"
+                      autoSend={modelReady && !isBootstrapUnbound}
+                      className="flex flex-col items-start rounded-xl border border-slate-200 bg-white p-4 text-left hover:border-slate-300 hover:bg-slate-50/70 dark:border-slate-800 dark:bg-[#121821] dark:hover:border-slate-700 dark:hover:bg-[#161E29] transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-700"
+                    >
+                      <span className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                        {item.label ?? item.prompt}
+                      </span>
+                      {item.label && (
+                        <span className="mt-1 line-clamp-2 text-xs text-slate-500 dark:text-slate-400">
+                          {item.prompt}
+                        </span>
+                      )}
+                    </ThreadPrimitive.Suggestion>
+                  ))}
+                </div>
+              )}
             </div>
           </ThreadPrimitive.Empty>
 
@@ -519,14 +623,20 @@ export const ThreadView: FC<ThreadViewProps> = ({
           </div>
 
           <ComposerPrimitive.Root className="rounded-xl border border-slate-200 bg-white shadow-xs focus-within:border-emerald-800 dark:border-slate-800 dark:bg-[#121821] dark:focus-within:border-emerald-500 transition-colors">
+            <div className="flex flex-wrap gap-1.5 px-3 pt-2.5 empty:hidden">
+              <ComposerPrimitive.Attachments
+                components={{ Attachment: ComposerAttachmentItem }}
+              />
+            </div>
+
             <ComposerPrimitive.Input
               aria-label="Message prompt"
               placeholder={
                 modelReady
-                  ? isStoryModel
-                    ? 'Write a story opening or switch to SmolLM2 / Qwen2.5 in Models...'
-                    : 'Ask anything — supports full model context input & output locally on vTensor...'
-                  : 'Loading GGUF weights into vTensor buffers...'
+                  ? isBootstrapUnbound
+                    ? 'Select a model in Models to start chatting...'
+                    : `Message ${engineState.model?.displayName ?? 'VerdantUI'}...`
+                  : 'Loading model...'
               }
               rows={2}
               autoFocus
@@ -535,12 +645,22 @@ export const ThreadView: FC<ThreadViewProps> = ({
 
             <div className="flex items-center justify-between gap-3 border-t border-slate-100 px-3 py-2 dark:border-slate-800/80">
               <div className="flex min-w-0 items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+                <ComposerPrimitive.AddAttachment
+                  aria-label="Attach text or code file"
+                  title="Attach text or code file"
+                  className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100 transition-colors"
+                >
+                  <Paperclip className="h-3.5 w-3.5" />
+                </ComposerPrimitive.AddAttachment>
+                <span aria-hidden="true">·</span>
                 <button
                   type="button"
                   onClick={onOpenModels}
-                  className="truncate max-w-[200px] font-medium text-slate-700 hover:text-emerald-800 dark:text-slate-300 dark:hover:text-emerald-400 transition-colors"
+                  className="max-w-[200px] truncate font-medium text-slate-700 hover:text-emerald-800 dark:text-slate-300 dark:hover:text-emerald-400 transition-colors"
                 >
-                  {engineState.model?.displayName ?? 'Loading GGUF...'}
+                  {isBootstrapUnbound
+                    ? 'Select Model'
+                    : (engineState.model?.displayName ?? 'Loading model...')}
                 </button>
                 <ComposerContextMeter
                   engineState={engineState}
@@ -551,7 +671,7 @@ export const ThreadView: FC<ThreadViewProps> = ({
                 <button
                   type="button"
                   onClick={onToggleInspector}
-                  className="inline-flex items-center gap-1 whitespace-nowrap shrink-0 hover:text-slate-900 dark:hover:text-slate-200 transition-colors"
+                  className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap hover:text-slate-900 dark:hover:text-slate-200 transition-colors"
                 >
                   <SlidersHorizontal className="h-3 w-3" />
                   <span className="font-mono tabular-nums">
@@ -564,18 +684,12 @@ export const ThreadView: FC<ThreadViewProps> = ({
                       ·
                     </span>
                     <span className="hidden truncate font-mono text-[11px] tabular-nums text-emerald-800 dark:text-emerald-400 sm:inline">
-                      prefill {engineState.prefillProgress.completedTokens}/
-                      {engineState.prefillProgress.totalTokens}
-                    </span>
-                  </>
-                ) : engineState.speculativePrefill.active ? (
-                  <>
-                    <span className="hidden sm:inline" aria-hidden="true">
-                      ·
-                    </span>
-                    <span className="hidden truncate font-mono text-[11px] tabular-nums text-emerald-800 dark:text-emerald-400 sm:inline">
-                      warming {engineState.speculativePrefill.readyTokens}/
-                      {engineState.speculativePrefill.targetTokens} tok
+                      {engineState.prefillProgress.totalTokens > 0 &&
+                      engineState.prefillProgress.completedTokens <
+                        engineState.prefillProgress.totalTokens
+                        ? `prefill ${engineState.prefillProgress.completedTokens}/${engineState.prefillProgress.totalTokens}${engineState.prefillProgress.detail ? ` · ${engineState.prefillProgress.detail}` : ''}`
+                        : (engineState.prefillProgress.detail ??
+                          `prefill ${engineState.prefillProgress.completedTokens}/${engineState.prefillProgress.totalTokens}`)}
                     </span>
                   </>
                 ) : engineState.lastTokensPerSec > 0 ? (
@@ -586,32 +700,11 @@ export const ThreadView: FC<ThreadViewProps> = ({
                     <span className="hidden font-mono tabular-nums sm:inline">
                       {engineState.lastTokensPerSec.toFixed(1)} tok/s
                     </span>
-                    {engineState.speculativePrefill.readyTokens > 0 && (
-                      <>
-                        <span className="hidden md:inline" aria-hidden="true">
-                          ·
-                        </span>
-                        <span className="hidden font-mono text-[11px] tabular-nums text-emerald-800 dark:text-emerald-400 md:inline">
-                          warmed {engineState.speculativePrefill.readyTokens} tok
-                        </span>
-                      </>
-                    )}
                   </>
-                ) : (
-                  engineState.speculativePrefill.readyTokens > 0 && (
-                    <>
-                      <span className="hidden sm:inline" aria-hidden="true">
-                        ·
-                      </span>
-                      <span className="hidden font-mono text-[11px] tabular-nums text-emerald-800 dark:text-emerald-400 sm:inline">
-                        warmed {engineState.speculativePrefill.readyTokens} tok
-                      </span>
-                    </>
-                  )
-                )}
+                ) : null}
               </div>
 
-              <div className="flex items-center gap-2 shrink-0">
+              <div className="flex shrink-0 items-center gap-2">
                 <AuiIf condition={(s) => s.thread.isRunning}>
                   <ComposerPrimitive.Cancel
                     aria-label="Stop generation"
@@ -636,6 +729,7 @@ export const ThreadView: FC<ThreadViewProps> = ({
           </ComposerPrimitive.Root>
         </ThreadPrimitive.ViewportFooter>
       </ThreadPrimitive.Viewport>
-    </ThreadPrimitive.Root>
+      </ThreadPrimitive.Root>
+    </AssistantMessageContext.Provider>
   );
 };
