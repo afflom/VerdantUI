@@ -5965,7 +5965,7 @@ function buildMulMatQ5KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
   const mn03 = f.local(I32);
   const mn47 = f.local(I32);
 
-  // Strictly 13 V128 locals -> 3 free XMM scratch registers on x86-64 (0 spills!)
+  // Strictly 14 V128 locals -> 2 free XMM scratch registers on x86-64 (0 spills!)
   const mask0f = f.local(V128);
   const mask10 = f.local(V128);
   const acc4 = f.local(V128);
@@ -5977,6 +5977,7 @@ function buildMulMatQ5KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
   const raw1 = f.local(V128);
   const w0 = f.local(V128);
   const w1 = f.local(V128);
+  const sc8V = f.local(V128);
   const scV = f.local(V128);
   const xtmp = f.local(V128);
 
@@ -5988,11 +5989,11 @@ function buildMulMatQ5KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
   f.get(5).set(oStride);
   f.i32Const(0).set(r);
 
-  const emitScaleSplat16 = (scWordLoc: number, byteIdx: number) => {
-    f.get(scWordLoc);
-    if (byteIdx > 0) f.i32Const(byteIdx * 8).i32ShrU();
-    if (byteIdx < 3) f.i32Const(0xff).i32And();
-    f.i16x8Splat().set(scV);
+  // Broadcast i16 lane `k` (0..7) from XMM `sc8V` in 1 single VPSHUFB (zero GPR->XMM stalls!)
+  const emitScaleShuffle16 = (laneIdx: number) => {
+    const lo = laneIdx * 2;
+    const hi = lo + 1;
+    f.get(sc8V).get(sc8V).i8x16Shuffle([lo, hi, lo, hi, lo, hi, lo, hi, lo, hi, lo, hi, lo, hi, lo, hi]).set(scV);
   };
 
   const emitQhBit4FromMem = (qhOff: number, bitIdx: number) => {
@@ -6061,14 +6062,15 @@ function buildMulMatQ5KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
     .get(w0).f32x4ConvertI32x4S().get(raw0).f32x4Mul()
     .f32x4Sub().set(acc4);
 
+  // Pack all 8 scales into XMM `sc8V` as i16x8 -> frees sc03/sc47 GPRs across chunk loop!
+  f.i32Const(0).i32x4Splat().get(sc03).i32x4ReplaceLane(0).get(sc47).i32x4ReplaceLane(1)
+    .i16x8ExtendLowI8x16U().set(sc8V);
+
   f.i32Const(0).i32x4Splat().tee(sumi0).tee(sumi1).tee(sumi2).set(sumi3);
 
   for (let c = 0; c < 4; c++) {
     const qsBase = 48 + c * 32;
     const xBase = 64 + c * 64;
-    const scWord = c < 2 ? sc03 : sc47;
-    const scLoIdx = (c & 1) * 2;
-    const scHiIdx = scLoIdx + 1;
     const bitLo = c * 2;
     const bitHi = c * 2 + 1;
 
@@ -6082,7 +6084,7 @@ function buildMulMatQ5KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
     f.get(raw1).get(mask0f).v128And();
     emitQhBit4FromMem(32, bitLo);
     f.v128Or().set(w1);
-    emitScaleSplat16(scWord, scLoIdx);
+    emitScaleShuffle16(c * 2);
     emitTokSub(qp0, xBase, sumi0);
     emitTokSub(qp1, xBase, sumi1);
     emitTokSub(qp2, xBase, sumi2);
@@ -6095,7 +6097,7 @@ function buildMulMatQ5KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
     f.get(raw1).i32Const(4).i8x16ShrU();
     emitQhBit4FromMem(32, bitHi);
     f.v128Or().set(w1);
-    emitScaleSplat16(scWord, scHiIdx);
+    emitScaleShuffle16(c * 2 + 1);
     emitTokSub(qp0, xBase + 32, sumi0);
     emitTokSub(qp1, xBase + 32, sumi1);
     emitTokSub(qp2, xBase + 32, sumi2);
@@ -6149,19 +6151,12 @@ function buildMulMatQ6KQ8K(useRelaxed: boolean): FuncBuilder {
   const wp1 = f.local(I32);
   const qp = f.local(I32);
   const sb = f.local(I32);
-  const h = f.local(I32);
-  const ql0 = f.local(I32);
-  const qh0 = f.local(I32);
-  const sc0 = f.local(I32);
-  const ql1 = f.local(I32);
-  const qh1 = f.local(I32);
-  const sc1 = f.local(I32);
-  const xBase = f.local(I32);
   const acc0 = f.local(F32);
   const acc1 = f.local(F32);
   const dxS = f.local(F32);
 
-  // Strictly 12 V128 locals -> 4 free XMM scratch registers on x86-64 (0 spills!)
+  // Strictly 13 V128 locals -> 3 free XMM scratch registers on x86-64 (0 spills!)
+  // Eliminates 8 extra GPR pointer locals & 32 GPR->XMM i16x8Splat stalls per super-block!
   const mask0f = f.local(V128);
   const mask30 = f.local(V128);
   const sumi0 = f.local(V128);
@@ -6174,6 +6169,7 @@ function buildMulMatQ6KQ8K(useRelaxed: boolean): FuncBuilder {
   const qlb = f.local(V128);
   const qhv = f.local(V128);
   const q6v = f.local(V128);
+  const scHalf = f.local(V128);
 
   f.i32Const(0x0f).i8x16Splat().set(mask0f);
   f.i32Const(0x30).i8x16Splat().set(mask30);
@@ -6191,24 +6187,29 @@ function buildMulMatQ6KQ8K(useRelaxed: boolean): FuncBuilder {
       .i32x4Sub().set(sumiLoc);
   };
 
-  // Emit all 4 groups of slice `s` (0 or 1) using current half pointers `(qlLoc, qhLoc, scLoc)`
+  // Emit all 4 groups of slice `s` (0 or 1) in half `h` (0 or 1) purely in XMM domain
   const emitSliceRow = (
-    qlLoc: number,
-    qhLoc: number,
-    scLoc: number,
+    wpLoc: number,
     sumiLoc: number,
+    h: number,
     s: number,
   ) => {
-    const sOff = s * 16;
-    f.get(qlLoc).v128Load(sOff).set(qla);
-    f.get(qlLoc).v128Load(32 + sOff).set(qlb);
-    f.get(qhLoc).v128Load(sOff).set(qhv);
+    const qlBase = h * 64 + s * 16;
+    const qhBase = 128 + h * 32 + s * 16;
+    f.get(wpLoc).v128Load(192);
+    if (h === 0) f.i16x8ExtendLowI8x16S().set(scHalf);
+    else f.i16x8ExtendHighI8x16S().set(scHalf);
+    f.get(wpLoc).v128Load(qlBase).set(qla);
+    f.get(wpLoc).v128Load(qlBase + 32).set(qlb);
+    f.get(wpLoc).v128Load(qhBase).set(qhv);
 
-    const emitGroup = (xLoc: number, scOff: number, buildQ6: () => void) => {
+    const emitGroup = (xLoc: number, scLane: number, buildQ6: () => void) => {
+      const lo = scLane * 2;
+      const hi = lo + 1;
       buildQ6();
       f.set(q6v);
       f.pushDotI8I7ToI16x8(xLoc, q6v, useRelaxed);
-      f.get(scLoc).i32Load8S(scOff).i16x8Splat()
+      f.get(scHalf).get(scHalf).i8x16Shuffle([lo, hi, lo, hi, lo, hi, lo, hi, lo, hi, lo, hi, lo, hi, lo, hi])
         .i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
     };
 
@@ -6230,7 +6231,7 @@ function buildMulMatQ6KQ8K(useRelaxed: boolean): FuncBuilder {
     });
   };
 
-  // 2-row zero-spill main loop with compact rolled h-loop (fits 100% in x86-64 DSB uop cache)
+  // 2-row zero-spill main loop with unrolled halves (zero pointer-increment GPR overhead)
   f.block().loop();
   f.get(r).i32Const(1).i32Add().get(4).i32GeS().brIf(1);
   f.get(0).get(r).get(rowBytes).i32Mul().i32Add().tee(wp0).get(rowBytes).i32Add().set(wp1);
@@ -6247,35 +6248,18 @@ function buildMulMatQ6KQ8K(useRelaxed: boolean): FuncBuilder {
   initRowOffset(wp0, sumi0);
   initRowOffset(wp1, sumi1);
 
-  f.get(wp0).set(ql0);
-  f.get(wp0).i32Const(128).i32Add().set(qh0);
-  f.get(wp0).i32Const(192).i32Add().set(sc0);
-  f.get(wp1).set(ql1);
-  f.get(wp1).i32Const(128).i32Add().set(qh1);
-  f.get(wp1).i32Const(192).i32Add().set(sc1);
-  f.get(qp).i32Const(64).i32Add().set(xBase);
-  f.i32Const(0).set(h);
-
-  f.block().loop();
-  f.get(h).i32Const(2).i32GeS().brIf(1);
-  for (let s = 0; s < 2; s++) {
-    const sOff = s * 16;
-    f.get(xBase).v128Load(0 + sOff, 4).set(x0);
-    f.get(xBase).v128Load(32 + sOff, 4).set(x1);
-    f.get(xBase).v128Load(64 + sOff, 4).set(x2);
-    f.get(xBase).v128Load(96 + sOff, 4).set(x3);
-    emitSliceRow(ql0, qh0, sc0, sumi0, s);
-    emitSliceRow(ql1, qh1, sc1, sumi1, s);
+  for (let h = 0; h < 2; h++) {
+    const xHalf = 64 + h * 128;
+    for (let s = 0; s < 2; s++) {
+      const sOff = s * 16;
+      f.get(qp).v128Load(xHalf + 0 + sOff, 4).set(x0);
+      f.get(qp).v128Load(xHalf + 32 + sOff, 4).set(x1);
+      f.get(qp).v128Load(xHalf + 64 + sOff, 4).set(x2);
+      f.get(qp).v128Load(xHalf + 96 + sOff, 4).set(x3);
+      emitSliceRow(wp0, sumi0, h, s);
+      emitSliceRow(wp1, sumi1, h, s);
+    }
   }
-  f.get(ql0).i32Const(64).i32Add().set(ql0);
-  f.get(qh0).i32Const(32).i32Add().set(qh0);
-  f.get(sc0).i32Const(8).i32Add().set(sc0);
-  f.get(ql1).i32Const(64).i32Add().set(ql1);
-  f.get(qh1).i32Const(32).i32Add().set(qh1);
-  f.get(sc1).i32Const(8).i32Add().set(sc1);
-  f.get(xBase).i32Const(128).i32Add().set(xBase);
-  f.get(h).i32Const(1).i32Add().set(h);
-  f.br(0).end().end();
 
   f.hsumI32x4(sumi0).f32ConvertI32S().loadF16AsF32(wp0, 208).get(dxS).f32Mul().f32Mul()
     .get(acc0).f32Add().set(acc0);
@@ -6308,28 +6292,17 @@ function buildMulMatQ6KQ8K(useRelaxed: boolean): FuncBuilder {
   f.get(qp).v128Load(32, 4).set(x1);
   initRowOffset(wp0, sumi0);
 
-  f.get(wp0).set(ql0);
-  f.get(wp0).i32Const(128).i32Add().set(qh0);
-  f.get(wp0).i32Const(192).i32Add().set(sc0);
-  f.get(qp).i32Const(64).i32Add().set(xBase);
-  f.i32Const(0).set(h);
-
-  f.block().loop();
-  f.get(h).i32Const(2).i32GeS().brIf(1);
-  for (let s = 0; s < 2; s++) {
-    const sOff = s * 16;
-    f.get(xBase).v128Load(0 + sOff, 4).set(x0);
-    f.get(xBase).v128Load(32 + sOff, 4).set(x1);
-    f.get(xBase).v128Load(64 + sOff, 4).set(x2);
-    f.get(xBase).v128Load(96 + sOff, 4).set(x3);
-    emitSliceRow(ql0, qh0, sc0, sumi0, s);
+  for (let h = 0; h < 2; h++) {
+    const xHalf = 64 + h * 128;
+    for (let s = 0; s < 2; s++) {
+      const sOff = s * 16;
+      f.get(qp).v128Load(xHalf + 0 + sOff, 4).set(x0);
+      f.get(qp).v128Load(xHalf + 32 + sOff, 4).set(x1);
+      f.get(qp).v128Load(xHalf + 64 + sOff, 4).set(x2);
+      f.get(qp).v128Load(xHalf + 96 + sOff, 4).set(x3);
+      emitSliceRow(wp0, sumi0, h, s);
+    }
   }
-  f.get(ql0).i32Const(64).i32Add().set(ql0);
-  f.get(qh0).i32Const(32).i32Add().set(qh0);
-  f.get(sc0).i32Const(8).i32Add().set(sc0);
-  f.get(xBase).i32Const(128).i32Add().set(xBase);
-  f.get(h).i32Const(1).i32Add().set(h);
-  f.br(0).end().end();
 
   f.hsumI32x4(sumi0).f32ConvertI32S().loadF16AsF32(wp0, 208).get(dxS).f32Mul().f32Mul()
     .get(acc0).f32Add().set(acc0);
@@ -6863,7 +6836,7 @@ function buildMulMatQ3KQ8K(useRelaxed: boolean): FuncBuilder {
   const acc1 = f.local(F32);
   const dxS = f.local(F32);
 
-  // Strictly 11 V128 locals -> 5 free XMM scratch registers (0 spills!)
+  // Strictly 13 V128 locals -> 3 free XMM scratch registers (0 spills!)
   const mask03 = f.local(V128);
   const mask04 = f.local(V128);
   const sumi0 = f.local(V128);
@@ -6874,6 +6847,8 @@ function buildMulMatQ3KQ8K(useRelaxed: boolean): FuncBuilder {
   const q1 = f.local(V128);
   const qv = f.local(V128);
   const x0 = f.local(V128);
+  const sc16V = f.local(V128);
+  const scHalf = f.local(V128);
   const x1 = f.local(V128);
 
   f.i32Const(0x03).i8x16Splat().set(mask03);
@@ -6882,13 +6857,11 @@ function buildMulMatQ3KQ8K(useRelaxed: boolean): FuncBuilder {
   f.get(nSuper).i32Const(110).i32Mul().set(rowBytes);
   f.i32Const(0).set(r);
 
-  const pushScaleSplat16 = (scIdx: number) => {
-    const uLoc = scIdx < 4 ? u0 : scIdx < 8 ? u1 : scIdx < 12 ? u2 : u3;
-    const byteIdx = scIdx & 3;
-    f.get(uLoc);
-    if (byteIdx > 0) f.i32Const(byteIdx * 8).i32ShrU();
-    if (byteIdx < 3) f.i32Const(0xff).i32And();
-    f.i32Const(32).i32Sub().i16x8Splat();
+  // XMM-domain signed scale broadcast: 1 single VPSHUFB per sub-block (zero GPR->XMM stalls!)
+  const emitScaleShuffleQ3 = (laneIdx: number) => {
+    const lo = laneIdx * 2;
+    const hi = lo + 1;
+    f.get(scHalf).get(scHalf).i8x16Shuffle([lo, hi, lo, hi, lo, hi, lo, hi, lo, hi, lo, hi, lo, hi, lo, hi]);
   };
 
   // Unpack scales of `wpLoc`, initialize `sumiLoc = -4 * sum_j(sc[j] * bsums16[j])`, and run all 16 sub-blocks
@@ -6905,16 +6878,16 @@ function buildMulMatQ3KQ8K(useRelaxed: boolean): FuncBuilder {
     f.get(a1).i32Const(4).i32ShrU().i32Const(0x0f0f0f0f).i32And()
       .get(tmp).i32Const(6).i32ShrU().i32Const(0x03030303).i32And().i32Const(4).i32Shl().i32Or().set(u3);
 
-    // Pack signed i8 scales [-32..31] into qv and absorb -4 * dot(sc, bsums16)
+    // Pack signed i8 scales [-32..31] into sc16V (reused for both min-offset AND sub-block shuffles!)
     f.i32Const(0).i32x4Splat()
       .get(u0).i32x4ReplaceLane(0)
       .get(u1).i32x4ReplaceLane(1)
       .get(u2).i32x4ReplaceLane(2)
       .get(u3).i32x4ReplaceLane(3)
-      .i32Const(32).i8x16Splat().i8x16Sub().set(qv);
+      .i32Const(32).i8x16Splat().i8x16Sub().set(sc16V);
     f.i32Const(0).i32x4Splat()
-      .get(qv).i16x8ExtendLowI8x16S().get(qp).v128Load(16, 4).i32x4DotI16x8S()
-      .get(qv).i16x8ExtendHighI8x16S().get(qp).v128Load(32, 4).i32x4DotI16x8S()
+      .get(sc16V).i16x8ExtendLowI8x16S().get(qp).v128Load(16, 4).i32x4DotI16x8S()
+      .get(sc16V).i16x8ExtendHighI8x16S().get(qp).v128Load(32, 4).i32x4DotI16x8S()
       .i32x4Add().i32Const(2).i32x4Shl()
       .i32x4Sub().set(sumiLoc);
 
@@ -6922,38 +6895,39 @@ function buildMulMatQ3KQ8K(useRelaxed: boolean): FuncBuilder {
     f.get(wpLoc).v128Load(16).set(hm1);
 
     for (let h = 0; h < 2; h++) {
+      if (h === 0) f.get(sc16V).i16x8ExtendLowI8x16S().set(scHalf);
+      else f.get(sc16V).i16x8ExtendHighI8x16S().set(scHalf);
       f.get(wpLoc).v128Load(32 + h * 32).set(q0);
       f.get(wpLoc).v128Load(48 + h * 32).set(q1);
       for (let s = 0; s < 4; s++) {
         const shift = s * 2;
         const bitIdx = h * 4 + s;
         const xOff = 64 + h * 128 + s * 32;
-        const scIdx0 = h * 8 + s * 2;
 
         // First 16 elements
         f.get(qp).v128Load(xOff, 4).set(x0);
         f.get(q0);
         if (shift > 0) f.i32Const(shift).i8x16ShrU();
-        f.get(mask03).v128And();
+        if (s < 3) f.get(mask03).v128And();
         f.get(hm0);
         if (bitIdx < 2) f.i32Const(2 - bitIdx).i8x16Shl();
         else if (bitIdx > 2) f.i32Const(bitIdx - 2).i8x16ShrU();
         f.get(mask04).v128And().v128Or().set(qv);
         f.pushDotI8I7ToI16x8(x0, qv, useRelaxed);
-        pushScaleSplat16(scIdx0);
+        emitScaleShuffleQ3(s * 2);
         f.i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
 
         // Next 16 elements
         f.get(qp).v128Load(xOff + 16, 4).set(x1);
         f.get(q1);
         if (shift > 0) f.i32Const(shift).i8x16ShrU();
-        f.get(mask03).v128And();
+        if (s < 3) f.get(mask03).v128And();
         f.get(hm1);
         if (bitIdx < 2) f.i32Const(2 - bitIdx).i8x16Shl();
         else if (bitIdx > 2) f.i32Const(bitIdx - 2).i8x16ShrU();
         f.get(mask04).v128And().v128Or().set(qv);
         f.pushDotI8I7ToI16x8(x1, qv, useRelaxed);
-        pushScaleSplat16(scIdx0 + 1);
+        emitScaleShuffleQ3(s * 2 + 1);
         f.i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
       }
     }
@@ -8748,7 +8722,9 @@ export class VerdantWasmArena {
     scStrideBytes: number,
   ): void {
     const pool = this.threadPool;
-    if (pool && pool.isActive && nHeads >= 2 && seqLen >= 192) {
+    // Adaptive work-based parallel FlashAttention floor: unlocks multi-core at seqLen >= 64
+    // on 16H–32H × 128D models (~80–150 us work vs ~0.6 us barrier) while bypassing tiny models.
+    if (pool && pool.isActive && nHeads >= 2 && nHeads * headDim * seqLen >= 131_072) {
       pool.dispatchParallelFlashAttn(
         qPtr,
         outPtr,
