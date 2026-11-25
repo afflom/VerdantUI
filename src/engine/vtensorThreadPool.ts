@@ -294,6 +294,18 @@ export function deriveOptimalPoolWorkers(hwCores: number): number {
   return Math.min(12, Math.max(4, Math.floor(n / 2)));
 }
 
+/**
+ * Prism Theorem T3-MoE wave-optimal thread count for expert-parallel dispatch:
+ * Given `K` experts and `P` workers, `waves = ceil(K / min(P, K))` is the minimum wave depth.
+ * Using more than `ceil(K / waves)` threads cannot reduce wave depth while increasing L3 cache
+ * thrashing and lowering all-core turbo (e.g., K=8 on P=6 -> 2 waves -> activeThreads=4 beats 6 by +74%).
+ */
+export function deriveWaveOptimalMoeThreads(workerCount: number, expertCount: number): number {
+  const maxT = Math.max(1, Math.min(workerCount | 0, expertCount | 0));
+  const waves = Math.ceil(Math.max(1, expertCount | 0) / maxT);
+  return Math.max(1, Math.ceil(Math.max(1, expertCount | 0) / waves));
+}
+
 export interface VTensorThreadPoolTelemetry {
   readonly active: boolean;
   readonly workerCount: number;
@@ -1352,7 +1364,8 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
       return;
     }
 
-    const activeThreads = this.active && this.helperCount > 0 ? Math.min(this.workerCount, count) : 1;
+    const activeThreads =
+      this.active && this.helperCount > 0 ? deriveWaveOptimalMoeThreads(this.workerCount, count) : 1;
     const ctrl = this.ctrl;
     const m = MOE_DESC_BASE;
 
@@ -1427,7 +1440,8 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
       return;
     }
 
-    const activeThreads = this.active && this.helperCount > 0 ? Math.min(this.workerCount, count) : 1;
+    const activeThreads =
+      this.active && this.helperCount > 0 ? deriveWaveOptimalMoeThreads(this.workerCount, count) : 1;
     const ctrl = this.ctrl;
     const m = MOE_DESC_BASE;
 
@@ -1481,14 +1495,25 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
 
     const stride = params.layout.strideBytes;
     const offAcc = params.layout.offAccum;
-    kernels.copy_bytes(params.outPtr, params.workerScratchBase + offAcc, totalFloats * 4);
-    for (let t = 1; t < activeThreads; t++) {
-      kernels.add_f32(
-        params.outPtr,
-        params.workerScratchBase + t * stride + offAcc,
-        params.outPtr,
-        totalFloats,
-      );
+    if (params.accumulate) {
+      for (let t = 0; t < activeThreads; t++) {
+        kernels.add_f32(
+          params.outPtr,
+          params.workerScratchBase + t * stride + offAcc,
+          params.outPtr,
+          totalFloats,
+        );
+      }
+    } else {
+      kernels.copy_bytes(params.outPtr, params.workerScratchBase + offAcc, totalFloats * 4);
+      for (let t = 1; t < activeThreads; t++) {
+        kernels.add_f32(
+          params.outPtr,
+          params.workerScratchBase + t * stride + offAcc,
+          params.outPtr,
+          totalFloats,
+        );
+      }
     }
   }
 

@@ -14,7 +14,11 @@ import {
   weightRowByteSize,
   type MatGroupEntry,
 } from './verdantWasmSimd';
-import { VTensorThreadPool, deriveOptimalPoolWorkers } from './vtensorThreadPool';
+import {
+  VTensorThreadPool,
+  deriveOptimalPoolWorkers,
+  deriveWaveOptimalMoeThreads,
+} from './vtensorThreadPool';
 import { verdantMulMat, verdantRope, verdantSwiGlu } from './verdantKernels';
 import { VramKvPager } from './vramKvPager';
 import { VramWeightPager, type LayerTensorInfoGroup } from './vramWeightPager';
@@ -1338,6 +1342,13 @@ test('deriveOptimalPoolWorkers avoids SMT spin-convoy saturation and OP_MOE_EXPE
   assert.equal(deriveOptimalPoolWorkers(16), 8);
   assert.equal(deriveOptimalPoolWorkers(24), 12);
   assert.equal(deriveOptimalPoolWorkers(32), 12);
+  // Verify Theorem T3-MoE wave-optimal active thread sizing
+  assert.equal(deriveWaveOptimalMoeThreads(6, 8), 4); // 2 waves -> 4 balanced cores (zero stragglers!)
+  assert.equal(deriveWaveOptimalMoeThreads(8, 8), 8); // 1 wave -> all 8 cores
+  assert.equal(deriveWaveOptimalMoeThreads(4, 8), 4); // 2 waves -> 4 balanced cores
+  assert.equal(deriveWaveOptimalMoeThreads(6, 6), 6); // 1 wave -> 6 balanced cores
+  assert.equal(deriveWaveOptimalMoeThreads(6, 12), 6); // 2 waves -> 6 balanced cores
+  assert.equal(deriveWaveOptimalMoeThreads(6, 10), 5); // 2 waves -> 5 balanced cores
 
   if (!isVerdantSharedWasmSupported()) return;
   const availCpus = Math.max(1, os.cpus().length);

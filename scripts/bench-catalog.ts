@@ -329,36 +329,8 @@ function runBatch4DenseOrMoeLayer(
     }
   }
 
-  if (isMoe) {
-    const dispatched =
-      ptrs.moeBatch4Layout !== null &&
-      ptrs.moeWorkerScratch >= 0 &&
-      arena.dispatchMoeExpertsBatch4Parallel({
-        uniqueCount: activeExperts,
-        dim,
-        expFfnDim: ffnDim,
-        gateUpBatchOp: useQ8K ? ParallelMatOp.MUL_MAT_BATCH4_Q8K : ParallelMatOp.MUL_MAT_BATCH4_Q8,
-        gateUpSingleOp: useQ8K ? ParallelMatOp.MUL_MAT_Q8K : ParallelMatOp.MUL_MAT_Q8,
-        downBatchOp: ffnUseQ8K ? ParallelMatOp.MUL_MAT_BATCH4_Q8K : ParallelMatOp.MUL_MAT_BATCH4_Q8,
-        downSingleOp: ffnUseQ8K ? ParallelMatOp.MUL_MAT_Q8K : ParallelMatOp.MUL_MAT_Q8,
-        gateType: wType,
-        upType: wType,
-        downType: wType,
-        bXOrQ8Ptr: useQ8K ? ptrs.q8kB4 : ptrs.q8B4,
-        bXF32Ptr: ptrs.xB4,
-        xQ8StrideBytes: useQ8K ? qkDimStride : qDimStride,
-        outPtr: ptrs.ffnProjB4,
-        workerScratchBase: ptrs.moeWorkerScratch,
-        layout: ptrs.moeBatch4Layout,
-        gatePtrs: ptrs.moeGatePtrs,
-        upPtrs: ptrs.moeUpPtrs,
-        downPtrs: ptrs.moeDownPtrs,
-        masks: ptrs.moeMasksB4,
-        weights: ptrs.moeWeightsB4,
-      });
-    if (dispatched) return performance.now() - t0;
-  }
-
+  // Mirrors hybrid llamaRuntime.ts executeSparseMoeBatch4Routed:
+  // Dense 4-token hits (`mask === 0b1111`) run row-striped Batch-4 across ALL P cores (100% balance + L3-resident)
   const nPasses = isMoe ? activeExperts : 1;
   for (let e = 0; e < nPasses; e++) {
     const ge: MatGroupEntry[] = [

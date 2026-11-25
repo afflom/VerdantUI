@@ -1631,6 +1631,7 @@ export class LlamaVTensorRuntime {
     const moeBatchGatePtrs = new Int32Array(moeBatchMaxUnique);
     const moeBatchUpPtrs = new Int32Array(moeBatchMaxUnique);
     const moeBatchDownPtrs = new Int32Array(moeBatchMaxUnique);
+    const moeBatchSparseMasks = new Uint8Array(moeBatchMaxUnique);
     const moeBatchWeightsF32 = new Float32Array(moeBatchMaxUnique * PREFILL_BATCH_SIZE);
 
     const routeTopKFromLogits = (rLogits: Float32Array, nExperts: number, kUsed: number): void => {
@@ -2145,99 +2146,6 @@ export class LlamaVTensorRuntime {
 
       const bFfnProjPtr = useWasm && bs.ffnProj.buffer.isWasmBacked ? bs.ffnProj.buffer.wasmPtr(bs.ffnProj) : -1;
       const outAll = bs.ffnProj.buffer.f32View(bs.ffnProj);
-
-      // Fast path: Single-barrier Expert-Parallel Batch-4 Sparse MoE (`OP_MOE_EXPERTS_BATCH4`)
-      // Cuts 16-48 sequential barriers per MoE prefill layer down to ONE barrier!
-      const pool = b.activeThreadPool;
-      if (
-        useWasm &&
-        arena &&
-        bFfnProjPtr >= 0 &&
-        pool &&
-        pool.isActive &&
-        uniqueCount >= 2 &&
-        uniqueCount <= 32 &&
-        s.moeWorkerScratch &&
-        s.moeBatch4WorkerScratchLayout &&
-        s.moeWorkerScratch.buffer.isWasmBacked &&
-        s.moeWorkerScratchSlots >= Math.min(pool.workerCount, uniqueCount)
-      ) {
-        let allWasm = true;
-        let sameTypes = true;
-        let gType: GgmlType = expGateType;
-        let uType: GgmlType = expUpType;
-        let dType: GgmlType = expDownType;
-        for (let u = 0; u < uniqueCount; u++) {
-          const exp = wp.acquireExpertSlice(layerIdx, moeBatchExpIds[u]);
-          if (
-            !exp.gate.buffer.isWasmBacked ||
-            !exp.up.buffer.isWasmBacked ||
-            !exp.down.buffer.isWasmBacked
-          ) {
-            allWasm = false;
-            break;
-          }
-          if (u === 0) {
-            gType = exp.gate.type;
-            uType = exp.up.type;
-            dType = exp.down.type;
-          } else if (exp.gate.type !== gType || exp.up.type !== uType || exp.down.type !== dType) {
-            sameTypes = false;
-            break;
-          }
-          moeBatchGatePtrs[u] = exp.gate.buffer.wasmPtr(exp.gate);
-          moeBatchUpPtrs[u] = exp.up.buffer.wasmPtr(exp.up);
-          moeBatchDownPtrs[u] = exp.down.buffer.wasmPtr(exp.down);
-          const wBase = u * B4;
-          moeBatchWeightsF32[wBase + 0] = moeBatchExpWeights[wBase + 0];
-          moeBatchWeightsF32[wBase + 1] = moeBatchExpWeights[wBase + 1];
-          moeBatchWeightsF32[wBase + 2] = moeBatchExpWeights[wBase + 2];
-          moeBatchWeightsF32[wBase + 3] = moeBatchExpWeights[wBase + 3];
-        }
-        if (allWasm && sameTypes) {
-          const dispatched = arena.dispatchMoeExpertsBatch4Parallel({
-            uniqueCount,
-            dim,
-            expFfnDim,
-            gateUpBatchOp: expInQ8K
-              ? ParallelMatOp.MUL_MAT_BATCH4_Q8K
-              : expInQ8
-                ? ParallelMatOp.MUL_MAT_BATCH4_Q8
-                : ParallelMatOp.MUL_MAT_BATCH4,
-            gateUpSingleOp: expInQ8K
-              ? ParallelMatOp.MUL_MAT_Q8K
-              : expInQ8
-                ? ParallelMatOp.MUL_MAT_Q8
-                : ParallelMatOp.MUL_MAT,
-            downBatchOp: expDownQ8K
-              ? ParallelMatOp.MUL_MAT_BATCH4_Q8K
-              : expDownQ8
-                ? ParallelMatOp.MUL_MAT_BATCH4_Q8
-                : ParallelMatOp.MUL_MAT_BATCH4,
-            downSingleOp: expDownQ8K
-              ? ParallelMatOp.MUL_MAT_Q8K
-              : expDownQ8
-                ? ParallelMatOp.MUL_MAT_Q8
-                : ParallelMatOp.MUL_MAT,
-            gateType: gType,
-            upType: uType,
-            downType: dType,
-            bXOrQ8Ptr: expInQ8K ? bQkDimPtr : expInQ8 ? bQDimPtr : bXNormPtr,
-            bXF32Ptr: bXNormPtr,
-            xQ8StrideBytes: expInQ8K ? qkDimStride : expInQ8 ? qDimStride : xStrideBytes,
-            outPtr: bFfnProjPtr,
-            workerScratchBase: s.moeWorkerScratch.buffer.wasmPtr(s.moeWorkerScratch),
-            layout: s.moeBatch4WorkerScratchLayout,
-            gatePtrs: moeBatchGatePtrs,
-            upPtrs: moeBatchUpPtrs,
-            downPtrs: moeBatchDownPtrs,
-            masks: moeBatchExpMask,
-            weights: moeBatchWeightsF32,
-          });
-          if (dispatched) return;
-        }
-      }
-
       if (useWasm && arena && bFfnProjPtr >= 0) {
         arena.kernels.zero_bytes(bFfnProjPtr, B4 * dim * 4);
       } else {
@@ -2248,7 +2156,29 @@ export class LlamaVTensorRuntime {
       const ge1 = moeGateUpGroupEntries[1];
       const eOutView = expertProj.buffer.f32View(expertProj);
 
-      // 3. Process each unique routed expert ONCE across all matching tokens in the 4-token batch!
+      // Hybrid Theorem T3-MoE Batch-4 dispatch:
+      // 1) Heavy 4-token hits (`mask === 0b1111`): row-striped Batch-4 across ALL P cores (100% core balance + L3-resident)
+      // 2) Light sparse hits (`popcount(mask) ∈ {1,2,3}`): collected and executed in ONE barrier via OP_MOE_EXPERTS_BATCH4!
+      const pool = b.activeThreadPool;
+      const canPoolSparse =
+        useWasm &&
+        arena !== null &&
+        bFfnProjPtr >= 0 &&
+        pool !== null &&
+        pool.isActive &&
+        s.moeWorkerScratch !== null &&
+        s.moeBatch4WorkerScratchLayout !== null &&
+        s.moeWorkerScratch.buffer.isWasmBacked;
+
+      let sparseCount = 0;
+      let sparseAllWasm = canPoolSparse;
+      let sparseSameTypes = true;
+      let sparseGType: GgmlType = expGateType;
+      let sparseUType: GgmlType = expUpType;
+      let sparseDType: GgmlType = expDownType;
+      let ranDenseHit = false;
+
+      // Pass 1: execute all full 4-token hits (`mask === 0b1111`) row-striped across P cores, and collect sparse hits
       for (let u = 0; u < uniqueCount; u++) {
         const expId = moeBatchExpIds[u];
         const mask = moeBatchExpMask[u];
@@ -2260,6 +2190,149 @@ export class LlamaVTensorRuntime {
           exp.up.buffer.isWasmBacked &&
           exp.down.buffer.isWasmBacked;
 
+        if (mask === 0b1111 && expWasm && arena) {
+          ranDenseHit = true;
+          const gPtr = exp.gate.buffer.wasmPtr(exp.gate);
+          const uPtr = exp.up.buffer.wasmPtr(exp.up);
+          const dPtr = exp.down.buffer.wasmPtr(exp.down);
+          ge0.weightType = exp.gate.type;
+          ge0.wPtr = gPtr;
+          ge0.rows = expFfnDim;
+          ge0.oStrideBytes = expFfnDim * 4;
+          ge0.outPtr = bGateOutPtr;
+          ge1.weightType = exp.up.type;
+          ge1.wPtr = uPtr;
+          ge1.rows = expFfnDim;
+          ge1.oStrideBytes = expFfnDim * 4;
+          ge1.outPtr = bUpOutPtr;
+
+          if (expInQ8K) {
+            arena.mulMatBatch4Q8KGroup(moeGateUpGroupEntries, bQkDimPtr, bXNormPtr, dim);
+          } else {
+            arena.mulMatBatch4Q8Group(moeGateUpGroupEntries, expInQ8 ? bQDimPtr : bXNormPtr, bXNormPtr, dim, expInQ8);
+          }
+          arena.kernels.swiglu_f32(bGateOutPtr, bUpOutPtr, bHidPtr, B4 * expFfnDim);
+          if (expDownQ8K && bQkFfnPtr >= 0) {
+            for (let t = 0; t < B4; t++) {
+              arena.quantizeActivationQ8K(bHidPtr + t * expFfnDim * 4, bQkFfnPtr + t * qkFfnStride, expFfnDim);
+            }
+            arena.mulMatBatchQ8K(exp.down.type, dPtr, bQkFfnPtr, bHidPtr, bTmpProjPtr, expFfnDim, dim, B4);
+          } else if (expDownQ8 && bQFfnPtr >= 0) {
+            for (let t = 0; t < B4; t++) {
+              arena.quantizeActivation(bHidPtr + t * expFfnDim * 4, bQFfnPtr + t * qFfnStride, expFfnDim);
+            }
+            arena.mulMatBatchQ8(exp.down.type, dPtr, bQFfnPtr, bHidPtr, bTmpProjPtr, expFfnDim, dim, B4);
+          } else {
+            arena.mulMatBatch(exp.down.type, dPtr, bHidPtr, bTmpProjPtr, expFfnDim, dim, B4);
+          }
+          for (let t = 0; t < B4; t++) {
+            const weight = moeBatchExpWeights[u * B4 + t];
+            if (bFfnProjPtr >= 0) {
+              arena.kernels.axpy_f32(bFfnProjPtr + t * xStrideBytes, bTmpProjPtr + t * xStrideBytes, weight, dim);
+            } else {
+              const base = t * dim;
+              for (let i = 0; i < dim; i++) {
+                outAll[base + i] += weight * bTmpProjView[base + i];
+              }
+            }
+          }
+          continue;
+        }
+
+        if (sparseAllWasm && expWasm && sparseCount < 32) {
+          if (sparseCount === 0) {
+            sparseGType = exp.gate.type;
+            sparseUType = exp.up.type;
+            sparseDType = exp.down.type;
+          } else if (
+            exp.gate.type !== sparseGType ||
+            exp.up.type !== sparseUType ||
+            exp.down.type !== sparseDType
+          ) {
+            sparseSameTypes = false;
+          }
+          moeBatchGatePtrs[sparseCount] = exp.gate.buffer.wasmPtr(exp.gate);
+          moeBatchUpPtrs[sparseCount] = exp.up.buffer.wasmPtr(exp.up);
+          moeBatchDownPtrs[sparseCount] = exp.down.buffer.wasmPtr(exp.down);
+          moeBatchSparseMasks[sparseCount] = mask;
+          const dstW = sparseCount * B4;
+          const srcW = u * B4;
+          moeBatchWeightsF32[dstW + 0] = moeBatchExpWeights[srcW + 0];
+          moeBatchWeightsF32[dstW + 1] = moeBatchExpWeights[srcW + 1];
+          moeBatchWeightsF32[dstW + 2] = moeBatchExpWeights[srcW + 2];
+          moeBatchWeightsF32[dstW + 3] = moeBatchExpWeights[srcW + 3];
+          sparseCount += 1;
+        } else {
+          sparseAllWasm = false;
+        }
+      }
+
+      // Pass 2: Execute collected sparse experts in ONE single barrier via OP_MOE_EXPERTS_BATCH4!
+      if (
+        sparseAllWasm &&
+        sparseSameTypes &&
+        sparseCount >= 2 &&
+        arena &&
+        pool &&
+        s.moeWorkerScratch &&
+        s.moeBatch4WorkerScratchLayout &&
+        s.moeWorkerScratchSlots >= Math.min(pool.workerCount, sparseCount)
+      ) {
+        const dispatched = arena.dispatchMoeExpertsBatch4Parallel({
+          uniqueCount: sparseCount,
+          dim,
+          expFfnDim,
+          gateUpBatchOp: expInQ8K
+            ? ParallelMatOp.MUL_MAT_BATCH4_Q8K
+            : expInQ8
+              ? ParallelMatOp.MUL_MAT_BATCH4_Q8
+              : ParallelMatOp.MUL_MAT_BATCH4,
+          gateUpSingleOp: expInQ8K
+            ? ParallelMatOp.MUL_MAT_Q8K
+            : expInQ8
+              ? ParallelMatOp.MUL_MAT_Q8
+              : ParallelMatOp.MUL_MAT,
+          downBatchOp: expDownQ8K
+            ? ParallelMatOp.MUL_MAT_BATCH4_Q8K
+            : expDownQ8
+              ? ParallelMatOp.MUL_MAT_BATCH4_Q8
+              : ParallelMatOp.MUL_MAT_BATCH4,
+          downSingleOp: expDownQ8K
+            ? ParallelMatOp.MUL_MAT_Q8K
+            : expDownQ8
+              ? ParallelMatOp.MUL_MAT_Q8
+              : ParallelMatOp.MUL_MAT,
+          gateType: sparseGType,
+          upType: sparseUType,
+          downType: sparseDType,
+          bXOrQ8Ptr: expInQ8K ? bQkDimPtr : expInQ8 ? bQDimPtr : bXNormPtr,
+          bXF32Ptr: bXNormPtr,
+          xQ8StrideBytes: expInQ8K ? qkDimStride : expInQ8 ? qDimStride : xStrideBytes,
+          outPtr: bFfnProjPtr,
+          workerScratchBase: s.moeWorkerScratch.buffer.wasmPtr(s.moeWorkerScratch),
+          layout: s.moeBatch4WorkerScratchLayout,
+          gatePtrs: moeBatchGatePtrs,
+          upPtrs: moeBatchUpPtrs,
+          downPtrs: moeBatchDownPtrs,
+          masks: moeBatchSparseMasks,
+          weights: moeBatchWeightsF32,
+          accumulate: ranDenseHit,
+        });
+        if (dispatched) return;
+      }
+
+      // Sequential fallback for remaining sparse experts (single-core or <=1 sparse expert or non-WASM)
+      for (let u = 0; u < uniqueCount; u++) {
+        const mask = moeBatchExpMask[u];
+        const exp = wp.acquireExpertSlice(layerIdx, moeBatchExpIds[u]);
+        const expWasm =
+          useWasm &&
+          arena !== null &&
+          exp.gate.buffer.isWasmBacked &&
+          exp.up.buffer.isWasmBacked &&
+          exp.down.buffer.isWasmBacked;
+        if (mask === 0b1111 && expWasm && arena) continue; // already computed in Pass 1
+
         if (expWasm && arena) {
           const gPtr = exp.gate.buffer.wasmPtr(exp.gate);
           const uPtr = exp.up.buffer.wasmPtr(exp.up);
@@ -2268,81 +2341,43 @@ export class LlamaVTensorRuntime {
           ge0.wPtr = gPtr;
           ge0.rows = expFfnDim;
           ge0.oStrideBytes = expFfnDim * 4;
+          ge0.outPtr = sGateOutPtr;
           ge1.weightType = exp.up.type;
           ge1.wPtr = uPtr;
           ge1.rows = expFfnDim;
           ge1.oStrideBytes = expFfnDim * 4;
-
-          if (mask === 0b1111) {
-            // All 4 tokens routed to this expert -> true Batch-4 weight-amortized contraction!
-            ge0.outPtr = bGateOutPtr;
-            ge1.outPtr = bUpOutPtr;
+          ge1.outPtr = sUpOutPtr;
+          for (let t = 0; t < B4; t++) {
+            if ((mask & (1 << t)) === 0) continue;
+            const weight = moeBatchExpWeights[u * B4 + t];
+            const txPtr = bXNormPtr + t * xStrideBytes;
             if (expInQ8K) {
-              arena.mulMatBatch4Q8KGroup(moeGateUpGroupEntries, bQkDimPtr, bXNormPtr, dim);
+              arena.mulMatQ8KGroup(moeGateUpGroupEntries, bQkDimPtr + t * qkDimStride, txPtr, dim);
             } else {
-              arena.mulMatBatch4Q8Group(moeGateUpGroupEntries, expInQ8 ? bQDimPtr : bXNormPtr, bXNormPtr, dim, expInQ8);
+              arena.mulMatQ8Group(
+                moeGateUpGroupEntries,
+                expInQ8 ? bQDimPtr + t * qDimStride : txPtr,
+                txPtr,
+                dim,
+                expInQ8,
+              );
             }
-            arena.kernels.swiglu_f32(bGateOutPtr, bUpOutPtr, bHidPtr, B4 * expFfnDim);
-            if (expDownQ8K && bQkFfnPtr >= 0) {
-              for (let t = 0; t < B4; t++) {
-                arena.quantizeActivationQ8K(bHidPtr + t * expFfnDim * 4, bQkFfnPtr + t * qkFfnStride, expFfnDim);
-              }
-              arena.mulMatBatchQ8K(exp.down.type, dPtr, bQkFfnPtr, bHidPtr, bTmpProjPtr, expFfnDim, dim, B4);
-            } else if (expDownQ8 && bQFfnPtr >= 0) {
-              for (let t = 0; t < B4; t++) {
-                arena.quantizeActivation(bHidPtr + t * expFfnDim * 4, bQFfnPtr + t * qFfnStride, expFfnDim);
-              }
-              arena.mulMatBatchQ8(exp.down.type, dPtr, bQFfnPtr, bHidPtr, bTmpProjPtr, expFfnDim, dim, B4);
+            arena.kernels.swiglu_f32(sGateOutPtr, sUpOutPtr, sHidPtr, expFfnDim);
+            if (expDownQ8K) {
+              arena.quantizeActivationQ8K(sHidPtr, qkFfnPtr, expFfnDim);
+              arena.mulMatQ8K(exp.down.type, dPtr, qkFfnPtr, sHidPtr, sExpProjPtr, expFfnDim, dim);
+            } else if (expDownQ8) {
+              arena.quantizeActivation(sHidPtr, qFfnPtr, expFfnDim);
+              arena.mulMatQ8(exp.down.type, dPtr, qFfnPtr, sHidPtr, sExpProjPtr, expFfnDim, dim);
             } else {
-              arena.mulMatBatch(exp.down.type, dPtr, bHidPtr, bTmpProjPtr, expFfnDim, dim, B4);
+              arena.mulMat(exp.down.type, dPtr, sHidPtr, sExpProjPtr, expFfnDim, dim);
             }
-            for (let t = 0; t < B4; t++) {
-              const weight = moeBatchExpWeights[u * B4 + t];
-              if (bFfnProjPtr >= 0) {
-                arena.kernels.axpy_f32(bFfnProjPtr + t * xStrideBytes, bTmpProjPtr + t * xStrideBytes, weight, dim);
-              } else {
-                const base = t * dim;
-                for (let i = 0; i < dim; i++) {
-                  outAll[base + i] += weight * bTmpProjView[base + i];
-                }
-              }
-            }
-          } else {
-            // 1..3 tokens routed to this expert -> weights stay hot in L1/L2 across matching tokens!
-            ge0.outPtr = sGateOutPtr;
-            ge1.outPtr = sUpOutPtr;
-            for (let t = 0; t < B4; t++) {
-              if ((mask & (1 << t)) === 0) continue;
-              const weight = moeBatchExpWeights[u * B4 + t];
-              const txPtr = bXNormPtr + t * xStrideBytes;
-              if (expInQ8K) {
-                arena.mulMatQ8KGroup(moeGateUpGroupEntries, bQkDimPtr + t * qkDimStride, txPtr, dim);
-              } else {
-                arena.mulMatQ8Group(
-                  moeGateUpGroupEntries,
-                  expInQ8 ? bQDimPtr + t * qDimStride : txPtr,
-                  txPtr,
-                  dim,
-                  expInQ8,
-                );
-              }
-              arena.kernels.swiglu_f32(sGateOutPtr, sUpOutPtr, sHidPtr, expFfnDim);
-              if (expDownQ8K) {
-                arena.quantizeActivationQ8K(sHidPtr, qkFfnPtr, expFfnDim);
-                arena.mulMatQ8K(exp.down.type, dPtr, qkFfnPtr, sHidPtr, sExpProjPtr, expFfnDim, dim);
-              } else if (expDownQ8) {
-                arena.quantizeActivation(sHidPtr, qFfnPtr, expFfnDim);
-                arena.mulMatQ8(exp.down.type, dPtr, qFfnPtr, sHidPtr, sExpProjPtr, expFfnDim, dim);
-              } else {
-                arena.mulMat(exp.down.type, dPtr, sHidPtr, sExpProjPtr, expFfnDim, dim);
-              }
-              if (bFfnProjPtr >= 0) {
-                arena.kernels.axpy_f32(bFfnProjPtr + t * xStrideBytes, sExpProjPtr, weight, dim);
-              } else {
-                const base = t * dim;
-                for (let i = 0; i < dim; i++) {
-                  outAll[base + i] += weight * eOutView[i];
-                }
+            if (bFfnProjPtr >= 0) {
+              arena.kernels.axpy_f32(bFfnProjPtr + t * xStrideBytes, sExpProjPtr, weight, dim);
+            } else {
+              const base = t * dim;
+              for (let i = 0; i < dim; i++) {
+                outAll[base + i] += weight * eOutView[i];
               }
             }
           }
@@ -4814,42 +4849,61 @@ export class LlamaVTensorRuntime {
     plan.embedNode.execute();
 
     const layerCount = plan.layers.length;
-    for (let l = 0; l < layerCount; l++) {
-      LlamaVTensorRuntime.throwIfAborted(signal);
-      const tLayer0 = performance.now();
-      const layerPlan = plan.layers[l];
-      const layerMissing = wp.getLayerMissingRanges(l);
-      if (layerMissing.length > 0) {
-        onDetail?.(`Layer ${l + 1}/${layerCount}`);
-        await backing.prefetchRanges(layerMissing, { signal });
-      } else if (l === 0 || (l + 1) % 4 === 0 || l === layerCount - 1) {
-        onDetail?.(`Layer ${l + 1}/${layerCount}`);
-      }
-      LlamaVTensorRuntime.throwIfAborted(signal);
-
-      layerPlan.acquireNode?.execute();
-      for (let n = 0; n < layerPlan.preMoeNodes.length; n++) {
-        layerPlan.preMoeNodes[n].execute();
-      }
-
-      if (layerPlan.moe) {
-        const routed = layerPlan.moe.routeAndGetExperts();
-        const expMissing = wp.getExpertMissingRanges(l, routed.expertIds);
-        if (expMissing.length > 0) {
-          onDetail?.(`Layer ${l + 1}/${layerCount} · loading experts`);
-          await backing.prefetchRanges(expMissing, { signal });
+    let pendingNextLayerPrefetch: Promise<void> | null = null;
+    try {
+      for (let l = 0; l < layerCount; l++) {
+        LlamaVTensorRuntime.throwIfAborted(signal);
+        const tLayer0 = performance.now();
+        const layerPlan = plan.layers[l];
+        if (pendingNextLayerPrefetch) {
+          await pendingNextLayerPrefetch;
+          pendingNextLayerPrefetch = null;
+        }
+        const layerMissing = wp.getLayerMissingRanges(l);
+        if (layerMissing.length > 0) {
+          onDetail?.(`Layer ${l + 1}/${layerCount}`);
+          await backing.prefetchRanges(layerMissing, { signal });
+        } else if (l === 0 || (l + 1) % 4 === 0 || l === layerCount - 1) {
+          onDetail?.(`Layer ${l + 1}/${layerCount}`);
         }
         LlamaVTensorRuntime.throwIfAborted(signal);
-        layerPlan.moe.executeRouted(routed.count);
-        layerPlan.moe.residualNode.execute();
-      } else {
-        for (let n = 0; n < layerPlan.denseFfnNodes.length; n++) {
-          layerPlan.denseFfnNodes[n].execute();
+
+        layerPlan.acquireNode?.execute();
+        // Overlap OPFS/network prefetch of dense layer `l + 1` with WASM SIMD compute of layer `l`
+        if (!layerPlan.moe && l + 1 < layerCount) {
+          const nextMissing = wp.getLayerMissingRanges(l + 1);
+          if (nextMissing.length > 0) {
+            pendingNextLayerPrefetch = backing.prefetchRanges(nextMissing, { signal });
+          }
+        }
+
+        for (let n = 0; n < layerPlan.preMoeNodes.length; n++) {
+          layerPlan.preMoeNodes[n].execute();
+        }
+
+        if (layerPlan.moe) {
+          const routed = layerPlan.moe.routeAndGetExperts();
+          const expMissing = wp.getExpertMissingRanges(l, routed.expertIds);
+          if (expMissing.length > 0) {
+            onDetail?.(`Layer ${l + 1}/${layerCount} · loading experts`);
+            await backing.prefetchRanges(expMissing, { signal });
+          }
+          LlamaVTensorRuntime.throwIfAborted(signal);
+          layerPlan.moe.executeRouted(routed.count);
+          layerPlan.moe.residualNode.execute();
+        } else {
+          for (let n = 0; n < layerPlan.denseFfnNodes.length; n++) {
+            layerPlan.denseFfnNodes[n].execute();
+          }
+        }
+
+        if (performance.now() - tLayer0 >= 12) {
+          await this.yielder.yieldNow();
         }
       }
-
-      if (performance.now() - tLayer0 >= 12) {
-        await this.yielder.yieldNow();
+    } finally {
+      if (pendingNextLayerPrefetch) {
+        pendingNextLayerPrefetch.catch(() => {});
       }
     }
 
@@ -4862,18 +4916,34 @@ export class LlamaVTensorRuntime {
         plan.pinnedLmHeadNode.execute();
       } else if (plan.executeLmHeadStripe) {
         const stripes = wp.getLmHeadStripeSpecs();
-        for (let sIdx = 0; sIdx < stripes.length; sIdx++) {
-          LlamaVTensorRuntime.throwIfAborted(signal);
-          const tStripe0 = performance.now();
-          const spec = stripes[sIdx];
-          const pct = Math.min(99, Math.max(1, Math.round(((sIdx + 1) / stripes.length) * 100)));
-          onDetail?.(`Computing logits (${pct}%)`);
-          await backing.prefetchRanges([spec], { signal });
-          LlamaVTensorRuntime.throwIfAborted(signal);
-          const weightStripe = wp.acquireLmHeadStripe(spec.rowStart, spec.rowCount);
-          plan.executeLmHeadStripe(weightStripe, spec.rowStart, spec.rowCount);
-          if (performance.now() - tStripe0 >= 12) {
-            await this.yielder.yieldNow();
+        let pendingNextStripe: Promise<void> | null = null;
+        try {
+          for (let sIdx = 0; sIdx < stripes.length; sIdx++) {
+            LlamaVTensorRuntime.throwIfAborted(signal);
+            const tStripe0 = performance.now();
+            const spec = stripes[sIdx];
+            const pct = Math.min(99, Math.max(1, Math.round(((sIdx + 1) / stripes.length) * 100)));
+            onDetail?.(`Computing logits (${pct}%)`);
+            if (pendingNextStripe) {
+              await pendingNextStripe;
+              pendingNextStripe = null;
+            } else {
+              await backing.prefetchRanges([spec], { signal });
+            }
+            LlamaVTensorRuntime.throwIfAborted(signal);
+            const weightStripe = wp.acquireLmHeadStripe(spec.rowStart, spec.rowCount);
+            // Overlap OPFS/network prefetch of stripe `sIdx + 1` with WASM SIMD projection of stripe `sIdx`
+            if (sIdx + 1 < stripes.length) {
+              pendingNextStripe = backing.prefetchRanges([stripes[sIdx + 1]], { signal });
+            }
+            plan.executeLmHeadStripe(weightStripe, spec.rowStart, spec.rowCount);
+            if (performance.now() - tStripe0 >= 12) {
+              await this.yielder.yieldNow();
+            }
+          }
+        } finally {
+          if (pendingNextStripe) {
+            pendingNextStripe.catch(() => {});
           }
         }
       }
@@ -4935,41 +5005,59 @@ export class LlamaVTensorRuntime {
     plan.embedNode.execute();
 
     const layerCount = plan.layers.length;
-    for (let l = 0; l < layerCount; l++) {
-      LlamaVTensorRuntime.throwIfAborted(signal);
-      const tLayer0 = performance.now();
-      const layerPlan = plan.layers[l];
-      const layerMissing = wp.getLayerMissingRanges(l);
-      if (layerMissing.length > 0) {
-        onDetail?.(`Layer ${l + 1}/${layerCount}`);
-        await backing.prefetchRanges(layerMissing, { signal });
-      } else if (l === 0 || (l + 1) % 4 === 0 || l === layerCount - 1) {
-        onDetail?.(`Layer ${l + 1}/${layerCount}`);
-      }
-      LlamaVTensorRuntime.throwIfAborted(signal);
-
-      layerPlan.acquireNode?.execute();
-      for (let n = 0; n < layerPlan.preMoeNodes.length; n++) {
-        layerPlan.preMoeNodes[n].execute();
-      }
-      if (layerPlan.moe) {
-        const routed = layerPlan.moe.routeAndGetExperts();
-        const expMissing = wp.getExpertMissingRanges(l, routed.expertIds);
-        if (expMissing.length > 0) {
-          onDetail?.(`Layer ${l + 1}/${layerCount} · loading experts`);
-          await backing.prefetchRanges(expMissing, { signal });
+    let pendingNextLayerPrefetch: Promise<void> | null = null;
+    try {
+      for (let l = 0; l < layerCount; l++) {
+        LlamaVTensorRuntime.throwIfAborted(signal);
+        const tLayer0 = performance.now();
+        const layerPlan = plan.layers[l];
+        if (pendingNextLayerPrefetch) {
+          await pendingNextLayerPrefetch;
+          pendingNextLayerPrefetch = null;
+        }
+        const layerMissing = wp.getLayerMissingRanges(l);
+        if (layerMissing.length > 0) {
+          onDetail?.(`Layer ${l + 1}/${layerCount}`);
+          await backing.prefetchRanges(layerMissing, { signal });
+        } else if (l === 0 || (l + 1) % 4 === 0 || l === layerCount - 1) {
+          onDetail?.(`Layer ${l + 1}/${layerCount}`);
         }
         LlamaVTensorRuntime.throwIfAborted(signal);
-        layerPlan.moe.executeRouted(routed.count);
-        layerPlan.moe.residualNode.execute();
-      } else {
-        for (let n = 0; n < layerPlan.denseFfnNodes.length; n++) {
-          layerPlan.denseFfnNodes[n].execute();
+
+        layerPlan.acquireNode?.execute();
+        if (!layerPlan.moe && l + 1 < layerCount) {
+          const nextMissing = wp.getLayerMissingRanges(l + 1);
+          if (nextMissing.length > 0) {
+            pendingNextLayerPrefetch = backing.prefetchRanges(nextMissing, { signal });
+          }
+        }
+
+        for (let n = 0; n < layerPlan.preMoeNodes.length; n++) {
+          layerPlan.preMoeNodes[n].execute();
+        }
+        if (layerPlan.moe) {
+          const routed = layerPlan.moe.routeAndGetExperts();
+          const expMissing = wp.getExpertMissingRanges(l, routed.expertIds);
+          if (expMissing.length > 0) {
+            onDetail?.(`Layer ${l + 1}/${layerCount} · loading experts`);
+            await backing.prefetchRanges(expMissing, { signal });
+          }
+          LlamaVTensorRuntime.throwIfAborted(signal);
+          layerPlan.moe.executeRouted(routed.count);
+          layerPlan.moe.residualNode.execute();
+        } else {
+          for (let n = 0; n < layerPlan.denseFfnNodes.length; n++) {
+            layerPlan.denseFfnNodes[n].execute();
+          }
+        }
+
+        if (performance.now() - tLayer0 >= 12) {
+          await this.yielder.yieldNow();
         }
       }
-
-      if (performance.now() - tLayer0 >= 12) {
-        await this.yielder.yieldNow();
+    } finally {
+      if (pendingNextLayerPrefetch) {
+        pendingNextLayerPrefetch.catch(() => {});
       }
     }
 
@@ -5031,50 +5119,68 @@ export class LlamaVTensorRuntime {
     }
 
     const layerCount = plan.layers.length;
-    for (let l = 0; l < layerCount; l++) {
-      LlamaVTensorRuntime.throwIfAborted(signal);
-      const tLayer0 = performance.now();
-      const layerPlan = plan.layers[l];
-      const layerMissing = wp.getLayerMissingRanges(l);
-      if (layerMissing.length > 0) {
-        onDetail?.(`Layer ${l + 1}/${layerCount}`);
-        await backing.prefetchRanges(layerMissing, { signal });
-      } else if (l === 0 || (l + 1) % 4 === 0 || l === layerCount - 1) {
-        onDetail?.(`Layer ${l + 1}/${layerCount}`);
-      }
-      LlamaVTensorRuntime.throwIfAborted(signal);
-
-      layerPlan.acquireNode?.execute();
-
-      for (let m = 0; m < microBatches; m++) {
+    let pendingNextLayerPrefetch: Promise<void> | null = null;
+    try {
+      for (let l = 0; l < layerCount; l++) {
         LlamaVTensorRuntime.throwIfAborted(signal);
-        const sliceStart = m * batchFloats;
-        bsXView.set(chunkX.subarray(sliceStart, sliceStart + batchFloats), 0);
-        this.batchExec.startPos = startPos + m * PREFILL_BATCH_SIZE;
-
-        for (let n = 0; n < layerPlan.preMoeNodes.length; n++) {
-          layerPlan.preMoeNodes[n].execute();
+        const tLayer0 = performance.now();
+        const layerPlan = plan.layers[l];
+        if (pendingNextLayerPrefetch) {
+          await pendingNextLayerPrefetch;
+          pendingNextLayerPrefetch = null;
         }
-        if (layerPlan.moe) {
-          const routed = layerPlan.moe.routeAndGetExperts();
-          const expMissing = wp.getExpertMissingRanges(l, routed.expertIds);
-          if (expMissing.length > 0) {
-            onDetail?.(`Layer ${l + 1}/${layerCount} · loading experts`);
-            await backing.prefetchRanges(expMissing, { signal });
+        const layerMissing = wp.getLayerMissingRanges(l);
+        if (layerMissing.length > 0) {
+          onDetail?.(`Layer ${l + 1}/${layerCount}`);
+          await backing.prefetchRanges(layerMissing, { signal });
+        } else if (l === 0 || (l + 1) % 4 === 0 || l === layerCount - 1) {
+          onDetail?.(`Layer ${l + 1}/${layerCount}`);
+        }
+        LlamaVTensorRuntime.throwIfAborted(signal);
+
+        layerPlan.acquireNode?.execute();
+        // Overlap OPFS/network prefetch of layer `l + 1` across ALL `microBatches` (up to 32 tokens!)
+        if (!layerPlan.moe && l + 1 < layerCount) {
+          const nextMissing = wp.getLayerMissingRanges(l + 1);
+          if (nextMissing.length > 0) {
+            pendingNextLayerPrefetch = backing.prefetchRanges(nextMissing, { signal });
           }
+        }
+
+        for (let m = 0; m < microBatches; m++) {
           LlamaVTensorRuntime.throwIfAborted(signal);
-          layerPlan.moe.executeRouted(routed.count);
-          layerPlan.moe.residualNode.execute();
-        } else {
-          for (let n = 0; n < layerPlan.denseFfnNodes.length; n++) {
-            layerPlan.denseFfnNodes[n].execute();
-          }
-        }
-        chunkX.set(bsXView, sliceStart);
-      }
+          const sliceStart = m * batchFloats;
+          bsXView.set(chunkX.subarray(sliceStart, sliceStart + batchFloats), 0);
+          this.batchExec.startPos = startPos + m * PREFILL_BATCH_SIZE;
 
-      if (performance.now() - tLayer0 >= 12) {
-        await this.yielder.yieldNow();
+          for (let n = 0; n < layerPlan.preMoeNodes.length; n++) {
+            layerPlan.preMoeNodes[n].execute();
+          }
+          if (layerPlan.moe) {
+            const routed = layerPlan.moe.routeAndGetExperts();
+            const expMissing = wp.getExpertMissingRanges(l, routed.expertIds);
+            if (expMissing.length > 0) {
+              onDetail?.(`Layer ${l + 1}/${layerCount} · loading experts`);
+              await backing.prefetchRanges(expMissing, { signal });
+            }
+            LlamaVTensorRuntime.throwIfAborted(signal);
+            layerPlan.moe.executeRouted(routed.count);
+            layerPlan.moe.residualNode.execute();
+          } else {
+            for (let n = 0; n < layerPlan.denseFfnNodes.length; n++) {
+              layerPlan.denseFfnNodes[n].execute();
+            }
+          }
+          chunkX.set(bsXView, sliceStart);
+        }
+
+        if (performance.now() - tLayer0 >= 12) {
+          await this.yielder.yieldNow();
+        }
+      }
+    } finally {
+      if (pendingNextLayerPrefetch) {
+        pendingNextLayerPrefetch.catch(() => {});
       }
     }
 

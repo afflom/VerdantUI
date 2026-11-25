@@ -7704,6 +7704,8 @@ export interface MoeExpertBatch4ParallelDispatch {
   readonly downPtrs: Int32Array;
   readonly masks: Uint8Array | Int32Array;
   readonly weights: Float32Array;
+  /** When true, adds the reduced result onto existing `outPtr` contents instead of overwriting. */
+  readonly accumulate?: boolean;
 }
 
 export interface VTensorThreadPoolLike {
