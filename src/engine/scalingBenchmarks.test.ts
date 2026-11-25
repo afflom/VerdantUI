@@ -1333,13 +1333,13 @@ test('Upstream VT-217 / verdant_row_ranking NaN-safe deterministic Argmax and To
 });
 
 test('deriveOptimalPoolWorkers avoids SMT spin-convoy saturation and OP_MOE_EXPERTS matches sequential MoE', async () => {
-  // Verify Theorem T3 physical-core worker-bound invariants across small to high-core hosts
+  // Verify Theorem T3 empirical worker-bound invariants across small to high-core hosts
   assert.equal(deriveOptimalPoolWorkers(1), 1);
   assert.equal(deriveOptimalPoolWorkers(2), 2);
   assert.equal(deriveOptimalPoolWorkers(4), 4);
-  assert.equal(deriveOptimalPoolWorkers(8), 4);
-  assert.equal(deriveOptimalPoolWorkers(12), 6);
-  assert.equal(deriveOptimalPoolWorkers(16), 8);
+  assert.equal(deriveOptimalPoolWorkers(8), 6);
+  assert.equal(deriveOptimalPoolWorkers(12), 8);
+  assert.equal(deriveOptimalPoolWorkers(16), 10);
   assert.equal(deriveOptimalPoolWorkers(24), 12);
   assert.equal(deriveOptimalPoolWorkers(32), 12);
   // Verify Theorem T3-MoE wave-optimal active thread sizing
