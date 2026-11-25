@@ -26,6 +26,14 @@ import {
   formatBytes,
   type CatalogModel,
 } from './modelCatalog';
+import {
+  VERDANT_HARNESS_MODES,
+  loadSavedHarnessMode,
+  resolveTierCatalogModel,
+  saveHarnessMode,
+  type VerdantHarnessMode,
+  type VerdantRuntimeTierId,
+} from './verdantHarness';
 import type { PrecisionContractMode } from './performanceContract';
 import type { OpfsQuotaSnapshot } from './vramBackingStore';
 import { trimToStableSpeculativePrefix } from './vramUnifiedStore';
@@ -67,6 +75,7 @@ export interface EngineState {
   readonly promptMode: PromptFormatMode;
   readonly precisionMode: PrecisionContractMode;
   readonly weightResidencyPolicy: WeightResidencyPolicy;
+  readonly harnessMode: VerdantHarnessMode;
   readonly importedHarness: ImportedHarnessSpec | null;
   readonly cachedModelIds: readonly string[];
   readonly opfsStorage: OpfsQuotaSnapshot;
@@ -232,6 +241,7 @@ export class LlamaVTensorWorkerClient {
   private speculativeWordTimer: ReturnType<typeof setTimeout> | null = null;
   private speculativeTailTimer: ReturnType<typeof setTimeout> | null = null;
   private lastSpeculativePrompt = '';
+  private activeSpeculativeThreadId: string | null = null;
   private readonly listeners = new Set<Listener>();
   private readonly pending = new Map<
     string,
@@ -260,6 +270,7 @@ export class LlamaVTensorWorkerClient {
   constructor() {
     const saved = loadSavedPrefs();
     const savedHarness = loadSavedHarness();
+    const savedHarnessMode = loadSavedHarnessMode();
     this.state = {
       status: 'idle',
       progressPercent: 0,
@@ -277,6 +288,7 @@ export class LlamaVTensorWorkerClient {
       promptMode: saved.promptMode,
       precisionMode: saved.precisionMode,
       weightResidencyPolicy: saved.weightResidencyPolicy,
+      harnessMode: savedHarnessMode,
       importedHarness: savedHarness,
       cachedModelIds: [],
       opfsStorage: INITIAL_OPFS_STORAGE,
@@ -601,17 +613,33 @@ export class LlamaVTensorWorkerClient {
     }
   }
 
-  private dispatchSpeculativePrefill(prompt: string): void {
+  private dispatchSpeculativePrefill(prompt: string, threadId?: string): void {
     if (this.state.status !== 'ready' || !this.state.model || !prompt) return;
     if (this.state.model.backingKind === 'opfs-demand') return;
-    if (prompt === this.lastSpeculativePrompt) return;
+    if (prompt === this.lastSpeculativePrompt && threadId === this.activeSpeculativeThreadId) return;
     this.lastSpeculativePrompt = prompt;
+    if (threadId !== undefined) {
+      this.activeSpeculativeThreadId = threadId;
+    }
     const requestId = this.nextRequestId('spec');
     this.worker.postMessage({
       type: 'speculative_prefill',
       requestId,
       prompt,
+      threadId,
     } satisfies WorkerRequest);
+  }
+
+  setHarnessMode(mode: VerdantHarnessMode): void {
+    if (this.state.harnessMode === mode) return;
+    saveHarnessMode(mode);
+    this.clearSpeculativeTimers();
+    this.lastSpeculativePrompt = '';
+    this.patchState({ harnessMode: mode });
+  }
+
+  async loadManagedTier(tierId: VerdantRuntimeTierId): Promise<LoadedModelSummary> {
+    return this.loadCatalogModel(resolveTierCatalogModel(tierId));
   }
 
   /**
@@ -621,14 +649,21 @@ export class LlamaVTensorWorkerClient {
     messages: readonly ThreadMessage[],
     draftText: string,
     systemMessage?: string,
+    threadId?: string,
   ): void {
     this.clearSpeculativeTimers();
+    if (threadId && this.activeSpeculativeThreadId && threadId !== this.activeSpeculativeThreadId) {
+      this.lastSpeculativePrompt = '';
+    }
     if (this.state.status !== 'ready' || !this.state.model) return;
     if (this.state.model.backingKind === 'opfs-demand') return;
 
     const model = this.state.model;
     const mode = this.state.importedHarness?.promptMode ?? this.state.promptMode;
-    const systemPrompt = systemMessage ?? this.state.importedHarness?.system;
+    const systemPrompt =
+      systemMessage ??
+      this.state.importedHarness?.system ??
+      VERDANT_HARNESS_MODES[this.state.harnessMode].system;
     const stableWordDraft = trimToStableSpeculativePrefix(draftText, false);
     const fullDraft = trimToStableSpeculativePrefix(draftText, true);
 
@@ -639,11 +674,11 @@ export class LlamaVTensorWorkerClient {
       mode,
       systemPrompt,
     );
-    if (wordPrompt && wordPrompt !== this.lastSpeculativePrompt) {
+    if (wordPrompt && (wordPrompt !== this.lastSpeculativePrompt || threadId !== this.activeSpeculativeThreadId)) {
       const delayMs = draftText.trim().length === 0 ? 60 : 160;
       this.speculativeWordTimer = setTimeout(() => {
         this.speculativeWordTimer = null;
-        this.dispatchSpeculativePrefill(wordPrompt);
+        this.dispatchSpeculativePrefill(wordPrompt, threadId);
       }, delayMs);
     }
 
@@ -655,10 +690,10 @@ export class LlamaVTensorWorkerClient {
         mode,
         systemPrompt,
       );
-      if (tailPrompt && tailPrompt !== this.lastSpeculativePrompt) {
+      if (tailPrompt && (tailPrompt !== this.lastSpeculativePrompt || threadId !== this.activeSpeculativeThreadId)) {
         this.speculativeTailTimer = setTimeout(() => {
           this.speculativeTailTimer = null;
-          this.dispatchSpeculativePrefill(tailPrompt);
+          this.dispatchSpeculativePrefill(tailPrompt, threadId);
         }, 460);
       }
     }
@@ -971,6 +1006,7 @@ export class LlamaVTensorWorkerClient {
     prompt: string,
     signal?: AbortSignal,
     samplingOverride?: SamplingConfig,
+    threadId?: string,
   ): AsyncGenerator<TokenStreamEvent, void, unknown> {
     if (!this.state.model) {
       throw new Error('Wait for the model to finish loading before sending a message.');
@@ -1033,6 +1069,7 @@ export class LlamaVTensorWorkerClient {
       requestId,
       prompt,
       sampling: samplingOverride ?? this.state.sampling,
+      threadId,
     };
     this.worker.postMessage(req);
 

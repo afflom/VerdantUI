@@ -1,15 +1,18 @@
 /**
- * Official @assistant-ui/react ChatModelAdapter connecting useLocalRuntime
+ * Official `@assistant-ui/react` `ChatModelAdapter` connecting `useLocalRuntime`
  * directly to the client-side Verdant inference worker.
  *
  * Strictly honors Assistant-UI's `ModelContext` (`context.system`, `context.callSettings`,
- * `context.config`):
- * - Never injects a fabricated/default system prompt when `context.system` is omitted.
- * - Parses reasoning traces (`<think>...</think>`, `<thought>...</thought>`) into official
- *   Assistant-UI `ReasoningMessagePart` (`type: 'reasoning'`) objects separate from
- *   user-facing `TextMessagePart` (`type: 'text'`) replies.
- * - Strips reasoning traces from prior assistant turns so multi-turn prompts stay clean.
- * - Includes text file attachments from `SimpleTextAttachmentAdapter`.
+ * `context.config`, `context.tools`) and `LocalThreadRuntimeCore` multi-step tool loop:
+ * - Passes `unstable_threadId` through to the worker so switching threads never conflates KV state.
+ * - Orchestrates native Qwen3 / thinking-model control prefixes (`<think>\n` for Thinking mode,
+ *   `<think>\n\n</think>\n\n` for Fast mode) so thinking models never get confused.
+ * - Parses reasoning traces (`<think>...</think>`, `<thought>...</thought>`, including prefilled
+ *   `startsInReasoning: true`) into official Assistant-UI `ReasoningMessagePart` objects.
+ * - Parses `<tool_call>...</tool_call>` blocks into official Assistant-UI `ToolCallMessagePart`
+ *   objects and yields `status: { type: 'requires-action', reason: 'tool-calls' }` so Assistant-UI's
+ *   `ToolInvocationTracker` executes client-side tools and resumes the next synthesis turn automatically.
+ * - Strips reasoning traces from prior assistant turns and includes text file attachments.
  */
 
 import type {
@@ -17,9 +20,16 @@ import type {
   ReasoningMessagePart,
   TextMessagePart,
   ThreadMessage,
+  ToolCallMessagePart,
 } from '@assistant-ui/react';
+import type { Tool } from 'assistant-stream';
+import type { ReadonlyJSONObject } from 'assistant-stream/utils';
 import { applyCallSettingsToSampling } from './harnessConfig';
 import type { LoadedModelSummary } from './llamaRuntime';
+import {
+  VERDANT_HARNESS_MODES,
+  type VerdantThinkingPolicy,
+} from './verdantHarness';
 import type { LlamaVTensorWorkerClient, PromptFormatMode } from './workerClient';
 
 export type DetectedChatTemplate =
@@ -32,11 +42,38 @@ export type DetectedChatTemplate =
   | 'continuation'
   | 'plain';
 
+export interface FormatPromptOptions {
+  /** Controls Qwen3/thinking model prefix (`'on'` -> `<think>\n`, `'off'` -> `<think>\n\n</think>\n\n`). */
+  readonly thinkingMode?: VerdantThinkingPolicy;
+  /** Optional Assistant-UI `ModelContext.tools` schemas serialized into `<tools>...</tools>`. */
+  readonly tools?: Record<string, Tool<any, any>>;
+  /** Optional in-progress assistant message from `unstable_getMessage()` carrying settled tool results for Step 2+. */
+  readonly pendingAssistantMessage?: ThreadMessage | null;
+}
+
+export interface ParseAssistantStreamOptions {
+  /** True when the prompt itself ended with `<think>\n` so generation begins inside a reasoning block. */
+  readonly startsInReasoning?: boolean;
+  /** True when Agentic tool calling is enabled and `<tool_call>...</tool_call>` should be parsed into ToolCallMessageParts. */
+  readonly parseToolCalls?: boolean;
+  /** Stable prefix used to generate deterministic `toolCallId`s within a single roundtrip. */
+  readonly idPrefix?: string;
+}
+
+export type ParsedAssistantContentPart =
+  | ReasoningMessagePart
+  | TextMessagePart
+  | ToolCallMessagePart;
+
 const REASONING_TAG_PAIRS: readonly { readonly open: string; readonly close: string }[] = [
   { open: '<think>', close: '</think>' },
   { open: '<thought>', close: '</thought>' },
   { open: '<|thought|>', close: '<|/thought|>' },
 ];
+
+const TOOL_CALL_OPEN = '<tool_call>';
+const TOOL_CALL_CLOSE = '</tool_call>';
+const TOOL_RESPONSE_OPEN = '<tool_response>';
 
 export function detectChatTemplate(
   model: Pick<LoadedModelSummary, 'id' | 'hparams'> | null | undefined,
@@ -58,7 +95,37 @@ export function detectChatTemplate(
   return 'plain';
 }
 
-function resolveEffectiveTemplate(
+/**
+ * Detects whether the loaded model natively uses `<think>...</think>` hybrid reasoning control
+ * (e.g., Qwen3 dense 4B/8B, QwQ, DeepSeek-R1) rather than pure non-thinking instruct models.
+ */
+export function isThinkingCapableModel(
+  modelOrId?: Pick<LoadedModelSummary, 'id' | 'hparams'> | string | null,
+): boolean {
+  if (!modelOrId) return false;
+  if (typeof modelOrId === 'string') {
+    const lower = modelOrId.toLowerCase();
+    if (lower.includes('coder')) return false;
+    return (
+      lower.includes('qwen3') ||
+      lower.includes('qwq') ||
+      lower.includes('deepseek-r1') ||
+      lower.includes('thinking')
+    );
+  }
+  const tmpl = (modelOrId.hparams.chatTemplate ?? '').toLowerCase();
+  if (tmpl.includes('<think>')) return true;
+  const hay = `${modelOrId.id} ${modelOrId.hparams.name}`.toLowerCase();
+  if (hay.includes('coder')) return false;
+  return (
+    hay.includes('qwen3') ||
+    hay.includes('qwq') ||
+    hay.includes('deepseek-r1') ||
+    hay.includes('thinking')
+  );
+}
+
+export function resolveEffectiveTemplate(
   modelOrId?: Pick<LoadedModelSummary, 'id' | 'hparams'> | string,
   mode: PromptFormatMode = 'auto',
 ): DetectedChatTemplate {
@@ -69,6 +136,28 @@ function resolveEffectiveTemplate(
     return modelOrId.toLowerCase().includes('stories') ? 'continuation' : 'plain';
   }
   return detectChatTemplate(modelOrId);
+}
+
+/** Returns true when `formatMessagesForLlama` prefills `<think>\n` for this model & thinking policy. */
+export function shouldPrefillOpenThink(
+  modelOrId?: Pick<LoadedModelSummary, 'id' | 'hparams'> | string | null,
+  mode: PromptFormatMode = 'auto',
+  thinkingMode: VerdantThinkingPolicy = 'auto',
+): boolean {
+  if (thinkingMode !== 'on') return false;
+  const tmpl = resolveEffectiveTemplate(modelOrId ?? undefined, mode);
+  return tmpl === 'chatml' && isThinkingCapableModel(modelOrId);
+}
+
+/** Returns true when `formatMessagesForLlama` prefills `<think>\n\n</think>\n\n` to disable monologue in Fast mode. */
+export function shouldPrefillEmptyThink(
+  modelOrId?: Pick<LoadedModelSummary, 'id' | 'hparams'> | string | null,
+  mode: PromptFormatMode = 'auto',
+  thinkingMode: VerdantThinkingPolicy = 'auto',
+): boolean {
+  if (thinkingMode !== 'off') return false;
+  const tmpl = resolveEffectiveTemplate(modelOrId ?? undefined, mode);
+  return tmpl === 'chatml' && isThinkingCapableModel(modelOrId);
 }
 
 /**
@@ -87,8 +176,38 @@ export function stripReasoningTags(text: string): string {
 }
 
 /**
+ * Serializes Assistant-UI `ModelContext.tools` into standard Hermes/Qwen3 `<tools>` JSON schemas.
+ */
+export function formatToolDeclarations(tools?: Record<string, Tool<any, any>>): string {
+  if (!tools) return '';
+  const entries = Object.entries(tools).filter(([, t]) => !t.disabled);
+  if (entries.length === 0) return '';
+  const specs = entries.map(([name, t]) => ({
+    type: 'function',
+    function: {
+      name,
+      description: t.description ?? `Execute ${name}`,
+      parameters:
+        t.parameters && typeof t.parameters === 'object'
+          ? t.parameters
+          : { type: 'object', properties: {} },
+    },
+  }));
+  return `<tools>\n${specs.map((s) => JSON.stringify(s)).join('\n')}\n</tools>`;
+}
+
+/** Returns true once raw output contains a completed `</tool_call>` block so generation can stop cleanly. */
+export function hasCompleteToolCallTag(rawText: string): boolean {
+  const lower = rawText.toLowerCase();
+  const openIdx = lower.indexOf(TOOL_CALL_OPEN);
+  if (openIdx === -1) return false;
+  const closeIdx = lower.indexOf(TOOL_CALL_CLOSE, openIdx + TOOL_CALL_OPEN.length);
+  return closeIdx !== -1;
+}
+
+/**
  * Computes the length of the longest suffix of `text` that is a strict prefix of any
- * tag in `tags` (case-insensitive), so streaming chunks never flash partial `<thi` or `</thi`
+ * tag in `tags` (case-insensitive), so streaming chunks never flash partial `<thi` or `</tool_`
  * fragments before the tag completes.
  */
 function trailingPartialTagLength(text: string, tags: readonly string[]): number {
@@ -106,36 +225,106 @@ function trailingPartialTagLength(text: string, tags: readonly string[]): number
   return maxLen;
 }
 
+function parseToolCallJson(
+  rawInner: string,
+  toolCallId: string,
+): ToolCallMessagePart | null {
+  const cleaned = rawInner
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+  if (!cleaned) return null;
+  try {
+    const parsed = JSON.parse(cleaned) as {
+      name?: unknown;
+      arguments?: unknown;
+      args?: unknown;
+      parameters?: unknown;
+    };
+    if (!parsed || typeof parsed !== 'object' || typeof parsed.name !== 'string') {
+      return null;
+    }
+    const toolName = parsed.name.trim();
+    if (!toolName) return null;
+    const rawArgs = parsed.arguments ?? parsed.args ?? parsed.parameters ?? {};
+    let argsObj: ReadonlyJSONObject;
+    if (typeof rawArgs === 'string') {
+      try {
+        const reparsed = JSON.parse(rawArgs);
+        argsObj =
+          reparsed && typeof reparsed === 'object' && !Array.isArray(reparsed)
+            ? (reparsed as ReadonlyJSONObject)
+            : {};
+      } catch {
+        argsObj = {};
+      }
+    } else if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) {
+      argsObj = rawArgs as ReadonlyJSONObject;
+    } else {
+      argsObj = {};
+    }
+    return {
+      type: 'tool-call',
+      toolCallId,
+      toolName,
+      args: argsObj,
+      argsText: JSON.stringify(argsObj),
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Incrementally parses raw streamed model output into official Assistant-UI content parts:
  * - `{ type: 'reasoning', text }` for `<think>...</think>` / `<thought>...</thought>` blocks
+ * - `{ type: 'tool-call', toolCallId, toolName, args, argsText }` for `<tool_call>...</tool_call>` blocks
  * - `{ type: 'text', text }` for visible answer text
  *
- * When `isComplete` is false (during streaming), partial tag prefixes at the tail are safely
- * held back until disambiguated, and an open `<think>` block streams live into a `reasoning` part.
+ * Supports `startsInReasoning: true` (when the prompt itself prefilled `<think>\n`) and holds back
+ * incomplete tag tails during streaming.
  */
 export function parseAssistantStreamParts(
   rawText: string,
   isComplete = false,
-): readonly (ReasoningMessagePart | TextMessagePart)[] {
+  options?: ParseAssistantStreamOptions,
+): readonly ParsedAssistantContentPart[] {
   if (!rawText) return [];
 
-  const openTags = REASONING_TAG_PAIRS.map((p) => p.open);
-  const parts: Array<ReasoningMessagePart | TextMessagePart> = [];
-  let cursor = 0;
-  let activeCloseTag: string | null = null;
-  let afterReasoningBlock = false;
+  const parseTools = Boolean(options?.parseToolCalls);
+  const idPrefix = options?.idPrefix ?? 'tc';
 
-  const pushPart = (type: 'reasoning' | 'text', slice: string) => {
+  // Truncate any hallucinated `<tool_response>` if the model tried to fabricate a tool output
+  let workingText = rawText;
+  if (parseTools) {
+    const respIdx = workingText.toLowerCase().indexOf(TOOL_RESPONSE_OPEN);
+    if (respIdx !== -1) {
+      workingText = workingText.slice(0, respIdx);
+    }
+  }
+  if (!workingText) return [];
+
+  const openTags = parseTools
+    ? [...REASONING_TAG_PAIRS.map((p) => p.open), TOOL_CALL_OPEN, TOOL_RESPONSE_OPEN]
+    : REASONING_TAG_PAIRS.map((p) => p.open);
+  const parts: ParsedAssistantContentPart[] = [];
+  let cursor = 0;
+  let activeMode: 'text' | 'reasoning' | 'tool-call' = options?.startsInReasoning ? 'reasoning' : 'text';
+  let activeCloseTag: string | null = options?.startsInReasoning ? '</think>' : null;
+  let afterBlock = false;
+  let toolSeq = 0;
+
+  const pushTextOrReasoning = (type: 'reasoning' | 'text', slice: string) => {
     const normalized =
       type === 'reasoning'
         ? slice.trim()
-        : afterReasoningBlock
+        : afterBlock
           ? slice.replace(/^\s+/, '')
           : slice;
     if (!normalized) return;
     if (type === 'text') {
-      afterReasoningBlock = false;
+      afterBlock = false;
     }
     const prev = parts[parts.length - 1];
     if (prev && prev.type === type) {
@@ -148,114 +337,227 @@ export function parseAssistantStreamParts(
     }
   };
 
-  const lower = rawText.toLowerCase();
+  const lower = workingText.toLowerCase();
 
-  while (cursor < rawText.length) {
-    if (activeCloseTag === null) {
-      // Find the earliest opening reasoning tag at or after cursor
+  while (cursor < workingText.length) {
+    if (activeMode === 'text') {
       let bestIdx = -1;
-      let bestPair: { readonly open: string; readonly close: string } | null = null;
+      let bestKind: 'reasoning' | 'tool-call' = 'reasoning';
+      let bestOpenLen = 0;
+      let bestClose = '';
+
       for (const pair of REASONING_TAG_PAIRS) {
         const idx = lower.indexOf(pair.open, cursor);
         if (idx !== -1 && (bestIdx === -1 || idx < bestIdx)) {
           bestIdx = idx;
-          bestPair = pair;
+          bestKind = 'reasoning';
+          bestOpenLen = pair.open.length;
+          bestClose = pair.close;
         }
       }
 
-      if (bestIdx === -1 || !bestPair) {
-        const remaining = rawText.slice(cursor);
+      if (parseTools) {
+        const tcIdx = lower.indexOf(TOOL_CALL_OPEN, cursor);
+        if (tcIdx !== -1 && (bestIdx === -1 || tcIdx < bestIdx)) {
+          bestIdx = tcIdx;
+          bestKind = 'tool-call';
+          bestOpenLen = TOOL_CALL_OPEN.length;
+          bestClose = TOOL_CALL_CLOSE;
+        }
+      }
+
+      if (bestIdx === -1) {
+        const remaining = workingText.slice(cursor);
         const holdback = isComplete ? 0 : trailingPartialTagLength(remaining, openTags);
         const safeText = holdback > 0 ? remaining.slice(0, remaining.length - holdback) : remaining;
-        pushPart('text', safeText);
+        pushTextOrReasoning('text', safeText);
         break;
       }
 
       if (bestIdx > cursor) {
-        pushPart('text', rawText.slice(cursor, bestIdx));
+        pushTextOrReasoning('text', workingText.slice(cursor, bestIdx));
       }
-      cursor = bestIdx + bestPair.open.length;
-      activeCloseTag = bestPair.close;
-    } else {
-      const closeIdx = lower.indexOf(activeCloseTag, cursor);
+      cursor = bestIdx + bestOpenLen;
+      activeMode = bestKind;
+      activeCloseTag = bestClose;
+    } else if (activeMode === 'reasoning') {
+      const closeTag = activeCloseTag!;
+      const closeIdx = lower.indexOf(closeTag, cursor);
       if (closeIdx === -1) {
-        const remaining = rawText.slice(cursor);
-        const holdback = isComplete ? 0 : trailingPartialTagLength(remaining, [activeCloseTag]);
+        const remaining = workingText.slice(cursor);
+        const holdback = isComplete ? 0 : trailingPartialTagLength(remaining, [closeTag]);
         const safeReasoning =
           holdback > 0 ? remaining.slice(0, remaining.length - holdback) : remaining;
         if (safeReasoning.trim().length > 0) {
-          pushPart('reasoning', safeReasoning);
+          pushTextOrReasoning('reasoning', safeReasoning);
         }
         break;
       }
 
-      const reasoningSlice = rawText.slice(cursor, closeIdx);
+      const reasoningSlice = workingText.slice(cursor, closeIdx);
       if (reasoningSlice.trim().length > 0) {
-        pushPart('reasoning', reasoningSlice);
+        pushTextOrReasoning('reasoning', reasoningSlice);
       }
-      cursor = closeIdx + activeCloseTag.length;
+      cursor = closeIdx + closeTag.length;
+      activeMode = 'text';
       activeCloseTag = null;
-      afterReasoningBlock = true;
+      afterBlock = true;
+    } else {
+      // activeMode === 'tool-call'
+      const closeIdx = lower.indexOf(TOOL_CALL_CLOSE, cursor);
+      if (closeIdx === -1) {
+        // Hold back incomplete `<tool_call>` JSON until `</tool_call>` arrives (or emit raw text if truncated on complete)
+        if (isComplete) {
+          const fallbackParsed = parseToolCallJson(workingText.slice(cursor), `${idPrefix}_${toolSeq}`);
+          if (fallbackParsed) {
+            toolSeq += 1;
+            parts.push(fallbackParsed);
+          }
+        }
+        break;
+      }
+
+      const inner = workingText.slice(cursor, closeIdx);
+      const parsedCall = parseToolCallJson(inner, `${idPrefix}_${toolSeq}`);
+      if (parsedCall) {
+        toolSeq += 1;
+        parts.push(parsedCall);
+      }
+      cursor = closeIdx + TOOL_CALL_CLOSE.length;
+      activeMode = 'text';
+      activeCloseTag = null;
+      afterBlock = true;
     }
   }
 
   return parts;
 }
 
+interface ExtractedTurn {
+  readonly role: 'system' | 'user' | 'assistant' | 'tool';
+  readonly text: string;
+}
+
+function serializeToolResultPayload(part: ToolCallMessagePart): string {
+  const payload = part.isError
+    ? { name: part.toolName, error: part.result ?? 'Tool execution failed.' }
+    : { name: part.toolName, result: part.result ?? null };
+  return `<tool_response>\n${JSON.stringify(payload)}\n</tool_response>`;
+}
+
 function extractTurns(
   messages: readonly ThreadMessage[],
-): Array<{ role: 'system' | 'user' | 'assistant'; text: string }> {
-  const extractText = (msg: ThreadMessage): string => {
-    const contentChunks = msg.content
-      .filter((part): part is { type: 'text'; text: string } => part.type === 'text')
-      .map((part) => part.text);
+  pendingAssistantMessage?: ThreadMessage | null,
+): ExtractedTurn[] {
+  const allMessages =
+    pendingAssistantMessage &&
+    pendingAssistantMessage.role === 'assistant' &&
+    pendingAssistantMessage.content.length > 0 &&
+    !messages.some((m) => m.id === pendingAssistantMessage.id)
+      ? [...messages, pendingAssistantMessage]
+      : messages;
 
-    // Include text file attachments attached via Assistant-UI's SimpleTextAttachmentAdapter
-    if (msg.role === 'user' && Array.isArray(msg.attachments)) {
-      for (const att of msg.attachments) {
-        if (!Array.isArray(att.content)) continue;
-        const attText = (att.content as readonly { type?: string; text?: string }[])
-          .filter((p): p is { type: 'text'; text: string } => p.type === 'text' && typeof p.text === 'string')
-          .map((p) => p.text)
-          .join('\n')
-          .trim();
-        if (attText) {
-          contentChunks.push(`[Attached file: ${att.name}]\n${attText}`);
+  const turns: ExtractedTurn[] = [];
+
+  for (const m of allMessages) {
+    if (m.role === 'user' || m.role === 'system') {
+      const contentChunks = (m.content as readonly { type?: string; text?: string }[])
+        .filter(
+          (part): part is { type: 'text'; text: string } =>
+            part.type === 'text' && typeof part.text === 'string',
+        )
+        .map((part) => part.text);
+
+      // Include text file attachments attached via Assistant-UI's SimpleTextAttachmentAdapter
+      if (m.role === 'user' && Array.isArray(m.attachments)) {
+        for (const att of m.attachments) {
+          if (!Array.isArray(att.content)) continue;
+          const attText = (att.content as readonly { type?: string; text?: string }[])
+            .filter((p): p is { type: 'text'; text: string } => p.type === 'text' && typeof p.text === 'string')
+            .map((p) => p.text)
+            .join('\n')
+            .trim();
+          if (attText) {
+            contentChunks.push(`[Attached file: ${att.name}]\n${attText}`);
+          }
         }
       }
+
+      const joined = contentChunks.join('\n').trim();
+      if (joined) {
+        turns.push({ role: m.role, text: joined });
+      }
+      continue;
     }
 
-    const joined = contentChunks.join('\n').trim();
-    return msg.role === 'assistant' ? stripReasoningTags(joined) : joined;
-  };
+    if (m.role === 'assistant') {
+      // Preserve sequential assistant text / tool-call / tool-response interleaving across multi-step agent runs
+      let pendingAssistantChunks: string[] = [];
+      let pendingToolResponses: string[] = [];
 
-  const turns: Array<{ role: 'system' | 'user' | 'assistant'; text: string }> = [];
-  for (const m of messages) {
-    const text = extractText(m);
-    if (!text) continue;
-    if (m.role === 'user' || m.role === 'assistant' || m.role === 'system') {
-      turns.push({ role: m.role, text });
+      const flushAssistantAndTools = () => {
+        const aText = pendingAssistantChunks.join('\n').trim();
+        if (aText) {
+          turns.push({ role: 'assistant', text: aText });
+        }
+        pendingAssistantChunks = [];
+        if (pendingToolResponses.length > 0) {
+          turns.push({ role: 'tool', text: pendingToolResponses.join('\n') });
+          pendingToolResponses = [];
+        }
+      };
+
+      for (const part of m.content) {
+        if (part.type === 'text') {
+          const clean = stripReasoningTags(part.text);
+          if (clean) {
+            if (pendingToolResponses.length > 0) {
+              flushAssistantAndTools();
+            }
+            pendingAssistantChunks.push(clean);
+          }
+        } else if (part.type === 'tool-call') {
+          const callJson = JSON.stringify({ name: part.toolName, arguments: part.args ?? {} });
+          pendingAssistantChunks.push(`${TOOL_CALL_OPEN}\n${callJson}\n${TOOL_CALL_CLOSE}`);
+          if (part.result !== undefined) {
+            pendingToolResponses.push(serializeToolResultPayload(part));
+          }
+        }
+      }
+      flushAssistantAndTools();
     }
   }
+
   return turns;
+}
+
+function buildEffectiveSystemPrompt(
+  explicitSystem: string,
+  tools?: Record<string, Tool<any, any>>,
+): string {
+  const toolBlock = formatToolDeclarations(tools);
+  if (!toolBlock) return explicitSystem;
+  return explicitSystem ? `${explicitSystem}\n\n${toolBlock}` : toolBlock;
 }
 
 /**
  * Formats assistant-ui ThreadMessage history into the exact prompt format expected
  * by the loaded GGUF model (ChatML, Llama-3, Gemma, Phi-3, Zephyr, Llama-2, or continuation).
  *
- * Strictly emits a `system` block ONLY when a non-empty `systemPrompt` is explicitly supplied
- * via Assistant-UI's `ModelContext` (or already present as a `role: 'system'` message).
+ * Strictly emits a `system` block ONLY when a non-empty `systemPrompt` or `options.tools` is
+ * supplied via Assistant-UI's `ModelContext` (or already present as a `role: 'system'` message).
  */
 export function formatMessagesForLlama(
   messages: readonly ThreadMessage[],
   modelOrId?: Pick<LoadedModelSummary, 'id' | 'hparams'> | string,
   mode: PromptFormatMode = 'auto',
   systemPrompt?: string,
+  options?: FormatPromptOptions,
 ): string {
-  const explicitSystem = systemPrompt?.trim() || '';
-  const turns = extractTurns(messages);
+  const explicitSystem = buildEffectiveSystemPrompt(systemPrompt?.trim() || '', options?.tools);
+  const turns = extractTurns(messages, options?.pendingAssistantMessage);
   const effectiveTemplate = resolveEffectiveTemplate(modelOrId, mode);
+  const thinkingMode = options?.thinkingMode ?? 'auto';
 
   if (effectiveTemplate === 'continuation') {
     const parts = turns.map((t) => t.text);
@@ -271,9 +573,16 @@ export function formatMessagesForLlama(
       chunks.push(`<|im_start|>system\n${explicitSystem}<|im_end|>\n`);
     }
     for (const t of turns) {
-      chunks.push(`<|im_start|>${t.role}\n${t.text}<|im_end|>\n`);
+      const chatRole = t.role === 'tool' ? 'user' : t.role;
+      chunks.push(`<|im_start|>${chatRole}\n${t.text}<|im_end|>\n`);
     }
-    chunks.push('<|im_start|>assistant\n');
+    if (shouldPrefillOpenThink(modelOrId, mode, thinkingMode)) {
+      chunks.push('<|im_start|>assistant\n<think>\n');
+    } else if (shouldPrefillEmptyThink(modelOrId, mode, thinkingMode)) {
+      chunks.push('<|im_start|>assistant\n<think>\n\n</think>\n\n');
+    } else {
+      chunks.push('<|im_start|>assistant\n');
+    }
     return chunks.join('');
   }
 
@@ -284,7 +593,8 @@ export function formatMessagesForLlama(
       chunks.push(`<|start_header_id|>system<|end_header_id|>\n\n${explicitSystem}<|eot_id|>`);
     }
     for (const t of turns) {
-      chunks.push(`<|start_header_id|>${t.role}<|end_header_id|>\n\n${t.text}<|eot_id|>`);
+      const role = t.role === 'tool' ? 'ipython' : t.role;
+      chunks.push(`<|start_header_id|>${role}<|end_header_id|>\n\n${t.text}<|eot_id|>`);
     }
     chunks.push('<|start_header_id|>assistant<|end_header_id|>\n\n');
     return chunks.join('');
@@ -314,7 +624,8 @@ export function formatMessagesForLlama(
       chunks.push(`<|system|>\n${explicitSystem}<|end|>\n`);
     }
     for (const t of turns) {
-      chunks.push(`<|${t.role}|>\n${t.text}<|end|>\n`);
+      const role = t.role === 'tool' ? 'user' : t.role;
+      chunks.push(`<|${role}|>\n${t.text}<|end|>\n`);
     }
     chunks.push('<|assistant|>\n');
     return chunks.join('');
@@ -327,7 +638,8 @@ export function formatMessagesForLlama(
       chunks.push(`<|system|>\n${explicitSystem}</s>\n`);
     }
     for (const t of turns) {
-      chunks.push(`<|${t.role}|>\n${t.text}</s>\n`);
+      const role = t.role === 'tool' ? 'user' : t.role;
+      chunks.push(`<|${role}|>\n${t.text}</s>\n`);
     }
     chunks.push('<|assistant|>\n');
     return chunks.join('');
@@ -341,7 +653,7 @@ export function formatMessagesForLlama(
         pendingSystem = pendingSystem ? `${pendingSystem}\n\n${t.text}` : t.text;
         continue;
       }
-      if (t.role === 'user') {
+      if (t.role === 'user' || t.role === 'tool') {
         const body = pendingSystem ? `<<SYS>>\n${pendingSystem}\n<</SYS>>\n\n${t.text}` : t.text;
         pendingSystem = '';
         chunks.push(`[INST] ${body} [/INST]`);
@@ -361,7 +673,7 @@ export function formatMessagesForLlama(
   for (const t of turns) {
     if (t.role === 'system') {
       lines.push(`System: ${t.text}`);
-    } else if (t.role === 'user') {
+    } else if (t.role === 'user' || t.role === 'tool') {
       lines.push(`User: ${t.text}`);
     } else if (t.role === 'assistant') {
       lines.push(`Assistant: ${t.text}`);
@@ -376,8 +688,8 @@ export function formatMessagesForLlama(
  * (or at boot when `draftPrefix === ''`).
  *
  * Invariant: for every chat template and any `fullText` whose `.trim()` starts with
- * `draftPrefix.trimStart()`, `formatMessagesForLlama([...messages, user(fullText)], model, mode, systemPrompt)`
- * strictly `startsWith(formatSpeculativePrefixForLlama(messages, draftPrefix, model, mode, systemPrompt))`!
+ * `draftPrefix.trimStart()`, `formatMessagesForLlama([...messages, user(fullText)], model, mode, systemPrompt, options)`
+ * strictly `startsWith(formatSpeculativePrefixForLlama(messages, draftPrefix, model, mode, systemPrompt, options))`!
  */
 export function formatSpeculativePrefixForLlama(
   messages: readonly ThreadMessage[],
@@ -385,8 +697,9 @@ export function formatSpeculativePrefixForLlama(
   modelOrId?: Pick<LoadedModelSummary, 'id' | 'hparams'> | string,
   mode: PromptFormatMode = 'auto',
   systemPrompt?: string,
+  options?: Pick<FormatPromptOptions, 'tools'>,
 ): string {
-  const explicitSystem = systemPrompt?.trim() || '';
+  const explicitSystem = buildEffectiveSystemPrompt(systemPrompt?.trim() || '', options?.tools);
   const turns = extractTurns(messages);
   const effectiveTemplate = resolveEffectiveTemplate(modelOrId, mode);
   const openDraft = draftPrefix.trimStart();
@@ -404,7 +717,8 @@ export function formatSpeculativePrefixForLlama(
       chunks.push(`<|im_start|>system\n${explicitSystem}<|im_end|>\n`);
     }
     for (const t of turns) {
-      chunks.push(`<|im_start|>${t.role}\n${t.text}<|im_end|>\n`);
+      const chatRole = t.role === 'tool' ? 'user' : t.role;
+      chunks.push(`<|im_start|>${chatRole}\n${t.text}<|im_end|>\n`);
     }
     chunks.push(`<|im_start|>user\n${openDraft}`);
     return chunks.join('');
@@ -417,7 +731,8 @@ export function formatSpeculativePrefixForLlama(
       chunks.push(`<|start_header_id|>system<|end_header_id|>\n\n${explicitSystem}<|eot_id|>`);
     }
     for (const t of turns) {
-      chunks.push(`<|start_header_id|>${t.role}<|end_header_id|>\n\n${t.text}<|eot_id|>`);
+      const role = t.role === 'tool' ? 'ipython' : t.role;
+      chunks.push(`<|start_header_id|>${role}<|end_header_id|>\n\n${t.text}<|eot_id|>`);
     }
     chunks.push(`<|start_header_id|>user<|end_header_id|>\n\n${openDraft}`);
     return chunks.join('');
@@ -448,7 +763,8 @@ export function formatSpeculativePrefixForLlama(
       chunks.push(`<|system|>\n${explicitSystem}<|end|>\n`);
     }
     for (const t of turns) {
-      chunks.push(`<|${t.role}|>\n${t.text}<|end|>\n`);
+      const role = t.role === 'tool' ? 'user' : t.role;
+      chunks.push(`<|${role}|>\n${t.text}<|end|>\n`);
     }
     chunks.push(`<|user|>\n${openDraft}`);
     return chunks.join('');
@@ -461,7 +777,8 @@ export function formatSpeculativePrefixForLlama(
       chunks.push(`<|system|>\n${explicitSystem}</s>\n`);
     }
     for (const t of turns) {
-      chunks.push(`<|${t.role}|>\n${t.text}</s>\n`);
+      const role = t.role === 'tool' ? 'user' : t.role;
+      chunks.push(`<|${role}|>\n${t.text}</s>\n`);
     }
     chunks.push(`<|user|>\n${openDraft}`);
     return chunks.join('');
@@ -475,7 +792,7 @@ export function formatSpeculativePrefixForLlama(
         pendingSystem = pendingSystem ? `${pendingSystem}\n\n${t.text}` : t.text;
         continue;
       }
-      if (t.role === 'user') {
+      if (t.role === 'user' || t.role === 'tool') {
         const body = pendingSystem ? `<<SYS>>\n${pendingSystem}\n<</SYS>>\n\n${t.text}` : t.text;
         pendingSystem = '';
         chunks.push(`[INST] ${body} [/INST]`);
@@ -497,7 +814,7 @@ export function formatSpeculativePrefixForLlama(
   for (const t of turns) {
     if (t.role === 'system') {
       lines.push(`System: ${t.text}`);
-    } else if (t.role === 'user') {
+    } else if (t.role === 'user' || t.role === 'tool') {
       lines.push(`User: ${t.text}`);
     } else if (t.role === 'assistant') {
       lines.push(`Assistant: ${t.text}`);
@@ -507,31 +824,84 @@ export function formatSpeculativePrefixForLlama(
   return lines.join('\n');
 }
 
+function resolveThinkingPolicy(
+  harnessMode: keyof typeof VERDANT_HARNESS_MODES,
+  reasoningEffort?: string,
+): VerdantThinkingPolicy {
+  const effort = reasoningEffort?.toLowerCase();
+  if (effort === 'none' || effort === 'off' || effort === 'low') return 'off';
+  if (effort === 'high') return 'on';
+  return VERDANT_HARNESS_MODES[harnessMode].thinkingPolicy;
+}
+
 export function createLlamaVTensorAdapter(
   client: LlamaVTensorWorkerClient,
 ): ChatModelAdapter {
+  let roundtripSeq = 0;
+
   return {
-    async *run({ messages, abortSignal, context }) {
+    async *run({
+      messages,
+      abortSignal,
+      context,
+      unstable_threadId,
+      unstable_getMessage,
+    }) {
       const state = client.getState();
       if (!state.model) {
         throw new Error('Model is still loading. Please wait a moment and try again.');
       }
 
+      roundtripSeq += 1;
+      const stepIdPrefix = `tc_${Date.now().toString(36)}_${roundtripSeq}`;
+      const harnessSpec = VERDANT_HARNESS_MODES[state.harnessMode];
+      const activeTools = context?.tools && Object.keys(context.tools).length > 0 ? context.tools : undefined;
+      const parseToolCalls = Boolean(activeTools);
+
       // Strictly read system instructions and callSettings from Assistant-UI's ModelContext
       const systemMessage = context?.system;
+      const baseWithHarness = {
+        ...state.sampling,
+        topK: state.importedHarness?.topK ?? harnessSpec.topK,
+        repeatPenalty: state.importedHarness?.repeatPenalty ?? harnessSpec.repeatPenalty,
+      };
       const effectiveSampling = applyCallSettingsToSampling(
-        state.sampling,
+        baseWithHarness,
         context?.callSettings,
         state.importedHarness,
       );
       const effectivePromptMode = state.importedHarness?.promptMode ?? state.promptMode;
+      const thinkingPolicy = resolveThinkingPolicy(
+        state.harnessMode,
+        context?.config?.reasoningEffort,
+      );
+      const pendingAssistantMessage = unstable_getMessage ? unstable_getMessage() : null;
+      const startsInReasoning = shouldPrefillOpenThink(
+        state.model,
+        effectivePromptMode,
+        thinkingPolicy,
+      );
 
       const prompt = formatMessagesForLlama(
         messages,
         state.model,
         effectivePromptMode,
         systemMessage,
+        {
+          thinkingMode: thinkingPolicy,
+          tools: activeTools,
+          pendingAssistantMessage,
+        },
       );
+
+      // Link an internal controller so Agentic tool calls stop cleanly right after `</tool_call>`
+      const runController = new AbortController();
+      const onExternalAbort = () => runController.abort();
+      if (abortSignal.aborted) {
+        runController.abort();
+      } else {
+        abortSignal.addEventListener('abort', onExternalAbort, { once: true });
+      }
 
       const streamStartTime = Date.now();
       let firstTokenTime: number | undefined;
@@ -540,40 +910,83 @@ export function createLlamaVTensorAdapter(
       let lastGeneratedTokens = 0;
       let lastTokensPerSecond = 0;
 
-      for await (const event of client.streamGenerate(prompt, abortSignal, effectiveSampling)) {
-        if (firstTokenTime === undefined) {
-          firstTokenTime = Date.now();
-        }
-        totalChunks += 1;
-        latestText = event.accumulatedText;
-        lastGeneratedTokens = event.generatedTokens;
-        lastTokensPerSecond = event.tokensPerSecond;
+      try {
+        for await (const event of client.streamGenerate(
+          prompt,
+          runController.signal,
+          effectiveSampling,
+          unstable_threadId,
+        )) {
+          if (firstTokenTime === undefined) {
+            firstTokenTime = Date.now();
+          }
+          totalChunks += 1;
+          latestText = event.accumulatedText;
+          lastGeneratedTokens = event.generatedTokens;
+          lastTokensPerSecond = event.tokensPerSecond;
 
-        const parts = parseAssistantStreamParts(latestText, false);
-        if (parts.length > 0) {
-          yield {
-            content: parts,
-            metadata: {
-              timing: {
-                streamStartTime,
-                firstTokenTime,
-                tokenCount: lastGeneratedTokens,
-                tokensPerSecond: lastTokensPerSecond,
-                totalChunks,
-                toolCallCount: 0,
+          const parts = parseAssistantStreamParts(latestText, false, {
+            startsInReasoning,
+            parseToolCalls,
+            idPrefix: stepIdPrefix,
+          });
+          const completedToolCall = parseToolCalls && hasCompleteToolCallTag(latestText);
+          const toolCallCount = parts.filter((p) => p.type === 'tool-call').length;
+
+          if (parts.length > 0 && !completedToolCall) {
+            yield {
+              content: parts,
+              metadata: {
+                timing: {
+                  streamStartTime,
+                  firstTokenTime,
+                  tokenCount: lastGeneratedTokens,
+                  tokensPerSecond: lastTokensPerSecond,
+                  totalChunks,
+                  toolCallCount,
+                },
               },
-            },
-          };
+            };
+          }
+
+          if (completedToolCall) {
+            // Stop generation right after `</tool_call>` so the model never fabricates `<tool_response>`
+            runController.abort();
+            break;
+          }
         }
+      } finally {
+        abortSignal.removeEventListener('abort', onExternalAbort);
       }
 
-      const finalParts = parseAssistantStreamParts(latestText, true);
+      if (abortSignal.aborted) {
+        return;
+      }
+
+      const finalParts = parseAssistantStreamParts(latestText, true, {
+        startsInReasoning,
+        parseToolCalls,
+        idPrefix: stepIdPrefix,
+      });
       const totalStreamTime = Date.now() - streamStartTime;
+      const toolCallsEmitted = finalParts.filter((p) => p.type === 'tool-call');
+      const hasToolCalls = toolCallsEmitted.length > 0;
 
       if (finalParts.length > 0) {
         yield {
           content: finalParts,
+          status: hasToolCalls
+            ? { type: 'requires-action', reason: 'tool-calls' }
+            : { type: 'complete', reason: 'stop' },
           metadata: {
+            steps: [
+              {
+                usage: {
+                  inputTokens: 0,
+                  outputTokens: lastGeneratedTokens,
+                },
+              },
+            ],
             timing: {
               streamStartTime,
               firstTokenTime,
@@ -581,7 +994,7 @@ export function createLlamaVTensorAdapter(
               tokenCount: lastGeneratedTokens,
               tokensPerSecond: lastTokensPerSecond,
               totalChunks,
-              toolCallCount: 0,
+              toolCallCount: toolCallsEmitted.length,
             },
           },
         };
@@ -593,6 +1006,7 @@ export function createLlamaVTensorAdapter(
               text: '(End of sequence token generated by model.)',
             },
           ],
+          status: { type: 'complete', reason: 'stop' },
           metadata: {
             timing: {
               streamStartTime,

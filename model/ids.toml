@@ -57,3 +57,9 @@ code = "VUI-DEDUP-01"
 title = "OPFS-to-runtime deduplication: cross-ID/ETag model reuse, .part slab salvage, content-fingerprinted KV/embedding/header/RoPE boot caches, and conflict-free MoE waves"
 owner = "src/engine/vramBootCache.ts"
 evidence = "src/engine/vramBootCache.test.ts"
+
+[[id]]
+code = "VUI-HARNESS-01"
+title = "Cohesive Verdant + Assistant-UI Fast/Thinking/Agentic harness with client-side tools, Qwen3 thinking-mode control, and strict per-thread KV cache isolation"
+owner = "src/engine/verdantHarness.ts"
+evidence = "src/engine/verdantHarness.test.ts"

@@ -528,6 +528,7 @@ export class LlamaVTensorRuntime {
 
   private kvPager: VramKvPager | null = null;
   private cachedTokens: number[] = [];
+  private activeThreadId: string | null = null;
   private unifiedStore: VramUnifiedStore | null = null;
   private readonly committedPageKeys = new Set<string>();
 
@@ -762,6 +763,7 @@ export class LlamaVTensorRuntime {
     this.layerInfos = [];
     this.kvPager = null;
     this.cachedTokens = [];
+    this.activeThreadId = null;
     this.unifiedStore = null;
     this.committedPageKeys.clear();
     this.ropeTables = null;
@@ -4784,6 +4786,7 @@ export class LlamaVTensorRuntime {
     prompt: string,
     signal?: AbortSignal,
     onProgress?: (progress: SpeculativePrefillProgress) => void,
+    threadId?: string,
   ): Promise<SpeculativePrefillResult> {
     // Never run background speculative prefill on network demand-paged models:
     // warming even 1 prefix token would stream gigabytes of cold weights before the user prompts.
@@ -4826,6 +4829,16 @@ export class LlamaVTensorRuntime {
     let aborted = false;
 
     try {
+      // Strict thread isolation: wipe live KV frames whenever switching threads so partial tail
+      // K/V state from another thread can NEVER bleed into this thread (shared system prompt blocks
+      // still restore cleanly from content-addressed VramUnifiedStore).
+      if (threadId && this.activeThreadId !== null && threadId !== this.activeThreadId) {
+        this.resetKvCache();
+      }
+      if (threadId) {
+        this.activeThreadId = threadId;
+      }
+
       const aligned = this.alignAndRestorePrefix(targetTokens, targetTokens.length);
       i = aligned.commonPrefix;
       reusedLive = aligned.reusedLive;
@@ -4922,6 +4935,7 @@ export class LlamaVTensorRuntime {
         aborted,
       };
     } finally {
+      this.kvPager?.truncateTo(this.cachedTokens.length);
       this.unifiedStore?.setSpeculativeActive(false);
     }
   }
@@ -5503,9 +5517,19 @@ export class LlamaVTensorRuntime {
     config: SamplingConfig = DEFAULT_SAMPLING_CONFIG,
     signal?: AbortSignal,
     onPrefillProgress?: (progress: PrefillProgressEvent) => void,
+    threadId?: string,
   ): AsyncGenerator<TokenStreamEvent, void, unknown> {
     if (!this.tokenizer || !this.hparams || !this.kvPager) {
       throw new Error('No GGUF model loaded in llama.cpp + vTensor runtime.');
+    }
+
+    // Strict thread isolation: reset live KV pages whenever switching threads so history from
+    // another thread can NEVER conflate with this conversation.
+    if (threadId && this.activeThreadId !== null && threadId !== this.activeThreadId) {
+      this.resetKvCache();
+    }
+    if (threadId) {
+      this.activeThreadId = threadId;
     }
 
     const promptTokens = this.tokenizer.encode(prompt, this.tokenizer.addBosToken);
@@ -5777,7 +5801,9 @@ export class LlamaVTensorRuntime {
       }
       throw err;
     } finally {
-      // Persist any newly completed assistant-turn 16-token KV pages into Unified Store
+      // Roll back any partially-written KV slots past `cachedTokens.length` (e.g. mid-chunk abort)
+      // before committing completed 16-token KV pages into the Unified Store.
+      this.kvPager?.truncateTo(this.cachedTokens.length);
       this.commitFullPagesToUnifiedStore(this.cachedTokens);
     }
   }

@@ -62,6 +62,7 @@ export type WorkerRequest =
       requestId: string;
       prompt: string;
       sampling: SamplingConfig;
+      threadId?: string;
     }
   | {
       type: 'cancel';
@@ -102,6 +103,7 @@ export type WorkerRequest =
       type: 'speculative_prefill';
       requestId: string;
       prompt: string;
+      threadId?: string;
     }
   | {
       type: 'count_tokens';
@@ -191,6 +193,8 @@ let activeSpeculativeController: AbortController | null = null;
 let activeSpeculativePromise: Promise<void> | null = null;
 let activeLoadController: AbortController | null = null;
 let activeLoadPromise: Promise<void> | null = null;
+let activeGenerationController: AbortController | null = null;
+let activeGenerationPromise: Promise<void> | null = null;
 let activeGenerationCount = 0;
 
 const workerInstanceId =
@@ -275,6 +279,23 @@ async function preemptSpeculativePrefill(): Promise<void> {
   }
 }
 
+/**
+ * Strictly serializes inference generations so switching threads or triggering a new prompt
+ * NEVER interleaves two generators over the shared `kvPager` / `cachedTokens` / `scratch` state!
+ */
+async function preemptActiveGeneration(): Promise<void> {
+  if (activeGenerationController) {
+    activeGenerationController.abort();
+  }
+  if (activeGenerationPromise) {
+    try {
+      await activeGenerationPromise;
+    } catch {
+      // Previous generation cleaned up
+    }
+  }
+}
+
 function formatEta(seconds: number | null | undefined): string {
   if (seconds == null || !Number.isFinite(seconds) || seconds <= 0) return '';
   if (seconds < 60) return `${Math.ceil(seconds)}s left`;
@@ -352,6 +373,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
 
     if (req.type === 'load_buffer') {
       await preemptSpeculativePrefill();
+      await preemptActiveGeneration();
       await preemptActiveLoad();
       await threadPoolReadyPromise;
       const summary = runtime.loadFromBuffer(
@@ -375,6 +397,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
 
     if (req.type === 'load_url') {
       await preemptSpeculativePrefill();
+      await preemptActiveGeneration();
       await preemptActiveLoad();
       await threadPoolReadyPromise;
       const controller = new AbortController();
@@ -491,6 +514,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
 
     if (req.type === 'load_file') {
       await preemptSpeculativePrefill();
+      await preemptActiveGeneration();
       await preemptActiveLoad();
       await threadPoolReadyPromise;
       const controller = new AbortController();
@@ -645,6 +669,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
 
     if (req.type === 'set_precision_mode') {
       await preemptSpeculativePrefill();
+      await preemptActiveGeneration();
       runtime.setPrecisionMode(req.mode);
       post({
         type: 'telemetry',
@@ -656,6 +681,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
 
     if (req.type === 'set_weight_residency_policy') {
       await preemptSpeculativePrefill();
+      await preemptActiveGeneration();
       runtime.setWeightResidencyPolicy(req.policy);
       post({
         type: 'telemetry',
@@ -677,6 +703,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
 
     if (req.type === 'delete_opfs_model') {
       await preemptSpeculativePrefill();
+      await preemptActiveGeneration();
       let modelUnloaded = false;
       if (runtime.getModelSummary()?.id === req.modelId) {
         runtime.unload();
@@ -695,6 +722,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
 
     if (req.type === 'clear_opfs_models') {
       await preemptSpeculativePrefill();
+      await preemptActiveGeneration();
       const activeId = runtime.getModelSummary()?.id;
       const before = await inspectOpfsVramStorage();
       const activeKind = runtime.getModelSummary()?.backingKind;
@@ -746,19 +774,24 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       let task: Promise<void> | null = null;
       task = (async () => {
         try {
-          const result = await runtime.speculativePrefill(req.prompt, controller.signal, (p) => {
-            const now = performance.now();
-            if (p.readyTokens === p.targetTokens || now - lastPost > 140) {
-              lastPost = now;
-              post({
-                type: 'speculative_status',
-                requestId: req.requestId,
-                active: p.readyTokens < p.targetTokens,
-                readyTokens: p.readyTokens,
-                targetTokens: p.targetTokens,
-              });
-            }
-          });
+          const result = await runtime.speculativePrefill(
+            req.prompt,
+            controller.signal,
+            (p) => {
+              const now = performance.now();
+              if (p.readyTokens === p.targetTokens || now - lastPost > 140) {
+                lastPost = now;
+                post({
+                  type: 'speculative_status',
+                  requestId: req.requestId,
+                  active: p.readyTokens < p.targetTokens,
+                  readyTokens: p.readyTokens,
+                  targetTokens: p.targetTokens,
+                });
+              }
+            },
+            req.threadId,
+          );
           if (!result.aborted && result.newlyPrefilledTokens > 0) {
             await runtime.persistUnifiedStoreToOpfs().catch(() => 0);
           }
@@ -786,9 +819,17 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
 
     if (req.type === 'generate') {
       await preemptSpeculativePrefill();
+      await preemptActiveGeneration();
       const controller = new AbortController();
       activeControllers.set(req.requestId, controller);
+      activeGenerationController = controller;
       activeGenerationCount += 1;
+
+      let finishGen!: () => void;
+      const genDone = new Promise<void>((resolve) => {
+        finishGen = resolve;
+      });
+      activeGenerationPromise = genDone;
 
       try {
         let count = 0;
@@ -821,6 +862,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
               });
             }
           },
+          req.threadId,
         )) {
           count += 1;
           const nowMs = performance.now();
@@ -850,6 +892,13 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       } finally {
         activeGenerationCount = Math.max(0, activeGenerationCount - 1);
         activeControllers.delete(req.requestId);
+        if (activeGenerationController === controller) {
+          activeGenerationController = null;
+        }
+        if (activeGenerationPromise === genDone) {
+          activeGenerationPromise = null;
+        }
+        finishGen();
       }
     }
   } catch (err) {
