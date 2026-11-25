@@ -191,7 +191,7 @@ test('Prism Theorem T4: 3-tier Hot/Warm/Cold-Q4 capacity law safely scales conte
   assert.ok(c1b.projectedKvContractBytes < c1b.projectedRawF32KvBytes * 0.45);
   assert.ok(c1b.projectedTotalArenaBytes <= SAMPLE_ENV.memoryBudgetBytes);
 
-  // Constrained budget where KV itself exceeds available memory safely scales context down
+  // Constrained budget where KV exceeds RAM engages Tier-3 Swapped Q4 while preserving FULL 16,384 context!
   const tightEnv: EnvironmentProfile = { ...SAMPLE_ENV, memoryBudgetBytes: 120 * 1024 * 1024 };
   const mBigKv = makeModelSpec({
     name: 'TightKv',
@@ -206,11 +206,14 @@ test('Prism Theorem T4: 3-tier Hot/Warm/Cold-Q4 capacity law safely scales conte
     type: GgmlType.Q4_K,
   });
   const cTight = derivePerformanceContract(tightEnv, mBigKv, { requestedMaxContext: 16384 });
-  assert.equal(cTight.contextScaledToFitBudget, true);
-  assert.ok(cTight.effectiveMaxContext < 16384);
-  assert.ok(cTight.effectiveMaxContext >= 64);
+  assert.equal(cTight.effectiveMaxContext, 16384);
+  assert.equal(cTight.contextScaledToFitBudget, false);
+  assert.equal(cTight.coldQ4Enabled, true);
+  assert.equal(cTight.swapQ4Enabled, true);
+  assert.ok(cTight.coldQ4RamLimit < cTight.totalKvPages);
+  assert.ok(cTight.projectedTotalArenaBytes <= tightEnv.memoryBudgetBytes);
 
-  // Theorem T4b: 3B 1.88 GB model exceeds WASM32 1.5 GiB budget -> automatically engages OPFS-backed vRAM weight paging!
+  // Theorem T4b + Full Context: 3B 1.88 GB model at full 131,072 ctx engages OPFS weight paging + 4-tier KV swap!
   const m3b = makeModelSpec({
     name: 'Llama-3.2-3B-Q4_K_M',
     layers: 28,
@@ -220,15 +223,16 @@ test('Prism Theorem T4: 3-tier Hot/Warm/Cold-Q4 capacity law safely scales conte
     kvHeads: 8,
     vocab: 128256,
     weightMB: 1926,
-    ctx: 8192,
+    ctx: 131072,
     type: GgmlType.Q4_K,
   });
   const c3b = derivePerformanceContract(SAMPLE_ENV, m3b, {
-    requestedMaxContext: 2048,
     backingKind: 'opfs-sync',
     weightResidencyPolicy: 'auto',
     backingQuotaBytes: 16 * 1024 * 1024 * 1024,
   });
+  assert.equal(c3b.effectiveMaxContext, 131072);
+  assert.equal(c3b.swapQ4Enabled, true);
   assert.equal(c3b.weightResidencyMode, 'opfs-paged');
   assert.equal(c3b.streamEmbeddings, true);
   assert.equal(c3b.streamLmHead, true);

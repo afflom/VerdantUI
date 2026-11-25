@@ -337,7 +337,14 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
           Atomics.notify(ctrl, ${CTRL_READY_COUNT}, 1);
 
           function runStripe(op, wt, wPtr, xOrQ8, xF32, outPtr, cols, rows, oStride) {
-            if (op === ${ParallelMatOp.MUL_MAT_BATCH4_Q8}) {
+            if (op === ${ParallelMatOp.MUL_MAT_BATCH4_Q8K}) {
+              if (wt === ${GgmlType.Q4_K}) { k.mul_mat_q4_k_q8k_batch4(wPtr, xOrQ8, outPtr, cols, rows, oStride); return; }
+              if (wt === ${GgmlType.Q6_K}) { k.mul_mat_q6_k_q8k_batch4(wPtr, xOrQ8, outPtr, cols, rows, oStride); return; }
+              if (wt === ${GgmlType.F32}) { k.mul_mat_f32_batch4(wPtr, xF32, outPtr, cols, rows, oStride); return; }
+            } else if (op === ${ParallelMatOp.MUL_MAT_Q8K}) {
+              if (wt === ${GgmlType.Q4_K}) { k.mul_mat_q4_k_q8k(wPtr, xOrQ8, outPtr, cols, rows); return; }
+              if (wt === ${GgmlType.Q6_K}) { k.mul_mat_q6_k_q8k(wPtr, xOrQ8, outPtr, cols, rows); return; }
+            } else if (op === ${ParallelMatOp.MUL_MAT_BATCH4_Q8}) {
               if (wt === ${GgmlType.Q4_0}) { k.mul_mat_q4_0_q8_batch4(wPtr, xOrQ8, outPtr, cols, rows, oStride); return; }
               if (wt === ${GgmlType.Q4_K}) { k.mul_mat_q4_k_q8_batch4(wPtr, xOrQ8, outPtr, cols, rows, oStride); return; }
               if (wt === ${GgmlType.Q6_K}) { k.mul_mat_q6_k_q8_batch4(wPtr, xOrQ8, outPtr, cols, rows, oStride); return; }
@@ -356,11 +363,17 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
               if (wt === ${GgmlType.Q5_K}) { k.mul_mat_q5_k_q8(wPtr, xOrQ8, outPtr, cols, rows); return; }
               if (wt === ${GgmlType.Q6_K}) { k.mul_mat_q6_k_q8(wPtr, xOrQ8, outPtr, cols, rows); return; }
             }
-            const xp = op === ${ParallelMatOp.MUL_MAT_Q8} ? xF32 : xOrQ8;
+            const xp = (op === ${ParallelMatOp.MUL_MAT_Q8} || op === ${ParallelMatOp.MUL_MAT_Q8K}) ? xF32 : xOrQ8;
             if (wt === ${GgmlType.F32}) { k.mul_mat_f32(wPtr, xp, outPtr, cols, rows); return; }
             if (wt === ${GgmlType.F16}) { k.mul_mat_f16(wPtr, xp, outPtr, cols, rows); return; }
             if (wt === ${GgmlType.BF16}) { k.mul_mat_bf16(wPtr, xp, outPtr, cols, rows); return; }
             if (wt === ${GgmlType.Q8_0}) { k.mul_mat_q8_0(wPtr, xp, outPtr, cols, rows); return; }
+            if (wt === ${GgmlType.Q4_0}) { k.mul_mat_q4_0(wPtr, xp, outPtr, cols, rows); return; }
+            if (wt === ${GgmlType.Q4_1}) { k.mul_mat_q4_1(wPtr, xp, outPtr, cols, rows); return; }
+            if (wt === ${GgmlType.Q5_0}) { k.mul_mat_q5_0(wPtr, xp, outPtr, cols, rows); return; }
+            if (wt === ${GgmlType.Q5_1}) { k.mul_mat_q5_1(wPtr, xp, outPtr, cols, rows); return; }
+            if (wt === ${GgmlType.Q4_K}) { k.mul_mat_q4_k(wPtr, xp, outPtr, cols, rows); return; }
+            if (wt === ${GgmlType.Q5_K}) { k.mul_mat_q5_k(wPtr, xp, outPtr, cols, rows); return; }
             if (wt === ${GgmlType.Q6_K}) { k.mul_mat_q6_k(wPtr, xp, outPtr, cols, rows); return; }
           }
 

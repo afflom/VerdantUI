@@ -187,3 +187,91 @@ test('VramKvPager 3-tier Hot F32 -> Warm Q8 -> Cold Q4 cascade attends via WASM 
 
   reg.freeAllBuffers();
 });
+
+test('VramKvPager 4-tier Hot -> Warm Q8 -> Cold Q4 -> Tier-3 SWAPPED_Q4 preserves full context with bounded WASM RAM', () => {
+  const reg = new VTensorBackendRegistry({ initialWasmPages: 24 });
+  const headDim = 64;
+  const nHeads = 4;
+  const nHeadsKv = 2;
+  const kvDim = nHeadsKv * headDim;
+  const maxCtx = 224; // 14 pages
+
+  // Bound Cold Q4 WASM pool to just 2 slots so remaining pages spill to Tier-3 SWAPPED_Q4!
+  const pager = new VramKvPager(
+    {
+      numLayers: 1,
+      maxContext: maxCtx,
+      nHeadsKv,
+      headDim,
+      hotFrameLimit: 2,
+      warmQ8Limit: 2,
+      coldQ4Enabled: true,
+      coldQ4PoolLimit: 2,
+    },
+    (id, usage, cap) => reg.allocBuffer(id, usage, cap),
+  );
+
+  const fullK = new Float32Array(maxCtx * kvDim);
+  const fullV = new Float32Array(maxCtx * kvDim);
+  const tmpK = new Float32Array(kvDim);
+  const tmpV = new Float32Array(kvDim);
+
+  // Fill 180 positions (12 pages: 2 hot + 2 warm + 2 cold Q4 + 6 swapped Q4!)
+  for (let pos = 0; pos < 180; pos++) {
+    for (let d = 0; d < kvDim; d++) {
+      tmpK[d] = Math.sin(pos * 0.13 + d * 0.07);
+      tmpV[d] = Math.cos(pos * 0.17 - d * 0.11);
+    }
+    fullK.set(tmpK, pos * kvDim);
+    fullV.set(tmpV, pos * kvDim);
+    pager.writeKv(false, 0, pos, tmpK);
+    pager.writeKv(true, 0, pos, tmpV);
+  }
+
+  const tel = pager.getTelemetry();
+  assert.equal(tel.swapQ4Enabled, true);
+  assert.equal(pager.getPageState(0), VramPageState.HOT_RESIDENT);
+  assert.equal(pager.getPageState(1), VramPageState.SWAPPED_Q4);
+  assert.equal(tel.hotResidentPages, 2);
+  assert.equal(tel.warmQ8Pages, 2);
+  assert.equal(tel.coldQ4Pages, 2);
+  assert.equal(tel.swappedQ4Pages, 6);
+  assert.ok(tel.swapCycles >= 6);
+
+  // Verify 4-tier streaming attention accuracy against full uncompressed F32 reference
+  // Also exercises empty Float32Array(0) + WASM pointer materialization path used by compiled graphs!
+  const scratch = reg.allocBuffer('test4t.scratch', 'compute', 4096);
+  const qH = scratch.allocTensor('q', GgmlType.F32, [nHeads * headDim]);
+  const oH = scratch.allocTensor('o', GgmlType.F32, [nHeads * headDim]);
+  const qView = scratch.f32View(qH);
+  for (let i = 0; i < qView.length; i++) qView[i] = Math.sin(i * 0.23);
+
+  const refOut = new Float32Array(nHeads * headDim);
+  verdantFlashAttnExt(qView, fullK, fullV, refOut, nHeads, nHeadsKv, headDim, 180, 0);
+  pager.flashAttnExt(
+    new Float32Array(0),
+    scratch.wasmPtr(qH),
+    new Float32Array(0),
+    scratch.wasmPtr(oH),
+    nHeads,
+    0,
+    180,
+    reg.arena,
+  );
+  const got = scratch.f32View(oH);
+  let maxErr = 0;
+  for (let i = 0; i < got.length; i++) {
+    maxErr = Math.max(maxErr, Math.abs(got[i] - refOut[i]));
+  }
+  assert.ok(maxErr < 0.08, `4-tier SWAPPED_Q4 attention max error ${maxErr}`);
+
+  // Truncating back into a SWAPPED_Q4 page (page 1, pos 20) refaults it cleanly back to Hot F32!
+  pager.truncateTo(20);
+  assert.equal(pager.getPageState(1), VramPageState.HOT_RESIDENT);
+  assert.equal(pager.getTelemetry().swappedQ4Pages, 0);
+  assert.equal(pager.getTelemetry().coldQ4Pages, 0);
+  assert.equal(pager.getTelemetry().refaultCount, 1);
+
+  reg.freeAllBuffers();
+});
+

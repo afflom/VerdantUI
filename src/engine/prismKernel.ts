@@ -179,7 +179,7 @@ export const PRISM_NARROW_LANE_PROOFS = Object.freeze({
   q6k_x_q8k: proveNarrowLaneExactness('Q6_K × Q8_K', 63, 127, 128, 256),
   q40_x_q80: proveNarrowLaneExactness('Q4_0 × Q8_0', 15, 127, 1, 32),
   q80_x_q80: proveNarrowLaneExactness('Q8_0 × Q8_0', 128, 127, 1, 32),
-  i8_lane_max_k: proveNarrowLaneExactness('uor-matmul i8 full', 128, 128, 1, 131_072),
+  i8_lane_max_k: proveNarrowLaneExactness('uor-matmul i8 full', 128, 128, 1, 131_071),
 });
 
 /** Exact port of `uor-matmul-gemm::tabulated::slab_codes`: rounds `codeSpace` up to power of 2. */
@@ -643,18 +643,20 @@ export function planVramReadWindows(
     let cur = iv.startPage;
     while (cur < iv.endPage) {
       const prev = windows.length > 0 ? windows[windows.length - 1] : null;
-      if (prev && cur <= prev.startPage + prev.pageCount) {
+      if (prev && cur < prev.startPage + prev.pageCount) {
+        cur = prev.startPage + prev.pageCount;
+        continue;
+      }
+      if (prev && cur === prev.startPage + prev.pageCount && prev.pageCount < maxWindowPages) {
         const mergedEnd = Math.min(iv.endPage, prev.startPage + maxWindowPages);
-        if (mergedEnd > prev.startPage + prev.pageCount) {
-          const newCount = mergedEnd - prev.startPage;
-          windows[windows.length - 1] = {
-            startPage: prev.startPage,
-            pageCount: newCount,
-            byteOffset: prev.startPage * VRAM_PAGE_BYTES,
-            byteLength: newCount * VRAM_PAGE_BYTES,
-          };
-        }
-        cur = Math.max(cur + 1, mergedEnd);
+        const newCount = mergedEnd - prev.startPage;
+        windows[windows.length - 1] = {
+          startPage: prev.startPage,
+          pageCount: newCount,
+          byteOffset: prev.startPage * VRAM_PAGE_BYTES,
+          byteLength: newCount * VRAM_PAGE_BYTES,
+        };
+        cur = mergedEnd;
       } else {
         const count = Math.min(maxWindowPages, iv.endPage - cur);
         windows.push({

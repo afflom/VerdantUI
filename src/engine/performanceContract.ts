@@ -115,13 +115,15 @@ export interface PerformanceContract {
   readonly parallelThresholdBytes: number;
   readonly parallelDispatchEnabled: boolean;
 
-  // Theorem T4: vRAM 3-Tier Bounded-Memory Capacity & Context Scaling
+  // Theorem T4: vRAM 4-Tier Bounded-Memory Capacity & Full-Context Scaling
   readonly requestedContextLength: number;
   readonly effectiveMaxContext: number;
   readonly totalKvPages: number;
   readonly hotFrameLimit: number;
   readonly warmQ8Limit: number;
   readonly coldQ4Enabled: boolean;
+  readonly coldQ4RamLimit: number;
+  readonly swapQ4Enabled: boolean;
   readonly kvPageBytesHotF32: number;
   readonly kvPageBytesWarmQ8: number;
   readonly kvPageBytesColdQ4: number;
@@ -386,9 +388,10 @@ export function derivePerformanceContract(
   const syncOverheadSec = parallelDispatchEnabled ? hp.blockCount * 5 * env.workerSyncLatencyUs * 1e-6 : 0;
 
   // --- Theorem T4b: OPFS-Backed vRAM Virtual DIMM Weight Residency (`afflom/vRAM` CapacityPolicy) ---
-  const requestedContextLength = Math.min(
-    hp.contextLength,
-    options?.requestedMaxContext ?? Math.min(hp.contextLength, 2048),
+  // Honor the selected model's full native context length by default (no artificial 1024/2048 ceiling)
+  const requestedContextLength = Math.max(
+    1,
+    Math.min(hp.contextLength, options?.requestedMaxContext ?? hp.contextLength),
   );
   const { hotF32Bytes, warmQ8Bytes, coldQ4Bytes } = computeVramKvPageSizes(
     hp.blockCount,
@@ -509,35 +512,19 @@ export function derivePerformanceContract(
     Math.floor((env.memoryBudgetBytes - projectedResidentWeightBytes - estimatedScratchBytes) * 0.65),
   );
 
-  // Target KV budget: never exceed 1/3 of available memory OR 96 MiB soft cap for crisp browser responsiveness
+  // Target KV budget: never exceed 65% of remaining WASM budget OR 96 MiB soft cap for crisp browser responsiveness
   const kvSoftTargetBytes = Math.min(availableForKvBytes, 96 * 1024 * 1024);
 
-  // Solve maximal safe page count C_eff* under 3-tier paging (Hot F32 + Warm Q8 + Cold Q4)
+  // Theorem T4 Full-Context 4-Tier Allocation:
+  // Always uphold the full requested native context length (`effectiveMaxContext === requestedContextLength`).
+  // When Cold Q4 for all pages exceeds physical WASM KV budget, bound physical WASM Cold Q4 to
+  // `coldQ4RamLimit` and engage Tier-3 vRAM Swapped Q4 (`swapQ4Enabled = true`) for overflow pages!
   const requestedPages = Math.max(1, Math.ceil(requestedContextLength / VRAM_KV_PAGE_TOKENS));
-  let totalKvPages = requestedPages;
-  let contextScaledToFitBudget = false;
+  const totalKvPages = requestedPages;
+  const effectiveMaxContext = requestedContextLength;
+  const contextScaledToFitBudget = false;
 
-  // Minimum bytes required to support `totalKvPages` with minHotFrames hot + rest in Cold Q4
-  const minBytesForPages = (pages: number) => {
-    const h = Math.min(pages, minHotFrames);
-    const cold = Math.max(0, pages - h);
-    return h * hotF32Bytes + cold * coldQ4Bytes;
-  };
-
-  if (minBytesForPages(totalKvPages) > availableForKvBytes) {
-    const maxColdPages = Math.max(
-      0,
-      Math.floor((availableForKvBytes - minHotFrames * hotF32Bytes) / Math.max(1, coldQ4Bytes)),
-    );
-    totalKvPages = Math.max(minHotFrames, Math.min(requestedPages, minHotFrames + maxColdPages));
-    contextScaledToFitBudget = totalKvPages < requestedPages;
-  }
-
-  const effectiveMaxContext = Math.min(requestedContextLength, totalKvPages * VRAM_KV_PAGE_TOKENS);
-
-  // Analytically solve Hot F32 frame pool H* and Warm Q8 frame pool W* within kvSoftTargetBytes:
-  // If entire context in F32 is tiny (< 2 MiB, e.g., stories260K), keep a balanced hot pool (6–8 pages)
-  // while still exercising vRAM paging for longer contexts.
+  // Analytically solve Hot F32 frame pool H* and Warm Q8 frame pool W* within kvSoftTargetBytes
   let hotFrameLimit: number;
   let warmQ8Limit: number;
   let coldQ4Enabled: boolean;
@@ -547,11 +534,9 @@ export function derivePerformanceContract(
     warmQ8Limit = 0;
     coldQ4Enabled = false;
   } else {
-    // Check if (H* hot F32 + all remaining pages in Warm Q8) fits within kvSoftTargetBytes
     const maxHotWithAllWarm = Math.floor(
       (kvSoftTargetBytes - totalKvPages * warmQ8Bytes) / Math.max(1, hotF32Bytes),
     );
-    // Keep hot working window proportional to sqrt(totalKvPages) (minimizes refault/reclaim thrash)
     const balancedHot = Math.max(
       minHotFrames + 2,
       Math.min(12, Math.ceil(Math.sqrt(totalKvPages))),
@@ -559,36 +544,49 @@ export function derivePerformanceContract(
 
     if (maxHotWithAllWarm >= minHotFrames) {
       hotFrameLimit = Math.max(minHotFrames, Math.min(totalKvPages, Math.min(balancedHot, maxHotWithAllWarm)));
-      // Enable 3rd tier (Cold Q4) whenever context >= 64 pages (1024+ tokens) OR model KV > 24 MiB raw
       const rawKvBytes = totalKvPages * hotF32Bytes;
       if (rawKvBytes > 32 * 1024 * 1024 || totalKvPages >= 96) {
-        // Keep ~40% of cold pages in Warm Q8 and cascade oldest tail to Cold Q4 (~7.1x compression)
-        warmQ8Limit = Math.max(8, Math.floor((totalKvPages - hotFrameLimit) * 0.4));
+        warmQ8Limit = Math.max(8, Math.min(64, Math.floor((totalKvPages - hotFrameLimit) * 0.4)));
         coldQ4Enabled = totalKvPages > hotFrameLimit + warmQ8Limit;
       } else {
         warmQ8Limit = totalKvPages;
         coldQ4Enabled = false;
       }
     } else {
-      // Large model / long context: tighten hot pool and aggressively engage 3-tier Cold Q4!
+      // Large model / long context (8K–131K): tighten hot/warm pools and engage Cold Q4 (+ Tier-3 Swap if needed)
       hotFrameLimit = Math.min(totalKvPages, minHotFrames);
       const remBudget = Math.max(0, kvSoftTargetBytes - hotFrameLimit * hotF32Bytes);
       const remPages = Math.max(0, totalKvPages - hotFrameLimit);
-      // Solve W* * warmQ8Bytes + (remPages - W*) * coldQ4Bytes <= remBudget
       const warmBudgetDelta = Math.max(1, warmQ8Bytes - coldQ4Bytes);
       const maxWarm = Math.floor((remBudget - remPages * coldQ4Bytes) / warmBudgetDelta);
-      warmQ8Limit = Math.max(4, Math.min(remPages, maxWarm));
+      const warmCapByRam = Math.max(
+        2,
+        Math.min(32, Math.floor((remBudget * 0.25) / Math.max(1, warmQ8Bytes))),
+      );
+      warmQ8Limit = Math.max(2, Math.min(remPages, Math.max(Math.min(remPages, maxWarm), warmCapByRam)));
       coldQ4Enabled = remPages > warmQ8Limit;
     }
   }
 
+  const maxColdQ4Needed = coldQ4Enabled ? Math.max(1, totalKvPages - hotFrameLimit) : 0;
+  const warmQ8PagesCap = Math.min(totalKvPages, coldQ4Enabled ? warmQ8Limit + 1 : totalKvPages);
+  const coldQ4BudgetBytes = Math.max(
+    coldQ4Bytes * 4,
+    Math.min(
+      128 * 1024 * 1024,
+      availableForKvBytes - hotFrameLimit * hotF32Bytes - warmQ8PagesCap * warmQ8Bytes,
+    ),
+  );
+  const coldQ4RamLimit = coldQ4Enabled
+    ? Math.max(1, Math.min(maxColdQ4Needed, Math.floor(coldQ4BudgetBytes / Math.max(1, coldQ4Bytes))))
+    : 0;
+  const swapQ4Enabled = coldQ4Enabled && maxColdQ4Needed > coldQ4RamLimit;
+
   const projectedRawF32KvBytes = totalKvPages * hotF32Bytes;
-  const coldQ4PagesCap = coldQ4Enabled ? Math.max(0, totalKvPages - hotFrameLimit) : 0;
-  const warmQ8PagesCap = Math.min(totalKvPages, coldQ4Enabled ? warmQ8Limit : totalKvPages);
   const projectedKvContractBytes =
     hotFrameLimit * hotF32Bytes +
     warmQ8PagesCap * warmQ8Bytes +
-    (coldQ4Enabled ? coldQ4PagesCap * coldQ4Bytes : 0);
+    (coldQ4Enabled ? coldQ4RamLimit * coldQ4Bytes : 0);
 
   const projectedTotalArenaBytes =
     projectedResidentWeightBytes + projectedKvContractBytes + estimatedScratchBytes;
@@ -600,7 +598,7 @@ export function derivePerformanceContract(
   const summaryTheoremLine =
     `T1 ${rooflineDecodeTokSec.toFixed(1)} tok/s* (${decodeRegime}) · ` +
     `T2 B*=${optimalPrefillBatchSize} · ` +
-    `T4 ${hotFrameLimit}H/${warmQ8Limit}W${coldQ4Enabled ? '/Q4' : ''} @ ${effectiveMaxContext}ctx` +
+    `T4 ${hotFrameLimit}H/${warmQ8Limit}W${coldQ4Enabled ? (swapQ4Enabled ? '/Q4+Swap' : '/Q4') : ''} @ ${effectiveMaxContext}ctx` +
     (weightResidencyMode === 'opfs-paged' ? ` · vRAM ${weightLayerFrameSlots}/${hp.blockCount}L` : '');
 
   return {
@@ -628,6 +626,8 @@ export function derivePerformanceContract(
     hotFrameLimit,
     warmQ8Limit,
     coldQ4Enabled,
+    coldQ4RamLimit,
+    swapQ4Enabled,
     kvPageBytesHotF32: hotF32Bytes,
     kvPageBytesWarmQ8: warmQ8Bytes,
     kvPageBytesColdQ4: coldQ4Bytes,

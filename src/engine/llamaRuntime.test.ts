@@ -163,3 +163,119 @@ test('LlamaVTensorRuntime WASM SIMD batched prefill matches Scalar JS single-tok
   assert.equal(wasmRuntime.getPrecisionMode(), 'strict-f64');
 });
 
+test('LlamaVTensorRuntime supports full context-length input (100%) and full context-length output without artificial caps', async () => {
+  const bytes = fs.readFileSync(STORIES_260K_PATH);
+  const runtime = new LlamaVTensorRuntime();
+  const summary = runtime.loadFromBuffer(
+    'stories260k-f32',
+    'TinyLLaMA Stories 260K',
+    '/models/stories260K.gguf',
+    bytes,
+  );
+  const maxCtx = summary.maxContextWindow;
+  assert.equal(maxCtx, summary.hparams.contextLength);
+  assert.equal(maxCtx, 2048);
+
+  // 1. Build a prompt that exceeds the old 1024 cap & fills ~98% of the full 2048 context window
+  const phrase = 'Once upon a time there was a little silver bird in a quiet forest. ';
+  const phraseToks = Math.max(1, runtime.countTokens(phrase) - 1);
+  const repeats = Math.max(1, Math.floor((maxCtx - 24) / phraseToks));
+  const longPrompt = phrase.repeat(repeats);
+  const nearFullTokens = runtime.countTokens(longPrompt);
+  assert.ok(
+    nearFullTokens > 1024 && nearFullTokens <= maxCtx - 8,
+    `Expected near-full prompt tokens (>1024 and <=${maxCtx - 8}), got ${nearFullTokens}`,
+  );
+
+  let lastPromptTokens = 0;
+  let lastTruncated = -1;
+  let lastGen = 0;
+  for await (const ev of runtime.generate(longPrompt, {
+    temperature: 0,
+    topP: 1,
+    topK: 1,
+    repeatPenalty: 1.0,
+    maxTokens: maxCtx,
+    fullContextOutput: true,
+    seed: 1,
+  })) {
+    lastPromptTokens = ev.promptTokens;
+    lastTruncated = ev.promptTruncatedTokens ?? 0;
+    lastGen = ev.generatedTokens;
+  }
+  assert.equal(lastPromptTokens, nearFullTokens, 'Zero prompt truncation for prompts fitting inside maxContextWindow');
+  assert.equal(lastTruncated, 0);
+  assert.ok(lastGen >= 1, 'Model emits tokens from near-full prompt without KV overflow');
+
+  // 2. Prompt at 100% of maxContextWindow (exact 2048-token boundary): zero truncation and safely emits 1 token without OOB
+  const needed = Math.max(1, maxCtx - nearFullTokens);
+  const exactFullPrompt = longPrompt + ' a'.repeat(needed);
+  const exactCount = runtime.countTokens(exactFullPrompt);
+  assert.ok(exactCount >= maxCtx, `Expected exact boundary prompt >= ${maxCtx} tokens, got ${exactCount}`);
+  let fullBoundaryPromptTokens = 0;
+  let fullBoundaryGen = 0;
+  for await (const ev of runtime.generate(exactFullPrompt, {
+    temperature: 0,
+    topP: 1,
+    topK: 1,
+    repeatPenalty: 1.0,
+    maxTokens: maxCtx,
+    fullContextOutput: true,
+    seed: 1,
+  })) {
+    fullBoundaryPromptTokens = ev.promptTokens;
+    fullBoundaryGen = ev.generatedTokens;
+  }
+  assert.equal(fullBoundaryPromptTokens, Math.min(exactCount, maxCtx));
+  assert.equal(fullBoundaryGen, 1);
+  assert.equal(runtime.getTelemetry().cpuFallbackOps, 0);
+
+  // 3. Short prompt with fullContextOutput: true generates beyond custom 16-token cap (up to EOS or full 2048 ctx)
+  runtime.resetKvCache();
+  let fullOutGen = 0;
+  for await (const ev of runtime.generate('Once', {
+    temperature: 0.7,
+    topP: 0.95,
+    topK: 40,
+    repeatPenalty: 1.05,
+    maxTokens: 16, // Ignored when fullContextOutput: true
+    fullContextOutput: true,
+    seed: 7,
+  })) {
+    fullOutGen = ev.generatedTokens;
+  }
+  assert.ok(fullOutGen > 16, `Expected fullContextOutput to exceed custom 16-token cap, got ${fullOutGen}`);
+});
+
+test('Bounded RoPE dynamic synthesis (pos >= 4096) matches full precomputed buildRopeTables bit-for-bit', async () => {
+  const { buildRopeTables, fillRopePositionCosSin, verdantRopePrecomputed } = await import(
+    './verdantKernels'
+  );
+  const fullTables = buildRopeTables(5000, 64, 1000000, 1.0);
+  const boundedTables = buildRopeTables(4096, 64, 1000000, 1.0);
+
+  for (const pos of [4096, 4097, 4500, 4999]) {
+    const cosDyn = new Float32Array(32);
+    const sinDyn = new Float32Array(32);
+    fillRopePositionCosSin(pos, boundedTables, cosDyn, sinDyn, 0);
+    for (let i = 0; i < 32; i++) {
+      assert.equal(cosDyn[i], fullTables.cos[pos * 32 + i]);
+      assert.equal(sinDyn[i], fullTables.sin[pos * 32 + i]);
+    }
+
+    for (const neox of [false, true]) {
+      const vecFull = new Float32Array(128);
+      const vecBounded = new Float32Array(128);
+      for (let i = 0; i < 128; i++) {
+        const v = Math.fround(Math.sin(i * 0.37 + pos * 0.01));
+        vecFull[i] = v;
+        vecBounded[i] = v;
+      }
+      verdantRopePrecomputed(vecFull, 2, 64, pos, fullTables, neox);
+      verdantRopePrecomputed(vecBounded, 2, 64, pos, boundedTables, neox);
+      assert.deepEqual(vecBounded, vecFull);
+    }
+  }
+});
+
+

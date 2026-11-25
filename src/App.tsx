@@ -219,6 +219,7 @@ export default function App() {
               onSpeculativeDraftChange={(messages, draft) =>
                 workerClient.scheduleSpeculativePrefill(messages, draft)
               }
+              onCountTokens={(prompt) => workerClient.countTokens(prompt)}
             />
           </main>
 

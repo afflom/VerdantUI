@@ -23,7 +23,7 @@ test('formatMessagesForLlama auto mode picks continuation for TinyStories models
   ];
 
   const autoStory = formatMessagesForLlama(messages, 'stories260k-f32', 'auto');
-  assert.equal(autoStory, 'there was a fox. The fox found a key.');
+  assert.equal(autoStory, 'Once upon a time there was a fox. The fox found a key.');
 
   const autoGeneral = formatMessagesForLlama(messages, 'llama-3-instruct-q4', 'auto');
   assert.equal(

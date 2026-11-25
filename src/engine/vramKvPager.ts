@@ -34,6 +34,7 @@ export const enum VramPageState {
   HOT_RESIDENT = 1,
   COLD_COMPRESSED = 2, // Tier 1: Warm Q8
   COLD_Q4 = 3, // Tier 2: Cold Q4 (~7.1x compression)
+  SWAPPED_Q4 = 4, // Tier 3: Overflow Cold Q4 paged out of WASM arena (supports full 131K+ context!)
 }
 
 export interface VramKvTelemetry {
@@ -42,11 +43,14 @@ export interface VramKvTelemetry {
   readonly hotFrameLimit: number;
   readonly warmQ8Limit: number;
   readonly coldQ4Enabled: boolean;
+  readonly coldQ4PoolLimit: number;
+  readonly swapQ4Enabled: boolean;
   readonly hotResidentPages: number;
-  /** Total non-hot compressed pages (Warm Q8 + Cold Q4) for backward compatibility. */
+  /** Total non-hot compressed pages (Warm Q8 + Cold Q4 + Swapped Q4) for backward compatibility. */
   readonly coldCompressedPages: number;
   readonly warmQ8Pages: number;
   readonly coldQ4Pages: number;
+  readonly swappedQ4Pages: number;
   readonly activePages: number;
   readonly rawEquivalentBytes: number;
   readonly allocatedBytes: number;
@@ -54,6 +58,7 @@ export interface VramKvTelemetry {
   readonly compressionRatio: number;
   readonly reclaimCycles: number;
   readonly tierCascadeCycles: number;
+  readonly swapCycles: number;
   readonly refaultCount: number;
   readonly hotAttentionReads: number;
   readonly coldAttentionReads: number;
@@ -118,6 +123,15 @@ export interface VramKvPagerConfig {
   readonly hotFrameLimit?: number;
   readonly warmQ8Limit?: number;
   readonly coldQ4Enabled?: boolean;
+  /** Bounded physical WASM Cold-Q4 frame pool; pages beyond this overflow into Tier-3 Swapped Q4. */
+  readonly coldQ4PoolLimit?: number;
+}
+
+interface SwappedQ4Page {
+  readonly kQ4: Uint8Array;
+  readonly vQ4: Uint8Array;
+  readonly kSc: Float32Array;
+  readonly vSc: Float32Array;
 }
 
 export class VramKvPager {
@@ -130,6 +144,7 @@ export class VramKvPager {
   readonly hotFrameLimit: number;
   readonly warmQ8Limit: number;
   readonly coldQ4Enabled: boolean;
+  readonly swapQ4Enabled: boolean;
 
   // Per-page geometry (for K or V individually)
   readonly hotPageFloats: number; // numLayers * PAGE_TOKENS * kvDim
@@ -140,6 +155,7 @@ export class VramKvPager {
   private readonly warmQ8PoolSize: number;
   private readonly coldQ4PoolSize: number;
   private readonly headQ4Bytes: number;
+  private readonly allocBufferFn: (id: string, usage: 'kv_cache', capacityBytes: number) => VTensorBuffer;
 
   // Backing vTensor handles (live directly inside WASM linear memory when SIMD arena is active)
   private readonly hotKHandle: VTensorHandle;
@@ -149,11 +165,14 @@ export class VramKvPager {
   private readonly coldKScaleHandle: VTensorHandle;
   private readonly coldVScaleHandle: VTensorHandle;
 
-  // Optional Tier-2 Cold Q4 backing handles (allocated only when coldQ4Enabled is true)
-  private readonly coldKQ4Handle: VTensorHandle | null;
-  private readonly coldVQ4Handle: VTensorHandle | null;
-  private readonly coldKQ4ScaleHandle: VTensorHandle | null;
-  private readonly coldVQ4ScaleHandle: VTensorHandle | null;
+  // Lazy Tier-2 Cold Q4 backing handles (allocated on first Warm->Cold Q4 cascade for instant 131K boot)
+  private coldKQ4Handle: VTensorHandle | null = null;
+  private coldVQ4Handle: VTensorHandle | null = null;
+  private coldKQ4ScaleHandle: VTensorHandle | null = null;
+  private coldVQ4ScaleHandle: VTensorHandle | null = null;
+
+  // Tier-3 Overflow Swapped Q4 store (keeps WASM arena strictly bounded up to 131K+ tokens!)
+  private readonly swappedQ4Store = new Map<number, SwappedQ4Page>();
 
   // Verdant WASM-resident KV page directory (i32[maxPages] state & active slot) for 1-call whole-layer FlashAttention
   private readonly wasmPageStateHandle: VTensorHandle;
@@ -176,6 +195,7 @@ export class VramKvPager {
   private coldQ4Count = 0;
   private reclaimCycles = 0;
   private tierCascadeCycles = 0;
+  private swapCycles = 0;
   private refaultCount = 0;
   private hotAttentionReads = 0;
   private coldAttentionReads = 0;
@@ -185,6 +205,7 @@ export class VramKvPager {
     config: VramKvPagerConfig,
     allocBuffer: (id: string, usage: 'kv_cache', capacityBytes: number) => VTensorBuffer,
   ) {
+    this.allocBufferFn = allocBuffer;
     this.numLayers = config.numLayers;
     this.maxContext = config.maxContext;
     this.nHeadsKv = config.nHeadsKv;
@@ -213,9 +234,11 @@ export class VramKvPager {
     this.warmQ8PoolSize = this.coldQ4Enabled
       ? Math.min(this.maxPages, this.warmQ8Limit + 1)
       : Math.max(1, this.maxPages);
+    const maxColdNeeded = this.coldQ4Enabled ? Math.max(1, this.maxPages - this.hotFrameLimit) : 0;
     this.coldQ4PoolSize = this.coldQ4Enabled
-      ? Math.max(1, this.maxPages - this.hotFrameLimit)
+      ? Math.max(1, Math.min(maxColdNeeded, config.coldQ4PoolLimit ?? maxColdNeeded))
       : 0;
+    this.swapQ4Enabled = this.coldQ4Enabled && this.coldQ4PoolSize < maxColdNeeded;
 
     const align32 = (n: number) => ((n + 31) & ~31);
 
@@ -266,41 +289,8 @@ export class VramKvPager {
       this.numLayers * this.warmQ8PoolSize,
     ]);
 
-    // 3. Tier-2 Cold Q4 backing store (enabled automatically by Theorem T4 for long context / large models)
-    if (this.coldQ4Enabled && this.coldQ4PoolSize > 0) {
-      const q4BytesTotal = this.coldQ4PoolSize * this.coldPageQ4Bytes;
-      const q4ScaleTotal = this.coldQ4PoolSize * this.coldPageScaleFloats * 4;
-      const q4Buf = allocBuffer(
-        'vtensor.vram_cold_q4',
-        'kv_cache',
-        align32(q4BytesTotal) * 2 + align32(q4ScaleTotal) * 2 + 256,
-      );
-      this.coldKQ4Handle = q4Buf.allocTensor('kv.cold_k_q4', GgmlType.I8, [
-        this.nHeadsKv * this.headQ4Bytes,
-        VRAM_KV_PAGE_TOKENS,
-        this.numLayers * this.coldQ4PoolSize,
-      ]);
-      this.coldVQ4Handle = q4Buf.allocTensor('kv.cold_v_q4', GgmlType.I8, [
-        this.nHeadsKv * this.headQ4Bytes,
-        VRAM_KV_PAGE_TOKENS,
-        this.numLayers * this.coldQ4PoolSize,
-      ]);
-      this.coldKQ4ScaleHandle = q4Buf.allocTensor('kv.cold_k_q4_scale', GgmlType.F32, [
-        this.nHeadsKv,
-        VRAM_KV_PAGE_TOKENS,
-        this.numLayers * this.coldQ4PoolSize,
-      ]);
-      this.coldVQ4ScaleHandle = q4Buf.allocTensor('kv.cold_v_q4_scale', GgmlType.F32, [
-        this.nHeadsKv,
-        VRAM_KV_PAGE_TOKENS,
-        this.numLayers * this.coldQ4PoolSize,
-      ]);
-    } else {
-      this.coldKQ4Handle = null;
-      this.coldVQ4Handle = null;
-      this.coldKQ4ScaleHandle = null;
-      this.coldVQ4ScaleHandle = null;
-    }
+    // 3. Tier-2 Cold Q4 backing store is allocated lazily on the first Warm->Cold Q4 cascade
+    // so 8K–131K context models boot instantly with minimal WASM RAM!
 
     // 4. Verdant WASM-resident page directory (state + active slot per page for zero-JS-loop flash_attn_layer)
     const ptBytes = align32(this.maxPages * 4);
@@ -356,15 +346,52 @@ export class VramKvPager {
       this.freeQ4Slots.push(s);
     }
 
+    this.swappedQ4Store.clear();
     this.hotResidentCount = 0;
     this.warmQ8Count = 0;
     this.coldQ4Count = 0;
     this.reclaimCycles = 0;
     this.tierCascadeCycles = 0;
+    this.swapCycles = 0;
     this.refaultCount = 0;
     this.hotAttentionReads = 0;
     this.coldAttentionReads = 0;
     this.coldQ4AttentionReads = 0;
+  }
+
+  /** Lazily allocates Tier-2 Cold Q4 WASM backing buffer on first cascade so boot RAM stays minimal. */
+  private ensureColdQ4PoolAllocated(): boolean {
+    if (!this.coldQ4Enabled || this.coldQ4PoolSize <= 0) return false;
+    if (this.coldKQ4Handle !== null) return true;
+    const align32 = (n: number) => (n + 31) & ~31;
+    const q4BytesTotal = this.coldQ4PoolSize * this.coldPageQ4Bytes;
+    const q4ScaleTotal = this.coldQ4PoolSize * this.coldPageScaleFloats * 4;
+    const q4Buf = this.allocBufferFn(
+      'vtensor.vram_cold_q4',
+      'kv_cache',
+      align32(q4BytesTotal) * 2 + align32(q4ScaleTotal) * 2 + 256,
+    );
+    this.coldKQ4Handle = q4Buf.allocTensor('kv.cold_k_q4', GgmlType.I8, [
+      this.nHeadsKv * this.headQ4Bytes,
+      VRAM_KV_PAGE_TOKENS,
+      this.numLayers * this.coldQ4PoolSize,
+    ]);
+    this.coldVQ4Handle = q4Buf.allocTensor('kv.cold_v_q4', GgmlType.I8, [
+      this.nHeadsKv * this.headQ4Bytes,
+      VRAM_KV_PAGE_TOKENS,
+      this.numLayers * this.coldQ4PoolSize,
+    ]);
+    this.coldKQ4ScaleHandle = q4Buf.allocTensor('kv.cold_k_q4_scale', GgmlType.F32, [
+      this.nHeadsKv,
+      VRAM_KV_PAGE_TOKENS,
+      this.numLayers * this.coldQ4PoolSize,
+    ]);
+    this.coldVQ4ScaleHandle = q4Buf.allocTensor('kv.cold_v_q4_scale', GgmlType.F32, [
+      this.nHeadsKv,
+      VRAM_KV_PAGE_TOKENS,
+      this.numLayers * this.coldQ4PoolSize,
+    ]);
+    return true;
   }
 
   private setHotBit(pageIdx: number, present: boolean): void {
@@ -419,6 +446,14 @@ export class VramKvPager {
       this.pageQ4Slot[pageIdx] = -1;
       this.coldQ4Count -= 1;
       this.setQ4Bit(pageIdx, false);
+      this.refaultCount += 1;
+    } else if (this.pageState[pageIdx] === VramPageState.SWAPPED_Q4) {
+      // Refault from Tier-3 Swapped Q4 back into hot F32 frame
+      const swapped = this.swappedQ4Store.get(pageIdx);
+      if (swapped) {
+        this.expandRawQ4ToHot(swapped.kQ4, 0, swapped.vQ4, 0, swapped.kSc, 0, swapped.vSc, 0, hotSlot);
+        this.swappedQ4Store.delete(pageIdx);
+      }
       this.refaultCount += 1;
     }
 
@@ -490,9 +525,10 @@ export class VramKvPager {
   /**
    * Tier-1 -> Tier-2 Cascade: compresses the oldest Warm Q8 page into packed 4-bit Cold Q4
    * (~7.1x vs F32), verified by the vRAM Cold-Q4 challenger admission gate.
+   * When physical WASM Cold-Q4 slots are full, spills the oldest Cold Q4 page to Tier-3 Swapped Q4!
    */
   private cascadeWarmToColdQ4(protectPageIdx: number): void {
-    if (!this.coldQ4Enabled || !this.coldKQ4Handle) return;
+    if (!this.coldQ4Enabled || !this.ensureColdQ4PoolAllocated()) return;
     let victim = -1;
     for (let p = 1; p < this.maxPages; p++) {
       if (p !== protectPageIdx && this.pageState[p] === VramPageState.COLD_COMPRESSED) {
@@ -502,6 +538,9 @@ export class VramKvPager {
     }
     if (victim === -1) return;
 
+    if (this.freeQ4Slots.length === 0) {
+      this.spillOldestColdQ4ToSwap(protectPageIdx);
+    }
     const q4Slot = this.freeQ4Slots.pop();
     if (q4Slot === undefined) return;
 
@@ -522,6 +561,50 @@ export class VramKvPager {
     this.setQ4Bit(victim, true);
     this.freeColdSlots.push(warmSlot);
     this.tierCascadeCycles += 1;
+  }
+
+  /**
+   * Tier-2 -> Tier-3 Spill: moves the oldest WASM-resident Cold Q4 page out of the WASM linear
+   * arena into compact off-arena Q4 swap backing so 8K–131K+ contexts never exhaust WASM RAM.
+   */
+  private spillOldestColdQ4ToSwap(protectPageIdx: number): void {
+    if (!this.coldKQ4Handle || !this.coldVQ4Handle || !this.coldKQ4ScaleHandle || !this.coldVQ4ScaleHandle) {
+      return;
+    }
+    let victim = -1;
+    for (let p = 1; p < this.maxPages; p++) {
+      if (p !== protectPageIdx && this.pageState[p] === VramPageState.COLD_Q4) {
+        victim = p;
+        break;
+      }
+    }
+    if (victim === -1) return;
+
+    const q4Slot = this.pageQ4Slot[victim];
+    if (q4Slot < 0) return;
+
+    const kQ4Raw = this.coldKQ4Handle.buffer.rawBytes();
+    const vQ4Raw = this.coldVQ4Handle.buffer.rawBytes();
+    const kBase = this.coldKQ4Handle.byteOffset + q4Slot * this.coldPageQ4Bytes;
+    const vBase = this.coldVQ4Handle.byteOffset + q4Slot * this.coldPageQ4Bytes;
+    const kScAll = this.coldKQ4ScaleHandle.buffer.f32View(this.coldKQ4ScaleHandle);
+    const vScAll = this.coldVQ4ScaleHandle.buffer.f32View(this.coldVQ4ScaleHandle);
+    const scBase = q4Slot * this.coldPageScaleFloats;
+
+    this.swappedQ4Store.set(victim, {
+      kQ4: kQ4Raw.slice(kBase, kBase + this.coldPageQ4Bytes),
+      vQ4: vQ4Raw.slice(vBase, vBase + this.coldPageQ4Bytes),
+      kSc: kScAll.slice(scBase, scBase + this.coldPageScaleFloats),
+      vSc: vScAll.slice(scBase, scBase + this.coldPageScaleFloats),
+    });
+
+    this.pageState[victim] = VramPageState.SWAPPED_Q4;
+    this.pageQ4Slot[victim] = -1;
+    this.syncWasmPageEntry(victim, VramPageState.SWAPPED_Q4, -1);
+    this.coldQ4Count -= 1;
+    this.setQ4Bit(victim, false);
+    this.freeQ4Slots.push(q4Slot);
+    this.swapCycles += 1;
   }
 
   /** Compresses one F32 hot page across all layers into symmetric per-head int8 (Warm Q8) backing. */
@@ -707,27 +790,40 @@ export class VramKvPager {
 
   /** Refault path (Tier-2 Cold Q4 -> Tier-0 Hot F32). */
   private expandColdQ4ToHot(q4Slot: number, hotSlot: number): void {
-    const hotK = this.hotKHandle.buffer.f32View(this.hotKHandle);
-    const hotV = this.hotVHandle.buffer.f32View(this.hotVHandle);
     const kQ4Raw = this.coldKQ4Handle!.buffer.rawBytes();
     const vQ4Raw = this.coldVQ4Handle!.buffer.rawBytes();
     const kQ4BaseByte = this.coldKQ4Handle!.byteOffset + q4Slot * this.coldPageQ4Bytes;
     const vQ4BaseByte = this.coldVQ4Handle!.byteOffset + q4Slot * this.coldPageQ4Bytes;
     const kQ4Sc = this.coldKQ4ScaleHandle!.buffer.f32View(this.coldKQ4ScaleHandle!);
     const vQ4Sc = this.coldVQ4ScaleHandle!.buffer.f32View(this.coldVQ4ScaleHandle!);
+    const q4ScBase = q4Slot * this.coldPageScaleFloats;
+    this.expandRawQ4ToHot(kQ4Raw, kQ4BaseByte, vQ4Raw, vQ4BaseByte, kQ4Sc, q4ScBase, vQ4Sc, q4ScBase, hotSlot);
+  }
 
+  private expandRawQ4ToHot(
+    kQ4Raw: Uint8Array,
+    kQ4BaseByte: number,
+    vQ4Raw: Uint8Array,
+    vQ4BaseByte: number,
+    kQ4Sc: Float32Array,
+    kScBase: number,
+    vQ4Sc: Float32Array,
+    vScBase: number,
+    hotSlot: number,
+  ): void {
+    const hotK = this.hotKHandle.buffer.f32View(this.hotKHandle);
+    const hotV = this.hotVHandle.buffer.f32View(this.hotVHandle);
     const headDim = this.headDim;
     const headQ4Bytes = this.headQ4Bytes;
     const chunkSpan = headDim >= 32 && (headDim & 31) === 0 ? 32 : headDim;
     const halfSpan = chunkSpan >>> 1;
     const totalVectors = this.numLayers * VRAM_KV_PAGE_TOKENS * this.nHeadsKv;
     const hotBase = hotSlot * this.hotPageFloats;
-    const q4ScBase = q4Slot * this.coldPageScaleFloats;
 
     for (let vec = 0; vec < totalVectors; vec++) {
       const fOff = hotBase + vec * headDim;
-      const ks = kQ4Sc[q4ScBase + vec];
-      const vs = vQ4Sc[q4ScBase + vec];
+      const ks = kQ4Sc[kScBase + vec];
+      const vs = vQ4Sc[vScBase + vec];
       let bOffK = kQ4BaseByte + vec * headQ4Bytes;
       let bOffV = vQ4BaseByte + vec * headQ4Bytes;
 
@@ -746,7 +842,7 @@ export class VramKvPager {
 
   /**
    * Truncates the paged KV cache after `validTokens` (used on multi-turn prefix reuse divergence).
-   * Releases any pages strictly past the prefix across all 3 tiers and ensures the active write page is hot.
+   * Releases any pages strictly past the prefix across all 4 tiers and ensures the active write page is hot.
    */
   truncateTo(validTokens: number): void {
     const keepPages = validTokens > 0 ? Math.ceil(validTokens / VRAM_KV_PAGE_TOKENS) : 0;
@@ -756,28 +852,37 @@ export class VramKvPager {
         this.freeHotSlots.push(this.pageHotSlot[p]);
         this.pageHotSlot[p] = -1;
         this.pageState[p] = VramPageState.EMPTY;
+        this.syncWasmPageEntry(p, VramPageState.EMPTY, -1);
         this.hotResidentCount -= 1;
         this.setHotBit(p, false);
       } else if (st === VramPageState.COLD_COMPRESSED) {
         this.freeColdSlots.push(this.pageColdSlot[p]);
         this.pageColdSlot[p] = -1;
         this.pageState[p] = VramPageState.EMPTY;
+        this.syncWasmPageEntry(p, VramPageState.EMPTY, -1);
         this.warmQ8Count -= 1;
         this.setColdBit(p, false);
       } else if (st === VramPageState.COLD_Q4) {
         this.freeQ4Slots.push(this.pageQ4Slot[p]);
         this.pageQ4Slot[p] = -1;
         this.pageState[p] = VramPageState.EMPTY;
+        this.syncWasmPageEntry(p, VramPageState.EMPTY, -1);
         this.coldQ4Count -= 1;
         this.setQ4Bit(p, false);
+      } else if (st === VramPageState.SWAPPED_Q4) {
+        this.swappedQ4Store.delete(p);
+        this.pageState[p] = VramPageState.EMPTY;
+        this.syncWasmPageEntry(p, VramPageState.EMPTY, -1);
       }
     }
-    // If validTokens lands mid-page on a Warm Q8 or Cold Q4 page, refault that tail page back to F32
+    // If validTokens lands mid-page on a Warm Q8, Cold Q4, or Swapped Q4 page, refault that tail page back to F32
     if (validTokens > 0 && validTokens % VRAM_KV_PAGE_TOKENS !== 0) {
       const tailPage = Math.floor(validTokens / VRAM_KV_PAGE_TOKENS);
+      const tailState = this.pageState[tailPage];
       if (
-        this.pageState[tailPage] === VramPageState.COLD_COMPRESSED ||
-        this.pageState[tailPage] === VramPageState.COLD_Q4
+        tailState === VramPageState.COLD_COMPRESSED ||
+        tailState === VramPageState.COLD_Q4 ||
+        tailState === VramPageState.SWAPPED_Q4
       ) {
         this.ensurePageHot(tailPage);
       }
@@ -851,7 +956,12 @@ export class VramKvPager {
     const useWasmQ4 = useWasm && hasQ4 && headDim >= 32 && (headDim & 31) === 0;
 
     // Fast path: 100% In-Verdant Whole-Layer FlashAttention (1 WASM call per layer, 0 JS views, 0 JS Math.exp!)
-    if (useWasm && arena && (!hasQ4 || useWasmQ4 || this.coldQ4Count === 0)) {
+    if (
+      useWasm &&
+      arena &&
+      this.swappedQ4Store.size === 0 &&
+      (!hasQ4 || useWasmQ4 || this.coldQ4Count === 0)
+    ) {
       const layerHotOffBytes = layerIndex * VRAM_KV_PAGE_TOKENS * this.kvDim * 4;
       const layerQ8OffBytes = layerIndex * VRAM_KV_PAGE_TOKENS * this.kvDim;
       const layerQ4OffBytes = layerIndex * VRAM_KV_PAGE_TOKENS * nHeadsKv * this.headQ4Bytes;
@@ -900,6 +1010,14 @@ export class VramKvPager {
       this.coldAttentionReads += nHeads * (wPages + q4Pages);
       this.coldQ4AttentionReads += nHeads * q4Pages;
       return;
+    }
+
+    // Ensure valid Float32Array views when streaming path handles Tier-3 Swapped Q4 alongside WASM pointers
+    if (q.length === 0 && useWasm && arena) {
+      q = new Float32Array(arena.memory.buffer, qWasmPtr, nHeads * headDim);
+    }
+    if (out.length === 0 && useWasm && arena) {
+      out = new Float32Array(arena.memory.buffer, outWasmPtr, nHeads * headDim);
     }
 
     const headsPerKv = Math.floor(nHeads / nHeadsKv);
@@ -1189,6 +1307,56 @@ export class VramKvPager {
               }
             }
           }
+        } else if (state === VramPageState.SWAPPED_Q4) {
+          const swapped = this.swappedQ4Store.get(p);
+          if (swapped) {
+            this.coldAttentionReads += 1;
+            this.coldQ4AttentionReads += 1;
+            for (let t = 0; t < pageEnd; t++) {
+              const q4RelOff = layerColdQ4Off + (t * nHeadsKv + kvHead) * this.headQ4Bytes;
+              const scOff = layerColdScOff + t * nHeadsKv + kvHead;
+              const kScale = swapped.kSc[scOff];
+              const vScale = swapped.vSc[scOff];
+
+              let dot = 0.0;
+              let bOff = q4RelOff;
+              for (let c = 0; c < headDim; c += chunkSpan) {
+                for (let j = 0; j < halfSpan; j++) {
+                  const byte = swapped.kQ4[bOff++];
+                  dot += q[qBase + c + j] * ((byte & 0x0f) - 8);
+                  dot += q[qBase + c + halfSpan + j] * ((byte >>> 4) - 8);
+                }
+              }
+              const score = dot * kScale * invScale;
+
+              if (score > runningMax) {
+                const rescale = runningMax === -Infinity ? 0.0 : Math.exp(runningMax - score);
+                runningDenom = runningDenom * rescale + 1.0;
+                for (let d = 0; d < headDim; d++) out[outBase + d] *= rescale;
+                let bOffV = q4RelOff;
+                for (let c = 0; c < headDim; c += chunkSpan) {
+                  for (let j = 0; j < halfSpan; j++) {
+                    const byte = swapped.vQ4[bOffV++];
+                    out[outBase + c + j] += ((byte & 0x0f) - 8) * vScale;
+                    out[outBase + c + halfSpan + j] += ((byte >>> 4) - 8) * vScale;
+                  }
+                }
+                runningMax = score;
+              } else {
+                const w = Math.exp(score - runningMax);
+                runningDenom += w;
+                const wv = w * vScale;
+                let bOffV = q4RelOff;
+                for (let c = 0; c < headDim; c += chunkSpan) {
+                  for (let j = 0; j < halfSpan; j++) {
+                    const byte = swapped.vQ4[bOffV++];
+                    out[outBase + c + j] += ((byte & 0x0f) - 8) * wv;
+                    out[outBase + c + halfSpan + j] += ((byte >>> 4) - 8) * wv;
+                  }
+                }
+              }
+            }
+          }
         }
       }
 
@@ -1340,6 +1508,8 @@ export class VramKvPager {
       this.pageQ4Slot[pageIdx] = -1;
       this.coldQ4Count -= 1;
       this.setQ4Bit(pageIdx, false);
+    } else if (prevState === VramPageState.SWAPPED_Q4) {
+      this.swappedQ4Store.delete(pageIdx);
     }
     this.pageState[pageIdx] = VramPageState.EMPTY;
     this.syncWasmPageEntry(pageIdx, VramPageState.EMPTY, -1);
@@ -1379,7 +1549,8 @@ export class VramKvPager {
   }
 
   getTelemetry(): VramKvTelemetry {
-    const coldCompressedPages = this.warmQ8Count + this.coldQ4Count;
+    const swappedQ4Pages = this.swappedQ4Store.size;
+    const coldCompressedPages = this.warmQ8Count + this.coldQ4Count + swappedQ4Pages;
     const activePages = this.hotResidentCount + coldCompressedPages;
     const f32PageBytes = this.hotPageFloats * 4 * 2;
     const warmQ8PageBytes = (this.coldPageQ8Bytes + this.coldPageScaleFloats * 4) * 2;
@@ -1388,14 +1559,15 @@ export class VramKvPager {
     const rawEquivalentBytes = Math.max(f32PageBytes * activePages, this.maxPages * f32PageBytes);
     const allocatedHotBytes = this.hotFrameLimit * f32PageBytes;
     const allocatedWarmBytes = this.warmQ8PoolSize * warmQ8PageBytes;
-    const allocatedQ4Bytes = this.coldQ4PoolSize * coldQ4PageBytes;
-    const allocatedBytes = allocatedHotBytes + allocatedWarmBytes + allocatedQ4Bytes;
+    const allocatedQ4Bytes = this.coldKQ4Handle ? this.coldQ4PoolSize * coldQ4PageBytes : 0;
+    const allocatedSwappedBytes = swappedQ4Pages * coldQ4PageBytes;
+    const allocatedBytes = allocatedHotBytes + allocatedWarmBytes + allocatedQ4Bytes + allocatedSwappedBytes;
 
     const activeRawBytes = activePages * f32PageBytes;
     const activeActualBytes =
       this.hotResidentCount * f32PageBytes +
       this.warmQ8Count * warmQ8PageBytes +
-      this.coldQ4Count * coldQ4PageBytes;
+      (this.coldQ4Count + swappedQ4Pages) * coldQ4PageBytes;
     const savedBytes = Math.max(0, rawEquivalentBytes - allocatedBytes);
     const compressionRatio =
       activeActualBytes > 0
@@ -1411,10 +1583,13 @@ export class VramKvPager {
       hotFrameLimit: this.hotFrameLimit,
       warmQ8Limit: this.warmQ8Limit,
       coldQ4Enabled: this.coldQ4Enabled,
+      coldQ4PoolLimit: this.coldQ4PoolSize,
+      swapQ4Enabled: this.swapQ4Enabled,
       hotResidentPages: this.hotResidentCount,
       coldCompressedPages,
       warmQ8Pages: this.warmQ8Count,
       coldQ4Pages: this.coldQ4Count,
+      swappedQ4Pages,
       activePages,
       rawEquivalentBytes,
       allocatedBytes,
@@ -1422,6 +1597,7 @@ export class VramKvPager {
       compressionRatio,
       reclaimCycles: this.reclaimCycles,
       tierCascadeCycles: this.tierCascadeCycles,
+      swapCycles: this.swapCycles,
       refaultCount: this.refaultCount,
       hotAttentionReads: this.hotAttentionReads,
       coldAttentionReads: this.coldAttentionReads,

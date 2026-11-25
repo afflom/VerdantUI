@@ -160,13 +160,15 @@ test('Verdant K-quant and 5-bit kernels (Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K) mat
   assert.ok(Math.abs(neoxVec[2] - Math.sin(1)) < 1e-5);
 });
 
-test('runVTensorConformanceSuite executes all 18 isolated VT checks (VT-02..VT-66) and passes cleanly', () => {
+test('runVTensorConformanceSuite executes all 24 isolated VT & Prism checks (VT-02..VT-67, PRISM-01..05) and passes cleanly', () => {
   const report = runVTensorConformanceSuite();
-  assert.equal(report.totalCount, 18);
-  assert.equal(report.passedCount, 18);
-  assert.equal(report.checks.length, 18);
+  assert.equal(report.totalCount, 24);
+  assert.equal(report.passedCount, 24);
+  assert.equal(report.checks.length, 24);
   assert.ok(report.checks.some((c) => c.id === 'VT-65' && c.passed));
   assert.ok(report.checks.some((c) => c.id === 'VT-66' && c.passed));
+  assert.ok(report.checks.some((c) => c.id === 'VT-67' && c.passed));
+  assert.ok(report.checks.some((c) => c.id === 'PRISM-05' && c.passed));
   for (const check of report.checks) {
     assert.equal(check.passed, true, `Expected ${check.id} (${check.name}) to pass: ${check.detail}`);
     assert.ok(check.durationMs >= 0);

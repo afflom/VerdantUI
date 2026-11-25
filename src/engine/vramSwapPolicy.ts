@@ -533,8 +533,6 @@ export function createCooperativeYielder(): CooperativeYielder {
     const channel = new MessageChannel();
     const port1 = channel.port1 as MessagePort & { ref?: () => void; unref?: () => void };
     const port2 = channel.port2 as MessagePort & { ref?: () => void; unref?: () => void };
-    port1.unref?.();
-    port2.unref?.();
     const queue: Array<() => void> = [];
     port1.onmessage = () => {
       const next = queue.shift();
@@ -543,6 +541,8 @@ export function createCooperativeYielder(): CooperativeYielder {
       }
       if (next) next();
     };
+    port1.unref?.();
+    port2.unref?.();
     return {
       transport: 'message-channel',
       yieldNow: () =>

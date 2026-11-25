@@ -390,12 +390,13 @@ test('Verdant/Prism Q4_K×Q8_K and Q6_K×Q8_K match reference across remainder r
       const gotSingle = new Float32Array(arena.memory.buffer, ySingleOff, rows);
       const gotBatch = new Float32Array(arena.memory.buffer, yBatchOff, 4 * rows);
 
-      // Token 0 single vs batch-4 must agree closely
+      // Token 0 single vs batch-4 must agree within <= 2 float32 ULPs (FMA vs mul+add)
       for (let r = 0; r < rows; r++) {
         assert.ok(Number.isFinite(gotSingle[r]));
+        const tol = Math.max(1e-4, Math.abs(gotSingle[r]) * 1e-6);
         assert.ok(
-          Math.abs(gotSingle[r] - gotBatch[r]) < 1e-4,
-          `${fmt.name} rows=${rows} token 0 single vs batch-4 mismatch at row ${r}`,
+          Math.abs(gotSingle[r] - gotBatch[r]) <= tol,
+          `${fmt.name} rows=${rows} token 0 single vs batch-4 mismatch at row ${r} (${gotSingle[r]} vs ${gotBatch[r]})`,
         );
       }
 

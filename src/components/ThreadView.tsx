@@ -1,4 +1,4 @@
-import { useEffect, type FC } from 'react';
+import { useEffect, useState, type FC } from 'react';
 import {
   ActionBarPrimitive,
   AuiIf,
@@ -25,7 +25,7 @@ import {
   SlidersHorizontal,
   Square,
 } from 'lucide-react';
-import { detectChatTemplate } from '../engine/assistantAdapter';
+import { detectChatTemplate, formatMessagesForLlama } from '../engine/assistantAdapter';
 import { RECOMMENDED_INSTRUCT_MODEL } from '../engine/modelCatalog';
 import type { EngineState } from '../engine/workerClient';
 
@@ -36,6 +36,7 @@ interface ThreadViewProps {
   onCancelDownload: () => void;
   onToggleInspector: () => void;
   onSpeculativeDraftChange?: (messages: readonly ThreadMessage[], draftText: string) => void;
+  onCountTokens?: (prompt: string) => Promise<{ tokenCount: number; maxContextWindow: number }>;
 }
 
 const SpeculativePrefillDriver: FC<{
@@ -54,6 +55,88 @@ const SpeculativePrefillDriver: FC<{
   }, [modelId, modelReady, promptMode, isRunning, messages, composerText, onSpeculativeDraftChange]);
 
   return null;
+};
+
+const ComposerContextMeter: FC<{
+  engineState: EngineState;
+  modelReady: boolean;
+  onCountTokens?: (prompt: string) => Promise<{ tokenCount: number; maxContextWindow: number }>;
+}> = ({ engineState, modelReady, onCountTokens }) => {
+  const composerText = useAuiState((s) => s.composer.text);
+  const messages = useAuiState((s) => s.thread.messages);
+  const [tokenCount, setTokenCount] = useState<number>(0);
+
+  const model = engineState.model;
+  const maxCtx = model?.maxContextWindow ?? 0;
+
+  useEffect(() => {
+    if (!modelReady || !model || !onCountTokens) {
+      setTokenCount(0);
+      return;
+    }
+    const trimmedDraft = composerText.trim();
+    if (messages.length === 0 && trimmedDraft.length === 0) {
+      setTokenCount(0);
+      return;
+    }
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      const syntheticMessages: ThreadMessage[] =
+        trimmedDraft.length > 0
+          ? [
+              ...messages,
+              {
+                id: 'draft-preview',
+                role: 'user',
+                createdAt: new Date(),
+                content: [{ type: 'text', text: composerText }],
+                attachments: [],
+                metadata: { custom: {} },
+              } as ThreadMessage,
+            ]
+          : [...messages];
+      const formatted = formatMessagesForLlama(syntheticMessages, model, engineState.promptMode);
+      void onCountTokens(formatted)
+        .then((res) => {
+          if (!cancelled) setTokenCount(res.tokenCount);
+        })
+        .catch(() => {
+          // Ignore transient count errors while switching models
+        });
+    }, 120);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [composerText, messages, model, modelReady, engineState.promptMode, onCountTokens]);
+
+  if (!model || maxCtx <= 0) return null;
+
+  const isOverContext = tokenCount > maxCtx;
+  const displayTokens =
+    tokenCount > 0 ? `${tokenCount.toLocaleString()} / ${maxCtx.toLocaleString()} ctx` : `${maxCtx.toLocaleString()} ctx`;
+
+  return (
+    <>
+      <span aria-hidden="true">·</span>
+      <span
+        data-testid="composer-context-meter"
+        title={
+          isOverContext
+            ? `Prompt is ${tokenCount.toLocaleString()} tokens; oldest ${(tokenCount - maxCtx).toLocaleString()} tokens will slide outside the ${maxCtx.toLocaleString()}-token window.`
+            : `Full native context supported: input & output up to ${maxCtx.toLocaleString()} tokens.`
+        }
+        className={`whitespace-nowrap shrink-0 font-mono text-[11px] tabular-nums ${
+          isOverContext
+            ? 'font-medium text-amber-700 dark:text-amber-400'
+            : 'text-slate-500 dark:text-slate-400'
+        }`}
+      >
+        {displayTokens}
+      </span>
+    </>
+  );
 };
 
 const INSTRUCT_STARTER_PROMPTS = [
@@ -240,6 +323,7 @@ export const ThreadView: FC<ThreadViewProps> = ({
   onCancelDownload,
   onToggleInspector,
   onSpeculativeDraftChange,
+  onCountTokens,
 }) => {
   const isDownloading = engineState.status === 'downloading';
   const isModelLoading = isDownloading || engineState.status === 'loading';
@@ -292,6 +376,13 @@ export const ThreadView: FC<ThreadViewProps> = ({
                     Quantization:{' '}
                     <span className="font-mono">
                       {engineState.model?.hparams.primaryQuantization ?? 'F32'}
+                    </span>
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span>
+                    Context:{' '}
+                    <span className="font-mono">
+                      {engineState.model?.maxContextWindow.toLocaleString() ?? '2,048'} tok
                     </span>
                   </span>
                   <span aria-hidden="true">·</span>
@@ -434,12 +525,12 @@ export const ThreadView: FC<ThreadViewProps> = ({
                 modelReady
                   ? isStoryModel
                     ? 'Write a story opening or switch to SmolLM2 / Qwen2.5 in Models...'
-                    : 'Ask anything — runs locally on llama.cpp + vTensor...'
+                    : 'Ask anything — supports full model context input & output locally on vTensor...'
                   : 'Loading GGUF weights into vTensor buffers...'
               }
               rows={2}
               autoFocus
-              className="max-h-40 w-full resize-none bg-transparent px-4 pt-3.5 pb-2 text-[15px] text-slate-900 outline-none placeholder:text-slate-400 dark:text-slate-100 dark:placeholder:text-slate-500"
+              className="max-h-56 w-full resize-none overflow-y-auto bg-transparent px-4 pt-3.5 pb-2 text-[15px] text-slate-900 outline-none placeholder:text-slate-400 dark:text-slate-100 dark:placeholder:text-slate-500"
             />
 
             <div className="flex items-center justify-between gap-3 border-t border-slate-100 px-3 py-2 dark:border-slate-800/80">
@@ -451,6 +542,11 @@ export const ThreadView: FC<ThreadViewProps> = ({
                 >
                   {engineState.model?.displayName ?? 'Loading GGUF...'}
                 </button>
+                <ComposerContextMeter
+                  engineState={engineState}
+                  modelReady={modelReady}
+                  onCountTokens={onCountTokens}
+                />
                 <span aria-hidden="true">·</span>
                 <button
                   type="button"

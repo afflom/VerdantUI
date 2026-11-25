@@ -53,6 +53,8 @@ export interface EngineState {
   readonly telemetry: VTensorTelemetrySnapshot;
   readonly lastTokensPerSec: number;
   readonly lastGeneratedTokens: number;
+  readonly lastPromptTokens: number;
+  readonly lastPromptTruncatedTokens: number;
   readonly prefillProgress: PrefillProgressEvent | null;
   readonly speculativePrefill: SpeculativePrefillState;
   readonly sampling: SamplingConfig;
@@ -144,9 +146,13 @@ function loadSavedPrefs(): {
           ? s.repeatPenalty
           : DEFAULT_SAMPLING_CONFIG.repeatPenalty,
       maxTokens:
-        typeof s.maxTokens === 'number' && s.maxTokens >= 16 && s.maxTokens <= 512
+        typeof s.maxTokens === 'number' && s.maxTokens >= 1 && s.maxTokens <= 1_048_576
           ? Math.round(s.maxTokens)
           : DEFAULT_SAMPLING_CONFIG.maxTokens,
+      fullContextOutput:
+        typeof s.fullContextOutput === 'boolean'
+          ? s.fullContextOutput
+          : DEFAULT_SAMPLING_CONFIG.fullContextOutput,
     };
     const promptMode: PromptFormatMode =
       parsed.promptMode === 'chatml' ||
@@ -238,6 +244,8 @@ export class LlamaVTensorWorkerClient {
       telemetry: INITIAL_TELEMETRY,
       lastTokensPerSec: 0,
       lastGeneratedTokens: 0,
+      lastPromptTokens: 0,
+      lastPromptTruncatedTokens: 0,
       prefillProgress: null,
       speculativePrefill: { active: false, readyTokens: 0, targetTokens: 0 },
       sampling: saved.sampling,
@@ -407,6 +415,24 @@ export class LlamaVTensorWorkerClient {
         },
       });
       this.worker.postMessage({ type: 'run_conformance', requestId } satisfies WorkerRequest);
+    });
+  }
+
+  async countTokens(prompt: string): Promise<{ tokenCount: number; maxContextWindow: number }> {
+    if (!this.state.model || !prompt) {
+      return { tokenCount: 0, maxContextWindow: this.state.model?.maxContextWindow ?? 0 };
+    }
+    const requestId = this.nextRequestId('tok');
+    return new Promise<{ tokenCount: number; maxContextWindow: number }>((resolve, reject) => {
+      this.pending.set(requestId, {
+        resolve: resolve as (v: unknown) => void,
+        reject,
+      });
+      this.worker.postMessage({
+        type: 'count_tokens',
+        requestId,
+        prompt,
+      } satisfies WorkerRequest);
     });
   }
 
@@ -596,6 +622,8 @@ export class LlamaVTensorWorkerClient {
         statusDetail: 'Generating tokens on vTensor',
         lastTokensPerSec: msg.event.tokensPerSecond,
         lastGeneratedTokens: msg.event.generatedTokens,
+        lastPromptTokens: msg.event.promptTokens,
+        lastPromptTruncatedTokens: msg.event.promptTruncatedTokens ?? 0,
         ...(msg.telemetry ? { telemetry: msg.telemetry } : {}),
       });
       entry.onToken?.(msg.event);
@@ -618,6 +646,12 @@ export class LlamaVTensorWorkerClient {
       this.pending.delete(msg.requestId);
       this.patchState({ telemetry: msg.telemetry });
       entry.resolve(msg.telemetry);
+      return;
+    }
+
+    if (msg.type === 'token_count') {
+      this.pending.delete(msg.requestId);
+      entry.resolve({ tokenCount: msg.tokenCount, maxContextWindow: msg.maxContextWindow });
       return;
     }
 

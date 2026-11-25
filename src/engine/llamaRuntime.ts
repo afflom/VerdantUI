@@ -33,6 +33,7 @@ import {
 import { GgufTokenizer } from './tokenizer';
 import {
   buildRopeTables,
+  fillRopePositionCosSin,
   type RopeTables,
   verdantAdd,
   verdantDecodeRow,
@@ -127,6 +128,8 @@ export interface SamplingConfig {
   readonly topK: number;
   readonly repeatPenalty: number;
   readonly maxTokens: number;
+  /** When true (default), decode continues up to the selected model's full context length. */
+  readonly fullContextOutput?: boolean;
   readonly seed?: number;
 }
 
@@ -135,7 +138,8 @@ export const DEFAULT_SAMPLING_CONFIG: SamplingConfig = {
   topP: 0.9,
   topK: 40,
   repeatPenalty: 1.1,
-  maxTokens: 160,
+  maxTokens: 2048,
+  fullContextOutput: true,
 };
 
 export interface LoadedModelSummary {
@@ -175,6 +179,8 @@ export interface TokenStreamEvent {
   readonly accumulatedText: string;
   readonly generatedTokens: number;
   readonly promptTokens: number;
+  readonly contextWindow?: number;
+  readonly promptTruncatedTokens?: number;
   readonly tokensPerSecond: number;
   readonly finished: boolean;
 }
@@ -618,7 +624,7 @@ export class LlamaVTensorRuntime {
     displayName: string,
     source: string,
     buffer: ArrayBuffer | Uint8Array,
-    maxContextCap = 1024,
+    maxContextCap?: number,
   ): LoadedModelSummary {
     const backing = new MemoryBackingStore(id, buffer);
     return this.loadFromBacking(id, displayName, source, backing, { maxContextCap });
@@ -807,7 +813,7 @@ export class LlamaVTensorRuntime {
       quantizedWeightFraction: activeWeightBytes > 0 ? quantizedLinearBytes / activeWeightBytes : 0,
     };
 
-    const maxContextCap = options?.maxContextCap ?? 1024;
+    const maxContextCap = options?.maxContextCap;
     this.backingStore = backing;
     this.calibratedBackingBandwidthMBs = calibrateBackingReadBandwidthMBs(backing);
     this.parsedHeader = parsed;
@@ -819,7 +825,10 @@ export class LlamaVTensorRuntime {
     this.hparams = hp;
     this.tokenizer = tokenizer;
     this.modelSpec = modelSpec;
-    this.requestedMaxContext = Math.min(hp.contextLength, maxContextCap);
+    this.requestedMaxContext =
+      maxContextCap != null && maxContextCap > 0
+        ? Math.min(hp.contextLength, maxContextCap)
+        : hp.contextLength;
 
     this.modelSummary = {
       id,
@@ -846,19 +855,17 @@ export class LlamaVTensorRuntime {
     const attempts: Array<{
       policy: WeightResidencyPolicy;
       maxLayerFrameSlotsCap?: number;
-      maxContextOverride?: number;
     }> = [
       { policy: this.weightResidencyPolicy },
       { policy: 'paged', maxLayerFrameSlotsCap: 2 },
       { policy: 'paged', maxLayerFrameSlotsCap: 1 },
-      { policy: 'paged', maxLayerFrameSlotsCap: 1, maxContextOverride: Math.min(512, this.requestedMaxContext) },
     ];
 
     let lastErr: unknown = null;
     for (let i = 0; i < attempts.length; i++) {
       const plan = attempts[i];
       try {
-        this.allocateWithPlan(plan.policy, plan.maxLayerFrameSlotsCap, plan.maxContextOverride);
+        this.allocateWithPlan(plan.policy, plan.maxLayerFrameSlotsCap);
         return;
       } catch (err) {
         lastErr = err;
@@ -943,7 +950,7 @@ export class LlamaVTensorRuntime {
     );
     this.backend.attachVramWeightTelemetry(() => weightPager.getTelemetry());
 
-    // 2. Allocate vRAM 3-Tier Paged KV-Cache driven strictly by Prism Theorem T4
+    // 2. Allocate vRAM 4-Tier Paged KV-Cache driven strictly by Prism Theorem T4 (preserves full context)
     const maxCtx = contract.effectiveMaxContext;
     const qDim = hp.headCount * headDim;
     const kvDim = hp.headCountKv * headDim;
@@ -956,6 +963,7 @@ export class LlamaVTensorRuntime {
         hotFrameLimit: contract.hotFrameLimit,
         warmQ8Limit: contract.warmQ8Limit,
         coldQ4Enabled: contract.coldQ4Enabled,
+        coldQ4PoolLimit: contract.coldQ4RamLimit,
       },
       (bufId, usage, cap) => this.backend.allocBuffer(bufId, usage, cap),
     );
@@ -1113,18 +1121,26 @@ export class LlamaVTensorRuntime {
           : null,
     };
 
-    // 4. Precompute RoPE cos/sin tables once and upload into Verdant WASM linear memory (zero JS exits!)
-    const ropeTables = buildRopeTables(maxCtx, hp.ropeDimensionCount, hp.ropeFreqBase, hp.ropeFreqScale);
-    const ropeTableBytes = alignUp32(ropeTables.cos.byteLength);
+    // 4. Precompute bounded RoPE cos/sin LUT (<= 4096 rows) + PREFILL_BATCH_SIZE dynamic scratch slots
+    //    so arbitrary full contexts (8K–131K+) never OOM WASM memory while remaining bit-exact.
+    const ropeLutMaxPos = Math.min(maxCtx, 4096);
+    const ropeTables = buildRopeTables(
+      ropeLutMaxPos,
+      hp.ropeDimensionCount,
+      hp.ropeFreqBase,
+      hp.ropeFreqScale,
+    );
+    const ropeTotalFloats = (ropeLutMaxPos + PREFILL_BATCH_SIZE) * ropeTables.half;
+    const ropeTableBytes = alignUp32(ropeTotalFloats * 4);
     const ropeBuf = this.backend.allocBuffer(
       'vtensor.rope_lut',
       'compute',
       ropeTableBytes * 2 + 128,
     );
-    const ropeCosHandle = ropeBuf.allocTensor('rope.cos', GgmlType.F32, [ropeTables.cos.length]);
-    const ropeSinHandle = ropeBuf.allocTensor('rope.sin', GgmlType.F32, [ropeTables.sin.length]);
-    ropeBuf.f32View(ropeCosHandle).set(ropeTables.cos);
-    ropeBuf.f32View(ropeSinHandle).set(ropeTables.sin);
+    const ropeCosHandle = ropeBuf.allocTensor('rope.cos', GgmlType.F32, [ropeTotalFloats]);
+    const ropeSinHandle = ropeBuf.allocTensor('rope.sin', GgmlType.F32, [ropeTotalFloats]);
+    ropeBuf.f32View(ropeCosHandle).set(ropeTables.cos, 0);
+    ropeBuf.f32View(ropeSinHandle).set(ropeTables.sin, 0);
 
     this.weightPager = weightPager;
     this.kvPager = kvPager;
@@ -1186,11 +1202,17 @@ export class LlamaVTensorRuntime {
     const layerCount = this.layerInfos.length;
 
     const useQ8 = Boolean(this.performanceContract?.useQ8Activations && arena !== null);
-    const kvTierLabel = kv.coldQ4Enabled ? 'F32/Q8/Q4 vRAM' : 'F32/Q8 vRAM';
+    const kvTierLabel = kv.swapQ4Enabled
+      ? 'F32/Q8/Q4/Swap vRAM'
+      : kv.coldQ4Enabled
+        ? 'F32/Q8/Q4 vRAM'
+        : 'F32/Q8 vRAM';
     const attnLabel = arena
-      ? kv.coldQ4Enabled
-        ? 'F32/Q8/Q4 SIMD'
-        : 'F32/Q8 SIMD'
+      ? kv.swapQ4Enabled
+        ? 'F32/Q8/Q4/Swap SIMD'
+        : kv.coldQ4Enabled
+          ? 'F32/Q8/Q4 SIMD'
+          : 'F32/Q8 SIMD'
       : kvTierLabel;
 
     // Compile formal Prism MatrixExecution schedule & cost-surface certificates for this model
@@ -1513,6 +1535,28 @@ export class LlamaVTensorRuntime {
     const canWasmRope =
       arena !== null && ropeCosPtr >= 0 && ropeSinPtr >= 0 && hp.ropeDimensionCount === headDim;
     const ropePosStrideBytes = (hp.ropeDimensionCount >>> 1) * 4;
+    const ropeLutMaxPos = rope.maxCtx;
+    const ropeHalf = rope.half;
+    const ropeCosHandleRef = this.ropeCosHandle;
+    const ropeSinHandleRef = this.ropeSinHandle;
+    const dynamicRopePosCache = new Int32Array(PREFILL_BATCH_SIZE).fill(-1);
+    const resolveRopeOffsetBytes = (pos: number, slotIdx: number): number => {
+      if (pos < ropeLutMaxPos) {
+        return pos * ropePosStrideBytes;
+      }
+      const rowIdx = ropeLutMaxPos + slotIdx;
+      if (dynamicRopePosCache[slotIdx] !== pos && ropeCosHandleRef && ropeSinHandleRef) {
+        fillRopePositionCosSin(
+          pos,
+          rope,
+          ropeCosHandleRef.buffer.f32View(ropeCosHandleRef),
+          ropeSinHandleRef.buffer.f32View(ropeSinHandleRef),
+          rowIdx * ropeHalf,
+        );
+        dynamicRopePosCache[slotIdx] = pos;
+      }
+      return rowIdx * ropePosStrideBytes;
+    };
     const neoxFlag = useNeoxRope ? 1 : 0;
 
     const sxPtr = arena && s.x.buffer.isWasmBacked ? s.x.buffer.wasmPtr(s.x) : -1;
@@ -1716,7 +1760,7 @@ export class LlamaVTensorRuntime {
           srcType: canWasmRope && useWasmAct ? 'F32 SIMD' : 'F32',
           execute: () => {
             if (canWasmRope && useWasmAct && arena) {
-              const pOff = execState.pos * ropePosStrideBytes;
+              const pOff = resolveRopeOffsetBytes(execState.pos, 0);
               arena.kernels.rope_f32(qPtr, ropeCosPtr + pOff, ropeSinPtr + pOff, hp.headCount, headDim, neoxFlag);
             } else {
               verdantRopePrecomputed(
@@ -1737,7 +1781,7 @@ export class LlamaVTensorRuntime {
           srcType: canWasmRope && useWasmAct ? 'F32 SIMD' : 'F32',
           execute: () => {
             if (canWasmRope && useWasmAct && arena) {
-              const pOff = execState.pos * ropePosStrideBytes;
+              const pOff = resolveRopeOffsetBytes(execState.pos, 0);
               arena.kernels.rope_f32(kPtr, ropeCosPtr + pOff, ropeSinPtr + pOff, hp.headCountKv, headDim, neoxFlag);
             } else {
               verdantRopePrecomputed(
@@ -2629,7 +2673,7 @@ export class LlamaVTensorRuntime {
           execute: () => {
             if (canWasmRope && useWasmBatchAct && arena) {
               for (let t = 0; t < B; t++) {
-                const pOff = (batchState.startPos + t) * ropePosStrideBytes;
+                const pOff = resolveRopeOffsetBytes(batchState.startPos + t, t);
                 arena.kernels.rope_f32(
                   bqBasePtr + t * qStrideBytes,
                   ropeCosPtr + pOff,
@@ -3032,7 +3076,7 @@ export class LlamaVTensorRuntime {
     }
 
     const encoded = this.tokenizer.encode(prompt, this.tokenizer.addBosToken);
-    const safeCap = Math.max(0, this.maxContextWindow - 48);
+    const safeCap = Math.max(0, this.maxContextWindow - 1);
     const targetTokens = encoded.length > safeCap ? encoded.slice(0, safeCap) : encoded;
     if (targetTokens.length === 0) {
       return {
@@ -3204,9 +3248,18 @@ export class LlamaVTensorRuntime {
   }
 
   /**
-   * Runs prompt prefill (with bit-exact KV-cache prefix reuse, 3-tier vRAM paging, contract-driven
+   * Returns the exact token count for `prompt` under the active GGUF model's tokenizer
+   * (including BOS when configured by the model), or 0 if no model is loaded.
+   */
+  countTokens(prompt: string): number {
+    if (!this.tokenizer || !prompt) return 0;
+    return this.tokenizer.encode(prompt, this.tokenizer.addBosToken).length;
+  }
+
+  /**
+   * Runs prompt prefill (with bit-exact KV-cache prefix reuse, 4-tier vRAM paging, contract-driven
    * batched-4 layer execution, and LM-head skipping) followed by autoregressive decoding through
-   * vTensor, continuously verifying Theorem T5 contract compliance.
+   * vTensor up to the model's full native context length, continuously verifying Theorem T5.
    */
   async *generate(
     prompt: string,
@@ -3219,8 +3272,9 @@ export class LlamaVTensorRuntime {
     }
 
     const promptTokens = this.tokenizer.encode(prompt, this.tokenizer.addBosToken);
-    const reservedGenTokens = Math.min(config.maxTokens, Math.max(16, Math.floor(this.maxContextWindow * 0.4)));
-    const maxPrompt = Math.max(1, this.maxContextWindow - reservedGenTokens);
+    // Allow users to input up to 100% of the selected model's native context window with zero artificial reservation.
+    const maxPrompt = Math.max(1, this.maxContextWindow);
+    const promptTruncatedTokens = Math.max(0, promptTokens.length - maxPrompt);
     let truncatedPrompt: number[];
     if (promptTokens.length > maxPrompt) {
       truncatedPrompt = this.tokenizer.addBosToken
@@ -3328,7 +3382,15 @@ export class LlamaVTensorRuntime {
     const decodeStart = performance.now();
     let pos = truncatedPrompt.length;
     let accumulated = '';
-    const maxGen = Math.min(config.maxTokens, Math.max(1, this.maxContextWindow - pos));
+    const requestedMaxGen =
+      config.fullContextOutput || config.maxTokens <= 0
+        ? this.maxContextWindow
+        : config.maxTokens;
+    const remainingSlots = Math.max(0, this.maxContextWindow - pos);
+    // Final prompt logits can always emit 1 token without writing a new KV slot; each subsequent token
+    // consumes 1 KV slot up to `this.maxContextWindow - 1`, allowing responses up to full context length.
+    const maxPossibleGen = Math.min(this.maxContextWindow, remainingSlots + 1);
+    const maxGen = Math.max(1, Math.min(requestedMaxGen, maxPossibleGen));
 
     const updateContract = (tokSec: number) => {
       if (this.performanceContract && tokSec > 0) {
@@ -3369,6 +3431,8 @@ export class LlamaVTensorRuntime {
             accumulatedText: accumulated,
             generatedTokens: step,
             promptTokens: truncatedPrompt.length,
+            contextWindow: this.maxContextWindow,
+            promptTruncatedTokens,
             tokensPerSecond: tokSec,
             finished: true,
           };
@@ -3396,11 +3460,13 @@ export class LlamaVTensorRuntime {
           accumulatedText: accumulated,
           generatedTokens: generatedCount,
           promptTokens: truncatedPrompt.length,
+          contextWindow: this.maxContextWindow,
+          promptTruncatedTokens,
           tokensPerSecond: tokSec,
           finished,
         };
 
-        if (!finished) {
+        if (!finished && pos < this.maxContextWindow) {
           logits = this.evalToken(nextToken, pos, step === 0, true);
           this.cachedTokens.push(nextToken);
           pos += 1;

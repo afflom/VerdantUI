@@ -101,6 +101,11 @@ export type WorkerRequest =
       type: 'speculative_prefill';
       requestId: string;
       prompt: string;
+    }
+  | {
+      type: 'count_tokens';
+      requestId: string;
+      prompt: string;
     };
 
 export type WorkerResponse =
@@ -159,6 +164,12 @@ export type WorkerResponse =
       readyTokens: number;
       targetTokens: number;
       telemetry?: VTensorTelemetrySnapshot;
+    }
+  | {
+      type: 'token_count';
+      requestId: string;
+      tokenCount: number;
+      maxContextWindow: number;
     }
   | {
       type: 'error';
@@ -270,7 +281,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         req.displayName,
         req.source,
         req.buffer,
-        req.maxContextCap ?? 1024,
+        req.maxContextCap,
       );
       await runtime.hydrateUnifiedStoreFromOpfs().catch(() => 0);
       const opfsStorage = await inspectOpfsVramStorage();
@@ -327,7 +338,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         });
 
         const summary = runtime.loadFromBacking(req.id, req.displayName, req.url, backing, {
-          maxContextCap: req.maxContextCap ?? 1024,
+          maxContextCap: req.maxContextCap,
           weightResidencyPolicy: req.weightResidencyPolicy,
           backingQuotaBytes: preStorage.quotaBytes > 0 ? preStorage.quotaBytes : undefined,
         });
@@ -402,7 +413,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         });
 
         const summary = runtime.loadFromBacking(req.id, req.displayName, req.source, backing, {
-          maxContextCap: req.maxContextCap ?? 1024,
+          maxContextCap: req.maxContextCap,
           weightResidencyPolicy: req.weightResidencyPolicy,
           backingQuotaBytes: preStorage.quotaBytes > 0 ? preStorage.quotaBytes : undefined,
         });
@@ -451,6 +462,18 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         type: 'telemetry',
         requestId: req.requestId,
         telemetry: runtime.getTelemetry(),
+      });
+      return;
+    }
+
+    if (req.type === 'count_tokens') {
+      const tokenCount = runtime.countTokens(req.prompt);
+      const maxContextWindow = runtime.getModelSummary()?.maxContextWindow ?? 0;
+      post({
+        type: 'token_count',
+        requestId: req.requestId,
+        tokenCount,
+        maxContextWindow,
       });
       return;
     }

@@ -1039,15 +1039,17 @@ export function verdantRope(
   pos: number,
   freqBase: number,
   neox = false,
+  freqScale = 1.0,
 ): void {
   const half = Math.floor(ropeDim / 2);
+  const safeScale = Number.isFinite(freqScale) && freqScale > 0 ? freqScale : 1.0;
   for (let h = 0; h < nHeads; h++) {
     const base = h * headDim;
     for (let i = 0; i < half; i++) {
-      const freq = 1.0 / Math.pow(freqBase, (2 * i) / ropeDim);
+      const freq = safeScale / Math.pow(freqBase, (2 * i) / ropeDim);
       const angle = pos * freq;
-      const cos = Math.cos(angle);
-      const sin = Math.sin(angle);
+      const cos = Math.fround(Math.cos(angle));
+      const sin = Math.fround(Math.sin(angle));
       if (neox) {
         const x0 = vec[base + i];
         const x1 = vec[base + i + half];
@@ -1067,13 +1069,15 @@ export function verdantRope(
 export interface RopeTables {
   readonly maxCtx: number;
   readonly half: number;
+  readonly freqs: Float64Array;
   readonly cos: Float32Array;
   readonly sin: Float32Array;
 }
 
 /**
- * Precomputes RoPE cos/sin tables once per model load (`[maxCtx * half]` floats),
- * eliminating thousands of per-token Math.pow / Math.cos / Math.sin calls across layers & heads.
+ * Precomputes RoPE cos/sin tables up to `maxCtx` positions (`[maxCtx * half]` floats),
+ * while retaining exact F64 inverse frequencies (`freqs`) for bit-identical on-demand
+ * synthesis at arbitrary positions `pos >= maxCtx` (e.g. 8K–131K context windows).
  */
 export function buildRopeTables(
   maxCtx: number,
@@ -1097,11 +1101,32 @@ export function buildRopeTables(
       sin[rowOff + i] = Math.sin(angle);
     }
   }
-  return { maxCtx, half, cos, sin };
+  return { maxCtx, half, freqs, cos, sin };
+}
+
+/**
+ * Computes cos/sin for a single arbitrary RoPE position `pos` into destination F32 views,
+ * bit-identical to `buildRopeTables`. Used by WASM dynamic RoPE scratch slots for `pos >= maxCtx`.
+ */
+export function fillRopePositionCosSin(
+  pos: number,
+  tables: RopeTables,
+  cosDst: Float32Array,
+  sinDst: Float32Array,
+  dstOffset = 0,
+): void {
+  const half = tables.half;
+  const freqs = tables.freqs;
+  for (let i = 0; i < half; i++) {
+    const angle = pos * freqs[i];
+    cosDst[dstOffset + i] = Math.cos(angle);
+    sinDst[dstOffset + i] = Math.sin(angle);
+  }
 }
 
 /**
  * Table-backed Verdant ROPE rotary position embedding (normal interleaved or NeoX split-half).
+ * Automatically synthesizes bit-exact cos/sin on the fly for `pos >= tables.maxCtx`.
  */
 export function verdantRopePrecomputed(
   vec: Float32Array,
@@ -1112,6 +1137,39 @@ export function verdantRopePrecomputed(
   neox = false,
 ): void {
   const half = tables.half;
+  if (pos >= tables.maxCtx || pos < 0) {
+    const freqs = tables.freqs;
+    if (neox) {
+      for (let h = 0; h < nHeads; h++) {
+        const base = h * headDim;
+        for (let i = 0; i < half; i++) {
+          const angle = pos * freqs[i];
+          const c = Math.fround(Math.cos(angle));
+          const s = Math.fround(Math.sin(angle));
+          const x0 = vec[base + i];
+          const x1 = vec[base + i + half];
+          vec[base + i] = Math.fround(x0 * c - x1 * s);
+          vec[base + i + half] = Math.fround(x0 * s + x1 * c);
+        }
+      }
+    } else {
+      for (let h = 0; h < nHeads; h++) {
+        const base = h * headDim;
+        for (let i = 0; i < half; i++) {
+          const angle = pos * freqs[i];
+          const c = Math.fround(Math.cos(angle));
+          const s = Math.fround(Math.sin(angle));
+          const idx = base + (i << 1);
+          const x0 = vec[idx];
+          const x1 = vec[idx + 1];
+          vec[idx] = Math.fround(x0 * c - x1 * s);
+          vec[idx + 1] = Math.fround(x0 * s + x1 * c);
+        }
+      }
+    }
+    return;
+  }
+
   const rowOff = pos * half;
   const cosTable = tables.cos;
   const sinTable = tables.sin;

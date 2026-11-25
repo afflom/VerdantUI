@@ -90,7 +90,7 @@ export function formatMessagesForLlama(
     const parts = turns.map((t) => t.text);
     if (parts.length === 0) return 'Once upon a time';
     if (parts.length === 1) return parts[0];
-    return parts.slice(-2).join(' ');
+    return parts.join(' ');
   }
 
   if (effectiveTemplate === 'chatml') {
@@ -202,7 +202,7 @@ export function formatSpeculativePrefixForLlama(
 
   if (effectiveTemplate === 'continuation') {
     if (turns.length === 0) return openDraft;
-    const prev = turns[turns.length - 1].text;
+    const prev = turns.map((t) => t.text).join(' ');
     return openDraft ? `${prev} ${openDraft}` : `${prev} `;
   }
 

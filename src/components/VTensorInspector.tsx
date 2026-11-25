@@ -312,7 +312,9 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
                     </dt>
                     <dd className="whitespace-nowrap font-mono text-[11px] tabular-nums text-slate-900 dark:text-slate-100">
                       {contract.hotFrameLimit}H/{contract.warmQ8Limit}W
-                      {contract.coldQ4Enabled ? '/Q4' : ''} @ {contract.effectiveMaxContext} ctx
+                      {contract.coldQ4Enabled ? '/Q4' : ''}
+                      {contract.swapQ4Enabled ? '+Sw' : ''} @{' '}
+                      {contract.effectiveMaxContext.toLocaleString()} ctx
                     </dd>
                   </div>
                   <div className="flex items-center justify-between gap-2 px-3 py-1.5">
@@ -536,12 +538,17 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
                 <dl className="mt-2 divide-y divide-slate-100 rounded-lg border border-slate-200 dark:divide-slate-800 dark:border-slate-800">
                   <div className="flex items-center justify-between px-3 py-1.5">
                     <dt className="text-slate-500 dark:text-slate-400">
-                      {telemetry.vramKv.coldQ4Enabled ? 'Hot / Warm / Cold Q4' : 'Hot F32 / Warm Q8'}
+                      {telemetry.vramKv.swapQ4Enabled
+                        ? 'Hot / Warm / Q4 / Swap'
+                        : telemetry.vramKv.coldQ4Enabled
+                          ? 'Hot / Warm / Cold Q4'
+                          : 'Hot F32 / Warm Q8'}
                     </dt>
                     <dd className="font-mono tabular-nums text-slate-900 dark:text-slate-100">
                       {telemetry.vramKv.hotResidentPages}/{telemetry.vramKv.hotFrameLimit}H ·{' '}
                       {telemetry.vramKv.warmQ8Pages}W
                       {telemetry.vramKv.coldQ4Enabled ? ` · ${telemetry.vramKv.coldQ4Pages}Q4` : ''}
+                      {telemetry.vramKv.swapQ4Enabled ? ` · ${telemetry.vramKv.swappedQ4Pages}Sw` : ''}
                     </dd>
                   </div>
                   <div className="flex items-center justify-between px-3 py-1.5">
@@ -653,9 +660,10 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
                     </dd>
                   </div>
                   <div className="flex justify-between px-3 py-1.5">
-                    <dt className="text-slate-500 dark:text-slate-400">Vocab / Ctx cap</dt>
+                    <dt className="text-slate-500 dark:text-slate-400">Vocab / Context</dt>
                     <dd className="font-mono tabular-nums text-slate-900 dark:text-slate-100">
-                      {model.hparams.vocabSize.toLocaleString()} / {model.maxContextWindow}
+                      {model.hparams.vocabSize.toLocaleString()} /{' '}
+                      {model.maxContextWindow.toLocaleString()} tok
                     </dd>
                   </div>
                 </dl>
@@ -921,27 +929,86 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
               </div>
 
               <div>
-                <div className="flex justify-between">
-                  <label
-                    htmlFor="sampling-max-tokens"
-                    className="font-medium text-slate-700 dark:text-slate-300"
-                  >
-                    Max Output Tokens
-                  </label>
-                  <span className="font-mono tabular-nums text-slate-900 dark:text-slate-100">
-                    {sampling.maxTokens}
-                  </span>
-                </div>
-                <input
-                  id="sampling-max-tokens"
-                  type="range"
-                  min={16}
-                  max={384}
-                  step={16}
-                  value={sampling.maxTokens}
-                  onChange={(e) => onUpdateSampling({ maxTokens: Number(e.target.value) })}
-                  className="mt-1.5 w-full accent-[#0F5132]"
-                />
+                {(() => {
+                  const maxCtx = Math.max(16, model?.maxContextWindow ?? 2048);
+                  const isFullContext = Boolean(sampling.fullContextOutput);
+                  const sliderStep = maxCtx > 8192 ? 128 : maxCtx > 2048 ? 64 : 16;
+                  const clampedCustom = Math.min(Math.max(1, sampling.maxTokens), maxCtx);
+                  return (
+                    <>
+                      <div className="flex items-center justify-between gap-2">
+                        <label
+                          htmlFor="sampling-max-tokens"
+                          className="font-medium text-slate-700 dark:text-slate-300"
+                        >
+                          Max Output Tokens
+                        </label>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            aria-pressed={isFullContext}
+                            onClick={() =>
+                              onUpdateSampling({
+                                fullContextOutput: !isFullContext,
+                                maxTokens: !isFullContext ? maxCtx : clampedCustom,
+                              })
+                            }
+                            className={`rounded-md border px-2 py-0.5 font-mono text-[10px] font-medium transition-colors whitespace-nowrap ${
+                              isFullContext
+                                ? 'border-emerald-700/30 bg-emerald-50 text-emerald-800 dark:border-emerald-500/40 dark:bg-emerald-950/50 dark:text-emerald-300'
+                                : 'border-slate-200 bg-white text-slate-600 hover:text-slate-900 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-400 dark:hover:text-slate-200'
+                            }`}
+                          >
+                            Full context
+                          </button>
+                          <span className="font-mono tabular-nums text-slate-900 dark:text-slate-100">
+                            {isFullContext ? maxCtx.toLocaleString() : clampedCustom.toLocaleString()}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="mt-1.5 flex items-center gap-2">
+                        <input
+                          id="sampling-max-tokens"
+                          type="range"
+                          min={16}
+                          max={maxCtx}
+                          step={sliderStep}
+                          value={isFullContext ? maxCtx : Math.max(16, clampedCustom)}
+                          onChange={(e) => {
+                            const nextVal = Number(e.target.value);
+                            onUpdateSampling({
+                              maxTokens: nextVal,
+                              fullContextOutput: nextVal >= maxCtx,
+                            });
+                          }}
+                          className="w-full accent-[#0F5132]"
+                        />
+                        <input
+                          aria-label="Exact max output tokens"
+                          type="number"
+                          min={1}
+                          max={maxCtx}
+                          value={isFullContext ? maxCtx : clampedCustom}
+                          onChange={(e) => {
+                            const raw = Number(e.target.value);
+                            if (!Number.isFinite(raw) || raw < 1) return;
+                            const nextVal = Math.min(maxCtx, Math.round(raw));
+                            onUpdateSampling({
+                              maxTokens: nextVal,
+                              fullContextOutput: nextVal >= maxCtx,
+                            });
+                          }}
+                          className="h-7 w-20 shrink-0 rounded-md border border-slate-200 bg-white px-2 text-right font-mono text-[11px] tabular-nums text-slate-900 outline-none focus:border-emerald-700 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-100"
+                        />
+                      </div>
+                      <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                        {isFullContext
+                          ? `Full-context mode: streams up to the model's entire ${maxCtx.toLocaleString()}-token window (stops naturally on EOS).`
+                          : `Custom cap: up to ${clampedCustom.toLocaleString()} of ${maxCtx.toLocaleString()} context tokens.`}
+                      </p>
+                    </>
+                  );
+                })()}
               </div>
 
               <div className="border-t border-slate-100 pt-4 dark:border-slate-800">
