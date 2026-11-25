@@ -49,7 +49,9 @@ test('LlamaVTensorRuntime loads stories260K.gguf into vTensor buffers and genera
   assert.equal(telemetry.cpuFallbackOps, 0);
   assert.ok(telemetry.totalGraphRuns > 5);
   assert.ok(telemetry.totalOpsExecuted > 100);
-  assert.equal(telemetry.buffers.length, 4); // weights, kv_hot_frames, vram_cold_kv, compute_scratch
+  assert.ok(telemetry.buffers.length >= 6); // weights, kv_hot, kv_warm, kv_pagetable, compute_scratch, rope_tables
+  const bufferUsages = new Set(telemetry.buffers.map((b) => b.usage));
+  assert.ok(bufferUsages.has('weights') && bufferUsages.has('kv_cache') && bufferUsages.has('compute'));
   assert.ok(telemetry.compiledGraphReuses > 5);
   assert.ok(telemetry.vramKv !== null);
   assert.ok(telemetry.vramKv.hotResidentPages >= 1);

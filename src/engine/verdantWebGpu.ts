@@ -576,7 +576,7 @@ interface GpuBufferLike {
 interface GpuDeviceLike {
   limits: { maxStorageBufferBindingSize?: number };
   queue: {
-    writeBuffer(buffer: GpuBufferLike, bufferOffset: number, data: BufferSource): void;
+    writeBuffer(buffer: GpuBufferLike, bufferOffset: number, data: ArrayBufferView | ArrayBufferLike): void;
     submit(commandBuffers: unknown[]): void;
   };
   createShaderModule(desc: { code: string }): unknown;

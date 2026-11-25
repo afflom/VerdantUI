@@ -436,6 +436,8 @@ export class VramWeightPager {
       this.lmHeadTileBuffer = null;
       this.lmHeadStripeRows = outWeightInfo.dims[1] ?? 1;
       this.residentWeightBytes = weightsBuf.capacityBytes;
+      this.pinnedLayerCount = layerInfos.length;
+      this.cachedStreamingPublications = [];
       return;
     }
 

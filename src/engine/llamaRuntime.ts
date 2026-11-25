@@ -3351,7 +3351,7 @@ export class LlamaVTensorRuntime {
           config,
           rng,
           this.backend.arena,
-          this.scratch.logits.buffer.wasmPtr(this.scratch.logits),
+          this.scratch ? this.scratch.logits.buffer.wasmPtr(this.scratch.logits) : -1,
         );
         const isStopToken =
           this.tokenizer.eogTokenIds.has(nextToken) ||

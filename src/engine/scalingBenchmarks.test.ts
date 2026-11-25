@@ -284,9 +284,9 @@ test('Belady-optimal cyclic layer pinning achieves exact (K-1)/L hit rate on cyc
   const makeInfo = (name: string, dims: number[], byteSize: number): GgufTensorInfo => {
     const info: GgufTensorInfo = {
       name,
-      nDims: dims.length,
       dims,
       type: GgmlType.F32,
+      typeName: 'F32',
       offset,
       byteSize,
     };
@@ -301,7 +301,6 @@ test('Belady-optimal cyclic layer pinning achieves exact (K-1)/L hit rate on cyc
   const layerInfos: LayerTensorInfoGroup[] = [];
   for (let l = 0; l < L; l++) {
     layerInfos.push({
-      layerIdx: l,
       attnNorm: makeInfo(`blk.${l}.attn_norm.weight`, [dim], normBytes),
       attnQ: makeInfo(`blk.${l}.attn_q.weight`, [dim, dim], tensorBytes),
       attnQBias: null,

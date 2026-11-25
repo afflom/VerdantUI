@@ -6,6 +6,7 @@ import {
   decideUorcChallengerAdmission,
   decodeRepeatedBytes,
   decodeSelectorPage,
+  decompressUnifiedKvBytes,
   factorRepeatedBytes,
   fitSelectorPage,
   FRAME_BUDGET_US,
