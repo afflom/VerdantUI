@@ -7654,6 +7654,8 @@ export interface MoeExpertParallelDispatch {
   readonly upPtrs: Int32Array;
   readonly downPtrs: Int32Array;
   readonly weights: Float32Array;
+  /** When true, adds the reduced result onto existing `outPtr` contents instead of overwriting. */
+  readonly accumulate?: boolean;
 }
 
 export interface MoeExpertBatch4ParallelDispatch {

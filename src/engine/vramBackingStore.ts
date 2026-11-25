@@ -661,14 +661,22 @@ export class OpfsDemandVramBackingStore implements VramBackingStore {
     this.lruPrev = new Int32Array(this.maxSlots).fill(-1);
     this.lruNext = new Int32Array(this.maxSlots).fill(-1);
 
+    const indexIdentityMatches =
+      options.initialIndex &&
+      (options.initialIndex.url === this.url ||
+        (Boolean(normalizeEtag(this.etag)) &&
+          normalizeEtag(options.initialIndex.etag) === normalizeEtag(this.etag)));
     if (
       options.initialIndex &&
       options.initialIndex.version === 1 &&
-      options.initialIndex.url === this.url &&
+      indexIdentityMatches &&
       options.initialIndex.totalBytes === this.byteLength &&
       options.initialIndex.slabBytes === this.slabBytes
     ) {
       this.hydrateIndex(options.initialIndex);
+      if (options.initialIndex.url !== this.url) {
+        this.dirtySincePersist += 1;
+      }
     }
   }
 
@@ -908,6 +916,19 @@ export class OpfsDemandVramBackingStore implements VramBackingStore {
       backingKind: 'opfs-demand',
       stage: 'cached',
     });
+  }
+
+  /** Flushes pending slab writes and persists the LRU slab directory to OPFS immediately. */
+  flush(): void {
+    if (!this.handle) return;
+    try {
+      this.handle.flush();
+    } catch {
+      // Ignore flush errors
+    }
+    if (this.dirtySincePersist > 0) {
+      this.persistIndexNow();
+    }
   }
 
   private persistIndexNow(): void {
@@ -1692,6 +1713,330 @@ async function writePartMeta(
   }
 }
 
+export interface CommittedModelMeta {
+  readonly version: 1;
+  readonly modelId: string;
+  readonly url: string;
+  readonly totalBytes: number;
+  readonly etag?: string;
+  readonly lastModified?: string;
+  readonly headerHash64: string;
+  readonly committedAt: number;
+}
+
+const FNV1A_OFFSET_64 = 0xcbf29ce484222325n;
+const FNV1A_PRIME_64 = 0x100000001b3n;
+const FNV1A_MASK_64 = 0xffffffffffffffffn;
+const HOT_BUNDLE_MAGIC = 0x544f4856; // "VHOT"
+const HOT_BUNDLE_VERSION = 1;
+const HOT_BUNDLE_MAX_BYTES = 32 * 1024 * 1024;
+
+/** Normalizes HTTP ETag values by stripping weak prefixes (`W/`) and surrounding quotes. */
+export function normalizeEtag(etag?: string | null): string | undefined {
+  if (!etag) return undefined;
+  const trimmed = etag.trim().replace(/^W\//i, '').replace(/^"+|"+$/g, '').trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/** Computes a deterministic 64-bit FNV-1a hex fingerprint over up to the first 4 KiB of a GGUF header. */
+export function computeHeaderFingerprint64(bytes: Uint8Array): string {
+  const len = Math.min(bytes.byteLength, 4096);
+  let h = FNV1A_OFFSET_64;
+  for (let i = 0; i < len; i++) {
+    h ^= BigInt(bytes[i]);
+    h = (h * FNV1A_PRIME_64) & FNV1A_MASK_64;
+  }
+  return h.toString(16).padStart(16, '0');
+}
+
+function computeSyncHandleHeaderFingerprint64(handle: SyncAccessHandleLike): string {
+  const len = Math.min(4096, Math.max(0, handle.getSize()));
+  if (len === 0) return '0000000000000000';
+  const buf = new Uint8Array(len);
+  const read = handle.read(buf, { at: 0 });
+  return computeHeaderFingerprint64(read === len ? buf : buf.subarray(0, Math.max(0, read)));
+}
+
+async function readCommittedMeta(
+  dir: FileSystemDirectoryHandle,
+  metaName: string,
+): Promise<CommittedModelMeta | null> {
+  try {
+    const h = await dir.getFileHandle(metaName, { create: false });
+    const f = await h.getFile();
+    const parsed = JSON.parse(await f.text()) as Partial<CommittedModelMeta>;
+    if (
+      parsed.version === 1 &&
+      typeof parsed.modelId === 'string' &&
+      typeof parsed.url === 'string' &&
+      typeof parsed.totalBytes === 'number' &&
+      parsed.totalBytes >= 24 &&
+      typeof parsed.headerHash64 === 'string'
+    ) {
+      return {
+        version: 1,
+        modelId: parsed.modelId,
+        url: parsed.url,
+        totalBytes: parsed.totalBytes,
+        etag: typeof parsed.etag === 'string' ? parsed.etag : undefined,
+        lastModified: typeof parsed.lastModified === 'string' ? parsed.lastModified : undefined,
+        headerHash64: parsed.headerHash64,
+        committedAt: typeof parsed.committedAt === 'number' ? parsed.committedAt : Date.now(),
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeCommittedMeta(
+  dir: FileSystemDirectoryHandle,
+  metaName: string,
+  meta: CommittedModelMeta,
+): Promise<void> {
+  try {
+    const h = (await dir.getFileHandle(metaName, { create: true })) as FileSystemFileHandle &
+      SyncAccessHandleCapableFile;
+    const encoded = new TextEncoder().encode(JSON.stringify(meta));
+    if (typeof h.createSyncAccessHandle === 'function') {
+      const sync = await openSyncAccessHandleWithRetry(h, {
+        mode: 'readwrite',
+        retryDelaysMs: [25, 50, 100],
+      });
+      try {
+        sync.truncate(0);
+        writeAllSync(sync, encoded, 0);
+        sync.flush();
+      } finally {
+        sync.close();
+      }
+    }
+  } catch {
+    // Non-fatal metadata sidecar write failure
+  }
+}
+
+export interface OpfsContentMatch {
+  readonly stem: string;
+  readonly meta: CommittedModelMeta;
+  readonly matchedBy: 'url' | 'etag-size';
+}
+
+/**
+ * Scans committed OPFS model sidecars (`<stem>.meta`) for an already-persisted immutable `.gguf`
+ * matching the requested URL or `(ETag, totalBytes)` so duplicate downloads across model IDs,
+ * custom URLs, or CDN mirrors resolve instantly with 0 bytes downloaded.
+ */
+export async function findExistingOpfsContentMatch(
+  dir: FileSystemDirectoryHandle,
+  query: {
+    url?: string;
+    etag?: string;
+    totalBytes?: number;
+    excludeStem?: string;
+  },
+): Promise<OpfsContentMatch | null> {
+  const iterable = dir as FileSystemDirectoryHandle & {
+    entries?: () => AsyncIterableIterator<[string, FileSystemHandle]>;
+  };
+  if (typeof iterable.entries !== 'function') return null;
+
+  const targetEtag = normalizeEtag(query.etag);
+  const targetBytes = query.totalBytes && query.totalBytes >= 24 ? query.totalBytes : 0;
+  let etagCandidate: OpfsContentMatch | null = null;
+
+  for await (const [name, handle] of iterable.entries()) {
+    if (handle.kind !== 'file' || !name.endsWith('.meta') || name.endsWith('.part.meta')) {
+      continue;
+    }
+    const stem = name.slice(0, -'.meta'.length);
+    if (!stem || stem === query.excludeStem) continue;
+
+    const meta = await readCommittedMeta(dir, name);
+    if (!meta) continue;
+
+    const ggufName = `${stem}.gguf`;
+    if (!(await hasOpfsEntry(dir, ggufName)) || (await hasOpfsEntry(dir, `${ggufName}.incomplete`))) {
+      continue;
+    }
+
+    if (query.url && meta.url === query.url) {
+      return { stem, meta, matchedBy: 'url' };
+    }
+    if (!etagCandidate && targetEtag && targetBytes > 0 && meta.totalBytes === targetBytes) {
+      const candidateEtag = normalizeEtag(meta.etag);
+      if (candidateEtag && candidateEtag === targetEtag) {
+        etagCandidate = { stem, meta, matchedBy: 'etag-size' };
+      }
+    }
+  }
+
+  return etagCandidate;
+}
+
+export interface HotMetadataBundleSignature {
+  readonly dataOffset: number;
+  readonly backingByteLength: number;
+  readonly expectedTensors: ReadonlyArray<{ readonly name: string; readonly byteSize: number }>;
+}
+
+/**
+ * Reads a persisted OPFS hot-metadata tensor bundle (`<stem>.hot.bin`) using lock-free
+ * `{ mode: 'read-only' }` I/O so demand-paged model reloads hydrate 150–350 tiny norm/bias
+ * tensors in 1 local OPFS read (~2ms) instead of dozens of HTTP Range requests.
+ */
+export async function readHotMetadataBundleFromOpfs(
+  modelId: string,
+  signature: HotMetadataBundleSignature,
+  dirOverride?: FileSystemDirectoryHandle,
+): Promise<Map<string, Uint8Array> | null> {
+  if (!dirOverride && !isOpfsSyncSupported()) return null;
+  if (signature.expectedTensors.length === 0) return null;
+  const dir = dirOverride ?? (await getOpfsVramDirectory(false));
+  if (!dir) return null;
+
+  const fileName = `${sanitizeOpfsBaseName(modelId)}.hot.bin`;
+  try {
+    const fh = (await dir.getFileHandle(fileName, { create: false })) as FileSystemFileHandle &
+      SyncAccessHandleCapableFile;
+    if (typeof fh.createSyncAccessHandle !== 'function') return null;
+
+    const sync = await openSyncAccessHandleWithRetry(fh, {
+      mode: 'read-only',
+      modelId,
+      retryDelaysMs: [25, 50],
+    });
+    let raw: Uint8Array;
+    try {
+      const size = sync.getSize();
+      if (size < 28 || size > HOT_BUNDLE_MAX_BYTES) return null;
+      raw = new Uint8Array(size);
+      let read = 0;
+      while (read < size) {
+        const n = sync.read(read === 0 ? raw : raw.subarray(read), { at: read });
+        if (n <= 0) break;
+        read += n;
+      }
+      if (read !== size) return null;
+    } finally {
+      sync.close();
+    }
+
+    const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+    if (
+      dv.getUint32(0, true) !== HOT_BUNDLE_MAGIC ||
+      dv.getUint32(4, true) !== HOT_BUNDLE_VERSION ||
+      dv.getFloat64(8, true) !== signature.dataOffset ||
+      dv.getFloat64(16, true) !== signature.backingByteLength
+    ) {
+      return null;
+    }
+
+    const tensorCount = dv.getUint32(24, true);
+    if (tensorCount < signature.expectedTensors.length) return null;
+
+    const decoder = new TextDecoder();
+    const loaded = new Map<string, Uint8Array>();
+    let off = 28;
+    for (let i = 0; i < tensorCount; i++) {
+      if (off + 6 > raw.byteLength) return null;
+      const nameLen = dv.getUint16(off, true);
+      off += 2;
+      if (off + nameLen + 4 > raw.byteLength) return null;
+      const name = decoder.decode(raw.subarray(off, off + nameLen));
+      off += nameLen;
+      const byteLen = dv.getUint32(off, true);
+      off += 4;
+      if (off + byteLen > raw.byteLength) return null;
+      loaded.set(name, raw.slice(off, off + byteLen));
+      off += byteLen;
+    }
+
+    for (let i = 0; i < signature.expectedTensors.length; i++) {
+      const exp = signature.expectedTensors[i];
+      const found = loaded.get(exp.name);
+      if (!found || found.byteLength !== exp.byteSize) {
+        return null;
+      }
+    }
+
+    return loaded;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Persists small immutable hot-metadata tensors (norms, biases, QK-norms) into a single
+ * content-verified OPFS sidecar (`<stem>.hot.bin`) for instant zero-network reloads.
+ */
+export async function writeHotMetadataBundleToOpfs(
+  modelId: string,
+  meta: { readonly dataOffset: number; readonly backingByteLength: number },
+  tensors: ReadonlyMap<string, Uint8Array>,
+  dirOverride?: FileSystemDirectoryHandle,
+): Promise<boolean> {
+  if (tensors.size === 0) return false;
+  if (!dirOverride && !isOpfsSyncSupported()) return false;
+  const dir = dirOverride ?? (await getOpfsVramDirectory(true));
+  if (!dir) return false;
+
+  const encoder = new TextEncoder();
+  const records: Array<{ nameBytes: Uint8Array; data: Uint8Array }> = [];
+  let totalBytes = 28;
+  for (const [name, data] of tensors.entries()) {
+    const nameBytes = encoder.encode(name);
+    if (nameBytes.byteLength > 0xffff) return false;
+    totalBytes += 2 + nameBytes.byteLength + 4 + data.byteLength;
+    if (totalBytes > HOT_BUNDLE_MAX_BYTES) return false;
+    records.push({ nameBytes, data });
+  }
+
+  const out = new Uint8Array(totalBytes);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, HOT_BUNDLE_MAGIC, true);
+  dv.setUint32(4, HOT_BUNDLE_VERSION, true);
+  dv.setFloat64(8, meta.dataOffset, true);
+  dv.setFloat64(16, meta.backingByteLength, true);
+  dv.setUint32(24, records.length, true);
+
+  let off = 28;
+  for (let i = 0; i < records.length; i++) {
+    const rec = records[i];
+    dv.setUint16(off, rec.nameBytes.byteLength, true);
+    off += 2;
+    out.set(rec.nameBytes, off);
+    off += rec.nameBytes.byteLength;
+    dv.setUint32(off, rec.data.byteLength, true);
+    off += 4;
+    out.set(rec.data, off);
+    off += rec.data.byteLength;
+  }
+
+  const fileName = `${sanitizeOpfsBaseName(modelId)}.hot.bin`;
+  try {
+    const fh = (await dir.getFileHandle(fileName, { create: true })) as FileSystemFileHandle &
+      SyncAccessHandleCapableFile;
+    if (typeof fh.createSyncAccessHandle !== 'function') return false;
+    const sync = await openSyncAccessHandleWithRetry(fh, {
+      mode: 'readwrite',
+      modelId,
+      retryDelaysMs: [25, 50, 100],
+    });
+    try {
+      sync.truncate(0);
+      writeAllSync(sync, out, 0);
+      sync.flush();
+    } finally {
+      sync.close();
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function readDemandIndexMeta(
   dir: FileSystemDirectoryHandle,
   idxName: string,
@@ -1788,6 +2133,9 @@ async function reclaimInactiveOpfsModels(
     else if (name.endsWith('.gguf.incomplete')) stem = name.slice(0, -'.gguf.incomplete'.length);
     else if (name.endsWith('.vram.cache')) stem = name.slice(0, -'.vram.cache'.length);
     else if (name.endsWith('.vram.idx')) stem = name.slice(0, -'.vram.idx'.length);
+    else if (name.endsWith('.hot.bin')) stem = name.slice(0, -'.hot.bin'.length);
+    else if (name.endsWith('.unified.kv')) stem = name.slice(0, -'.unified.kv'.length);
+    else if (name.endsWith('.meta')) stem = name.slice(0, -'.meta'.length);
     if (!stem || protectedModelIds.has(stem)) continue;
 
     try {
@@ -1833,11 +2181,12 @@ async function reclaimInactiveOpfsModels(
 export async function openOpfsModelBacking(
   modelId: string,
   dirOverride?: FileSystemDirectoryHandle,
-  options?: { signal?: AbortSignal; retryDelaysMs?: readonly number[] },
+  options?: { signal?: AbortSignal; retryDelaysMs?: readonly number[]; logicalModelId?: string },
 ): Promise<VramBackingStore | null> {
   if (!dirOverride && !isOpfsSyncSupported()) return null;
   const dir = dirOverride ?? (await getOpfsVramDirectory(false));
   if (!dir) return null;
+  const resolvedId = options?.logicalModelId ?? modelId;
   const fileName = sanitizeOpfsModelFileName(modelId);
   // If direct-write `.incomplete` marker exists, this file is a resumable partial download, not committed!
   if (await hasOpfsEntry(dir, `${fileName}.incomplete`)) {
@@ -1854,7 +2203,7 @@ export async function openOpfsModelBacking(
   try {
     const syncHandle = await openSyncAccessHandleWithRetry(fileHandle, {
       mode: 'read-only',
-      modelId,
+      modelId: resolvedId,
       signal: options?.signal,
       retryDelaysMs: options?.retryDelaysMs,
     });
@@ -1866,7 +2215,7 @@ export async function openOpfsModelBacking(
       await dir.removeEntry(fileName).catch(() => {});
       return null;
     }
-    return new OpfsSyncBackingStore(modelId, syncHandle, size);
+    return new OpfsSyncBackingStore(resolvedId, syncHandle, size);
   } catch (err) {
     if (isAbortError(err)) throw err;
     if (isOpfsLockError(err)) {
@@ -1878,7 +2227,7 @@ export async function openOpfsModelBacking(
           if (blob.size >= 24) {
             const headBuf = new Uint8Array(await blob.slice(0, 24).arrayBuffer());
             if (validateGgufMagicHeader(headBuf).valid) {
-              return new LocalFileSyncBackingStore(modelId, blob);
+              return new LocalFileSyncBackingStore(resolvedId, blob);
             }
           }
         } catch {
@@ -1887,7 +2236,7 @@ export async function openOpfsModelBacking(
       }
       throw err instanceof OpfsLockError
         ? err
-        : new OpfsLockError(err instanceof Error ? err.message : String(err), modelId);
+        : new OpfsLockError(err instanceof Error ? err.message : String(err), resolvedId);
     }
     return null;
   }
@@ -1903,6 +2252,7 @@ export async function openOpfsDemandModelBacking(
     asyncRangeFetcher?: AsyncRangeFetcher;
     fetchFn?: typeof fetch;
     upgradeLegacyOversizedSlabs?: boolean;
+    expectedEtag?: string;
     signal?: AbortSignal;
     retryDelaysMs?: readonly number[];
   },
@@ -1915,7 +2265,12 @@ export async function openOpfsDemandModelBacking(
   const cacheName = `${base}.vram.cache`;
   const idxName = `${base}.vram.idx`;
   const meta = await readDemandIndexMeta(dir, idxName);
-  if (!meta || meta.url !== url || meta.totalBytes < 24) {
+  const expectedEtagNorm = normalizeEtag(options?.expectedEtag);
+  const metaEtagNorm = normalizeEtag(meta?.etag);
+  const identityMatch =
+    meta !== null &&
+    (meta.url === url || (Boolean(expectedEtagNorm) && metaEtagNorm === expectedEtagNorm));
+  if (!meta || !identityMatch || meta.totalBytes < 24) {
     return null;
   }
   // Transparently upgrade nearly-empty legacy 4 MiB demand caches to 1 MiB slabs for low MoE read amplification
@@ -2080,6 +2435,33 @@ export async function streamUrlToVramBacking(
         await existingDemand.prewarmHeader(fetchImpl, options?.signal, options?.onProgress);
         return existingDemand;
       }
+
+      // 1b. Cross-ID OPFS content deduplication: if another committed OPFS model already holds this
+      //     exact URL, reuse its immutable `.gguf` via lock-free read-only I/O with 0 bytes downloaded!
+      const dedupDir = options?.opfsDirectoryOverride ?? (await getOpfsVramDirectory(false));
+      if (dedupDir) {
+        const urlMatch = await findExistingOpfsContentMatch(dedupDir, {
+          url,
+          excludeStem: sanitizeOpfsBaseName(modelId),
+        });
+        if (urlMatch) {
+          const reused = await openOpfsModelBacking(urlMatch.stem, dedupDir, {
+            signal: options?.signal,
+            logicalModelId: modelId,
+          });
+          if (reused) {
+            options?.onProgress?.({
+              receivedBytes: reused.byteLength,
+              totalBytes: reused.byteLength,
+              percent: 100,
+              backingKind: reused.kind,
+              stage: 'cached',
+              note: `Deduplicated from local cache (${urlMatch.meta.modelId})`,
+            });
+            return reused;
+          }
+        }
+      }
     }
 
     // 2. OPFS resumable streaming path with automatic LRU reclamation and seamless demand-cache tiering
@@ -2161,18 +2543,20 @@ export async function streamUrlToVramBacking(
 
         // Helper to seamlessly switch to Verdant Demand-Paged OPFS Slab Cache when a model exceeds
         // the browser origin's total OPFS quota (e.g., 18.6 GB 30B model on a 10.8 GB origin).
+        // Salvages all complete slabs already written into `.part` directly into `.vram.cache`
+        // before removing `.part` so zero downloaded bytes are wasted!
         const switchToDemandSlabCache = async (
           totalBytes: number,
           availableBytes: number,
           etag?: string,
         ): Promise<OpfsDemandVramBackingStore> => {
-          closeHandleSafe();
-          await dir.removeEntry(activeFileName).catch(() => {});
-          await dir.removeEntry(metaName).catch(() => {});
-          await dir.removeEntry(incompleteMarkerName).catch(() => {});
-
+          flushStage();
           const slabBytes = options?.demandSlabBytesOverride ?? OPFS_DEMAND_SLAB_BYTES;
           if (availableBytes < slabBytes * 2) {
+            closeHandleSafe();
+            await dir.removeEntry(activeFileName).catch(() => {});
+            await dir.removeEntry(metaName).catch(() => {});
+            await dir.removeEntry(incompleteMarkerName).catch(() => {});
             throw new Error(
               `Insufficient browser storage: at least ${formatShortSize(slabBytes * 2)} free is required to initialize on-demand caching.`,
             );
@@ -2183,6 +2567,18 @@ export async function streamUrlToVramBacking(
             totalBytes,
             Math.max(slabBytes * 2, Math.min(availableBytes, safeTargetCache)),
           );
+          const maxSalvageSlots = Math.max(2, Math.floor(maxCacheBytes / slabBytes));
+          const completePartSlabs = !handleClosed
+            ? Math.min(maxSalvageSlots, Math.floor(writtenOffset / slabBytes))
+            : 0;
+
+          // If we don't have any complete slabs to salvage, delete `.part` first to maximize free space
+          if (completePartSlabs <= 0) {
+            closeHandleSafe();
+            await dir.removeEntry(activeFileName).catch(() => {});
+            await dir.removeEntry(metaName).catch(() => {});
+            await dir.removeEntry(incompleteMarkerName).catch(() => {});
+          }
 
           const cacheName = `${base}.vram.cache`;
           const idxName = `${base}.vram.idx`;
@@ -2210,6 +2606,10 @@ export async function streamUrlToVramBacking(
             } catch {
               // Ignore duplicate close
             }
+            closeHandleSafe();
+            await dir.removeEntry(activeFileName).catch(() => {});
+            await dir.removeEntry(metaName).catch(() => {});
+            await dir.removeEntry(incompleteMarkerName).catch(() => {});
             throw err;
           }
 
@@ -2234,6 +2634,44 @@ export async function streamUrlToVramBacking(
               // Ignore duplicate close
             }
           };
+
+          // Zero-waste `.part` -> `.vram.cache` slab salvage: migrate every complete slab already
+          // on disk into the demand slab pool before releasing `.part`!
+          if (completePartSlabs > 0 && !handleClosed) {
+            const salvageBuf = new Uint8Array(slabBytes);
+            let salvagedCount = 0;
+            try {
+              for (let s = 0; s < completePartSlabs; s++) {
+                const slabOff = s * slabBytes;
+                let got = 0;
+                while (got < slabBytes) {
+                  const view = got === 0 ? salvageBuf : salvageBuf.subarray(got);
+                  const n = syncHandle.read(view, { at: slabOff + got });
+                  if (n <= 0) break;
+                  got += n;
+                }
+                if (got < slabBytes) break;
+                if (s === 0 && !validateGgufMagicHeader(salvageBuf).valid) {
+                  break;
+                }
+                demandStore.putSlab(s, salvageBuf);
+                salvagedCount += 1;
+              }
+            } catch (salvageErr) {
+              // If browser quota hits mid-salvage while `.part` is still present, keep already-migrated slabs
+              if (!isQuotaError(salvageErr)) {
+                // Non-quota read issue — stop salvage cleanly and let prewarmHeader verify
+              }
+            } finally {
+              closeHandleSafe();
+              await dir.removeEntry(activeFileName).catch(() => {});
+              await dir.removeEntry(metaName).catch(() => {});
+              await dir.removeEntry(incompleteMarkerName).catch(() => {});
+            }
+            if (salvagedCount > 0) {
+              demandStore.flush();
+            }
+          }
 
           try {
             await demandStore.prewarmHeader(fetchImpl, options?.signal, options?.onProgress);
@@ -2362,6 +2800,40 @@ export async function streamUrlToVramBacking(
 
               if (respEtag) knownEtag = respEtag;
               if (respLastMod) knownLastModified = respLastMod;
+
+              // Cross-mirror / cross-ID OPFS content deduplication via (ETag, totalBytes):
+              // If another committed OPFS model already holds this exact payload, abort the network
+              // stream immediately and open the existing immutable `.gguf` with 0 bytes downloaded!
+              if (!quotaChecked && knownEtag && knownTotalBytes >= 24) {
+                const etagMatch = await findExistingOpfsContentMatch(dir, {
+                  etag: knownEtag,
+                  totalBytes: knownTotalBytes,
+                  excludeStem: base,
+                });
+                if (etagMatch) {
+                  const reused = await openOpfsModelBacking(etagMatch.stem, dir, {
+                    signal: options?.signal,
+                    logicalModelId: modelId,
+                  });
+                  if (reused) {
+                    attemptController.abort();
+                    void res.body?.cancel().catch(() => {});
+                    closeHandleSafe();
+                    await dir.removeEntry(activeFileName).catch(() => {});
+                    await dir.removeEntry(metaName).catch(() => {});
+                    await dir.removeEntry(incompleteMarkerName).catch(() => {});
+                    options?.onProgress?.({
+                      receivedBytes: reused.byteLength,
+                      totalBytes: reused.byteLength,
+                      percent: 100,
+                      backingKind: reused.kind,
+                      stage: 'cached',
+                      note: `Deduplicated by ETag from local cache (${etagMatch.meta.modelId})`,
+                    });
+                    return reused;
+                  }
+                }
+              }
 
               // Smart OPFS tier selection: auto-reclaim oldest inactive models first, then
               // seamlessly activate Verdant Demand-Paged OPFS Slab Cache if model exceeds origin quota!
@@ -2588,6 +3060,7 @@ export async function streamUrlToVramBacking(
             );
           }
 
+          const headerHash64 = computeSyncHandleHeaderFingerprint64(syncHandle);
           syncHandle.flush();
           closeHandleSafe();
 
@@ -2599,6 +3072,16 @@ export async function streamUrlToVramBacking(
             await dir.removeEntry(incompleteMarkerName).catch(() => {});
           }
           await dir.removeEntry(metaName).catch(() => {});
+          await writeCommittedMeta(dir, `${base}.meta`, {
+            version: 1,
+            modelId,
+            url,
+            totalBytes: knownTotalBytes || writtenOffset,
+            etag: knownEtag,
+            lastModified: knownLastModified,
+            headerHash64,
+            committedAt: Date.now(),
+          });
 
           const committed = await openOpfsModelBacking(modelId, options?.opfsDirectoryOverride);
           if (!committed) {
@@ -3024,6 +3507,8 @@ export async function deleteOpfsModel(
       `${base}.part`,
       `${base}.part.meta`,
       `${base}.incomplete`,
+      `${stem}.meta`,
+      `${stem}.hot.bin`,
       `${stem}.vram.cache`,
       `${stem}.vram.idx`,
       `${stem}.unified.kv`,

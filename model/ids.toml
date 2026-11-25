@@ -51,3 +51,9 @@ code = "VUI-PAGES-01"
 title = "Subpath-safe GitHub Pages static bundle with commit-pinned fast CD workflow"
 owner = "scripts/assemble-pages.ts"
 evidence = ".github/workflows/pages.yml"
+
+[[id]]
+code = "VUI-DEDUP-01"
+title = "OPFS-to-runtime deduplication: cross-ID/ETag model reuse, .part slab salvage, persistent .hot.bin metadata cache, and conflict-free MoE waves"
+owner = "src/engine/vramBackingStore.ts"
+evidence = "src/engine/vramBackingStore.test.ts"

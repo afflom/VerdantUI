@@ -1365,7 +1365,9 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
   ): void {
     const count = Math.min(MAX_MOE_ACTIVE_EXPERTS, params.expertCount);
     if (count <= 0) {
-      kernels.zero_bytes(params.outPtr, params.dim * 4);
+      if (!params.accumulate) {
+        kernels.zero_bytes(params.outPtr, params.dim * 4);
+      }
       return;
     }
 
@@ -1417,14 +1419,25 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
     // Deterministic SIMD reduction across thread accumulators `0..activeThreads-1`
     const stride = params.layout.strideBytes;
     const offAcc = params.layout.offAccum;
-    kernels.copy_bytes(params.outPtr, params.workerScratchBase + offAcc, params.dim * 4);
-    for (let t = 1; t < activeThreads; t++) {
-      kernels.add_f32(
-        params.outPtr,
-        params.workerScratchBase + t * stride + offAcc,
-        params.outPtr,
-        params.dim,
-      );
+    if (params.accumulate) {
+      for (let t = 0; t < activeThreads; t++) {
+        kernels.add_f32(
+          params.outPtr,
+          params.workerScratchBase + t * stride + offAcc,
+          params.outPtr,
+          params.dim,
+        );
+      }
+    } else {
+      kernels.copy_bytes(params.outPtr, params.workerScratchBase + offAcc, params.dim * 4);
+      for (let t = 1; t < activeThreads; t++) {
+        kernels.add_f32(
+          params.outPtr,
+          params.workerScratchBase + t * stride + offAcc,
+          params.outPtr,
+          params.dim,
+        );
+      }
     }
   }
 

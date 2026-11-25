@@ -1001,6 +1001,18 @@ export class VramWeightPager {
   }
 
   /**
+   * Maximum number of distinct routed experts that can remain resident simultaneously in WASM
+   * memory without evicting one another (`Infinity` in `resident-all`, `moeCacheSlots.length`
+   * in `opfs-paged`). Used by parallel Sparse MoE dispatch to avoid slot-overwrite corruption.
+   */
+  get moeExpertCacheCapacity(): number {
+    if (this.residencyMode === 'resident-all') {
+      return Number.POSITIVE_INFINITY;
+    }
+    return this.moeCacheSlots.length;
+  }
+
+  /**
    * Acquires the 2D `(gate, up, down)` weight slices for routed expert `(layerIdx, expertIdx)`.
    * - In `resident-all` mode: returns the prebuilt zero-copy slice views inside `vtensor.weights`.
    * - In `opfs-paged` mode: checks the O(1) frequency-protected WASM Sparse Expert Cache

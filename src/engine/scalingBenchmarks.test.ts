@@ -282,7 +282,7 @@ test('Multi-core VTensorThreadPool produces bit-identical results and scales thr
     }
   } finally {
     arena.attachThreadPool(null);
-    pool.dispose();
+    await pool.disposeAsync();
   }
 });
 
@@ -811,7 +811,7 @@ test('Fused single-barrier QKV & Gate+Up dispatch is bit-exact and scales throug
     assert.ok(pool.barrierLatencyUs > 0 && pool.barrierLatencyUs <= 18);
   } finally {
     arena.attachThreadPool(null);
-    pool.dispose();
+    await pool.disposeAsync();
   }
 });
 
@@ -1069,7 +1069,7 @@ test('Prism Q8_K narrow-lane accelerates Q4_K & Q6_K over Q8_0 and maintains bit
     assert.ok(q6Gain > 1.1, `Expected Q6_K×Q8_K speedup > 1.10x over Q8_0 (got ${q6Gain.toFixed(2)}x)`);
   } finally {
     arena.attachThreadPool(null);
-    pool.dispose();
+    await pool.disposeAsync();
   }
 });
 
@@ -1186,7 +1186,7 @@ test('Verdant v2.22.4 Q5_K × Q8_K single & batch-4 narrow-lane kernels match ex
     }
   } finally {
     arena.attachThreadPool(null);
-    pool.dispose();
+    await pool.disposeAsync();
   }
 });
 
@@ -1285,7 +1285,7 @@ test('Multi-core parallel flash_attn_layer_range is bit-exact (maxDiff === 0) ac
     }
   } finally {
     arena.attachThreadPool(null);
-    pool.dispose();
+    await pool.disposeAsync();
     reg.freeAllBuffers();
   }
 });
@@ -1490,7 +1490,7 @@ test('deriveOptimalPoolWorkers avoids SMT spin-convoy saturation and OP_MOE_EXPE
       }
     } finally {
       arena.attachThreadPool(null);
-      pool.dispose();
+      await pool.disposeAsync();
     }
   }
 });
@@ -1655,6 +1655,122 @@ test('OP_MOE_EXPERTS_BATCH4 matches sequential Batch-4 MoE across dense (0b1111)
     if (process.env.CI !== 'true') {
       assert.ok(speedup > 1.5, `Expected OP_MOE_EXPERTS_BATCH4 speedup > 1.5x (got ${speedup.toFixed(2)}x)`);
     }
+
+    // Also verify multi-wave accumulate parity (simulating bounded moeExpertCacheCapacity = 4 < 8)
+    const outWavePtr = arena.allocRegion(4 * dim * 4);
+    const waveGatePtrs = new Int32Array(4);
+    const waveUpPtrs = new Int32Array(4);
+    const waveDownPtrs = new Int32Array(4);
+    const waveMasks = new Uint8Array(4);
+    const waveWeights = new Float32Array(4 * 4);
+    for (let wave = 0; wave < 2; wave++) {
+      const base = wave * 4;
+      for (let i = 0; i < 4; i++) {
+        waveGatePtrs[i] = gatePtrs[base + i];
+        waveUpPtrs[i] = upPtrs[base + i];
+        waveDownPtrs[i] = downPtrs[base + i];
+        waveMasks[i] = masks[base + i];
+        for (let t = 0; t < 4; t++) {
+          waveWeights[i * 4 + t] = weights[(base + i) * 4 + t];
+        }
+      }
+      const okWave = arena.dispatchMoeExpertsBatch4Parallel({
+        uniqueCount: 4,
+        dim,
+        expFfnDim,
+        gateUpBatchOp: ParallelMatOp.MUL_MAT_BATCH4_Q8K,
+        gateUpSingleOp: ParallelMatOp.MUL_MAT_Q8K,
+        downBatchOp: ParallelMatOp.MUL_MAT_BATCH4_Q8K,
+        downSingleOp: ParallelMatOp.MUL_MAT_Q8K,
+        gateType: wType,
+        upType: wType,
+        downType: wType,
+        bXOrQ8Ptr: bQkDimPtr,
+        bXF32Ptr: bXPtr,
+        xQ8StrideBytes: qkDimStride,
+        outPtr: outWavePtr,
+        workerScratchBase: workerScratch,
+        layout: layout4,
+        gatePtrs: waveGatePtrs,
+        upPtrs: waveUpPtrs,
+        downPtrs: waveDownPtrs,
+        masks: waveMasks,
+        weights: waveWeights,
+        accumulate: wave > 0,
+      });
+      assert.equal(okWave, true);
+    }
+    const waveOut = new Float32Array(arena.memory.buffer, outWavePtr, 4 * dim);
+    let maxWaveDiff = 0;
+    for (let i = 0; i < 4 * dim; i++) {
+      maxWaveDiff = Math.max(maxWaveDiff, Math.abs(waveOut[i] - seqOut[i]));
+    }
+    assert.ok(maxWaveDiff < 1e-4, `Multi-wave OP_MOE_EXPERTS_BATCH4 accumulate drift: ${maxWaveDiff}`);
+
+    // Verify single-token OP_MOE_EXPERTS multi-wave accumulate parity (4 + 4 waves vs 8-expert single wave)
+    const outSingleRefPtr = arena.allocRegion(dim * 4);
+    const outSingleWavePtr = arena.allocRegion(dim * 4);
+    const singleWeights = new Float32Array(uniqueCount);
+    for (let u = 0; u < uniqueCount; u++) singleWeights[u] = 0.05 + (u + 1) * 0.02;
+    const layout1 = computeMoeWorkerScratchLayout(dim, expFfnDim, 1);
+    const okSingleFull = arena.dispatchMoeExpertsParallel({
+      expertCount: uniqueCount,
+      dim,
+      expFfnDim,
+      gateUpOp: ParallelMatOp.MUL_MAT_Q8K,
+      downOp: ParallelMatOp.MUL_MAT_Q8K,
+      gateType: wType,
+      upType: wType,
+      downType: wType,
+      xOrQ8Ptr: bQkDimPtr,
+      xF32Ptr: bXPtr,
+      outPtr: outSingleRefPtr,
+      workerScratchBase: workerScratch,
+      layout: layout1,
+      gatePtrs,
+      upPtrs,
+      downPtrs,
+      weights: singleWeights,
+    });
+    assert.equal(okSingleFull, true);
+    const wSingleWeights = new Float32Array(4);
+    for (let wave = 0; wave < 2; wave++) {
+      const base = wave * 4;
+      for (let i = 0; i < 4; i++) {
+        waveGatePtrs[i] = gatePtrs[base + i];
+        waveUpPtrs[i] = upPtrs[base + i];
+        waveDownPtrs[i] = downPtrs[base + i];
+        wSingleWeights[i] = singleWeights[base + i];
+      }
+      const okSW = arena.dispatchMoeExpertsParallel({
+        expertCount: 4,
+        dim,
+        expFfnDim,
+        gateUpOp: ParallelMatOp.MUL_MAT_Q8K,
+        downOp: ParallelMatOp.MUL_MAT_Q8K,
+        gateType: wType,
+        upType: wType,
+        downType: wType,
+        xOrQ8Ptr: bQkDimPtr,
+        xF32Ptr: bXPtr,
+        outPtr: outSingleWavePtr,
+        workerScratchBase: workerScratch,
+        layout: layout1,
+        gatePtrs: waveGatePtrs,
+        upPtrs: waveUpPtrs,
+        downPtrs: waveDownPtrs,
+        weights: wSingleWeights,
+        accumulate: wave > 0,
+      });
+      assert.equal(okSW, true);
+    }
+    const sRef = new Float32Array(arena.memory.buffer, outSingleRefPtr, dim);
+    const sWave = new Float32Array(arena.memory.buffer, outSingleWavePtr, dim);
+    let maxSingleWaveDiff = 0;
+    for (let i = 0; i < dim; i++) {
+      maxSingleWaveDiff = Math.max(maxSingleWaveDiff, Math.abs(sWave[i] - sRef[i]));
+    }
+    assert.ok(maxSingleWaveDiff < 1e-4, `Multi-wave OP_MOE_EXPERTS accumulate drift: ${maxSingleWaveDiff}`);
   } finally {
     arena.attachThreadPool(null);
     await pool.disposeAsync();

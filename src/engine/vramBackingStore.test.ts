@@ -12,16 +12,19 @@ import {
   OpfsLockError,
   OpfsSyncBackingStore,
   coalesceTensorExtents,
+  deleteOpfsModel,
   inspectOpfsVramStorage,
   isOpfsLockError,
   openOpfsDemandModelBacking,
   openOpfsModelBacking,
   openSyncAccessHandleWithRetry,
   parseContentRangeHeader,
+  readHotMetadataBundleFromOpfs,
   sanitizeOpfsModelFileName,
   streamUrlToVramBacking,
   validateGgufMagicHeader,
   vramCapacityCeiling,
+  writeHotMetadataBundleToOpfs,
   type FileReaderSyncLike,
   type StreamIngestProgress,
   type SyncAccessHandleLike,
@@ -1071,5 +1074,340 @@ test('OPFS SyncAccessHandle reload lock recovery, read-only committed reads, and
     assert.equal(store.hasSlab(2), true);
   } finally {
     store.close();
+  }
+});
+
+test('OPFS content deduplication reuses committed models across IDs (by URL) and mirrors (by ETag+size) with 0 downloaded bytes', async () => {
+  const payload = makeFakeGgufPayload(48 * 1024);
+  const { dir, files } = createMockOpfsDir();
+  const etag = '"sha256-deadbeef12345678"';
+
+  let bodyReads = 0;
+  let headRequests = 0;
+  const mockFetch: typeof fetch = async (_input, init) => {
+    headRequests += 1;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        if (init?.signal?.aborted) {
+          controller.close();
+          return;
+        }
+        // Delay one macrotask so post-header ETag dedup can abort before body bytes are read
+        setTimeout(() => {
+          if (init?.signal?.aborted) {
+            try {
+              controller.close();
+            } catch {
+              // ignore
+            }
+            return;
+          }
+          bodyReads += 1;
+          controller.enqueue(payload.slice());
+          controller.close();
+        }, 10);
+      },
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        'content-length': String(payload.byteLength),
+        'accept-ranges': 'bytes',
+        etag,
+      },
+    });
+  };
+
+  // 1. Initial download commits `model-primary.gguf` + `model-primary.meta`
+  const primary = await streamUrlToVramBacking('model-primary', 'https://cdn-a.test/qwen3.gguf', {
+    opfsDirectoryOverride: dir,
+    fetchFn: mockFetch,
+    baseRetryDelayMs: 1,
+  });
+  try {
+    assert.equal(primary.kind, 'opfs-sync');
+    assert.equal(primary.modelId, 'model-primary');
+    assert.equal(files.has('model-primary.gguf'), true);
+    assert.equal(files.has('model-primary.meta'), true);
+    assert.equal(headRequests, 1);
+    assert.equal(bodyReads, 1);
+  } finally {
+    primary.close();
+  }
+
+  // 2. Different model ID pointing to the SAME URL -> 0 network requests!
+  const urlDup = await streamUrlToVramBacking('custom-alias-id', 'https://cdn-a.test/qwen3.gguf', {
+    opfsDirectoryOverride: dir,
+    fetchFn: async () => {
+      throw new Error('fetch should NOT be called when URL already matches a committed OPFS model');
+    },
+    baseRetryDelayMs: 1,
+  });
+  try {
+    assert.equal(urlDup.kind, 'opfs-sync');
+    assert.equal(urlDup.modelId, 'custom-alias-id');
+    assert.equal(urlDup.byteLength, payload.byteLength);
+    const readBuf = new Uint8Array(payload.byteLength);
+    assert.equal(urlDup.readRange(0, readBuf), payload.byteLength);
+    assert.deepEqual(readBuf, payload);
+    assert.equal(files.has('custom-alias-id.gguf'), false, 'Expected zero duplicate .gguf file on disk');
+  } finally {
+    urlDup.close();
+  }
+
+  // 3. Different model ID AND different mirror URL with matching (ETag, totalBytes) -> aborts stream before reading body!
+  const mirrorDup = await streamUrlToVramBacking('mirror-alias-id', 'https://cdn-b.test/mirror/qwen3.gguf', {
+    opfsDirectoryOverride: dir,
+    fetchFn: mockFetch,
+    baseRetryDelayMs: 1,
+  });
+  try {
+    assert.equal(mirrorDup.kind, 'opfs-sync');
+    assert.equal(mirrorDup.modelId, 'mirror-alias-id');
+    assert.equal(mirrorDup.byteLength, payload.byteLength);
+    const readBuf = new Uint8Array(payload.byteLength);
+    assert.equal(mirrorDup.readRange(0, readBuf), payload.byteLength);
+    assert.deepEqual(readBuf, payload);
+    assert.equal(headRequests, 2, 'Expected only 1 header check request for mirror ETag match');
+    assert.equal(bodyReads, 1, 'Expected 0 body bytes downloaded after ETag+size dedup');
+    assert.equal(files.has('mirror-alias-id.gguf'), false);
+    assert.equal(files.has('mirror-alias-id.gguf.part'), false);
+  } finally {
+    mirrorDup.close();
+  }
+
+  // 4. deleteOpfsModel removes `.meta` and `.hot.bin` sidecars alongside `.gguf`
+  files.set('model-primary.hot.bin', new Uint8Array([1, 2, 3, 4]));
+  await deleteOpfsModel('model-primary', dir);
+  assert.equal(files.has('model-primary.gguf'), false);
+  assert.equal(files.has('model-primary.meta'), false);
+  assert.equal(files.has('model-primary.hot.bin'), false);
+});
+
+test('switchToDemandSlabCache salvages complete .part slabs with 0 re-fetched bytes and openOpfsDemandModelBacking matches mirror ETag', async () => {
+  const slabBytes = 16 * 1024;
+  const payload = makeFakeGgufPayload(slabBytes * 6); // 96 KiB = 6 slabs
+  const { dir, files } = createMockOpfsDir();
+  const etag = '"v1-demand-etag-99"';
+
+  // Seed a partial download `.part` + `.part.meta` with 2.5 slabs (40 KiB) already downloaded
+  const partialLen = slabBytes * 2 + 8192;
+  files.set('salvage-model.gguf.part', payload.slice(0, partialLen));
+  files.set(
+    'salvage-model.gguf.part.meta',
+    new TextEncoder().encode(
+      JSON.stringify({
+        url: 'https://cdn-a.test/big.gguf',
+        totalBytes: payload.byteLength,
+        etag,
+        receivedBytes: partialLen,
+        updatedAt: Date.now(),
+      }),
+    ),
+  );
+
+  let headerRangeFetches = 0;
+  const mockFetch: typeof fetch = async (_input, init) => {
+    const range = new Headers(init?.headers).get('Range');
+    if (range === `bytes=0-${slabBytes - 1}`) {
+      headerRangeFetches += 1;
+    }
+    const resumeMatch = range ? /bytes=(\d+)-$/.exec(range) : null;
+    if (resumeMatch) {
+      const start = Number(resumeMatch[1]);
+      return new Response(payload.slice(start), {
+        status: 206,
+        headers: {
+          'content-range': `bytes ${start}-${payload.byteLength - 1}/${payload.byteLength}`,
+          'content-length': String(payload.byteLength - start),
+          'accept-ranges': 'bytes',
+          etag,
+        },
+      });
+    }
+    return new Response(payload.slice(), {
+      status: 200,
+      headers: {
+        'content-length': String(payload.byteLength),
+        'accept-ranges': 'bytes',
+        etag,
+      },
+    });
+  };
+
+  // Free space is 56 KiB (< remaining 56 KiB + headroom) -> switches to demand cache and MUST salvage slabs 0 & 1!
+  const store = await streamUrlToVramBacking('salvage-model', 'https://cdn-a.test/big.gguf', {
+    opfsDirectoryOverride: dir,
+    fetchFn: mockFetch,
+    demandSlabBytesOverride: slabBytes,
+    storageEstimateOverride: async () => ({ usage: 0, quota: 56 * 1024 }),
+    syncRangeFetcherOverride: (_u, s, e) => payload.slice(s, e + 1),
+    baseRetryDelayMs: 1,
+  });
+
+  try {
+    assert.ok(store instanceof OpfsDemandVramBackingStore);
+    assert.equal(store.hasSlab(0), true, 'Expected slab 0 to be salvaged from .part');
+    assert.equal(store.hasSlab(1), true, 'Expected slab 1 to be salvaged from .part');
+    assert.equal(headerRangeFetches, 0, 'Expected 0 HTTP Range prewarm fetches because slab 0 was salvaged locally');
+    assert.equal(files.has('salvage-model.gguf.part'), false, 'Expected .part cleaned up after salvage');
+
+    const checkBuf = new Uint8Array(slabBytes * 2);
+    assert.equal(store.readRange(0, checkBuf), slabBytes * 2);
+    assert.deepEqual(checkBuf, payload.subarray(0, slabBytes * 2));
+  } finally {
+    store.close();
+  }
+
+  // Reopen persisted demand cache under a DIFFERENT mirror URL with the SAME ETag -> reuses salvaged slabs!
+  const reopenedMirror = await openOpfsDemandModelBacking('salvage-model', 'https://cdn-mirror.test/big.gguf', {
+    dirOverride: dir,
+    expectedEtag: `W/${etag}`,
+    syncRangeFetcher: () => {
+      throw new Error('Should hit salvaged slabs locally without network fetch');
+    },
+  });
+  assert.ok(reopenedMirror, 'Expected ETag-matched mirror URL to reopen existing demand slab cache');
+  try {
+    assert.equal(reopenedMirror.hasSlab(0), true);
+    assert.equal(reopenedMirror.hasSlab(1), true);
+  } finally {
+    reopenedMirror.close();
+  }
+});
+
+test('Persistent OPFS hot-metadata bundle (<stem>.hot.bin) eliminates direct Range fetches on demand-paged model reload', async () => {
+  const modelPath = path.resolve(process.cwd(), 'public/models/stories260K.gguf');
+  const fileBytes = new Uint8Array(fs.readFileSync(modelPath));
+  const { dir, files } = createMockOpfsDir();
+
+  // 1. Unit check: hot bundle round-trip and signature invalidation
+  const sampleTensors = new Map<string, Uint8Array>([
+    ['output_norm.weight', new Uint8Array([1, 2, 3, 4])],
+    ['blk.0.attn_norm.weight', new Uint8Array([5, 6, 7, 8, 9, 10])],
+  ]);
+  const wrote = await writeHotMetadataBundleToOpfs(
+    'hot-bundle-unit',
+    { dataOffset: 1024, backingByteLength: 65536 },
+    sampleTensors,
+    dir,
+  );
+  assert.equal(wrote, true);
+  assert.equal(files.has('hot-bundle-unit.hot.bin'), true);
+
+  const hit = await readHotMetadataBundleFromOpfs(
+    'hot-bundle-unit',
+    {
+      dataOffset: 1024,
+      backingByteLength: 65536,
+      expectedTensors: [
+        { name: 'output_norm.weight', byteSize: 4 },
+        { name: 'blk.0.attn_norm.weight', byteSize: 6 },
+      ],
+    },
+    dir,
+  );
+  assert.ok(hit !== null);
+  assert.deepEqual(hit.get('output_norm.weight'), sampleTensors.get('output_norm.weight'));
+  assert.deepEqual(hit.get('blk.0.attn_norm.weight'), sampleTensors.get('blk.0.attn_norm.weight'));
+
+  // Mismatched backingByteLength invalidates bundle cleanly
+  const miss = await readHotMetadataBundleFromOpfs(
+    'hot-bundle-unit',
+    {
+      dataOffset: 1024,
+      backingByteLength: 99999,
+      expectedTensors: [{ name: 'output_norm.weight', byteSize: 4 }],
+    },
+    dir,
+  );
+  assert.equal(miss, null);
+
+  // 2. End-to-end LlamaVTensorRuntime.loadFromBackingAsync reload test:
+  //    First boot fetches hot norm/bias tensors via readRangesDirectAsync & persists `.hot.bin`;
+  //    Second boot hydrates 100% from OPFS `.hot.bin` with 0 direct Range calls and bit-exact output!
+  const slabBytes = 32 * 1024;
+  const openDemand = async (onDirectFetch: () => void) => {
+    const cacheHandle = (await dir.getFileHandle('stories-hot-reload.vram.cache', {
+      create: true,
+    })) as FileSystemFileHandle & { createSyncAccessHandle: () => Promise<SyncAccessHandleLike> };
+    const syncHandle = await cacheHandle.createSyncAccessHandle();
+    const store = new OpfsDemandVramBackingStore({
+      modelId: 'stories-hot-reload',
+      url: 'https://example.test/stories260K.gguf',
+      totalBytes: fileBytes.byteLength,
+      handle: syncHandle,
+      maxCacheBytes: slabBytes * 12,
+      slabBytes,
+      asyncRangeFetcher: async (_url, start, endInclusive) => fileBytes.slice(start, endInclusive + 1),
+      syncRangeFetcher: (_url, start, endInclusive) => fileBytes.slice(start, endInclusive + 1),
+    });
+    const origDirect = store.readRangesDirectAsync.bind(store);
+    store.readRangesDirectAsync = async (ranges, opts) => {
+      // Track hot-metadata multi-tensor direct reads separately from single-range header probes
+      if (ranges.length > 1) {
+        onDirectFetch();
+      }
+      return origDirect(ranges, opts);
+    };
+    return store;
+  };
+
+  let directCallsFirst = 0;
+  const store1 = await openDemand(() => {
+    directCallsFirst += 1;
+  });
+  const rt1 = new LlamaVTensorRuntime();
+  const tokens1: number[] = [];
+  try {
+    await rt1.loadFromBackingAsync('stories-hot-reload', 'Stories260K', 'opfs-demand://stories', store1, {
+      weightResidencyPolicy: 'paged',
+      opfsDirectoryOverride: dir,
+    });
+    assert.equal(directCallsFirst, 1, 'Expected first load to fetch hot metadata once and persist .hot.bin');
+    assert.equal(files.has('stories-hot-reload.hot.bin'), true, 'Expected .hot.bin sidecar written');
+    for await (const ev of rt1.generate('Once upon a time', {
+      temperature: 0,
+      topP: 1,
+      topK: 1,
+      repeatPenalty: 1.0,
+      maxTokens: 8,
+      fullContextOutput: false,
+    })) {
+      tokens1.push(ev.tokenId);
+    }
+  } finally {
+    rt1.unload();
+  }
+
+  let directCallsSecond = 0;
+  const store2 = await openDemand(() => {
+    directCallsSecond += 1;
+  });
+  const rt2 = new LlamaVTensorRuntime();
+  const tokens2: number[] = [];
+  try {
+    await rt2.loadFromBackingAsync('stories-hot-reload', 'Stories260K', 'opfs-demand://stories', store2, {
+      weightResidencyPolicy: 'paged',
+      opfsDirectoryOverride: dir,
+    });
+    assert.equal(
+      directCallsSecond,
+      0,
+      'Expected reload to hydrate all hot metadata from OPFS .hot.bin with ZERO direct Range calls',
+    );
+    for await (const ev of rt2.generate('Once upon a time', {
+      temperature: 0,
+      topP: 1,
+      topK: 1,
+      repeatPenalty: 1.0,
+      maxTokens: 8,
+      fullContextOutput: false,
+    })) {
+      tokens2.push(ev.tokenId);
+    }
+    assert.deepEqual(tokens2, tokens1, 'Expected bit-exact greedy output from OPFS .hot.bin reload');
+  } finally {
+    rt2.unload();
   }
 });

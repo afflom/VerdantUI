@@ -68,6 +68,8 @@ import { VramKvPager } from './vramKvPager';
 import {
   calibrateBackingReadBandwidthMBs,
   MemoryBackingStore,
+  readHotMetadataBundleFromOpfs,
+  writeHotMetadataBundleToOpfs,
   type VramBackingKind,
   type VramBackingStore,
 } from './vramBackingStore';
@@ -304,6 +306,9 @@ const savedPenaltyVals = new Float32Array(64);
 const samplerTopkIds = new Int32Array(1024);
 const samplerTopkVals = new Float32Array(1024);
 const samplerTopkProbs = new Float64Array(1024);
+let cachedTopkMemBuf: ArrayBufferLike | null = null;
+let cachedTopkIdsView: Int32Array | null = null;
+let cachedTopkValsView: Float32Array | null = null;
 
 /**
  * Zero-allocation token sampler: applies repeat penalty in-place to the <=64 unique recent token
@@ -375,11 +380,15 @@ export function sampleNextToken(
           WASM_TOPK_IDS_OFFSET,
           WASM_TOPK_VALS_OFFSET,
         );
-        const idsView = new Int32Array(arena.memory.buffer, WASM_TOPK_IDS_OFFSET, candCount);
-        const valsView = new Float32Array(arena.memory.buffer, WASM_TOPK_VALS_OFFSET, candCount);
+        const memBuf = arena.memory.buffer;
+        if (cachedTopkMemBuf !== memBuf || !cachedTopkIdsView || !cachedTopkValsView) {
+          cachedTopkMemBuf = memBuf;
+          cachedTopkIdsView = new Int32Array(memBuf, WASM_TOPK_IDS_OFFSET, 1024);
+          cachedTopkValsView = new Float32Array(memBuf, WASM_TOPK_VALS_OFFSET, 1024);
+        }
         for (let i = 0; i < candCount; i++) {
-          samplerTopkIds[i] = idsView[i];
-          samplerTopkVals[i] = valsView[i];
+          samplerTopkIds[i] = cachedTopkIdsView[i];
+          samplerTopkVals[i] = cachedTopkValsView[i];
         }
       } else {
         candCount = k;
@@ -799,6 +808,7 @@ export class LlamaVTensorRuntime {
       backingQuotaBytes?: number;
       signal?: AbortSignal;
       onProgress?: (progress: AsyncLoadProgressEvent) => void;
+      opfsDirectoryOverride?: FileSystemDirectoryHandle;
     },
   ): Promise<LoadedModelSummary> {
     this.unload();
@@ -858,28 +868,62 @@ export class LlamaVTensorRuntime {
 
           const preloaded = new Map<string, Uint8Array>();
           if (smallInfos.length > 0 && backing.readRangesDirectAsync) {
-            options?.onProgress?.({
-              percent: 98,
-              detail: `Loading ${displayName} layer metadata`,
-            });
-            const rawSlices = await backing.readRangesDirectAsync(
-              smallInfos.map((t) => ({
-                fileOffset: parsed.dataOffset + t.offset,
-                byteLength: t.byteSize,
-              })),
-              {
-                signal: options?.signal,
-                onProgress: (done, total) => {
-                  const pct = total > 0 ? 97 + Math.min(2, Math.round((done / total) * 2)) : 98;
-                  options?.onProgress?.({
-                    percent: pct,
-                    detail: `Loading layer metadata (${done}/${total})`,
-                  });
+            // Try persistent OPFS hot-metadata sidecar (`<stem>.hot.bin`) first to convert 30–100
+            // HTTP Range fetches on reload into 1 local lock-free OPFS read (~2ms)!
+            const cachedHot = backing.isPersistent
+              ? await readHotMetadataBundleFromOpfs(
+                  id,
+                  {
+                    dataOffset: parsed.dataOffset,
+                    backingByteLength: backing.byteLength,
+                    expectedTensors: smallInfos,
+                  },
+                  options?.opfsDirectoryOverride,
+                )
+              : null;
+
+            if (cachedHot) {
+              options?.onProgress?.({
+                percent: 98,
+                detail: `Loaded ${displayName} layer metadata from local cache`,
+              });
+              for (let i = 0; i < smallInfos.length; i++) {
+                const name = smallInfos[i].name;
+                const slice = cachedHot.get(name);
+                if (slice) preloaded.set(name, slice);
+              }
+            } else {
+              options?.onProgress?.({
+                percent: 98,
+                detail: `Loading ${displayName} layer metadata`,
+              });
+              const rawSlices = await backing.readRangesDirectAsync(
+                smallInfos.map((t) => ({
+                  fileOffset: parsed.dataOffset + t.offset,
+                  byteLength: t.byteSize,
+                })),
+                {
+                  signal: options?.signal,
+                  onProgress: (done, total) => {
+                    const pct = total > 0 ? 97 + Math.min(2, Math.round((done / total) * 2)) : 98;
+                    options?.onProgress?.({
+                      percent: pct,
+                      detail: `Loading layer metadata (${done}/${total})`,
+                    });
+                  },
                 },
-              },
-            );
-            for (let i = 0; i < smallInfos.length; i++) {
-              preloaded.set(smallInfos[i].name, rawSlices[i]);
+              );
+              for (let i = 0; i < smallInfos.length; i++) {
+                preloaded.set(smallInfos[i].name, rawSlices[i]);
+              }
+              if (backing.isPersistent && !options?.signal?.aborted) {
+                await writeHotMetadataBundleToOpfs(
+                  id,
+                  { dataOffset: parsed.dataOffset, backingByteLength: backing.byteLength },
+                  preloaded,
+                  options?.opfsDirectoryOverride,
+                ).catch(() => {});
+              }
             }
           }
           if (largeInfos.length > 0 && backing.prefetchRanges) {
@@ -1623,11 +1667,16 @@ export class LlamaVTensorRuntime {
       { weightType: GgmlType.F32, wPtr: 0, outPtr: 0, rows: 0, oStrideBytes: 0 },
       { weightType: GgmlType.F32, wPtr: 0, outPtr: 0, rows: 0, oStrideBytes: 0 },
     ];
-    // Preallocated zero-alloc expert-grouping tables for Batch-4 Sparse MoE prefill
+    // Preallocated zero-alloc expert tables for single-token & Batch-4 Sparse MoE dispatch
+    const moeSingleGatePtrs = new Int32Array(moeTopK);
+    const moeSingleUpPtrs = new Int32Array(moeTopK);
+    const moeSingleDownPtrs = new Int32Array(moeTopK);
+    const moeSingleWeightsF32 = new Float32Array(moeTopK);
     const moeBatchMaxUnique = PREFILL_BATCH_SIZE * moeTopK;
     const moeBatchExpIds = new Int32Array(moeBatchMaxUnique);
     const moeBatchExpMask = new Uint8Array(moeBatchMaxUnique);
     const moeBatchExpWeights = new Float64Array(moeBatchMaxUnique * PREFILL_BATCH_SIZE);
+    const moeBatchSparseIdx = new Int32Array(moeBatchMaxUnique);
     const moeBatchGatePtrs = new Int32Array(moeBatchMaxUnique);
     const moeBatchUpPtrs = new Int32Array(moeBatchMaxUnique);
     const moeBatchDownPtrs = new Int32Array(moeBatchMaxUnique);
@@ -1798,11 +1847,14 @@ export class LlamaVTensorRuntime {
       const qkFfnPtr = expDownQ8K && s.q8kFfn ? s.q8kFfn.buffer.wasmPtr(s.q8kFfn) : -1;
       const qFfnPtr = expDownQ8 && s.q8Ffn ? s.q8Ffn.buffer.wasmPtr(s.q8Ffn) : -1;
 
-      // 3. Single-barrier Expert-Parallel MoE fast path (`OP_MOE_EXPERTS`) when thread pool is active
+      // 3. Single-barrier Expert-Parallel MoE fast path (`OP_MOE_EXPERTS`) when thread pool is active.
+      //    Chunks into conflict-free waves of `<= wp.moeExpertCacheCapacity` experts so WASM
+      //    paged expert cache slots can NEVER be evicted and overwritten while queued in parallel!
       const outBasePtr = useWasm && outProjHandle.buffer.isWasmBacked
         ? outProjHandle.buffer.wasmPtr(outProjHandle) + outProjOffsetFloats * 4
         : -1;
       const pool = this.backend.activeThreadPool;
+      const maxSingleWave = Math.min(16, Math.max(1, wp.moeExpertCacheCapacity));
       if (
         useWasm &&
         arena &&
@@ -1810,18 +1862,88 @@ export class LlamaVTensorRuntime {
         pool &&
         pool.isActive &&
         kUsed >= 2 &&
-        kUsed <= 16 &&
+        maxSingleWave >= 2 &&
         s.moeWorkerScratch &&
         s.moeWorkerScratchLayout &&
         s.moeWorkerScratch.buffer.isWasmBacked &&
-        s.moeWorkerScratchSlots >= Math.min(pool.workerCount, kUsed)
+        s.moeWorkerScratchSlots >= Math.min(pool.workerCount, Math.min(kUsed, maxSingleWave))
       ) {
-        const expGatePtrs = new Int32Array(kUsed);
-        const expUpPtrs = new Int32Array(kUsed);
-        const expDownPtrs = new Int32Array(kUsed);
-        const expWeights = new Float32Array(kUsed);
-        let activeCount = 0;
+        let waveCount = 0;
+        let dispatchedWaves = 0;
         let allHomogeneousWasm = true;
+
+        const flushSingleWave = (): boolean => {
+          if (waveCount === 0) return true;
+          if (waveCount >= 2) {
+            const ok = arena.dispatchMoeExpertsParallel({
+              expertCount: waveCount,
+              dim,
+              expFfnDim,
+              gateUpOp: expInQ8K
+                ? ParallelMatOp.MUL_MAT_Q8K
+                : expInQ8
+                  ? ParallelMatOp.MUL_MAT_Q8
+                  : ParallelMatOp.MUL_MAT,
+              downOp: expDownQ8K
+                ? ParallelMatOp.MUL_MAT_Q8K
+                : expDownQ8
+                  ? ParallelMatOp.MUL_MAT_Q8
+                  : ParallelMatOp.MUL_MAT,
+              gateType: expGateType,
+              upType: expUpType,
+              downType: expDownType,
+              xOrQ8Ptr: expInQ8K ? qkDimPtr : expInQ8 ? qDimPtr : xPtr,
+              xF32Ptr: xPtr,
+              outPtr: outBasePtr,
+              workerScratchBase: s.moeWorkerScratch!.buffer.wasmPtr(s.moeWorkerScratch!),
+              layout: s.moeWorkerScratchLayout!,
+              gatePtrs: moeSingleGatePtrs,
+              upPtrs: moeSingleUpPtrs,
+              downPtrs: moeSingleDownPtrs,
+              weights: moeSingleWeightsF32,
+              accumulate: dispatchedWaves > 0,
+            });
+            if (!ok) return false;
+          } else {
+            // Tail wave of 1 expert: row-stripe across all P cores via mulMatQ8KGroup/mulMatQ8Group
+            if (dispatchedWaves === 0) {
+              arena.kernels.zero_bytes(outBasePtr, dim * 4);
+            }
+            const g0 = moeGateUpGroupEntries[0];
+            const g1 = moeGateUpGroupEntries[1];
+            g0.weightType = expGateType;
+            g0.wPtr = moeSingleGatePtrs[0];
+            g0.outPtr = gateOutPtr;
+            g0.rows = expFfnDim;
+            g0.oStrideBytes = expFfnDim * 4;
+            g1.weightType = expUpType;
+            g1.wPtr = moeSingleUpPtrs[0];
+            g1.outPtr = upOutPtr;
+            g1.rows = expFfnDim;
+            g1.oStrideBytes = expFfnDim * 4;
+            const dPtr = moeSingleDownPtrs[0];
+            if (expInQ8K) {
+              arena.mulMatQ8KGroup(moeGateUpGroupEntries, qkDimPtr, xPtr, dim);
+            } else {
+              arena.mulMatQ8Group(moeGateUpGroupEntries, expInQ8 ? qDimPtr : xPtr, xPtr, dim, expInQ8);
+            }
+            arena.kernels.swiglu_f32(gateOutPtr, upOutPtr, hidPtr, expFfnDim);
+            if (expDownQ8K) {
+              arena.quantizeActivationQ8K(hidPtr, qkFfnPtr, expFfnDim);
+              arena.mulMatQ8K(expDownType, dPtr, qkFfnPtr, hidPtr, expProjPtr, expFfnDim, dim);
+            } else if (expDownQ8) {
+              arena.quantizeActivation(hidPtr, qFfnPtr, expFfnDim);
+              arena.mulMatQ8(expDownType, dPtr, qFfnPtr, hidPtr, expProjPtr, expFfnDim, dim);
+            } else {
+              arena.mulMat(expDownType, dPtr, hidPtr, expProjPtr, expFfnDim, dim);
+            }
+            arena.kernels.axpy_f32(outBasePtr, expProjPtr, moeSingleWeightsF32[0], dim);
+          }
+          dispatchedWaves += 1;
+          waveCount = 0;
+          return true;
+        };
+
         for (let k = 0; k < kUsed; k++) {
           const expId = moeTopIds[k];
           const weight = moeTopProbs[k];
@@ -1838,41 +1960,22 @@ export class LlamaVTensorRuntime {
             allHomogeneousWasm = false;
             break;
           }
-          expGatePtrs[activeCount] = exp.gate.buffer.wasmPtr(exp.gate);
-          expUpPtrs[activeCount] = exp.up.buffer.wasmPtr(exp.up);
-          expDownPtrs[activeCount] = exp.down.buffer.wasmPtr(exp.down);
-          expWeights[activeCount] = weight;
-          activeCount += 1;
+          moeSingleGatePtrs[waveCount] = exp.gate.buffer.wasmPtr(exp.gate);
+          moeSingleUpPtrs[waveCount] = exp.up.buffer.wasmPtr(exp.up);
+          moeSingleDownPtrs[waveCount] = exp.down.buffer.wasmPtr(exp.down);
+          moeSingleWeightsF32[waveCount] = weight;
+          waveCount += 1;
+          if (waveCount === maxSingleWave) {
+            if (!flushSingleWave()) {
+              allHomogeneousWasm = false;
+              break;
+            }
+          }
         }
-        if (allHomogeneousWasm && activeCount >= 2) {
-          const dispatched = arena.dispatchMoeExpertsParallel({
-            expertCount: activeCount,
-            dim,
-            expFfnDim,
-            gateUpOp: expInQ8K
-              ? ParallelMatOp.MUL_MAT_Q8K
-              : expInQ8
-                ? ParallelMatOp.MUL_MAT_Q8
-                : ParallelMatOp.MUL_MAT,
-            downOp: expDownQ8K
-              ? ParallelMatOp.MUL_MAT_Q8K
-              : expDownQ8
-                ? ParallelMatOp.MUL_MAT_Q8
-                : ParallelMatOp.MUL_MAT,
-            gateType: expGateType,
-            upType: expUpType,
-            downType: expDownType,
-            xOrQ8Ptr: expInQ8K ? qkDimPtr : expInQ8 ? qDimPtr : xPtr,
-            xF32Ptr: xPtr,
-            outPtr: outBasePtr,
-            workerScratchBase: s.moeWorkerScratch.buffer.wasmPtr(s.moeWorkerScratch),
-            layout: s.moeWorkerScratchLayout,
-            gatePtrs: expGatePtrs,
-            upPtrs: expUpPtrs,
-            downPtrs: expDownPtrs,
-            weights: expWeights,
-          });
-          if (dispatched) return;
+        if (allHomogeneousWasm && (waveCount > 0 || dispatchedWaves > 0)) {
+          if (waveCount === 0 || (dispatchedWaves > 0 ? flushSingleWave() : waveCount >= 2 && flushSingleWave())) {
+            return;
+          }
         }
       }
 
@@ -2158,7 +2261,9 @@ export class LlamaVTensorRuntime {
 
       // Hybrid Theorem T3-MoE Batch-4 dispatch:
       // 1) Heavy 4-token hits (`mask === 0b1111`): row-striped Batch-4 across ALL P cores (100% core balance + L3-resident)
-      // 2) Light sparse hits (`popcount(mask) ∈ {1,2,3}`): collected and executed in ONE barrier via OP_MOE_EXPERTS_BATCH4!
+      // 2) Light sparse hits (`popcount(mask) ∈ {1,2,3}`): executed in conflict-free waves of
+      //    `<= wp.moeExpertCacheCapacity` experts via OP_MOE_EXPERTS_BATCH4 so WASM paged expert
+      //    cache slots can NEVER be evicted while queued in parallel!
       const pool = b.activeThreadPool;
       const canPoolSparse =
         useWasm &&
@@ -2170,18 +2275,18 @@ export class LlamaVTensorRuntime {
         s.moeBatch4WorkerScratchLayout !== null &&
         s.moeWorkerScratch.buffer.isWasmBacked;
 
-      let sparseCount = 0;
-      let sparseAllWasm = canPoolSparse;
-      let sparseSameTypes = true;
-      let sparseGType: GgmlType = expGateType;
-      let sparseUType: GgmlType = expUpType;
-      let sparseDType: GgmlType = expDownType;
+      let sparseIdxCount = 0;
       let ranDenseHit = false;
 
-      // Pass 1: execute all full 4-token hits (`mask === 0b1111`) row-striped across P cores, and collect sparse hits
+      // Pass 1: execute all full 4-token hits (`mask === 0b1111`) row-striped across P cores;
+      // defer sparse hits until Pass 2 so dense acquires never evict queued sparse cache slots.
       for (let u = 0; u < uniqueCount; u++) {
-        const expId = moeBatchExpIds[u];
         const mask = moeBatchExpMask[u];
+        if (mask !== 0b1111) {
+          moeBatchSparseIdx[sparseIdxCount++] = u;
+          continue;
+        }
+        const expId = moeBatchExpIds[u];
         const exp = wp.acquireExpertSlice(layerIdx, expId);
         const expWasm =
           useWasm &&
@@ -2190,7 +2295,7 @@ export class LlamaVTensorRuntime {
           exp.up.buffer.isWasmBacked &&
           exp.down.buffer.isWasmBacked;
 
-        if (mask === 0b1111 && expWasm && arena) {
+        if (expWasm && arena) {
           ranDenseHit = true;
           const gPtr = exp.gate.buffer.wasmPtr(exp.gate);
           const uPtr = exp.up.buffer.wasmPtr(exp.up);
@@ -2236,93 +2341,14 @@ export class LlamaVTensorRuntime {
               }
             }
           }
-          continue;
-        }
-
-        if (sparseAllWasm && expWasm && sparseCount < 32) {
-          if (sparseCount === 0) {
-            sparseGType = exp.gate.type;
-            sparseUType = exp.up.type;
-            sparseDType = exp.down.type;
-          } else if (
-            exp.gate.type !== sparseGType ||
-            exp.up.type !== sparseUType ||
-            exp.down.type !== sparseDType
-          ) {
-            sparseSameTypes = false;
-          }
-          moeBatchGatePtrs[sparseCount] = exp.gate.buffer.wasmPtr(exp.gate);
-          moeBatchUpPtrs[sparseCount] = exp.up.buffer.wasmPtr(exp.up);
-          moeBatchDownPtrs[sparseCount] = exp.down.buffer.wasmPtr(exp.down);
-          moeBatchSparseMasks[sparseCount] = mask;
-          const dstW = sparseCount * B4;
-          const srcW = u * B4;
-          moeBatchWeightsF32[dstW + 0] = moeBatchExpWeights[srcW + 0];
-          moeBatchWeightsF32[dstW + 1] = moeBatchExpWeights[srcW + 1];
-          moeBatchWeightsF32[dstW + 2] = moeBatchExpWeights[srcW + 2];
-          moeBatchWeightsF32[dstW + 3] = moeBatchExpWeights[srcW + 3];
-          sparseCount += 1;
         } else {
-          sparseAllWasm = false;
+          moeBatchSparseIdx[sparseIdxCount++] = u;
         }
       }
 
-      // Pass 2: Execute collected sparse experts in ONE single barrier via OP_MOE_EXPERTS_BATCH4!
-      if (
-        sparseAllWasm &&
-        sparseSameTypes &&
-        sparseCount >= 2 &&
-        arena &&
-        pool &&
-        s.moeWorkerScratch &&
-        s.moeBatch4WorkerScratchLayout &&
-        s.moeWorkerScratchSlots >= Math.min(pool.workerCount, sparseCount)
-      ) {
-        const dispatched = arena.dispatchMoeExpertsBatch4Parallel({
-          uniqueCount: sparseCount,
-          dim,
-          expFfnDim,
-          gateUpBatchOp: expInQ8K
-            ? ParallelMatOp.MUL_MAT_BATCH4_Q8K
-            : expInQ8
-              ? ParallelMatOp.MUL_MAT_BATCH4_Q8
-              : ParallelMatOp.MUL_MAT_BATCH4,
-          gateUpSingleOp: expInQ8K
-            ? ParallelMatOp.MUL_MAT_Q8K
-            : expInQ8
-              ? ParallelMatOp.MUL_MAT_Q8
-              : ParallelMatOp.MUL_MAT,
-          downBatchOp: expDownQ8K
-            ? ParallelMatOp.MUL_MAT_BATCH4_Q8K
-            : expDownQ8
-              ? ParallelMatOp.MUL_MAT_BATCH4_Q8
-              : ParallelMatOp.MUL_MAT_BATCH4,
-          downSingleOp: expDownQ8K
-            ? ParallelMatOp.MUL_MAT_Q8K
-            : expDownQ8
-              ? ParallelMatOp.MUL_MAT_Q8
-              : ParallelMatOp.MUL_MAT,
-          gateType: sparseGType,
-          upType: sparseUType,
-          downType: sparseDType,
-          bXOrQ8Ptr: expInQ8K ? bQkDimPtr : expInQ8 ? bQDimPtr : bXNormPtr,
-          bXF32Ptr: bXNormPtr,
-          xQ8StrideBytes: expInQ8K ? qkDimStride : expInQ8 ? qDimStride : xStrideBytes,
-          outPtr: bFfnProjPtr,
-          workerScratchBase: s.moeWorkerScratch.buffer.wasmPtr(s.moeWorkerScratch),
-          layout: s.moeBatch4WorkerScratchLayout,
-          gatePtrs: moeBatchGatePtrs,
-          upPtrs: moeBatchUpPtrs,
-          downPtrs: moeBatchDownPtrs,
-          masks: moeBatchSparseMasks,
-          weights: moeBatchWeightsF32,
-          accumulate: ranDenseHit,
-        });
-        if (dispatched) return;
-      }
+      if (sparseIdxCount === 0) return;
 
-      // Sequential fallback for remaining sparse experts (single-core or <=1 sparse expert or non-WASM)
-      for (let u = 0; u < uniqueCount; u++) {
+      const runSparseExpertSequential = (u: number): void => {
         const mask = moeBatchExpMask[u];
         const exp = wp.acquireExpertSlice(layerIdx, moeBatchExpIds[u]);
         const expWasm =
@@ -2331,7 +2357,6 @@ export class LlamaVTensorRuntime {
           exp.gate.buffer.isWasmBacked &&
           exp.up.buffer.isWasmBacked &&
           exp.down.buffer.isWasmBacked;
-        if (mask === 0b1111 && expWasm && arena) continue; // already computed in Pass 1
 
         if (expWasm && arena) {
           const gPtr = exp.gate.buffer.wasmPtr(exp.gate);
@@ -2399,6 +2424,118 @@ export class LlamaVTensorRuntime {
             }
           }
         }
+      };
+
+      // Pass 2: Execute sparse experts in conflict-free waves of `<= min(32, moeExpertCacheCapacity)`
+      const maxBatchWave = Math.min(32, Math.max(1, wp.moeExpertCacheCapacity));
+      if (canPoolSparse && maxBatchWave >= 2 && sparseIdxCount >= 2 && arena && pool) {
+        let accumulatedOut = ranDenseHit;
+        for (let wStart = 0; wStart < sparseIdxCount; wStart += maxBatchWave) {
+          const wEnd = Math.min(sparseIdxCount, wStart + maxBatchWave);
+          const wTarget = wEnd - wStart;
+          if (wTarget < 2 || s.moeWorkerScratchSlots < Math.min(pool.workerCount, wTarget)) {
+            for (let wi = wStart; wi < wEnd; wi++) {
+              runSparseExpertSequential(moeBatchSparseIdx[wi]);
+            }
+            accumulatedOut = true;
+            continue;
+          }
+
+          let waveAllWasm = true;
+          let waveSameTypes = true;
+          let waveGType: GgmlType = expGateType;
+          let waveUType: GgmlType = expUpType;
+          let waveDType: GgmlType = expDownType;
+          for (let wi = 0; wi < wTarget; wi++) {
+            const u = moeBatchSparseIdx[wStart + wi];
+            const exp = wp.acquireExpertSlice(layerIdx, moeBatchExpIds[u]);
+            if (
+              !exp.gate.buffer.isWasmBacked ||
+              !exp.up.buffer.isWasmBacked ||
+              !exp.down.buffer.isWasmBacked
+            ) {
+              waveAllWasm = false;
+              break;
+            }
+            if (wi === 0) {
+              waveGType = exp.gate.type;
+              waveUType = exp.up.type;
+              waveDType = exp.down.type;
+            } else if (
+              exp.gate.type !== waveGType ||
+              exp.up.type !== waveUType ||
+              exp.down.type !== waveDType
+            ) {
+              waveSameTypes = false;
+            }
+            moeBatchGatePtrs[wi] = exp.gate.buffer.wasmPtr(exp.gate);
+            moeBatchUpPtrs[wi] = exp.up.buffer.wasmPtr(exp.up);
+            moeBatchDownPtrs[wi] = exp.down.buffer.wasmPtr(exp.down);
+            moeBatchSparseMasks[wi] = moeBatchExpMask[u];
+            const dstW = wi * B4;
+            const srcW = u * B4;
+            moeBatchWeightsF32[dstW + 0] = moeBatchExpWeights[srcW + 0];
+            moeBatchWeightsF32[dstW + 1] = moeBatchExpWeights[srcW + 1];
+            moeBatchWeightsF32[dstW + 2] = moeBatchExpWeights[srcW + 2];
+            moeBatchWeightsF32[dstW + 3] = moeBatchExpWeights[srcW + 3];
+          }
+
+          let dispatched = false;
+          if (waveAllWasm && waveSameTypes) {
+            dispatched = arena.dispatchMoeExpertsBatch4Parallel({
+              uniqueCount: wTarget,
+              dim,
+              expFfnDim,
+              gateUpBatchOp: expInQ8K
+                ? ParallelMatOp.MUL_MAT_BATCH4_Q8K
+                : expInQ8
+                  ? ParallelMatOp.MUL_MAT_BATCH4_Q8
+                  : ParallelMatOp.MUL_MAT_BATCH4,
+              gateUpSingleOp: expInQ8K
+                ? ParallelMatOp.MUL_MAT_Q8K
+                : expInQ8
+                  ? ParallelMatOp.MUL_MAT_Q8
+                  : ParallelMatOp.MUL_MAT,
+              downBatchOp: expDownQ8K
+                ? ParallelMatOp.MUL_MAT_BATCH4_Q8K
+                : expDownQ8
+                  ? ParallelMatOp.MUL_MAT_BATCH4_Q8
+                  : ParallelMatOp.MUL_MAT_BATCH4,
+              downSingleOp: expDownQ8K
+                ? ParallelMatOp.MUL_MAT_Q8K
+                : expDownQ8
+                  ? ParallelMatOp.MUL_MAT_Q8
+                  : ParallelMatOp.MUL_MAT,
+              gateType: waveGType,
+              upType: waveUType,
+              downType: waveDType,
+              bXOrQ8Ptr: expInQ8K ? bQkDimPtr : expInQ8 ? bQDimPtr : bXNormPtr,
+              bXF32Ptr: bXNormPtr,
+              xQ8StrideBytes: expInQ8K ? qkDimStride : expInQ8 ? qDimStride : xStrideBytes,
+              outPtr: bFfnProjPtr,
+              workerScratchBase: s.moeWorkerScratch!.buffer.wasmPtr(s.moeWorkerScratch!),
+              layout: s.moeBatch4WorkerScratchLayout!,
+              gatePtrs: moeBatchGatePtrs,
+              upPtrs: moeBatchUpPtrs,
+              downPtrs: moeBatchDownPtrs,
+              masks: moeBatchSparseMasks,
+              weights: moeBatchWeightsF32,
+              accumulate: accumulatedOut,
+            });
+          }
+          if (!dispatched) {
+            for (let wi = wStart; wi < wEnd; wi++) {
+              runSparseExpertSequential(moeBatchSparseIdx[wi]);
+            }
+          }
+          accumulatedOut = true;
+        }
+        return;
+      }
+
+      // Sequential fallback for remaining sparse experts (single-core or <=1 sparse expert or non-WASM)
+      for (let si = 0; si < sparseIdxCount; si++) {
+        runSparseExpertSequential(moeBatchSparseIdx[si]);
       }
     };
 
