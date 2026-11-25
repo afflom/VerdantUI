@@ -99,7 +99,6 @@ const INITIAL_TELEMETRY: VTensorTelemetrySnapshot = {
   unifiedStore: null,
   performanceContract: null,
   frameBudget: null,
-  webgpu: null,
   threadPool: null,
   prism: null,
   buffers: [],
@@ -794,6 +793,19 @@ export class LlamaVTensorWorkerClient {
     }
   }
 
+  private resolveWorkerFetchUrl(url: string): string {
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(url)) {
+      return url;
+    }
+    if (typeof document !== 'undefined' && document.baseURI) {
+      return new URL(url.replace(/^\/+/, ''), document.baseURI).href;
+    }
+    if (typeof window !== 'undefined' && window.location?.href) {
+      return new URL(url.replace(/^\/+/, ''), window.location.href).href;
+    }
+    return url;
+  }
+
   async loadCatalogModel(model: CatalogModel): Promise<LoadedModelSummary> {
     return this.loadFromUrl(model.id, model.name, model.url, model.bundled);
   }
@@ -807,6 +819,7 @@ export class LlamaVTensorWorkerClient {
     this.cancelDownload();
     const requestId = this.nextRequestId('url');
     this.activeLoadRequestId = requestId;
+    const resolvedUrl = this.resolveWorkerFetchUrl(url);
 
     this.patchState({
       status: 'downloading',
@@ -825,7 +838,7 @@ export class LlamaVTensorWorkerClient {
         requestId,
         id,
         displayName,
-        url,
+        url: resolvedUrl,
         skipOpfs,
         weightResidencyPolicy: this.state.weightResidencyPolicy,
       } satisfies WorkerRequest);

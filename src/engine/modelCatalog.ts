@@ -453,7 +453,7 @@ export const INTERNAL_BOOTSTRAP_MODEL: CatalogModel = {
   quantization: 'F32',
   sizeLabel: '1.13 MB',
   approximateBytes: 1_189_600,
-  url: '/models/stories260K.gguf',
+  url: 'models/stories260K.gguf',
   bundled: true,
   description: 'Internal zero-network bootstrap checkpoint.',
   geometry: {

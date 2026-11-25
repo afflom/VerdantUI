@@ -1,6 +1,6 @@
 {
-  "name": "vTensor Assistant",
-  "description": "Client-side assistant-ui web application powered by llama.cpp with the afflom/vTensor GGML backend provider and Verdant Tensor compute substrate.",
+  "name": "VerdantUI",
+  "description": "100% client-side assistant-ui web workbench powered by the afflom/vTensor GGML backend provider and multi-threaded Verdant Tensor WASM SIMD compute substrate.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": []
 }

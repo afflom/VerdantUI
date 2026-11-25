@@ -31,7 +31,6 @@ import {
   type MatGroupEntry,
 } from './verdantWasmSimd';
 import { verdantMulMat } from './verdantKernels';
-import { classifyWebGpuAdapter } from './verdantWebGpu';
 import { runVTensorConformanceSuite } from './vtensorProvider';
 
 function makeRng(seed: number): () => number {
@@ -162,7 +161,6 @@ test('Prism CanonicalObjective, CostSurface routing, schedule compilation, vRAM 
   const baseHost: PrismHostCapabilities = {
     wasmSimd: true,
     relaxedVnni: true,
-    hardwareWebGpu: false,
     effectiveWorkers: 4,
     memoryBandwidthGBs: 16,
     computeGops: 32,
@@ -178,7 +176,6 @@ test('Prism CanonicalObjective, CostSurface routing, schedule compilation, vRAM 
     batchSize: 1,
     groupSize: 3,
     weightBytes: 2048 * 8 * 144,
-    gpuResident: false,
   });
   assert.equal(q4kCert.selectedRoute, 'wasm-q8k-4row');
 
@@ -190,24 +187,8 @@ test('Prism CanonicalObjective, CostSurface routing, schedule compilation, vRAM 
     batchSize: 1,
     groupSize: 2,
     weightBytes: 2048 * 64 * 18,
-    gpuResident: false,
   });
   assert.equal(q40Cert.selectedRoute, 'wasm-q8-4row');
-
-  // Hardware GPU resident matrix selects webgpu-wgsl-group
-  const gpuCert = selectCertifiedPrismRoute(
-    { ...baseHost, hardwareWebGpu: true },
-    {
-      weightType: GgmlType.Q4_K,
-      rows: 4096,
-      cols: 2048,
-      batchSize: 1,
-      groupSize: 3,
-      weightBytes: 4096 * 8 * 144,
-      gpuResident: true,
-    },
-  );
-  assert.equal(gpuCert.selectedRoute, 'webgpu-wgsl-group');
 
   // Strict F64 precision mode selects wasm-f32-strict
   const strictCert = selectCertifiedPrismRoute(
@@ -219,7 +200,6 @@ test('Prism CanonicalObjective, CostSurface routing, schedule compilation, vRAM 
       batchSize: 1,
       groupSize: 1,
       weightBytes: 2048 * 8 * 144,
-      gpuResident: false,
     },
   );
   assert.equal(strictCert.selectedRoute, 'wasm-f32-strict');
@@ -234,7 +214,6 @@ test('Prism CanonicalObjective, CostSurface routing, schedule compilation, vRAM 
       batchSize: 1,
       groupSize: 3,
       weightBytes: 2048 * 8 * 144,
-      gpuResident: false,
     },
     {
       label: 'blk.0.bad_op',
@@ -244,7 +223,6 @@ test('Prism CanonicalObjective, CostSurface routing, schedule compilation, vRAM 
       batchSize: 1,
       groupSize: 1,
       weightBytes: 0,
-      gpuResident: false,
     },
   ]);
   assert.equal(sched.q8kOps, 1);
@@ -271,7 +249,6 @@ test('Prism CanonicalObjective, CostSurface routing, schedule compilation, vRAM 
   ledger.recordQ8K(512, 2048, 4);
   ledger.recordQ80();
   ledger.recordTabulated();
-  ledger.recordWebGpuGroup();
   ledger.recordStrictF32();
   ledger.recordFusedBarrier();
   const snap = ledger.snapshot();
@@ -279,7 +256,6 @@ test('Prism CanonicalObjective, CostSurface routing, schedule compilation, vRAM 
   assert.equal(snap.q8kSuperBlocks, 512 * 8 * 4);
   assert.equal(snap.q80Dispatches, 1);
   assert.equal(snap.uorTabulatedDispatches, 1);
-  assert.equal(snap.webGpuGroupDispatches, 1);
   assert.equal(snap.strictF32Dispatches, 1);
   assert.equal(snap.fusedGroupBarriers, 1);
   assert.equal(snap.narrowLaneVerified, true);
@@ -466,24 +442,6 @@ test('Verdant/Prism Q4_K×Q8_K and Q6_K×Q8_K match reference across remainder r
   for (let i = 0; i < r0; i++) {
     assert.ok(Math.abs(g0B0[i] - g0S[i]) < 1e-4);
   }
-});
-
-test('WebGPU hardware-only admission rejects software renderers and admits hardware silicon', () => {
-  assert.equal(
-    classifyWebGpuAdapter({ vendor: 'Google', description: 'SwiftShader Device (Subzero)' }).admitted,
-    false,
-  );
-  assert.equal(
-    classifyWebGpuAdapter({ vendor: 'Mesa', device: 'llvmpipe (LLVM 17.0)' }).admitted,
-    false,
-  );
-  assert.equal(
-    classifyWebGpuAdapter({ vendor: 'Apple', device: 'Apple M3 Max', isFallbackAdapter: true }).admitted,
-    false,
-  );
-  const hw = classifyWebGpuAdapter({ vendor: 'Apple', architecture: 'metal-3', device: 'Apple M3 Max' });
-  assert.equal(hw.admitted, true);
-  assert.equal(hw.status, 'hardware-active');
 });
 
 test('Full vTensor conformance suite passes 100% including VT-67 & PRISM-01..05 with zero CPU fallbacks', () => {

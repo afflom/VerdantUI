@@ -226,7 +226,6 @@ export function uorLexicographicArgmax(values: Float32Array | readonly number[])
 // ---------------------------------------------------------------------------
 
 export type PrismKernelRoute =
-  | 'webgpu-wgsl-group'
   | 'wasm-q8k-4row'
   | 'wasm-q8-4row'
   | 'wasm-uor-tabulated'
@@ -275,7 +274,6 @@ export function canonicalTieBreak(routeA: string, routeB: string): number {
 export interface PrismHostCapabilities {
   readonly wasmSimd: boolean;
   readonly relaxedVnni: boolean;
-  readonly hardwareWebGpu: boolean;
   readonly effectiveWorkers: number;
   readonly memoryBandwidthGBs: number;
   readonly computeGops: number;
@@ -290,7 +288,6 @@ export interface PrismOpDescriptor {
   readonly batchSize: number;
   readonly groupSize: number;
   readonly weightBytes: number;
-  readonly gpuResident: boolean;
 }
 
 export interface PrismRouteEvaluation {
@@ -339,13 +336,6 @@ export function selectCertifiedPrismRoute(
     op.weightType === GgmlType.Q5_0 ||
     op.weightType === GgmlType.Q5_1 ||
     op.weightType === GgmlType.Q8_0;
-  const isWebGpuQuant =
-    op.weightType === GgmlType.F32 ||
-    op.weightType === GgmlType.F16 ||
-    op.weightType === GgmlType.Q4_0 ||
-    op.weightType === GgmlType.Q8_0 ||
-    op.weightType === GgmlType.Q4_K ||
-    op.weightType === GgmlType.Q6_K;
 
   const pScale =
     host.effectiveWorkers <= 1
@@ -361,30 +351,7 @@ export function selectCertifiedPrismRoute(
 
   const candidates: PrismRouteEvaluation[] = [];
 
-  // 1. Verdant WebGPU WGSL Workgroup-Tiled Compute (hardware GPU only)
-  {
-    const admitted = host.hardwareWebGpu && op.gpuResident && isWebGpuQuant && op.batchSize === 1;
-    // Hardware GPU DRAM bandwidth is conservatively modeled at 120 GB/s; command encode + readback amortized across group
-    const gpuDramUs = (op.weightBytes / 1e9 / 120) * 1e6;
-    const gpuComputeUs = (flops / 1e9 / 1500) * 1e6;
-    const gpuSyncUs = 85 / Math.max(1, op.groupSize); // command submit + mapAsync round-trip
-    const cost: PrismArtifactCostVector = {
-      dramReadCost: toTicks(gpuDramUs),
-      computeOpCost: toTicks(gpuComputeUs),
-      quantEncodeCost: 0,
-      syncBarrierCost: 0,
-      hostTransferCost: toTicks(gpuSyncUs),
-    };
-    candidates.push({
-      route: 'webgpu-wgsl-group',
-      admitted,
-      cost,
-      score: canonicalObjectiveScore(cost),
-      refusalReason: admitted ? undefined : 'Hardware WebGPU resident buffer unavailable',
-    });
-  }
-
-  // 2. Verdant Q8_K Super-Block Narrow-Lane Integer Contraction (encode once per 256 weights)
+  // 1. Verdant Q8_K Super-Block Narrow-Lane Integer Contraction (encode once per 256 weights)
   {
     const admitted =
       host.wasmSimd &&
@@ -535,7 +502,6 @@ export interface PrismCompiledSchedule {
   readonly instructions: readonly PrismMatrixInstruction[];
   readonly q8kOps: number;
   readonly q80Ops: number;
-  readonly webGpuOps: number;
   readonly strictF32Ops: number;
   readonly refusedOps: number;
 }
@@ -551,7 +517,6 @@ export function compilePrismMatrixSchedule(
   const instructions: PrismMatrixInstruction[] = [];
   let q8kOps = 0;
   let q80Ops = 0;
-  let webGpuOps = 0;
   let strictF32Ops = 0;
   let refusedOps = 0;
 
@@ -586,11 +551,10 @@ export function compilePrismMatrixSchedule(
     const cert = selectCertifiedPrismRoute(host, op);
     if (cert.selectedRoute === 'wasm-q8k-4row') q8kOps += 1;
     else if (cert.selectedRoute === 'wasm-q8-4row') q80Ops += 1;
-    else if (cert.selectedRoute === 'webgpu-wgsl-group') webGpuOps += 1;
     else strictF32Ops += 1;
 
     instructions.push({
-      kind: cert.selectedRoute === 'webgpu-wgsl-group' ? 'transfer' : 'multiply',
+      kind: 'multiply',
       opIndex: i,
       label: op.label,
       route: cert.selectedRoute,
@@ -609,7 +573,6 @@ export function compilePrismMatrixSchedule(
     instructions,
     q8kOps,
     q80Ops,
-    webGpuOps,
     strictF32Ops,
     refusedOps,
   };
@@ -692,7 +655,6 @@ export interface PrismExecutionCensus {
   readonly q8kDispatches: number;
   readonly q80Dispatches: number;
   readonly uorTabulatedDispatches: number;
-  readonly webGpuGroupDispatches: number;
   readonly strictF32Dispatches: number;
   readonly fusedGroupBarriers: number;
   readonly activePrimaryRoute: PrismKernelRoute;
@@ -705,7 +667,6 @@ export class PrismCensusLedger {
   q8kDispatches = 0;
   q80Dispatches = 0;
   uorTabulatedDispatches = 0;
-  webGpuGroupDispatches = 0;
   strictF32Dispatches = 0;
   fusedGroupBarriers = 0;
   activePrimaryRoute: PrismKernelRoute = 'wasm-q8k-4row';
@@ -716,7 +677,6 @@ export class PrismCensusLedger {
     this.q8kDispatches = 0;
     this.q80Dispatches = 0;
     this.uorTabulatedDispatches = 0;
-    this.webGpuGroupDispatches = 0;
     this.strictF32Dispatches = 0;
     this.fusedGroupBarriers = 0;
   }
@@ -734,10 +694,6 @@ export class PrismCensusLedger {
     this.uorTabulatedDispatches += 1;
   }
 
-  recordWebGpuGroup(): void {
-    this.webGpuGroupDispatches += 1;
-  }
-
   recordStrictF32(): void {
     this.strictF32Dispatches += 1;
   }
@@ -752,7 +708,6 @@ export class PrismCensusLedger {
       q8kDispatches: this.q8kDispatches,
       q80Dispatches: this.q80Dispatches,
       uorTabulatedDispatches: this.uorTabulatedDispatches,
-      webGpuGroupDispatches: this.webGpuGroupDispatches,
       strictF32Dispatches: this.strictF32Dispatches,
       fusedGroupBarriers: this.fusedGroupBarriers,
       activePrimaryRoute: this.activePrimaryRoute,
@@ -832,7 +787,6 @@ export function runPrismVerificationSuite(): readonly PrismGateCheck[] {
     {
       wasmSimd: true,
       relaxedVnni: true,
-      hardwareWebGpu: false,
       effectiveWorkers: 4,
       memoryBandwidthGBs: 12,
       computeGops: 16,
@@ -846,7 +800,6 @@ export function runPrismVerificationSuite(): readonly PrismGateCheck[] {
       batchSize: 1,
       groupSize: 3,
       weightBytes: 2048 * 8 * 144,
-      gpuResident: false,
     },
   );
   const costOk =

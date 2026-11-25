@@ -1,0 +1,96 @@
+# Publishes client-side VerdantUI (`dist/`) to GitHub Pages on every push to `main`.
+#
+# Modeled after `afflom/verdant-aqm/.github/workflows/pages.yml` and
+# `afflom/verdant-engine/.github/workflows/pages.yml` with commit-pinned GitHub Actions,
+# two-stage `build` -> `deploy` isolation, and a fast verification path:
+#   1. VerdantUI permanent ratchet (`npm run ratchet`) + planted-defect self-check
+#   2. TypeScript typecheck (`npm run lint`)
+#   3. Fast engine unit test suite (`npm test`)
+#   4. Subpath-safe Vite build + Pages assembly + COOP/COEP & bundle verification (`npm run build:pages`)
+
+name: pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.ref == 'refs/heads/main' && 'pages-main' || format('pages-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build:
+    name: verify ratchet, test, and assemble VerdantUI Pages bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - name: Check out revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install Node 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Configure Pages
+        if: github.event_name != 'pull_request'
+        id: pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d
+
+      - name: Run Verdant ratchet, typecheck, and fast engine tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run ratchet
+          npm run lint
+          npm test
+
+      - name: Build and verify GitHub Pages bundle
+        shell: bash
+        env:
+          VITE_BASE_PATH: './'
+          PAGES_BASE_URL: ${{ steps.pages.outputs.base_url != '' && format('{0}/', steps.pages.outputs.base_url) || '' }}
+        run: |
+          set -euo pipefail
+          npm run build:pages
+
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
+        with:
+          path: dist
+
+  deploy:
+    name: publish VerdantUI to GitHub Pages
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346

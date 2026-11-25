@@ -1,23 +1,27 @@
 {
-  "name": "react-example",
+  "name": "verdant-ui",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "100% client-side local AI workbench powered by Verdant Tensor multi-threaded WASM SIMD and vTensor.",
+  "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "dev": "vite --port=3000 --host=0.0.0.0",
     "build": "vite build",
+    "build:pages": "VITE_BASE_PATH=./ vite build && tsx scripts/assemble-pages.ts dist && tsx scripts/verify-pages.ts dist",
+    "verify:pages": "tsx scripts/verify-pages.ts dist",
+    "ratchet": "tsx scripts/ratchet-gate.ts",
+    "test": "tsx --test src/engine/assistantAdapter.test.ts src/engine/gguf.test.ts src/engine/harnessConfig.test.ts src/engine/llamaRuntime.test.ts src/engine/performanceContract.test.ts src/engine/prismKernel.test.ts src/engine/tokenizer.test.ts src/engine/verdantObserver.test.ts src/engine/verdantWasmSimd.test.ts src/engine/vramBackingStore.test.ts src/engine/vramKvPager.test.ts src/engine/vramSwapPolicy.test.ts src/engine/vramUnifiedStore.test.ts src/engine/vramWeightPager.test.ts src/engine/vtensorProvider.test.ts",
+    "test:bench": "tsx --test src/engine/scalingBenchmarks.test.ts",
     "preview": "vite preview",
-    "clean": "rm -rf dist server.js",
+    "clean": "rm -rf dist",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
     "@assistant-ui/react": "^0.15.38",
     "@assistant-ui/react-markdown": "^0.14.26",
-    "@google/genai": "^2.4.0",
     "@tailwindcss/vite": "^4.3.3",
     "@vitejs/plugin-react": "^6.1.1",
-    "dotenv": "^17.2.3",
-    "express": "^4.21.2",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
     "react": "^19.0.1",
@@ -30,10 +34,9 @@
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "autoprefixer": "^10.4.21",
-    "esbuild": "^0.25.0",
+    "esbuild": "^0.28.0",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
-    "typescript": "^7.0.2",
-    "@types/express": "^4.17.21"
+    "typescript": "^7.0.2"
   }
 }

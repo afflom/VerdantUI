@@ -21,13 +21,6 @@ import {
   swapTwoWithin,
   UnifiedPageCodecTag,
 } from './vramSwapPolicy';
-import {
-  classifyWebGpuAdapter,
-  VerdantWebGpuSubstrate,
-  WGSL_MUL_MAT_F32,
-  WGSL_MUL_MAT_Q4_0,
-  WGSL_MUL_MAT_Q8_0,
-} from './verdantWebGpu';
 
 test('Lean 4 SwapPolicy Theorem T7 invariants hold across medians, budgets, break-even, and factor dominance', () => {
   // All 6 permutations of (5, 12, 20) must yield median 12
@@ -152,37 +145,4 @@ test('Zero-clamp MessageChannel yielder and FrameBudgetProfiler enforce 16,666 u
   assert.equal(tel.yieldsAvoided, 2);
   assert.equal(tel.medianStepUs, 1_100);
   assert.equal(tel.withinFrameBudget, true);
-});
-
-test('VerdantWebGpuSubstrate strictly rejects software renderers and exposes valid WGSL compute shaders', async () => {
-  assert.equal(
-    classifyWebGpuAdapter({ vendor: 'Google', description: 'Google SwiftShader Device' }).admitted,
-    false,
-  );
-  assert.equal(
-    classifyWebGpuAdapter({ vendor: 'Mesa', device: 'llvmpipe (LLVM 17.0.6)' }).status,
-    'software-rejected',
-  );
-  assert.equal(
-    classifyWebGpuAdapter({ vendor: 'Microsoft', description: 'Microsoft Basic Render Driver' }).admitted,
-    false,
-  );
-  assert.equal(
-    classifyWebGpuAdapter({ vendor: 'Apple', device: 'Apple M3', isFallbackAdapter: true }).admitted,
-    false,
-  );
-
-  const hw = classifyWebGpuAdapter({ vendor: 'NVIDIA', architecture: 'ampere', device: 'RTX 4090' });
-  assert.equal(hw.admitted, true);
-  assert.equal(hw.status, 'hardware-active');
-
-  assert.ok(WGSL_MUL_MAT_F32.includes('@compute @workgroup_size(64)'));
-  assert.ok(WGSL_MUL_MAT_Q4_0.includes('unpack2x16float'));
-  assert.ok(WGSL_MUL_MAT_Q8_0.includes('@compute @workgroup_size(64)'));
-
-  const sub = new VerdantWebGpuSubstrate();
-  const res = await sub.probeAndInit();
-  assert.equal(res.status, 'unavailable');
-  assert.equal(sub.isHardwareActive, false);
-  assert.match(res.adapterLabel, /Verdant-Only/i);
 });

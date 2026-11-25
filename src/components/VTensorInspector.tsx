@@ -719,7 +719,7 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
                   Worker to verify exclusive provider lock, Prism NativeBackend &amp; CostSurface
                   certificates, Q8_K narrow-lane (Q4_K/Q6_K) &amp; uor-matmul tabulated kernels,
                   3-tier vRAM KV paging, OPFS Belady-cyclic weight paging, Unified Store (T6), and
-                  strict Verdant-only execution (browser WebGPU disabled).
+                  strict Verdant-only multi-threaded WASM SIMD execution.
                 </p>
               )}
             </section>

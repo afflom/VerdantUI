@@ -86,10 +86,6 @@ import {
   type FrameBudgetTelemetry,
 } from './vramSwapPolicy';
 import {
-  classifyWebGpuAdapter,
-  type WebGpuSubstrateTelemetry,
-} from './verdantWebGpu';
-import {
   runPrismVerificationSuite,
   type PrismExecutionCensus,
 } from './prismKernel';
@@ -469,7 +465,6 @@ export interface VTensorTelemetrySnapshot {
   readonly unifiedStore: UnifiedStoreTelemetry | null;
   readonly performanceContract: PerformanceContract | null;
   readonly frameBudget: FrameBudgetTelemetry | null;
-  readonly webgpu: WebGpuSubstrateTelemetry | null;
   readonly threadPool: VTensorThreadPoolTelemetry | null;
   readonly prism: PrismExecutionCensus | null;
   readonly buffers: readonly {
@@ -499,7 +494,6 @@ export class VTensorBackendRegistry {
   private unifiedStoreTelemetryProvider: (() => UnifiedStoreTelemetry) | null = null;
   private contractProvider: (() => PerformanceContract | null) | null = null;
   private frameBudgetTelemetryProvider: (() => FrameBudgetTelemetry) | null = null;
-  private webgpuTelemetryProvider: (() => WebGpuSubstrateTelemetry) | null = null;
   private prismTelemetryProvider: (() => PrismExecutionCensus | null) | null = null;
   private threadPool: VTensorThreadPool | null = null;
   private cachedEnvProfile: EnvironmentProfile | null = null;
@@ -607,10 +601,6 @@ export class VTensorBackendRegistry {
 
   attachFrameBudgetTelemetry(provider: (() => FrameBudgetTelemetry) | null): void {
     this.frameBudgetTelemetryProvider = provider;
-  }
-
-  attachWebGpuTelemetry(provider: (() => WebGpuSubstrateTelemetry) | null): void {
-    this.webgpuTelemetryProvider = provider;
   }
 
   attachPrismTelemetry(provider: (() => PrismExecutionCensus | null) | null): void {
@@ -1353,7 +1343,6 @@ export class VTensorBackendRegistry {
       unifiedStore: this.unifiedStoreTelemetryProvider ? this.unifiedStoreTelemetryProvider() : null,
       performanceContract: this.contractProvider ? this.contractProvider() : null,
       frameBudget: this.frameBudgetTelemetryProvider ? this.frameBudgetTelemetryProvider() : null,
-      webgpu: this.webgpuTelemetryProvider ? this.webgpuTelemetryProvider() : null,
       threadPool: this.getThreadPoolTelemetry(),
       prism: this.prismTelemetryProvider ? this.prismTelemetryProvider() : null,
       buffers,
@@ -2126,8 +2115,8 @@ export function runVTensorConformanceSuite(): ConformanceSuiteReport {
     return `T6 (${plan.hotEmbeddingCacheSlots} embd slots · ${plan.maxKvPrefixBlocks} KV blocks) · Q8 restore & dedup verified`;
   });
 
-  // VT-65: Theorem T7 Swap Latency Bounds, 4-Row SIMD + add_f32, Lossless Factoring & Hardware WebGPU Policy
-  runCheck('VT-65', 'Theorem T7 frame bounds, 4-row SIMD, lossless factoring & WebGPU policy', () => {
+  // VT-65: Theorem T7 Swap Latency Bounds, 4-Row SIMD + add_f32 & Lossless Factoring
+  runCheck('VT-65', 'Theorem T7 frame bounds, 4-row SIMD & lossless factoring', () => {
     // 1. Verify 4-row register-blocked F32/Q4_0/Q8_0 SIMD + SIMD add_f32 on non-multiple-of-4 rows
     const reg = new VTensorBackendRegistry({ initialWasmPages: 24 });
     const arena = reg.arena;
@@ -2203,7 +2192,7 @@ export function runVTensorConformanceSuite(): ConformanceSuiteReport {
       }
     }
 
-    // 4. Verify FrameBudgetProfiler (16,666 µs KPI) & Hardware-Only WebGPU Adapter Policy
+    // 4. Verify FrameBudgetProfiler (16,666 µs KPI) & pure Verdant-only substrate isolation
     const profiler = new FrameBudgetProfiler(FRAME_BUDGET_US, 'message-channel');
     profiler.beginSlice(0);
     const y1 = profiler.recordStepAndShouldYield(1_200, 12_000, 16, 1.2);
@@ -2211,14 +2200,9 @@ export function runVTensorConformanceSuite(): ConformanceSuiteReport {
     if (y1 !== false || y2 !== true || !profiler.isWithinFrameBudget()) {
       throw new Error('FrameBudgetProfiler yield gating invariant violated');
     }
-    const sw = classifyWebGpuAdapter({ vendor: 'Google', description: 'SwiftShader Device (Subzero)' });
-    const hw = classifyWebGpuAdapter({ vendor: 'Apple', architecture: 'metal-3', device: 'Apple M3' });
-    if (sw.admitted || sw.status !== 'software-rejected' || !hw.admitted) {
-      throw new Error('WebGPU hardware-only admission policy failed');
-    }
 
     reg.freeAllBuffers();
-    return `T7 16.67ms KPI · 4-row SIMD + add_f32 · Selector ${(4096 / selFit.encodedBytes).toFixed(1)}× lossless · SW GPU rejected`;
+    return `T7 16.67ms KPI · 4-row SIMD + add_f32 · Selector ${(4096 / selFit.encodedBytes).toFixed(1)}× lossless · Verdant-only`;
   });
 
   // VT-66: Large-Scale Scaling Invariants (WASM SIMD SwiGLU, Fused 16-Token Page Attention, Belady Cyclic Paging)

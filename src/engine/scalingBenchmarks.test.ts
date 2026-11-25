@@ -1073,7 +1073,6 @@ test('Verdant v2.22.4 Q5_K × Q8_K single & batch-4 narrow-lane kernels match ex
     {
       wasmSimd: true,
       relaxedVnni: true,
-      hardwareWebGpu: false,
       effectiveWorkers: 4,
       memoryBandwidthGBs: 25,
       computeGops: 140,
@@ -1087,7 +1086,6 @@ test('Verdant v2.22.4 Q5_K × Q8_K single & batch-4 narrow-lane kernels match ex
       batchSize: 1,
       groupSize: 1,
       weightBytes: 3072 * (8192 / 256) * 176,
-      gpuResident: false,
     },
   );
   assert.equal(cert.selectedRoute, 'wasm-q8k-4row');

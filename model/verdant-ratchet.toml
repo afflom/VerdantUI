@@ -1,0 +1,21 @@
+# VerdantUI Permanent Ratchet Policy (`verdant-ui/ratchet/1`)
+#
+# Enforces non-negotiable architectural invariants on every local check and CI run
+# with permanent zero ceilings and planted-defect self-verification:
+#   1. 100% client-side runtime — zero server dependencies, zero server files.
+#   2. Pure verdant-engine / vTensor compute substrate — zero WebGPU or foreign processor APIs.
+#   3. Multi-threaded WASM SIMD guaranteed on static hosts (COOP/COEP isolation + thread pool).
+#   4. Subpath-safe GitHub Pages asset routing — zero root-absolute bundled model URLs.
+#   5. Exclusive vTensor GGML provider lock — default GGML backends explicitly refused.
+
+schema = "verdant-ui/ratchet/1"
+
+[ceilings]
+server_dependencies_max = 0
+server_files_max = 0
+webgpu_or_foreign_processor_apis_max = 0
+root_absolute_bundled_asset_urls_max = 0
+
+[requirements]
+require_coop_coep_multithread_isolation = true
+require_exclusive_vtensor_provider_lock = true

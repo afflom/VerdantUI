@@ -89,7 +89,6 @@ import {
   SPECULATIVE_SLICE_BUDGET_US,
   type CooperativeYielder,
 } from './vramSwapPolicy';
-import type { WebGpuSubstrateTelemetry } from './verdantWebGpu';
 import {
   compilePrismMatrixSchedule,
   PrismCensusLedger,
@@ -558,10 +557,6 @@ export class LlamaVTensorRuntime {
     this.yielder = createCooperativeYielder();
     this.frameBudget = new FrameBudgetProfiler(undefined, this.yielder.transport);
     this.backend.attachFrameBudgetTelemetry(() => this.frameBudget.getTelemetry());
-  }
-
-  attachWebGpuTelemetry(provider: (() => WebGpuSubstrateTelemetry) | null): void {
-    this.backend.attachWebGpuTelemetry(provider);
   }
 
   /**
@@ -2182,7 +2177,6 @@ export class LlamaVTensorRuntime {
     const prismHost: PrismHostCapabilities = {
       wasmSimd: arena !== null,
       relaxedVnni: arena?.relaxedSimdActive ?? false,
-      hardwareWebGpu: false,
       effectiveWorkers: contractEnv?.effectiveWorkers ?? 1,
       memoryBandwidthGBs: contractEnv?.memoryBandwidthGBs ?? 4,
       computeGops: contractEnv?.computeGops ?? 8,
@@ -2201,7 +2195,6 @@ export class LlamaVTensorRuntime {
           batchSize: 1,
           groupSize,
           weightBytes: info.byteSize,
-          gpuResident: false,
         });
       };
       pushOp(`blk.${l}.attn_q`, li.attnQ, 3);
@@ -2221,7 +2214,6 @@ export class LlamaVTensorRuntime {
             batchSize: expUsed,
             groupSize,
             weightBytes: Math.ceil((info.byteSize / nExp) * expUsed),
-            gpuResident: false,
           });
         };
         pushMoeExp(`blk.${l}.ffn_gate_exps`, li.ffnGateExps, 2);
@@ -2241,7 +2233,6 @@ export class LlamaVTensorRuntime {
       batchSize: 1,
       groupSize: 1,
       weightBytes: outWeightInfo.byteSize,
-      gpuResident: false,
     });
     const compiledPrism = compilePrismMatrixSchedule(prismHost, scheduleOps);
     this.prismSchedule = compiledPrism;
