@@ -23,6 +23,7 @@ import {
   WASM_ATTN_WORKER_SCRATCH_STRIDE,
   weightRowByteSize,
   type MatGroupEntry,
+  type MoeExpertParallelDispatch,
   type VerdantSimdExports,
   type VTensorThreadPoolLike,
 } from './verdantWasmSimd';
@@ -68,10 +69,108 @@ export const SLOT_G2_ROW_COUNT = 6;
 export const OP_GROUP_DISPATCH = 50;
 export const OP_PING = 51;
 export const OP_FLASH_ATTN_RANGE = 52;
+export const OP_MOE_EXPERTS = 53;
 export const OP_SHUTDOWN = 99;
 export const MAX_POOL_WORKERS = 32;
+export const MAX_MOE_ACTIVE_EXPERTS = 16;
 /** 26-int FlashAttention descriptor overlaid onto indices 16..41 (strictly < WORKER_SLOT_BASE = 48). */
 export const ATTN_DESC_BASE = GROUP_DESC_BASE;
+/** Dedicated single-barrier Expert-Parallel MoE descriptor placed cleanly after all worker slots. */
+export const MOE_DESC_BASE = WORKER_SLOT_BASE + MAX_POOL_WORKERS * WORKER_SLOT_STRIDE; // 560
+export const MOE_HDR_COUNT = 19; // header ints at MOE_DESC_BASE + 0..18
+export const MOE_EXPERT_LIST_BASE = MOE_DESC_BASE + MOE_HDR_COUNT; // 579
+export const MOE_EXPERT_STRIDE = 4; // [gatePtr, upPtr, downPtr, weightF32Bits]
+export const CTRL_TOTAL_INTS = MOE_EXPERT_LIST_BASE + MAX_MOE_ACTIVE_EXPERTS * MOE_EXPERT_STRIDE + 16;
+
+const moeF32Buf = new ArrayBuffer(4);
+const moeF32View = new Float32Array(moeF32Buf);
+const moeI32View = new Int32Array(moeF32Buf);
+
+function f32ToI32Bits(v: number): number {
+  moeF32View[0] = v;
+  return moeI32View[0];
+}
+
+function i32BitsToF32(bits: number): number {
+  moeI32View[0] = bits;
+  return moeF32View[0];
+}
+
+function runMoeWorkerSlice(
+  kernels: VerdantSimdExports,
+  ctrl: Int32Array,
+  threadId: number,
+): void {
+  const m = MOE_DESC_BASE;
+  const expertCount = ctrl[m + 0];
+  const activeThreads = ctrl[m + 18];
+  if (threadId >= expertCount || threadId >= activeThreads) return;
+
+  const dim = ctrl[m + 1];
+  const expFfnDim = ctrl[m + 2];
+  const gateUpOp = ctrl[m + 3] as ParallelMatOp;
+  const downOp = ctrl[m + 4] as ParallelMatOp;
+  const gateType = ctrl[m + 5] as GgmlType;
+  const upType = ctrl[m + 6] as GgmlType;
+  const downType = ctrl[m + 7] as GgmlType;
+  const xOrQ8Ptr = ctrl[m + 8] >>> 0;
+  const xF32Ptr = ctrl[m + 9] >>> 0;
+  const scratchBase = (ctrl[m + 10] >>> 0) + threadId * ctrl[m + 11];
+  const gateOutPtr = scratchBase + ctrl[m + 12];
+  const upOutPtr = scratchBase + ctrl[m + 13];
+  const hidPtr = scratchBase + ctrl[m + 14];
+  const q8FfnPtr = scratchBase + ctrl[m + 15];
+  const expProjPtr = scratchBase + ctrl[m + 16];
+  const accumPtr = scratchBase + ctrl[m + 17];
+  const gateOutStride = expFfnDim * 4;
+  const dimStride = dim * 4;
+
+  kernels.zero_bytes(accumPtr, dimStride);
+
+  for (let k = threadId; k < expertCount; k += activeThreads) {
+    const eBase = MOE_EXPERT_LIST_BASE + k * MOE_EXPERT_STRIDE;
+    const gateWPtr = ctrl[eBase + 0] >>> 0;
+    const upWPtr = ctrl[eBase + 1] >>> 0;
+    const downWPtr = ctrl[eBase + 2] >>> 0;
+    const weight = i32BitsToF32(ctrl[eBase + 3]);
+
+    executeWasmMatStripe(
+      kernels,
+      gateUpOp,
+      gateType,
+      gateWPtr,
+      xOrQ8Ptr,
+      xF32Ptr,
+      gateOutPtr,
+      dim,
+      expFfnDim,
+      gateOutStride,
+    );
+    executeWasmMatStripe(
+      kernels,
+      gateUpOp,
+      upType,
+      upWPtr,
+      xOrQ8Ptr,
+      xF32Ptr,
+      upOutPtr,
+      dim,
+      expFfnDim,
+      gateOutStride,
+    );
+    kernels.swiglu_f32(gateOutPtr, upOutPtr, hidPtr, expFfnDim);
+    if (downOp === ParallelMatOp.MUL_MAT_Q8K) {
+      kernels.quantize_f32_to_q8_k(hidPtr, q8FfnPtr, expFfnDim);
+      executeWasmMatStripe(kernels, downOp, downType, downWPtr, q8FfnPtr, hidPtr, expProjPtr, expFfnDim, dim, dimStride);
+    } else if (downOp === ParallelMatOp.MUL_MAT_Q8) {
+      kernels.quantize_f32_to_q8_0(hidPtr, q8FfnPtr, expFfnDim);
+      executeWasmMatStripe(kernels, downOp, downType, downWPtr, q8FfnPtr, hidPtr, expProjPtr, expFfnDim, dim, dimStride);
+    } else {
+      executeWasmMatStripe(kernels, downOp, downType, downWPtr, hidPtr, hidPtr, expProjPtr, expFfnDim, dim, dimStride);
+    }
+    kernels.axpy_f32(accumPtr, expProjPtr, weight, dim);
+  }
+}
 
 /** Active spin window (~400–800 µs) keeps helper threads hot across attention/RMSNorm gaps without futex syscalls. */
 export const WORKER_ACTIVE_SPIN = 80_000;
@@ -79,6 +178,18 @@ export const COORDINATOR_JOIN_SPIN = 80_000;
 
 /** Default Theorem T3 parallel dispatch floor (48 KiB): unlocks multi-core across 135M–3B models. */
 export const DEFAULT_PARALLEL_THRESHOLD_BYTES = 48 * 1024;
+
+/**
+ * Prism Theorem T3 physical-core saturation bound:
+ * 256-bit AVX2/SIMD execution saturates physical FMA/load ports at 1 thread per physical core.
+ * Oversubscribing SMT siblings (e.g. P=8..12 on a 6C/12T CPU) causes straggler barriers and
+ * OS preemption convoys (measured +24% higher Q4_K/Q4_0 bandwidth at P=6 vs P=8 and 3–7x vs P=12).
+ */
+export function deriveOptimalPoolWorkers(hwCores: number): number {
+  const n = Math.max(1, Math.floor(hwCores));
+  if (n <= 4) return n;
+  return Math.min(12, Math.max(4, Math.floor(n / 2)));
+}
 
 export interface VTensorThreadPoolTelemetry {
   readonly active: boolean;
@@ -135,6 +246,15 @@ export function runComputeWorkerLoop(
     }
 
     if (op === OP_PING) {
+      Atomics.store(ctrl, slotBase + SLOT_DONE_SEQ, seq);
+      if (Atomics.load(ctrl, CTRL_COORDINATOR_WAITING) !== 0) {
+        Atomics.notify(ctrl, slotBase + SLOT_DONE_SEQ, 1);
+      }
+      continue;
+    }
+
+    if (op === OP_MOE_EXPERTS) {
+      runMoeWorkerSlice(kernels, ctrl, workerIndex + 1);
       Atomics.store(ctrl, slotBase + SLOT_DONE_SEQ, seq);
       if (Atomics.load(ctrl, CTRL_COORDINATOR_WAITING) !== 0) {
         Atomics.notify(ctrl, slotBase + SLOT_DONE_SEQ, 1);
@@ -360,13 +480,13 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
       typeof navigator !== 'undefined' && typeof navigator.hardwareConcurrency === 'number'
         ? navigator.hardwareConcurrency
         : 4;
-    const requestedMax = options?.maxWorkers ?? MAX_POOL_WORKERS;
+    const requestedMax = options?.maxWorkers ?? deriveOptimalPoolWorkers(hwCores);
     const totalWorkers = Math.max(1, Math.min(MAX_POOL_WORKERS, requestedMax, Math.floor(hwCores)));
     if (totalWorkers <= 1) {
       return null;
     }
 
-    const ctrlSab = new SharedArrayBuffer((WORKER_SLOT_BASE + totalWorkers * WORKER_SLOT_STRIDE) * 4);
+    const ctrlSab = new SharedArrayBuffer(CTRL_TOTAL_INTS * 4);
     const pool = new VTensorThreadPool(
       totalWorkers,
       ctrlSab,
@@ -406,6 +526,9 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
           const k = instance.exports;
           const ctrl = new Int32Array(ctrlSab);
           const slotBase = ${WORKER_SLOT_BASE} + workerIndex * ${WORKER_SLOT_STRIDE};
+          const f32Buf = new ArrayBuffer(4);
+          const f32View = new Float32Array(f32Buf);
+          const i32View = new Int32Array(f32Buf);
           Atomics.add(ctrl, ${CTRL_READY_COUNT}, 1);
           Atomics.notify(ctrl, ${CTRL_READY_COUNT}, 1);
 
@@ -483,6 +606,59 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
               break;
             }
             if (op === ${OP_PING}) {
+              Atomics.store(ctrl, slotBase + ${SLOT_DONE_SEQ}, seq);
+              if (Atomics.load(ctrl, ${CTRL_COORDINATOR_WAITING}) !== 0) {
+                Atomics.notify(ctrl, slotBase + ${SLOT_DONE_SEQ}, 1);
+              }
+              continue;
+            }
+            if (op === ${OP_MOE_EXPERTS}) {
+              const m = ${MOE_DESC_BASE};
+              const expertCount = ctrl[m + 0];
+              const activeThreads = ctrl[m + 18];
+              const tid = workerIndex + 1;
+              if (tid < expertCount && tid < activeThreads) {
+                const dim = ctrl[m + 1];
+                const expFfnDim = ctrl[m + 2];
+                const gateUpOp = ctrl[m + 3];
+                const downOp = ctrl[m + 4];
+                const gateType = ctrl[m + 5];
+                const upType = ctrl[m + 6];
+                const downType = ctrl[m + 7];
+                const xOrQ8 = ctrl[m + 8] >>> 0;
+                const xF32 = ctrl[m + 9] >>> 0;
+                const scratchBase = (ctrl[m + 10] >>> 0) + tid * ctrl[m + 11];
+                const gateOutPtr = scratchBase + ctrl[m + 12];
+                const upOutPtr = scratchBase + ctrl[m + 13];
+                const hidPtr = scratchBase + ctrl[m + 14];
+                const q8FfnPtr = scratchBase + ctrl[m + 15];
+                const expProjPtr = scratchBase + ctrl[m + 16];
+                const accumPtr = scratchBase + ctrl[m + 17];
+                const gateStride = expFfnDim * 4;
+                const dimStride = dim * 4;
+                k.zero_bytes(accumPtr, dimStride);
+                for (let e = tid; e < expertCount; e += activeThreads) {
+                  const eBase = ${MOE_EXPERT_LIST_BASE} + e * ${MOE_EXPERT_STRIDE};
+                  const gW = ctrl[eBase + 0] >>> 0;
+                  const uW = ctrl[eBase + 1] >>> 0;
+                  const dW = ctrl[eBase + 2] >>> 0;
+                  i32View[0] = ctrl[eBase + 3];
+                  const weight = f32View[0];
+                  runStripe(gateUpOp, gateType, gW, xOrQ8, xF32, gateOutPtr, dim, expFfnDim, gateStride);
+                  runStripe(gateUpOp, upType, uW, xOrQ8, xF32, upOutPtr, dim, expFfnDim, gateStride);
+                  k.swiglu_f32(gateOutPtr, upOutPtr, hidPtr, expFfnDim);
+                  if (downOp === ${ParallelMatOp.MUL_MAT_Q8K}) {
+                    k.quantize_f32_to_q8_k(hidPtr, q8FfnPtr, expFfnDim);
+                    runStripe(downOp, downType, dW, q8FfnPtr, hidPtr, expProjPtr, expFfnDim, dim, dimStride);
+                  } else if (downOp === ${ParallelMatOp.MUL_MAT_Q8}) {
+                    k.quantize_f32_to_q8_0(hidPtr, q8FfnPtr, expFfnDim);
+                    runStripe(downOp, downType, dW, q8FfnPtr, hidPtr, expProjPtr, expFfnDim, dim, dimStride);
+                  } else {
+                    runStripe(downOp, downType, dW, hidPtr, hidPtr, expProjPtr, expFfnDim, dim, dimStride);
+                  }
+                  k.axpy_f32(accumPtr, expProjPtr, weight, dim);
+                }
+              }
               Atomics.store(ctrl, slotBase + ${SLOT_DONE_SEQ}, seq);
               if (Atomics.load(ctrl, ${CTRL_COORDINATOR_WAITING}) !== 0) {
                 Atomics.notify(ctrl, slotBase + ${SLOT_DONE_SEQ}, 1);
@@ -959,21 +1135,106 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
     this.dispatches += 1;
   }
 
+  /**
+   * Single-barrier Expert-Parallel Sparse MoE dispatch (`OP_MOE_EXPERTS`):
+   * Distributes all `K` routed experts across `min(P, K)` threads in ONE barrier — cutting
+   * barriers per MoE layer from `2*K` (16 on Qwen3-30B-A3B) down to 1 and parallelizing
+   * `gate`, `up`, `swiglu_f32`, `quantize`, `down`, and `axpy_f32` inside L1-resident scratch!
+   */
+  dispatchParallelMoeExperts(
+    params: MoeExpertParallelDispatch,
+    kernels: VerdantSimdExports,
+  ): void {
+    const count = Math.min(MAX_MOE_ACTIVE_EXPERTS, params.expertCount);
+    if (count <= 0) {
+      kernels.zero_bytes(params.outPtr, params.dim * 4);
+      return;
+    }
+
+    const activeThreads = this.active && this.helperCount > 0 ? Math.min(this.workerCount, count) : 1;
+    const ctrl = this.ctrl;
+    const m = MOE_DESC_BASE;
+
+    ctrl[CTRL_OP_CODE] = OP_MOE_EXPERTS;
+    ctrl[m + 0] = count;
+    ctrl[m + 1] = params.dim;
+    ctrl[m + 2] = params.expFfnDim;
+    ctrl[m + 3] = params.gateUpOp;
+    ctrl[m + 4] = params.downOp;
+    ctrl[m + 5] = params.gateType;
+    ctrl[m + 6] = params.upType;
+    ctrl[m + 7] = params.downType;
+    ctrl[m + 8] = params.xOrQ8Ptr | 0;
+    ctrl[m + 9] = params.xF32Ptr | 0;
+    ctrl[m + 10] = params.workerScratchBase | 0;
+    ctrl[m + 11] = params.layout.strideBytes;
+    ctrl[m + 12] = params.layout.offGateOut;
+    ctrl[m + 13] = params.layout.offUpOut;
+    ctrl[m + 14] = params.layout.offHid;
+    ctrl[m + 15] = params.layout.offQ8Ffn;
+    ctrl[m + 16] = params.layout.offExpProj;
+    ctrl[m + 17] = params.layout.offAccum;
+    ctrl[m + 18] = activeThreads;
+
+    for (let k = 0; k < count; k++) {
+      const eBase = MOE_EXPERT_LIST_BASE + k * MOE_EXPERT_STRIDE;
+      ctrl[eBase + 0] = params.gatePtrs[k] | 0;
+      ctrl[eBase + 1] = params.upPtrs[k] | 0;
+      ctrl[eBase + 2] = params.downPtrs[k] | 0;
+      ctrl[eBase + 3] = f32ToI32Bits(params.weights[k]);
+    }
+
+    if (activeThreads > 1) {
+      const nextSeq = (this.jobSeq + 1) | 0;
+      this.jobSeq = nextSeq;
+      this.publishJob(nextSeq);
+      runMoeWorkerSlice(kernels, ctrl, 0);
+      this.joinHelpers(nextSeq);
+      this.dispatches += 1;
+    } else {
+      runMoeWorkerSlice(kernels, ctrl, 0);
+    }
+
+    // Deterministic SIMD reduction across thread accumulators `0..activeThreads-1`
+    const stride = params.layout.strideBytes;
+    const offAcc = params.layout.offAccum;
+    kernels.copy_bytes(params.outPtr, params.workerScratchBase + offAcc, params.dim * 4);
+    for (let t = 1; t < activeThreads; t++) {
+      kernels.add_f32(
+        params.outPtr,
+        params.workerScratchBase + t * stride + offAcc,
+        params.outPtr,
+        params.dim,
+      );
+    }
+  }
+
   dispose(): void {
+    void this.disposeAsync();
+  }
+
+  async disposeAsync(): Promise<void> {
     if (this.workers.length > 0) {
       const nextSeq = (this.jobSeq + 1) | 0;
       this.jobSeq = nextSeq;
       Atomics.store(this.ctrl, CTRL_OP_CODE, OP_SHUTDOWN);
       Atomics.store(this.ctrl, CTRL_JOB_SEQ, nextSeq);
       Atomics.notify(this.ctrl, CTRL_JOB_SEQ, this.workers.length);
+      const pending: Array<Promise<unknown>> = [];
       for (const w of this.workers) {
         try {
-          void w.terminate();
+          const res = w.terminate();
+          if (res && typeof (res as Promise<unknown>).then === 'function') {
+            pending.push(res as Promise<unknown>);
+          }
         } catch {
           // ignore
         }
       }
       this.workers.length = 0;
+      if (pending.length > 0) {
+        await Promise.allSettled(pending);
+      }
     }
     this.active = false;
   }

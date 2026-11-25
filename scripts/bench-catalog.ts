@@ -17,11 +17,14 @@ import os from 'node:os';
 import { GgmlType, getGgmlTypeTrait } from '../src/engine/gguf';
 import { MODEL_CATALOG, type CatalogModel } from '../src/engine/modelCatalog';
 import {
+  computeMoeWorkerScratchLayout,
+  ParallelMatOp,
   Q8_0_ACT_BLOCK_BYTES,
   Q8_K_ACT_BLOCK_BYTES,
   VerdantWasmArena,
   weightRowByteSize,
   type MatGroupEntry,
+  type MoeWorkerScratchLayout,
 } from '../src/engine/verdantWasmSimd';
 import { VTensorThreadPool } from '../src/engine/vtensorThreadPool';
 
@@ -54,6 +57,13 @@ interface CatalogBenchRow {
 
 function alignUp64(n: number): number {
   return (n + 63) & ~63;
+}
+
+function median(values: readonly number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = sorted.length >>> 1;
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) * 0.5;
 }
 
 function fillSyntheticWeights(dst: Uint8Array, seed: number): void {
@@ -107,6 +117,12 @@ function runSingleDenseOrMoeLayer(
     expProj: number;
     expStrideGate: number;
     expStrideDown: number;
+    moeWorkerScratch: number;
+    moeLayout: MoeWorkerScratchLayout | null;
+    moeGatePtrs: Int32Array;
+    moeUpPtrs: Int32Array;
+    moeDownPtrs: Int32Array;
+    moeWeights: Float32Array;
   },
 ): { totalMs: number; moeMs: number } {
   const useQ8K = arena.supportsQ8KActivation(wType) && (dim & 255) === 0;
@@ -148,36 +164,51 @@ function runSingleDenseOrMoeLayer(
   }
 
   if (isMoe) {
-    // Mirrors llamaRuntime.ts executeSparseMoeSingleRouted current path
-    arena.kernels.zero_bytes(ptrs.ffnProj, dim * 4);
-    const outView = new Float32Array(arena.memory.buffer, ptrs.ffnProj, dim);
-    const expView = new Float32Array(arena.memory.buffer, ptrs.expProj, dim);
-    const ge: MatGroupEntry[] = [
-      { weightType: wType, wPtr: 0, outPtr: ptrs.ffnGate, rows: ffnDim, oStrideBytes: ffnDim * 4 },
-      { weightType: wType, wPtr: 0, outPtr: ptrs.ffnUp, rows: ffnDim, oStrideBytes: ffnDim * 4 },
-    ];
-    for (let e = 0; e < activeExperts; e++) {
-      const gPtr = ptrs.wGate + e * ptrs.expStrideGate;
-      const uPtr = ptrs.wUp + e * ptrs.expStrideGate;
-      const dPtr = ptrs.wDown + e * ptrs.expStrideDown;
-      ge[0].wPtr = gPtr;
-      ge[1].wPtr = uPtr;
-      if (useQ8K) {
-        arena.mulMatQ8KGroup(ge, ptrs.q8k, ptrs.x, dim);
-      } else {
-        arena.mulMatQ8Group(ge, ptrs.q8, ptrs.x, dim, true);
-      }
-      arena.kernels.swiglu_f32(ptrs.ffnGate, ptrs.ffnUp, ptrs.ffnHid, ffnDim);
-      if (ffnUseQ8K) {
-        arena.quantizeActivationQ8K(ptrs.ffnHid, ptrs.q8kFfn, ffnDim);
-        arena.mulMatQ8K(wType, dPtr, ptrs.q8kFfn, ptrs.ffnHid, ptrs.expProj, ffnDim, dim);
-      } else {
-        arena.quantizeActivation(ptrs.ffnHid, ptrs.q8Ffn, ffnDim);
-        arena.mulMatQ8(wType, dPtr, ptrs.q8Ffn, ptrs.ffnHid, ptrs.expProj, ffnDim, dim);
-      }
-      const w = 1 / activeExperts;
-      for (let i = 0; i < dim; i++) {
-        outView[i] += w * expView[i];
+    // Mirrors llamaRuntime.ts executeSparseMoeSingleRouted: single-barrier OP_MOE_EXPERTS when pooled
+    const dispatched =
+      ptrs.moeLayout !== null &&
+      ptrs.moeWorkerScratch >= 0 &&
+      arena.dispatchMoeExpertsParallel({
+        expertCount: activeExperts,
+        dim,
+        expFfnDim: ffnDim,
+        gateUpOp: useQ8K ? ParallelMatOp.MUL_MAT_Q8K : ParallelMatOp.MUL_MAT_Q8,
+        downOp: ffnUseQ8K ? ParallelMatOp.MUL_MAT_Q8K : ParallelMatOp.MUL_MAT_Q8,
+        gateType: wType,
+        upType: wType,
+        downType: wType,
+        xOrQ8Ptr: useQ8K ? ptrs.q8k : ptrs.q8,
+        xF32Ptr: ptrs.x,
+        outPtr: ptrs.ffnProj,
+        workerScratchBase: ptrs.moeWorkerScratch,
+        layout: ptrs.moeLayout,
+        gatePtrs: ptrs.moeGatePtrs,
+        upPtrs: ptrs.moeUpPtrs,
+        downPtrs: ptrs.moeDownPtrs,
+        weights: ptrs.moeWeights,
+      });
+    if (!dispatched) {
+      arena.kernels.zero_bytes(ptrs.ffnProj, dim * 4);
+      for (let e = 0; e < activeExperts; e++) {
+        const ge: MatGroupEntry[] = [
+          { weightType: wType, wPtr: ptrs.wGate + e * ptrs.expStrideGate, outPtr: ptrs.ffnGate, rows: ffnDim, oStrideBytes: ffnDim * 4 },
+          { weightType: wType, wPtr: ptrs.wUp + e * ptrs.expStrideGate, outPtr: ptrs.ffnUp, rows: ffnDim, oStrideBytes: ffnDim * 4 },
+        ];
+        const dPtr = ptrs.wDown + e * ptrs.expStrideDown;
+        if (useQ8K) {
+          arena.mulMatQ8KGroup(ge, ptrs.q8k, ptrs.x, dim);
+        } else {
+          arena.mulMatQ8Group(ge, ptrs.q8, ptrs.x, dim, true);
+        }
+        arena.kernels.swiglu_f32(ptrs.ffnGate, ptrs.ffnUp, ptrs.ffnHid, ffnDim);
+        if (ffnUseQ8K) {
+          arena.quantizeActivationQ8K(ptrs.ffnHid, ptrs.q8kFfn, ffnDim);
+          arena.mulMatQ8K(wType, dPtr, ptrs.q8kFfn, ptrs.ffnHid, ptrs.expProj, ffnDim, dim);
+        } else {
+          arena.quantizeActivation(ptrs.ffnHid, ptrs.q8Ffn, ffnDim);
+          arena.mulMatQ8(wType, dPtr, ptrs.q8Ffn, ptrs.ffnHid, ptrs.expProj, ffnDim, dim);
+        }
+        arena.kernels.axpy_f32(ptrs.ffnProj, ptrs.expProj, 1 / activeExperts, dim);
       }
     }
   } else {
@@ -292,13 +323,11 @@ function runBatch4DenseOrMoeLayer(
   }
 
   const nPasses = isMoe ? activeExperts : 1;
-  const ge: MatGroupEntry[] = [
-    { weightType: wType, wPtr: ptrs.wGate, outPtr: ptrs.ffnGateB4, rows: ffnDim, oStrideBytes: ffnDim * 4 },
-    { weightType: wType, wPtr: ptrs.wUp, outPtr: ptrs.ffnUpB4, rows: ffnDim, oStrideBytes: ffnDim * 4 },
-  ];
   for (let e = 0; e < nPasses; e++) {
-    ge[0].wPtr = ptrs.wGate + e * ptrs.expStrideGate;
-    ge[1].wPtr = ptrs.wUp + e * ptrs.expStrideGate;
+    const ge: MatGroupEntry[] = [
+      { weightType: wType, wPtr: ptrs.wGate + e * ptrs.expStrideGate, outPtr: ptrs.ffnGateB4, rows: ffnDim, oStrideBytes: ffnDim * 4 },
+      { weightType: wType, wPtr: ptrs.wUp + e * ptrs.expStrideGate, outPtr: ptrs.ffnUpB4, rows: ffnDim, oStrideBytes: ffnDim * 4 },
+    ];
     const dPtr = ptrs.wDown + e * ptrs.expStrideDown;
     if (useQ8K) {
       arena.mulMatBatch4Q8KGroup(ge, ptrs.q8kB4, ptrs.xB4, dim);
@@ -356,6 +385,18 @@ async function runThreadSweep(): Promise<{ bestWorkers: number; results: ThreadS
   const mQ8kFfn = arena.allocRegion((mFfn >>> 8) * Q8_K_ACT_BLOCK_BYTES);
   const mProj = arena.allocRegion(mDim * 4);
   const mExpProj = arena.allocRegion(mDim * 4);
+  const mLayout = computeMoeWorkerScratchLayout(mDim, mFfn);
+  const mWorkerScratch = arena.allocRegion(mLayout.strideBytes * Math.max(1, logicalCpus));
+  const mGatePtrs = new Int32Array(mExpK);
+  const mUpPtrs = new Int32Array(mExpK);
+  const mDownPtrs = new Int32Array(mExpK);
+  const mWeights = new Float32Array(mExpK);
+  for (let e = 0; e < mExpK; e++) {
+    mGatePtrs[e] = mGatePtr + e * mGateBytes;
+    mUpPtrs[e] = mUpPtr + e * mGateBytes;
+    mDownPtrs[e] = mDownPtr + e * mDownBytes;
+    mWeights[e] = 1 / mExpK;
+  }
 
   fillSyntheticWeights(arena.bytes().subarray(wQ4kPtr, wQ4kPtr + q4kBytes), 11);
   fillSyntheticWeights(arena.bytes().subarray(wQ40Ptr, wQ40Ptr + q40Bytes), 22);
@@ -397,24 +438,41 @@ async function runThreadSweep(): Promise<{ bestWorkers: number; results: ThreadS
     }
     const q40DecodeMs = (performance.now() - t1) / iters;
 
-    // MoE Top-8 layer benchmark
-    const mOutView = new Float32Array(arena.memory.buffer, mProj, mDim);
-    const mExpView = new Float32Array(arena.memory.buffer, mExpProj, mDim);
-    const ge: MatGroupEntry[] = [
-      { weightType: GgmlType.Q4_K, wPtr: 0, outPtr: mGateOut, rows: mFfn, oStrideBytes: mFfn * 4 },
-      { weightType: GgmlType.Q4_K, wPtr: 0, outPtr: mUpOut, rows: mFfn, oStrideBytes: mFfn * 4 },
-    ];
+    // MoE Top-8 layer benchmark (single-barrier OP_MOE_EXPERTS when pooled, WASM SIMD axpy otherwise)
     const t2 = performance.now();
     for (let it = 0; it < iters; it++) {
-      arena.kernels.zero_bytes(mProj, mDim * 4);
-      for (let e = 0; e < mExpK; e++) {
-        ge[0].wPtr = mGatePtr + e * mGateBytes;
-        ge[1].wPtr = mUpPtr + e * mGateBytes;
-        arena.mulMatQ8KGroup(ge, q8kPtr, xPtr, mDim);
-        arena.kernels.swiglu_f32(mGateOut, mUpOut, mHid, mFfn);
-        arena.quantizeActivationQ8K(mHid, mQ8kFfn, mFfn);
-        arena.mulMatQ8K(GgmlType.Q4_K, mDownPtr + e * mDownBytes, mQ8kFfn, mHid, mExpProj, mFfn, mDim);
-        for (let i = 0; i < mDim; i++) mOutView[i] += 0.125 * mExpView[i];
+      const dispatched = arena.dispatchMoeExpertsParallel({
+        expertCount: mExpK,
+        dim: mDim,
+        expFfnDim: mFfn,
+        gateUpOp: ParallelMatOp.MUL_MAT_Q8K,
+        downOp: ParallelMatOp.MUL_MAT_Q8K,
+        gateType: GgmlType.Q4_K,
+        upType: GgmlType.Q4_K,
+        downType: GgmlType.Q4_K,
+        xOrQ8Ptr: q8kPtr,
+        xF32Ptr: xPtr,
+        outPtr: mProj,
+        workerScratchBase: mWorkerScratch,
+        layout: mLayout,
+        gatePtrs: mGatePtrs,
+        upPtrs: mUpPtrs,
+        downPtrs: mDownPtrs,
+        weights: mWeights,
+      });
+      if (!dispatched) {
+        arena.kernels.zero_bytes(mProj, mDim * 4);
+        for (let e = 0; e < mExpK; e++) {
+          const ge: MatGroupEntry[] = [
+            { weightType: GgmlType.Q4_K, wPtr: mGatePtr + e * mGateBytes, outPtr: mGateOut, rows: mFfn, oStrideBytes: mFfn * 4 },
+            { weightType: GgmlType.Q4_K, wPtr: mUpPtr + e * mGateBytes, outPtr: mUpOut, rows: mFfn, oStrideBytes: mFfn * 4 },
+          ];
+          arena.mulMatQ8KGroup(ge, q8kPtr, xPtr, mDim);
+          arena.kernels.swiglu_f32(mGateOut, mUpOut, mHid, mFfn);
+          arena.quantizeActivationQ8K(mHid, mQ8kFfn, mFfn);
+          arena.mulMatQ8K(GgmlType.Q4_K, mDownPtr + e * mDownBytes, mQ8kFfn, mHid, mExpProj, mFfn, mDim);
+          arena.kernels.axpy_f32(mProj, mExpProj, 0.125, mDim);
+        }
       }
     }
     const moeLayerMs = (performance.now() - t2) / iters;
@@ -434,7 +492,7 @@ async function runThreadSweep(): Promise<{ bestWorkers: number; results: ThreadS
 
     if (pool) {
       arena.attachThreadPool(null);
-      pool.dispose();
+      await pool.disposeAsync();
     }
   }
 
@@ -447,7 +505,11 @@ async function runThreadSweep(): Promise<{ bestWorkers: number; results: ThreadS
 
 async function benchmarkModel(model: CatalogModel, workers: number): Promise<CatalogBenchRow> {
   const g = model.geometry;
-  const wType = g.dominantGgmlType;
+  // Real GGUF models with dim % 256 !== 0 (e.g. Qwen2.5 0.5B dim=896) store those projections in Q8_0/Q4_0 (32-elem blocks)
+  const wType =
+    g.dominantGgmlType === GgmlType.Q4_K && (g.embeddingLength & 255) !== 0
+      ? GgmlType.Q4_0
+      : g.dominantGgmlType;
   const dim = g.embeddingLength;
   const qDim = g.headCount * g.headDim;
   const kvDim = g.headCountKv * g.headDim;
@@ -515,6 +577,19 @@ async function benchmarkModel(model: CatalogModel, workers: number): Promise<Cat
     const ffnProj = arena.allocRegion(dim * 4);
     const expProj = arena.allocRegion(dim * 4);
     const logitsTile = arena.allocRegion(lmTileRows * 4);
+    const moeLayout = g.isMoe ? computeMoeWorkerScratchLayout(dim, ffnDim) : null;
+    const moeWorkerScratch =
+      moeLayout !== null ? arena.allocRegion(moeLayout.strideBytes * Math.max(1, workers)) : -1;
+    const moeGatePtrs = new Int32Array(activeExperts);
+    const moeUpPtrs = new Int32Array(activeExperts);
+    const moeDownPtrs = new Int32Array(activeExperts);
+    const moeWeights = new Float32Array(activeExperts);
+    for (let e = 0; e < activeExperts; e++) {
+      moeGatePtrs[e] = wGate + e * expStrideGate;
+      moeUpPtrs[e] = wUp + e * expStrideGate;
+      moeDownPtrs[e] = wDown + e * expStrideDown;
+      moeWeights[e] = 1 / activeExperts;
+    }
 
     const xB4 = arena.allocRegion(4 * dim * 4);
     const q8B4 = arena.allocRegion(4 * (maxActCols >>> 5) * Q8_0_ACT_BLOCK_BYTES);
@@ -536,43 +611,51 @@ async function benchmarkModel(model: CatalogModel, workers: number): Promise<Cat
     const singlePtrs = {
       wQ, wK, wV, wO, wGate, wUp, wDown, x, q8, q8k, q, k, v, attnProj,
       ffnGate, ffnUp, ffnHid, q8Ffn, q8kFfn, ffnProj, expProj, expStrideGate, expStrideDown,
+      moeWorkerScratch, moeLayout, moeGatePtrs, moeUpPtrs, moeDownPtrs, moeWeights,
     };
     const b4Ptrs = {
       wQ, wK, wV, wO, wGate, wUp, wDown, xB4, q8B4, q8kB4, qB4, kB4, vB4,
       attnProjB4, ffnGateB4, ffnUpB4, ffnHidB4, q8FfnB4, q8kFfnB4, ffnProjB4, expStrideGate, expStrideDown,
     };
 
-    // Warmup
-    runSingleDenseOrMoeLayer(arena, wType, dim, qDim, kvDim, ffnDim, g.isMoe, activeExperts, singlePtrs);
-    runBatch4DenseOrMoeLayer(arena, wType, dim, qDim, kvDim, ffnDim, g.isMoe, activeExperts, b4Ptrs);
-
-    const iters = totalWeightsBytes > 40 * 1024 * 1024 ? 3 : 6;
-    let sumLayerMs = 0;
-    let sumMoeMs = 0;
-    for (let i = 0; i < iters; i++) {
-      const r = runSingleDenseOrMoeLayer(arena, wType, dim, qDim, kvDim, ffnDim, g.isMoe, activeExperts, singlePtrs);
-      sumLayerMs += r.totalMs;
-      sumMoeMs += r.moeMs;
-    }
-    const layerDecodeMs = sumLayerMs / iters;
-    const moeFfnMs = sumMoeMs / iters;
-
-    const tb0 = performance.now();
-    for (let i = 0; i < iters; i++) {
-      runBatch4DenseOrMoeLayer(arena, wType, dim, qDim, kvDim, ffnDim, g.isMoe, activeExperts, b4Ptrs);
-    }
-    const layerPrefillB4Ms = (performance.now() - tb0) / iters;
-
-    // LM-head tile measurement scaled to full vocab
+    // Warmup all hot kernels (single-token, batch-4, and LM-head) across workers so TurboFan tiers up before timing
     const lmUseQ8K = arena.supportsQ8KActivation(wType) && (dim & 255) === 0;
     if (lmUseQ8K) arena.quantizeActivationQ8K(x, q8k, dim);
     else arena.quantizeActivation(x, q8, dim);
-    const tLm0 = performance.now();
-    for (let i = 0; i < iters; i++) {
+    const warmupIters = totalWeightsBytes > 40 * 1024 * 1024 ? 2 : 3;
+    for (let w = 0; w < warmupIters; w++) {
+      runSingleDenseOrMoeLayer(arena, wType, dim, qDim, kvDim, ffnDim, g.isMoe, activeExperts, singlePtrs);
+      runBatch4DenseOrMoeLayer(arena, wType, dim, qDim, kvDim, ffnDim, g.isMoe, activeExperts, b4Ptrs);
       if (lmUseQ8K) arena.mulMatQ8K(wType, wLm, q8k, x, logitsTile, dim, lmTileRows);
       else arena.mulMatQ8(wType, wLm, q8, x, logitsTile, dim, lmTileRows);
     }
-    const lmTileMs = (performance.now() - tLm0) / iters;
+
+    const iters = totalWeightsBytes > 40 * 1024 * 1024 ? 5 : 7;
+    const layerSamples: number[] = [];
+    const moeSamples: number[] = [];
+    for (let i = 0; i < iters; i++) {
+      const r = runSingleDenseOrMoeLayer(arena, wType, dim, qDim, kvDim, ffnDim, g.isMoe, activeExperts, singlePtrs);
+      layerSamples.push(r.totalMs);
+      moeSamples.push(r.moeMs);
+    }
+    const layerDecodeMs = median(layerSamples);
+    const moeFfnMs = median(moeSamples);
+
+    const b4Samples: number[] = [];
+    for (let i = 0; i < iters; i++) {
+      b4Samples.push(runBatch4DenseOrMoeLayer(arena, wType, dim, qDim, kvDim, ffnDim, g.isMoe, activeExperts, b4Ptrs));
+    }
+    const layerPrefillB4Ms = median(b4Samples);
+
+    // LM-head tile measurement scaled to full vocab
+    const lmSamples: number[] = [];
+    for (let i = 0; i < iters; i++) {
+      const tLm0 = performance.now();
+      if (lmUseQ8K) arena.mulMatQ8K(wType, wLm, q8k, x, logitsTile, dim, lmTileRows);
+      else arena.mulMatQ8(wType, wLm, q8, x, logitsTile, dim, lmTileRows);
+      lmSamples.push(performance.now() - tLm0);
+    }
+    const lmTileMs = median(lmSamples);
     const lmHeadMs = lmTileMs * (g.vocabSize / lmTileRows);
 
     const activeLayerBytes =
@@ -599,7 +682,7 @@ async function benchmarkModel(model: CatalogModel, workers: number): Promise<Cat
     };
   } finally {
     arena.attachThreadPool(null);
-    pool?.dispose();
+    if (pool) await pool.disposeAsync();
   }
 }
 

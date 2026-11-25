@@ -2654,9 +2654,12 @@ function buildMulMatQ4_0Q8(useRelaxed: boolean): FuncBuilder {
 }
 
 /**
- * 4-token batched Q4_0 × Q8_0_ACT VNNI/Int8 prefill kernel: (wPtr, q8BatchPtr, outBatchPtr, cols, rows, oStrideBytes)
- * Unpacks each Q4_0 weight block ONCE and evaluates all 4 prompt tokens with a single vectorized
- * 4-lane horizontal-transpose epilogue (`hsum4RowsI32x4` + `f32x4RelaxedMadd`, zero scalar extracts!).
+ * 4-row × 4-token register-blocked Q4_0 × Q8_0_ACT VNNI/Int8 prefill kernel:
+ * `(wPtr, q8BatchPtr, outBatchPtr, cols, rows, oStrideBytes)`.
+ *
+ * Tiles 4 output rows across each 32-element activation block so `qp0..qp3` (192 B = 3 cache lines)
+ * stay 100% L1D-hot across all 4 rows and `sum4`/`dx4` are packed ONCE per 4 rows (4× less L2/L3
+ * activation bandwidth on large FFN dims like 13,824–27,648!). Strictly 14 V128 locals (zero spills).
  */
 function buildMulMatQ4_0Q8Batch4(useRelaxed: boolean): FuncBuilder {
   const f = new FuncBuilder([I32, I32, I32, I32, I32, I32]);
@@ -2665,14 +2668,25 @@ function buildMulMatQ4_0Q8Batch4(useRelaxed: boolean): FuncBuilder {
   const rowBytes = f.local(I32);
   const qStride = f.local(I32);
   const oStride = f.local(I32);
-  const wp = f.local(I32);
+  const wp0 = f.local(I32);
+  const wp1 = f.local(I32);
+  const wp2 = f.local(I32);
+  const wp3 = f.local(I32);
   const qp0 = f.local(I32);
   const qp1 = f.local(I32);
   const qp2 = f.local(I32);
   const qp3 = f.local(I32);
+  const op = f.local(I32);
   const b = f.local(I32);
+
+  // Strictly 14 V128 locals (<= 16 XMM registers -> zero spills!)
   const mask0f = f.local(V128);
-  const zero = f.local(V128);
+  const acc0 = f.local(V128);
+  const acc1 = f.local(V128);
+  const acc2 = f.local(V128);
+  const acc3 = f.local(V128);
+  const sum4 = f.local(V128);
+  const dx4 = f.local(V128);
   const wlo = f.local(V128);
   const whi = f.local(V128);
   const xtmp = f.local(V128);
@@ -2680,12 +2694,8 @@ function buildMulMatQ4_0Q8Batch4(useRelaxed: boolean): FuncBuilder {
   const dot1 = f.local(V128);
   const dot2 = f.local(V128);
   const dot3 = f.local(V128);
-  const t0 = f.local(V128);
-  const t1 = f.local(V128);
-  const acc4 = f.local(V128);
 
   f.i32Const(0x0f).i8x16Splat().set(mask0f);
-  f.i32Const(0).i32x4Splat().set(zero);
   f.get(3).i32Const(5).i32ShrS().set(nBlocks);
   f.get(nBlocks).i32Const(18).i32Mul().set(rowBytes);
   f.get(nBlocks).i32Const(Q8_0_ACT_BLOCK_BYTES).i32Mul().set(qStride);
@@ -2693,59 +2703,80 @@ function buildMulMatQ4_0Q8Batch4(useRelaxed: boolean): FuncBuilder {
   f.i32Const(0).set(r);
 
   const emitTokDot = (qpLoc: number, dotLoc: number) => {
-    f.get(zero).set(dotLoc);
+    f.i32Const(0).i32x4Splat().set(dotLoc);
     f.get(qpLoc).v128Load(16, 4).set(xtmp);
     f.dotI8I7Add(xtmp, wlo, dotLoc, useRelaxed);
     f.get(qpLoc).v128Load(32, 4).set(xtmp);
     f.dotI8I7Add(xtmp, whi, dotLoc, useRelaxed);
   };
 
+  const emitRowBlock = (wpLoc: number, accLoc: number) => {
+    f.get(wpLoc).v128Load(2).tee(xtmp).get(mask0f).v128And().set(wlo);
+    f.get(xtmp).i32Const(4).i8x16ShrU().set(whi);
+
+    emitTokDot(qp0, dot0);
+    emitTokDot(qp1, dot1);
+    emitTokDot(qp2, dot2);
+    emitTokDot(qp3, dot3);
+
+    // Reuse wlo/whi as scratch for 6-op 4-token horizontal sum
+    f.hsum4RowsI32x4(dot0, dot1, dot2, dot3, wlo, whi, dot0);
+    f.get(dot0).get(sum4).i32x4Sub().f32x4ConvertI32x4S().set(dot0);
+    f.loadF16AsF32(wpLoc, 0).f32x4Splat().get(dx4).f32x4Mul().set(wlo);
+    if (useRelaxed) {
+      f.get(dot0).get(wlo).get(accLoc).f32x4RelaxedMadd().set(accLoc);
+    } else {
+      f.get(dot0).get(wlo).f32x4Mul().get(accLoc).f32x4Add().set(accLoc);
+    }
+  };
+
+  const loadSharedBlockMeta = () => {
+    f.i32Const(0).i32x4Splat()
+      .get(qp0).i32Load(12).i32x4ReplaceLane(0)
+      .get(qp1).i32Load(12).i32x4ReplaceLane(1)
+      .get(qp2).i32Load(12).i32x4ReplaceLane(2)
+      .get(qp3).i32Load(12).i32x4ReplaceLane(3)
+      .i32Const(3).i32x4Shl()
+      .set(sum4);
+    f.f32Const(0).f32x4Splat()
+      .get(qp0).f32Load(0).f32x4ReplaceLane(0)
+      .get(qp1).f32Load(0).f32x4ReplaceLane(1)
+      .get(qp2).f32Load(0).f32x4ReplaceLane(2)
+      .get(qp3).f32Load(0).f32x4ReplaceLane(3)
+      .set(dx4);
+  };
+
+  const storeRowTokens = (rowIndexExpr: () => void, accLoc: number) => {
+    rowIndexExpr();
+    f.i32Const(2).i32Shl().get(2).i32Add().tee(op).get(accLoc).f32x4Extract(0).f32Store(0);
+    f.get(op).get(oStride).i32Add().tee(op).get(accLoc).f32x4Extract(1).f32Store(0);
+    f.get(op).get(oStride).i32Add().tee(op).get(accLoc).f32x4Extract(2).f32Store(0);
+    f.get(op).get(oStride).i32Add().get(accLoc).f32x4Extract(3).f32Store(0);
+  };
+
+  // Main 4-row × 4-token loop
   f.block().loop();
-  f.get(r).get(4).i32GeS().brIf(1);
-  f.get(0).get(r).get(rowBytes).i32Mul().i32Add().set(wp);
+  f.get(r).i32Const(3).i32Add().get(4).i32GeS().brIf(1);
+  f.get(0).get(r).get(rowBytes).i32Mul().i32Add()
+    .tee(wp0).get(rowBytes).i32Add()
+    .tee(wp1).get(rowBytes).i32Add()
+    .tee(wp2).get(rowBytes).i32Add().set(wp3);
   f.get(1).tee(qp0).get(qStride).i32Add().tee(qp1).get(qStride).i32Add().tee(qp2).get(qStride).i32Add().set(qp3);
-  f.f32Const(0).f32x4Splat().set(acc4);
+  f.f32Const(0).f32x4Splat().tee(acc0).tee(acc1).tee(acc2).set(acc3);
   f.i32Const(0).set(b);
 
   f.block().loop();
   f.get(b).get(nBlocks).i32GeS().brIf(1);
-  f.get(wp).v128Load(2).tee(xtmp).get(mask0f).v128And().set(wlo);
-  f.get(xtmp).i32Const(4).i8x16ShrU().set(whi);
+  loadSharedBlockMeta();
+  emitRowBlock(wp0, acc0);
+  emitRowBlock(wp1, acc1);
+  emitRowBlock(wp2, acc2);
+  emitRowBlock(wp3, acc3);
 
-  emitTokDot(qp0, dot0);
-  emitTokDot(qp1, dot1);
-  emitTokDot(qp2, dot2);
-  emitTokDot(qp3, dot3);
-
-  // Reduce all 4 tokens in 6 SIMD ops (zero scalar lane extracts!)
-  f.hsum4RowsI32x4(dot0, dot1, dot2, dot3, t0, t1, dot0);
-
-  // Subtract 8 * [sum_all0, sum_all1, sum_all2, sum_all3] and convert to f32x4
-  f.get(zero)
-    .get(qp0).i32Load(12).i32x4ReplaceLane(0)
-    .get(qp1).i32Load(12).i32x4ReplaceLane(1)
-    .get(qp2).i32Load(12).i32x4ReplaceLane(2)
-    .get(qp3).i32Load(12).i32x4ReplaceLane(3)
-    .i32Const(3).i32x4Shl()
-    .set(t0);
-  f.get(dot0).get(t0).i32x4Sub().f32x4ConvertI32x4S().set(dot0);
-
-  // Scale by dw * [dx0, dx1, dx2, dx3] and FMA into acc4
-  f.get(zero)
-    .get(qp0).f32Load(0).f32x4ReplaceLane(0)
-    .get(qp1).f32Load(0).f32x4ReplaceLane(1)
-    .get(qp2).f32Load(0).f32x4ReplaceLane(2)
-    .get(qp3).f32Load(0).f32x4ReplaceLane(3)
-    .loadF16AsF32(wp, 0).f32x4Splat().f32x4Mul()
-    .set(t1);
-
-  if (useRelaxed) {
-    f.get(dot0).get(t1).get(acc4).f32x4RelaxedMadd().set(acc4);
-  } else {
-    f.get(dot0).get(t1).f32x4Mul().get(acc4).f32x4Add().set(acc4);
-  }
-
-  f.get(wp).i32Const(18).i32Add().set(wp);
+  f.get(wp0).i32Const(18).i32Add().set(wp0);
+  f.get(wp1).i32Const(18).i32Add().set(wp1);
+  f.get(wp2).i32Const(18).i32Add().set(wp2);
+  f.get(wp3).i32Const(18).i32Add().set(wp3);
   f.get(qp0).i32Const(Q8_0_ACT_BLOCK_BYTES).i32Add().set(qp0);
   f.get(qp1).i32Const(Q8_0_ACT_BLOCK_BYTES).i32Add().set(qp1);
   f.get(qp2).i32Const(Q8_0_ACT_BLOCK_BYTES).i32Add().set(qp2);
@@ -2753,11 +2784,34 @@ function buildMulMatQ4_0Q8Batch4(useRelaxed: boolean): FuncBuilder {
   f.get(b).i32Const(1).i32Add().set(b);
   f.br(0).end().end();
 
-  f.get(2).get(r).i32Const(2).i32Shl().i32Add().tee(wp).get(acc4).f32x4Extract(0).f32Store(0);
-  f.get(wp).get(oStride).i32Add().tee(wp).get(acc4).f32x4Extract(1).f32Store(0);
-  f.get(wp).get(oStride).i32Add().tee(wp).get(acc4).f32x4Extract(2).f32Store(0);
-  f.get(wp).get(oStride).i32Add().get(acc4).f32x4Extract(3).f32Store(0);
+  storeRowTokens(() => f.get(r), acc0);
+  storeRowTokens(() => f.get(r).i32Const(1).i32Add(), acc1);
+  storeRowTokens(() => f.get(r).i32Const(2).i32Add(), acc2);
+  storeRowTokens(() => f.get(r).i32Const(3).i32Add(), acc3);
+  f.get(r).i32Const(4).i32Add().set(r);
+  f.br(0).end().end();
 
+  // Remainder rows (0..3)
+  f.block().loop();
+  f.get(r).get(4).i32GeS().brIf(1);
+  f.get(0).get(r).get(rowBytes).i32Mul().i32Add().set(wp0);
+  f.get(1).tee(qp0).get(qStride).i32Add().tee(qp1).get(qStride).i32Add().tee(qp2).get(qStride).i32Add().set(qp3);
+  f.f32Const(0).f32x4Splat().set(acc0);
+  f.i32Const(0).set(b);
+
+  f.block().loop();
+  f.get(b).get(nBlocks).i32GeS().brIf(1);
+  loadSharedBlockMeta();
+  emitRowBlock(wp0, acc0);
+  f.get(wp0).i32Const(18).i32Add().set(wp0);
+  f.get(qp0).i32Const(Q8_0_ACT_BLOCK_BYTES).i32Add().set(qp0);
+  f.get(qp1).i32Const(Q8_0_ACT_BLOCK_BYTES).i32Add().set(qp1);
+  f.get(qp2).i32Const(Q8_0_ACT_BLOCK_BYTES).i32Add().set(qp2);
+  f.get(qp3).i32Const(Q8_0_ACT_BLOCK_BYTES).i32Add().set(qp3);
+  f.get(b).i32Const(1).i32Add().set(b);
+  f.br(0).end().end();
+
+  storeRowTokens(() => f.get(r), acc0);
   f.get(r).i32Const(1).i32Add().set(r);
   f.br(0).end().end();
 
@@ -5568,7 +5622,6 @@ function buildMulMatQ4KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
   f.block().loop();
   f.get(sb).get(nSuper).i32GeS().brIf(1);
 
-  // SWAR unpack scales & mins ONCE for all 4 tokens
   f.get(wp).i32Load(4).set(u0);
   f.get(wp).i32Load(8).set(u1);
   f.get(wp).i32Load(12).set(u2);
@@ -5581,7 +5634,6 @@ function buildMulMatQ4KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
     .get(u1).i32Const(2).i32ShrU().i32Const(0x30303030).i32And()
     .i32Or().set(mn47);
 
-  // Pack dx4 = [dx0, dx1, dx2, dx3]
   f.f32Const(0).f32x4Splat()
     .get(qp0).f32Load(0).f32x4ReplaceLane(0)
     .get(qp1).f32Load(0).f32x4ReplaceLane(1)
@@ -5589,7 +5641,6 @@ function buildMulMatQ4KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
     .get(qp3).f32Load(0).f32x4ReplaceLane(3)
     .set(dx4);
 
-  // Compute min dots for all 4 tokens via 1x dot_i16x8 each, fold into acc4
   f.i32Const(0).i32x4Splat().get(mn03).i32x4ReplaceLane(0).get(mn47).i32x4ReplaceLane(1)
     .i16x8ExtendLowI8x16U().set(scV);
   f.get(scV).get(qp0).v128Load(48, 4).i32x4DotI16x8S().set(sumi0);
@@ -5602,7 +5653,6 @@ function buildMulMatQ4KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
     .loadF16AsF32(wp, 2).f32x4Splat().get(dx4).f32x4Mul().f32x4Mul()
     .f32x4Sub().set(acc4);
 
-  // Zero narrow-lane i32x4 accumulators for the 4 tokens
   f.i32Const(0).i32x4Splat().tee(sumi0).tee(sumi1).tee(sumi2).set(sumi3);
 
   for (let c = 0; c < 4; c++) {
@@ -5615,7 +5665,6 @@ function buildMulMatQ4KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
     f.get(wp).v128Load(qsBase).set(raw0);
     f.get(wp).v128Load(qsBase + 16).set(raw1);
 
-    // Sub-block 2c (low nibbles) across all 4 tokens
     f.get(raw0).get(mask0f).v128And().set(wlo0);
     f.get(raw1).get(mask0f).v128And().set(wlo1);
     emitScaleSplat16(scWord, scLoIdx);
@@ -5624,7 +5673,6 @@ function buildMulMatQ4KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
     emitTokSub(qp2, xBase, sumi2);
     emitTokSub(qp3, xBase, sumi3);
 
-    // Sub-block 2c+1 (high nibbles) across all 4 tokens
     f.get(raw0).i32Const(4).i8x16ShrU().set(wlo0);
     f.get(raw1).i32Const(4).i8x16ShrU().set(wlo1);
     emitScaleSplat16(scWord, scHiIdx);
@@ -5634,7 +5682,6 @@ function buildMulMatQ4KQ8KBatch4(useRelaxed: boolean): FuncBuilder {
     emitTokSub(qp3, xBase + 32, sumi3);
   }
 
-  // Encode all 4 tokens ONCE per 256-weight super-block!
   f.hsum4RowsI32x4(sumi0, sumi1, sumi2, sumi3, raw0, raw1, dotV);
   f.loadF16AsF32(wp, 0).f32x4Splat().get(dx4).f32x4Mul().set(raw0);
   if (useRelaxed) {
@@ -6464,6 +6511,7 @@ function buildMulMatQ2KQ8K(useRelaxed: boolean): FuncBuilder {
   const wp3 = f.local(I32);
   const qp = f.local(I32);
   const sb = f.local(I32);
+  const scW = f.local(I32);
   const accS = f.local(F32);
   const dxS = f.local(F32);
 
@@ -6494,30 +6542,43 @@ function buildMulMatQ2KQ8K(useRelaxed: boolean): FuncBuilder {
       .i32x4Add().set(dstLoc);
   };
 
-  // Accumulate all 16 sub-blocks of one row `wpLoc` into `sumiLoc` (loads q0, q1 once per half)
+  // SWAR 4-scale extract from `scW = (i32Load(off) & 0x0f0f0f0f)` (4x fewer scalar memory loads!)
+  const emitScaleSplatFromWord = (byteIdx: number) => {
+    f.get(scW);
+    if (byteIdx > 0) f.i32Const(byteIdx * 8).i32ShrU();
+    if (byteIdx < 3) f.i32Const(0xff).i32And();
+    f.i16x8Splat();
+  };
+
+  // Accumulate all 16 sub-blocks of one row `wpLoc` into `sumiLoc` with SWAR scale loads
   const emitRowQ2 = (wpLoc: number, sumiLoc: number) => {
     for (let h = 0; h < 2; h++) {
       f.get(wpLoc).v128Load(16 + h * 32).set(q0);
       f.get(wpLoc).v128Load(32 + h * 32).set(q1);
-      for (let s = 0; s < 4; s++) {
-        const shift = s * 2;
-        const xOff = 64 + h * 128 + s * 32;
-        const scIdx0 = h * 8 + s * 2;
-        f.get(qp).v128Load(xOff, 4).set(x0);
-        f.get(q0);
-        if (shift > 0) f.i32Const(shift).i8x16ShrU();
-        f.get(mask03).v128And().set(qv);
-        f.pushDotI8I7ToI16x8(x0, qv, useRelaxed);
-        f.get(wpLoc).i32Load8U(scIdx0).i32Const(0x0f).i32And().i16x8Splat()
-          .i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
+      for (let pair = 0; pair < 2; pair++) {
+        // Load 4 sub-block low-nibble scales in ONE 32-bit SWAR load
+        f.get(wpLoc).i32Load(h * 8 + pair * 4).i32Const(0x0f0f0f0f).i32And().set(scW);
+        for (let sub = 0; sub < 2; sub++) {
+          const s = pair * 2 + sub;
+          const shift = s * 2;
+          const xOff = 64 + h * 128 + s * 32;
+          const b0 = sub * 2;
+          f.get(qp).v128Load(xOff, 4).set(x0);
+          f.get(q0);
+          if (shift > 0) f.i32Const(shift).i8x16ShrU();
+          f.get(mask03).v128And().set(qv);
+          f.pushDotI8I7ToI16x8(x0, qv, useRelaxed);
+          emitScaleSplatFromWord(b0);
+          f.i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
 
-        f.get(qp).v128Load(xOff + 16, 4).set(x1);
-        f.get(q1);
-        if (shift > 0) f.i32Const(shift).i8x16ShrU();
-        f.get(mask03).v128And().set(qv);
-        f.pushDotI8I7ToI16x8(x1, qv, useRelaxed);
-        f.get(wpLoc).i32Load8U(scIdx0 + 1).i32Const(0x0f).i32And().i16x8Splat()
-          .i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
+          f.get(qp).v128Load(xOff + 16, 4).set(x1);
+          f.get(q1);
+          if (shift > 0) f.i32Const(shift).i8x16ShrU();
+          f.get(mask03).v128And().set(qv);
+          f.pushDotI8I7ToI16x8(x1, qv, useRelaxed);
+          emitScaleSplatFromWord(b0 + 1);
+          f.i32x4DotI16x8S().get(sumiLoc).i32x4Add().set(sumiLoc);
+        }
       }
     }
   };
@@ -7551,6 +7612,60 @@ export interface MatGroupEntry {
   readonly oStrideBytes: number;
 }
 
+export interface MoeWorkerScratchLayout {
+  readonly offGateOut: number;
+  readonly offUpOut: number;
+  readonly offHid: number;
+  readonly offQ8Ffn: number;
+  readonly offExpProj: number;
+  readonly offAccum: number;
+  readonly strideBytes: number;
+}
+
+export function computeMoeWorkerScratchLayout(
+  dim: number,
+  expFfnDim: number,
+): MoeWorkerScratchLayout {
+  const align64 = (n: number) => (n + 63) & ~63;
+  const ffnBytes = align64(expFfnDim * 4);
+  const dimBytes = align64(dim * 4);
+  const q8Bytes = align64(
+    Math.max(
+      Math.ceil(expFfnDim / 256) * Q8_K_ACT_BLOCK_BYTES,
+      Math.ceil(expFfnDim / 32) * Q8_0_ACT_BLOCK_BYTES,
+      64,
+    ),
+  );
+  const offGateOut = 0;
+  const offUpOut = offGateOut + ffnBytes;
+  const offHid = offUpOut + ffnBytes;
+  const offQ8Ffn = offHid + ffnBytes;
+  const offExpProj = offQ8Ffn + q8Bytes;
+  const offAccum = offExpProj + dimBytes;
+  const strideBytes = offAccum + dimBytes;
+  return { offGateOut, offUpOut, offHid, offQ8Ffn, offExpProj, offAccum, strideBytes };
+}
+
+export interface MoeExpertParallelDispatch {
+  readonly expertCount: number;
+  readonly dim: number;
+  readonly expFfnDim: number;
+  readonly gateUpOp: ParallelMatOp;
+  readonly downOp: ParallelMatOp;
+  readonly gateType: GgmlType;
+  readonly upType: GgmlType;
+  readonly downType: GgmlType;
+  readonly xOrQ8Ptr: number;
+  readonly xF32Ptr: number;
+  readonly outPtr: number;
+  readonly workerScratchBase: number;
+  readonly layout: MoeWorkerScratchLayout;
+  readonly gatePtrs: Int32Array;
+  readonly upPtrs: Int32Array;
+  readonly downPtrs: Int32Array;
+  readonly weights: Float32Array;
+}
+
 export interface VTensorThreadPoolLike {
   readonly isActive: boolean;
   readonly workerCount: number;
@@ -7576,6 +7691,10 @@ export interface VTensorThreadPoolLike {
     xF32Ptr: number,
     cols: number,
     runLocalEntry: (entryIdx: number, rowStart: number, rowCount: number) => void,
+  ): void;
+  dispatchParallelMoeExperts(
+    params: MoeExpertParallelDispatch,
+    kernels: VerdantSimdExports,
   ): void;
   dispatchParallelFlashAttn(
     qPtr: number,
@@ -8877,6 +8996,21 @@ export class VerdantWasmArena {
       );
       t += 1;
     }
+  }
+
+  /**
+   * Single-barrier Expert-Parallel Sparse MoE dispatch (`OP_MOE_EXPERTS`):
+   * Distributes active routed experts `0..K-1` across all `P` cores in ONE thread barrier,
+   * executing `gate`, `up`, `swiglu_f32`, `quantize`, `down`, and SIMD `axpy_f32` in L1-resident
+   * per-worker scratch, then deterministically summing worker accumulators.
+   */
+  dispatchMoeExpertsParallel(params: MoeExpertParallelDispatch): boolean {
+    const pool = this.threadPool;
+    if (!pool || !pool.isActive || params.expertCount < 2) {
+      return false;
+    }
+    pool.dispatchParallelMoeExperts(params, this.kernels);
+    return true;
   }
 
   /** Fused 4-token batched multi-projection single-barrier `Q8_K` prefill dispatch. */

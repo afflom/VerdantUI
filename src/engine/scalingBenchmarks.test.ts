@@ -3,15 +3,18 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import { GgmlType, type GgufTensorInfo, type ParsedGgufModel } from './gguf';
 import {
+  ParallelMatOp,
   Q8_0_ACT_BLOCK_BYTES,
   Q8_K_ACT_BLOCK_BYTES,
   VerdantWasmArena,
   WASM_TOPK_IDS_OFFSET,
   WASM_TOPK_VALS_OFFSET,
+  computeMoeWorkerScratchLayout,
   isVerdantSharedWasmSupported,
+  weightRowByteSize,
   type MatGroupEntry,
 } from './verdantWasmSimd';
-import { VTensorThreadPool } from './vtensorThreadPool';
+import { VTensorThreadPool, deriveOptimalPoolWorkers } from './vtensorThreadPool';
 import { verdantMulMat, verdantRope, verdantSwiGlu } from './verdantKernels';
 import { VramKvPager } from './vramKvPager';
 import { VramWeightPager, type LayerTensorInfoGroup } from './vramWeightPager';
@@ -1323,5 +1326,161 @@ test('Upstream VT-217 / verdant_row_ranking NaN-safe deterministic Argmax and To
   logits[17] = -123.5;
   logits[19] = -123.5;
   assert.equal(arena.kernels.argmax_f32(lOff, n), 17);
+});
+
+test('deriveOptimalPoolWorkers avoids SMT spin-convoy saturation and OP_MOE_EXPERTS matches sequential MoE', async () => {
+  // Verify Theorem T3 physical-core worker-bound invariants across small to high-core hosts
+  assert.equal(deriveOptimalPoolWorkers(1), 1);
+  assert.equal(deriveOptimalPoolWorkers(2), 2);
+  assert.equal(deriveOptimalPoolWorkers(4), 4);
+  assert.equal(deriveOptimalPoolWorkers(8), 4);
+  assert.equal(deriveOptimalPoolWorkers(12), 6);
+  assert.equal(deriveOptimalPoolWorkers(16), 8);
+  assert.equal(deriveOptimalPoolWorkers(24), 12);
+  assert.equal(deriveOptimalPoolWorkers(32), 12);
+
+  if (!isVerdantSharedWasmSupported()) return;
+  const availCpus = Math.max(1, os.cpus().length);
+  const targetWorkers = Math.min(4, availCpus);
+  if (targetWorkers < 2) return;
+
+  // Qwen3-30B-A3B exact MoE geometry: dim=2048, expFfnDim=768, Top-8 experts
+  const dim = 2048;
+  const expFfnDim = 768;
+  const expertCount = 8;
+  const rng = makeRng(30303);
+
+  for (const wType of [GgmlType.Q4_K, GgmlType.Q2_K] as const) {
+    const gateBytes = (weightRowByteSize(wType, dim) * expFfnDim + 63) & ~63;
+    const downBytes = (weightRowByteSize(wType, expFfnDim) * dim + 63) & ~63;
+    const layout = computeMoeWorkerScratchLayout(dim, expFfnDim);
+    const totalBytes = (gateBytes * 2 + downBytes) * expertCount + layout.strideBytes * targetWorkers + 2 * 1024 * 1024;
+    const arena = new VerdantWasmArena({ initialPages: Math.ceil(totalBytes / 65536), shared: true });
+    const pool = await VTensorThreadPool.create(arena, { maxWorkers: targetWorkers, parallelThresholdBytes: 32 * 1024 });
+    assert.ok(pool && pool.isActive);
+
+    try {
+      const wGate = arena.allocRegion(gateBytes * expertCount);
+      const wUp = arena.allocRegion(gateBytes * expertCount);
+      const wDown = arena.allocRegion(downBytes * expertCount);
+      const xPtr = arena.allocRegion(dim * 4);
+      const q8kPtr = arena.allocRegion((dim >>> 8) * Q8_K_ACT_BLOCK_BYTES);
+      const outSeqPtr = arena.allocRegion(dim * 4);
+      const outParPtr = arena.allocRegion(dim * 4);
+      const gateTmp = arena.allocRegion(expFfnDim * 4);
+      const upTmp = arena.allocRegion(expFfnDim * 4);
+      const hidTmp = arena.allocRegion(expFfnDim * 4);
+      const q8kFfnTmp = arena.allocRegion((expFfnDim >>> 8) * Q8_K_ACT_BLOCK_BYTES);
+      const expOutTmp = arena.allocRegion(dim * 4);
+      const workerScratch = arena.allocRegion(layout.strideBytes * targetWorkers);
+
+      const bytes = arena.bytes();
+      for (const [base, len] of [
+        [wGate, gateBytes * expertCount],
+        [wUp, gateBytes * expertCount],
+        [wDown, downBytes * expertCount],
+      ] as const) {
+        const u32 = new Uint32Array(bytes.buffer, base, len >>> 2);
+        for (let i = 0; i < u32.length; i++) {
+          u32[i] = ((rng() * 0xffffffff) >>> 0) & 0x3bff3bff;
+        }
+      }
+      const xArr = new Float32Array(arena.memory.buffer, xPtr, dim);
+      for (let i = 0; i < dim; i++) xArr[i] = (rng() - 0.5) * 0.8;
+      arena.quantizeActivationQ8K(xPtr, q8kPtr, dim);
+
+      const gatePtrs = new Int32Array(expertCount);
+      const upPtrs = new Int32Array(expertCount);
+      const downPtrs = new Int32Array(expertCount);
+      const weights = new Float32Array(expertCount);
+      let wSum = 0;
+      for (let e = 0; e < expertCount; e++) {
+        gatePtrs[e] = wGate + e * gateBytes;
+        upPtrs[e] = wUp + e * gateBytes;
+        downPtrs[e] = wDown + e * downBytes;
+        weights[e] = 0.05 + rng() * 0.25;
+        wSum += weights[e];
+      }
+      for (let e = 0; e < expertCount; e++) weights[e] /= wSum;
+
+      // 1. Sequential reference (P=1)
+      arena.attachThreadPool(null);
+      const runSeq = () => {
+        arena.kernels.zero_bytes(outSeqPtr, dim * 4);
+        for (let e = 0; e < expertCount; e++) {
+          arena.mulMatQ8K(wType, gatePtrs[e], q8kPtr, xPtr, gateTmp, dim, expFfnDim);
+          arena.mulMatQ8K(wType, upPtrs[e], q8kPtr, xPtr, upTmp, dim, expFfnDim);
+          arena.kernels.swiglu_f32(gateTmp, upTmp, hidTmp, expFfnDim);
+          arena.quantizeActivationQ8K(hidTmp, q8kFfnTmp, expFfnDim);
+          arena.mulMatQ8K(wType, downPtrs[e], q8kFfnTmp, hidTmp, expOutTmp, expFfnDim, dim);
+          arena.kernels.axpy_f32(outSeqPtr, expOutTmp, weights[e], dim);
+        }
+      };
+      runSeq();
+
+      // 2. Single-barrier Expert-Parallel OP_MOE_EXPERTS (P=targetWorkers)
+      arena.attachThreadPool(pool);
+      const runPar = () => {
+        const ok = arena.dispatchMoeExpertsParallel({
+          expertCount,
+          dim,
+          expFfnDim,
+          gateUpOp: ParallelMatOp.MUL_MAT_Q8K,
+          downOp: ParallelMatOp.MUL_MAT_Q8K,
+          gateType: wType,
+          upType: wType,
+          downType: wType,
+          xOrQ8Ptr: q8kPtr,
+          xF32Ptr: xPtr,
+          outPtr: outParPtr,
+          workerScratchBase: workerScratch,
+          layout,
+          gatePtrs,
+          upPtrs,
+          downPtrs,
+          weights,
+        });
+        assert.equal(ok, true);
+      };
+      runPar();
+
+      const seqOut = new Float32Array(arena.memory.buffer, outSeqPtr, dim);
+      const parOut = new Float32Array(arena.memory.buffer, outParPtr, dim);
+      let maxDiff = 0;
+      for (let i = 0; i < dim; i++) {
+        assert.ok(Number.isFinite(parOut[i]), `Non-finite MoE output at idx ${i}`);
+        const d = Math.abs(parOut[i] - seqOut[i]);
+        if (d > maxDiff) maxDiff = d;
+      }
+      // Different summation order across workers (per-worker reduction) permits tiny F32 ULP drift only
+      assert.ok(maxDiff < 1e-4, `OP_MOE_EXPERTS (${wType}) parity drift too large: maxDiff=${maxDiff}`);
+
+      if (wType === GgmlType.Q4_K) {
+        const iters = 6;
+        arena.attachThreadPool(null);
+        runSeq();
+        const t0 = performance.now();
+        for (let i = 0; i < iters; i++) runSeq();
+        const seqMs = (performance.now() - t0) / iters;
+
+        arena.attachThreadPool(pool);
+        runPar();
+        const t1 = performance.now();
+        for (let i = 0; i < iters; i++) runPar();
+        const parMs = (performance.now() - t1) / iters;
+
+        const speedup = seqMs / Math.max(0.01, parMs);
+        console.log(
+          `[OP_MOE_EXPERTS P=${pool.workerCount} Q4_K 8×(2048→768→2048)] ${speedup.toFixed(2)}x (${seqMs.toFixed(2)}ms -> ${parMs.toFixed(2)}ms, maxDiff=${maxDiff.toExponential(1)})`,
+        );
+        if (process.env.CI !== 'true') {
+          assert.ok(speedup > 1.5, `Expected OP_MOE_EXPERTS speedup > 1.5x (got ${speedup.toFixed(2)}x)`);
+        }
+      }
+    } finally {
+      arena.attachThreadPool(null);
+      pool.dispose();
+    }
+  }
 });
 

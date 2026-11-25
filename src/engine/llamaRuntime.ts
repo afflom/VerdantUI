@@ -45,11 +45,14 @@ import {
   verdantSwiGlu,
 } from './verdantKernels';
 import {
+  computeMoeWorkerScratchLayout,
+  ParallelMatOp,
   Q8_0_ACT_BLOCK_BYTES,
   Q8_K_ACT_BLOCK_BYTES,
   WASM_TOPK_IDS_OFFSET,
   WASM_TOPK_VALS_OFFSET,
   type MatGroupEntry,
+  type MoeWorkerScratchLayout,
   type VerdantWasmArena,
 } from './verdantWasmSimd';
 import {
@@ -239,6 +242,9 @@ interface ScratchTensors {
   // Sparse MoE reusable scratch vectors (null for dense models)
   readonly moeRouterLogits: VTensorHandle | null;
   readonly moeExpertProj: VTensorHandle | null;
+  readonly moeWorkerScratch: VTensorHandle | null;
+  readonly moeWorkerScratchLayout: MoeWorkerScratchLayout | null;
+  readonly moeWorkerScratchSlots: number;
   // Shared packed Q8_0_ACT & Q8_K_ACT scratch vectors (amortized across Q/K/V and gate/up!)
   readonly q8Dim: VTensorHandle | null;
   readonly q8AttnOut: VTensorHandle | null;
@@ -1411,13 +1417,22 @@ export class LlamaVTensorRuntime {
     const q8kAttnOutBytes = canQuantizeQ8KQDim ? (qDim >>> 8) * Q8_K_ACT_BLOCK_BYTES : 0;
     const q8kFfnBytes = canQuantizeQ8KFfn ? (ffnDim >>> 8) * Q8_K_ACT_BLOCK_BYTES : 0;
 
+    const moeWorkerScratchLayout =
+      moeExpertCount > 0 ? computeMoeWorkerScratchLayout(dim, ffnDim) : null;
+    const moeWorkerScratchSlots =
+      moeExpertCount > 0
+        ? Math.max(1, Math.min(16, this.backend.activeThreadPool?.workerCount ?? 1))
+        : 0;
+    const moeWorkerScratchBytes =
+      moeWorkerScratchLayout !== null ? moeWorkerScratchLayout.strideBytes * moeWorkerScratchSlots : 0;
+
     const scratchCapacity =
       alignUp32(dim * 4) * 5 +
       alignUp32(qDim * 4) * 2 +
       alignUp32(kvDim * 4) * 2 +
       alignUp32(ffnDim * 4) * 3 +
       alignUp32(vocab * 4) +
-      (moeExpertCount > 0 ? alignUp32(moeExpertCount * 4) + 64 : 0) +
+      (moeExpertCount > 0 ? alignUp32(moeExpertCount * 4) + alignUp32(moeWorkerScratchBytes) + 128 : 0) +
       alignUp32(dim * B * 4) * 4 +
       alignUp32(qDim * B * 4) * 2 +
       alignUp32(kvDim * B * 4) * 2 +
@@ -1457,6 +1472,12 @@ export class LlamaVTensorRuntime {
         moeExpertCount > 0
           ? computeBuffer.allocTensor('act.moe_exp_proj', GgmlType.F32, [dim])
           : null,
+      moeWorkerScratch:
+        moeWorkerScratchBytes > 0
+          ? computeBuffer.allocTensor('act.moe_worker_scratch', GgmlType.I8, [moeWorkerScratchBytes])
+          : null,
+      moeWorkerScratchLayout,
+      moeWorkerScratchSlots,
       q8Dim: q8DimBytes > 0 ? computeBuffer.allocTensor('act.q8_dim', GgmlType.I8, [q8DimBytes]) : null,
       q8AttnOut:
         q8AttnOutBytes > 0
@@ -1766,13 +1787,95 @@ export class LlamaVTensorRuntime {
       const qkFfnPtr = expDownQ8K && s.q8kFfn ? s.q8kFfn.buffer.wasmPtr(s.q8kFfn) : -1;
       const qFfnPtr = expDownQ8 && s.q8Ffn ? s.q8Ffn.buffer.wasmPtr(s.q8Ffn) : -1;
 
-      // 3. Zero destination ffnProj slice and accumulate weighted Top-K experts
-      const outAll = outProjHandle.buffer.f32View(outProjHandle);
-      const outSlice =
-        outProjOffsetFloats === 0
-          ? outAll.subarray(0, dim)
-          : outAll.subarray(outProjOffsetFloats, outProjOffsetFloats + dim);
-      outSlice.fill(0);
+      // 3. Single-barrier Expert-Parallel MoE fast path (`OP_MOE_EXPERTS`) when thread pool is active
+      const outBasePtr = useWasm && outProjHandle.buffer.isWasmBacked
+        ? outProjHandle.buffer.wasmPtr(outProjHandle) + outProjOffsetFloats * 4
+        : -1;
+      const pool = this.backend.activeThreadPool;
+      if (
+        useWasm &&
+        arena &&
+        outBasePtr >= 0 &&
+        pool &&
+        pool.isActive &&
+        kUsed >= 2 &&
+        kUsed <= 16 &&
+        s.moeWorkerScratch &&
+        s.moeWorkerScratchLayout &&
+        s.moeWorkerScratch.buffer.isWasmBacked &&
+        s.moeWorkerScratchSlots >= Math.min(pool.workerCount, kUsed)
+      ) {
+        const expGatePtrs = new Int32Array(kUsed);
+        const expUpPtrs = new Int32Array(kUsed);
+        const expDownPtrs = new Int32Array(kUsed);
+        const expWeights = new Float32Array(kUsed);
+        let activeCount = 0;
+        let allHomogeneousWasm = true;
+        for (let k = 0; k < kUsed; k++) {
+          const expId = moeTopIds[k];
+          const weight = moeTopProbs[k];
+          if (expId < 0 || weight === 0) continue;
+          const exp = wp.acquireExpertSlice(layerIdx, expId);
+          if (
+            !exp.gate.buffer.isWasmBacked ||
+            !exp.up.buffer.isWasmBacked ||
+            !exp.down.buffer.isWasmBacked ||
+            exp.gate.type !== expGateType ||
+            exp.up.type !== expUpType ||
+            exp.down.type !== expDownType
+          ) {
+            allHomogeneousWasm = false;
+            break;
+          }
+          expGatePtrs[activeCount] = exp.gate.buffer.wasmPtr(exp.gate);
+          expUpPtrs[activeCount] = exp.up.buffer.wasmPtr(exp.up);
+          expDownPtrs[activeCount] = exp.down.buffer.wasmPtr(exp.down);
+          expWeights[activeCount] = weight;
+          activeCount += 1;
+        }
+        if (allHomogeneousWasm && activeCount >= 2) {
+          const dispatched = arena.dispatchMoeExpertsParallel({
+            expertCount: activeCount,
+            dim,
+            expFfnDim,
+            gateUpOp: expInQ8K
+              ? ParallelMatOp.MUL_MAT_Q8K
+              : expInQ8
+                ? ParallelMatOp.MUL_MAT_Q8
+                : ParallelMatOp.MUL_MAT,
+            downOp: expDownQ8K
+              ? ParallelMatOp.MUL_MAT_Q8K
+              : expDownQ8
+                ? ParallelMatOp.MUL_MAT_Q8
+                : ParallelMatOp.MUL_MAT,
+            gateType: expGateType,
+            upType: expUpType,
+            downType: expDownType,
+            xOrQ8Ptr: expInQ8K ? qkDimPtr : expInQ8 ? qDimPtr : xPtr,
+            xF32Ptr: xPtr,
+            outPtr: outBasePtr,
+            workerScratchBase: s.moeWorkerScratch.buffer.wasmPtr(s.moeWorkerScratch),
+            layout: s.moeWorkerScratchLayout,
+            gatePtrs: expGatePtrs,
+            upPtrs: expUpPtrs,
+            downPtrs: expDownPtrs,
+            weights: expWeights,
+          });
+          if (dispatched) return;
+        }
+      }
+
+      // Single-thread / fallback path with WASM SIMD zero_bytes + axpy_f32 accumulation
+      if (useWasm && arena && outBasePtr >= 0) {
+        arena.kernels.zero_bytes(outBasePtr, dim * 4);
+      } else {
+        const outAll = outProjHandle.buffer.f32View(outProjHandle);
+        const outSlice =
+          outProjOffsetFloats === 0
+            ? outAll.subarray(0, dim)
+            : outAll.subarray(outProjOffsetFloats, outProjOffsetFloats + dim);
+        outSlice.fill(0);
+      }
 
       const ge0 = moeGateUpGroupEntries[0];
       const ge1 = moeGateUpGroupEntries[1];
@@ -1810,6 +1913,10 @@ export class LlamaVTensorRuntime {
           } else {
             arena.mulMat(exp.down.type, dPtr, hidPtr, expProjPtr, expFfnDim, dim);
           }
+          if (outBasePtr >= 0) {
+            arena.kernels.axpy_f32(outBasePtr, expProjPtr, weight, dim);
+            continue;
+          }
         } else {
           const xView = xActHandle.buffer.f32View(xActHandle);
           const gView = s.ffnGate.buffer.f32View(s.ffnGate).subarray(0, expFfnDim);
@@ -1822,6 +1929,11 @@ export class LlamaVTensorRuntime {
           verdantMulMat(exp.down.buffer.rawBytes(), exp.down.byteOffset, exp.down.type, expFfnDim, dim, hView, eView);
         }
 
+        const outAll = outProjHandle.buffer.f32View(outProjHandle);
+        const outSlice =
+          outProjOffsetFloats === 0
+            ? outAll.subarray(0, dim)
+            : outAll.subarray(outProjOffsetFloats, outProjOffsetFloats + dim);
         const eOut = expertProj.buffer.f32View(expertProj);
         for (let i = 0; i < dim; i++) {
           outSlice[i] += weight * eOut[i];
@@ -2021,8 +2133,13 @@ export class LlamaVTensorRuntime {
       const bTmpProjPtr = useWasm ? bs.attnProj.buffer.wasmPtr(bs.attnProj) : -1;
       const bTmpProjView = bs.attnProj.buffer.f32View(bs.attnProj);
 
+      const bFfnProjPtr = useWasm && bs.ffnProj.buffer.isWasmBacked ? bs.ffnProj.buffer.wasmPtr(bs.ffnProj) : -1;
       const outAll = bs.ffnProj.buffer.f32View(bs.ffnProj);
-      outAll.fill(0);
+      if (useWasm && arena && bFfnProjPtr >= 0) {
+        arena.kernels.zero_bytes(bFfnProjPtr, B4 * dim * 4);
+      } else {
+        outAll.fill(0);
+      }
 
       const ge0 = moeGateUpGroupEntries[0];
       const ge1 = moeGateUpGroupEntries[1];
@@ -2078,9 +2195,13 @@ export class LlamaVTensorRuntime {
             }
             for (let t = 0; t < B4; t++) {
               const weight = moeBatchExpWeights[u * B4 + t];
-              const base = t * dim;
-              for (let i = 0; i < dim; i++) {
-                outAll[base + i] += weight * bTmpProjView[base + i];
+              if (bFfnProjPtr >= 0) {
+                arena.kernels.axpy_f32(bFfnProjPtr + t * xStrideBytes, bTmpProjPtr + t * xStrideBytes, weight, dim);
+              } else {
+                const base = t * dim;
+                for (let i = 0; i < dim; i++) {
+                  outAll[base + i] += weight * bTmpProjView[base + i];
+                }
               }
             }
           } else {
@@ -2112,9 +2233,13 @@ export class LlamaVTensorRuntime {
               } else {
                 arena.mulMat(exp.down.type, dPtr, sHidPtr, sExpProjPtr, expFfnDim, dim);
               }
-              const base = t * dim;
-              for (let i = 0; i < dim; i++) {
-                outAll[base + i] += weight * eOutView[i];
+              if (bFfnProjPtr >= 0) {
+                arena.kernels.axpy_f32(bFfnProjPtr + t * xStrideBytes, sExpProjPtr, weight, dim);
+              } else {
+                const base = t * dim;
+                for (let i = 0; i < dim; i++) {
+                  outAll[base + i] += weight * eOutView[i];
+                }
               }
             }
           }
