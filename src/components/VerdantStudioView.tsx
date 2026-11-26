@@ -20,9 +20,12 @@ import {
   ChevronDown,
   ChevronRight,
   Code2,
+  Copy,
   Download,
   ExternalLink,
+  Eye,
   Globe,
+  Layers,
   Loader2,
   Monitor,
   Play,
@@ -34,6 +37,7 @@ import {
   Undo2,
   Upload,
   Wrench,
+  X,
 } from 'lucide-react';
 import {
   formatMessagesForLlama,
@@ -70,8 +74,9 @@ interface VerdantStudioViewProps {
   onSelectProject: (prismId: string, mode: 'studio' | 'app') => void;
 }
 
-type FocusDrawerTab = 'streams' | 'source' | 'package';
+type PrismPanelTab = 'overview' | 'code' | 'package';
 type SourceFileTab = 'html' | 'css' | 'js';
+type PreviewPaneMode = 'preview' | 'prism';
 
 export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   project,
@@ -86,8 +91,11 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   onEnableModelStream,
   onSelectProject,
 }) => {
-  const [focusExpanded, setFocusExpanded] = useState(false);
-  const [drawerTab, setDrawerTab] = useState<FocusDrawerTab>('streams');
+  const [previewPaneMode, setPreviewPaneMode] = useState<PreviewPaneMode>('preview');
+  const [appPrismModalOpen, setAppPrismModalOpen] = useState(false);
+  const [panelTab, setPanelTab] = useState<PrismPanelTab>('overview');
+  const [schemaExpanded, setSchemaExpanded] = useState(false);
+  const [digestCopied, setDigestCopied] = useState(false);
   const [sourceTab, setSourceTab] = useState<SourceFileTab>('html');
   const [viewportMode, setViewportMode] = useState<'desktop' | 'mobile'>('desktop');
   const [reloadNonce, setReloadNonce] = useState(0);
@@ -158,6 +166,19 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [project.messages.length, streamingReply]);
+
+  useEffect(() => {
+    setAppPrismModalOpen(false);
+  }, [project.id, mode]);
+
+  useEffect(() => {
+    if (!appPrismModalOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setAppPrismModalOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [appPrismModalOpen]);
 
   useEffect(() => {
     return () => {
@@ -325,8 +346,8 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
 
       if (!hasRealModel) {
         const msg = engineState.modelStreamEnabled
-          ? `Model Stream is initializing (${engineState.progressPercent}%). Wait for it to finish, or edit the Prism directly in the expanded Prism drawer.`
-          : 'Model Stream is currently **Off**. Toggle **Model Stream** on in the top bar for freeform AI app generation—or pick a starter below / expand the **Prism** bar to edit HTML, CSS, and JS directly.';
+          ? `Model Stream is initializing (${engineState.progressPercent}%). Wait for it to finish, or switch the preview to Prism to edit code directly.`
+          : 'Model Stream is currently **Off**. Toggle **Model Stream** on in the top bar for freeform AI app generation—or pick a starter below / toggle **Prism** in the preview bar to edit HTML, CSS, and JS directly.';
         await store.appendMessage(project.id, { role: 'assistant', content: msg });
         span.end('ok');
         return;
@@ -444,403 +465,323 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       ? { label: 'Modified', dot: 'bg-amber-500' }
       : { label: 'Published', dot: 'bg-emerald-600 dark:bg-emerald-400' };
 
-  return (
-    <div className="flex h-full flex-col overflow-hidden bg-[#F8F9FA] dark:bg-[#0B0F14]">
-      {/* Collapsed ~40px Prism Focus Bar */}
-      <div className="flex min-h-[44px] shrink-0 flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-white px-3.5 py-1.5 dark:border-slate-800 dark:bg-[#0F141C]">
-        <div className="flex min-w-0 items-center gap-2">
+  const isReadOnlyAppInspect = mode === 'app';
+
+  const handleCopyDigest = () => {
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      void navigator.clipboard.writeText(activeSnapshot.digest);
+    }
+    setDigestCopied(true);
+    setTimeout(() => setDigestCopied(false), 1500);
+  };
+
+  const renderPrismPanelContent = () => (
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-white dark:bg-[#0F141C]">
+      {/* Refined Prism Tab Strip */}
+      <div className="flex shrink-0 items-center justify-between gap-2 border-b border-slate-200 px-4 py-2 dark:border-slate-800">
+        <div className="flex items-center gap-1">
+          {(
+            [
+              { id: 'overview', label: 'Overview' },
+              { id: 'code', label: 'Code' },
+              { id: 'package', label: 'Package (.holo)' },
+            ] as const
+          ).map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => setPanelTab(t.id)}
+              className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                panelTab === t.id
+                  ? 'bg-slate-900 text-white dark:bg-emerald-700 dark:text-white'
+                  : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200'
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+        {isReadOnlyAppInspect && (
           <button
             type="button"
-            aria-expanded={focusExpanded}
-            data-testid="prism-focus-toggle"
-            onClick={() => setFocusExpanded((prev) => !prev)}
-            className="inline-flex h-7 items-center gap-1 rounded-md px-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
-            title="Inspect or edit Prism model, grants, source, and .holo package"
+            onClick={() => {
+              setAppPrismModalOpen(false);
+              onChangeMode('studio');
+            }}
+            className="text-xs font-medium text-emerald-800 hover:underline dark:text-emerald-400"
           >
-            {focusExpanded ? (
-              <ChevronDown className="h-3.5 w-3.5" />
-            ) : (
-              <ChevronRight className="h-3.5 w-3.5" />
-            )}
-            <span className="hidden sm:inline">Prism</span>
+            Edit in Studio
           </button>
-
-          {editingTitle && mode === 'studio' ? (
-            <input
-              type="text"
-              autoFocus
-              value={titleDraft}
-              onChange={(e) => setTitleDraft(e.target.value)}
-              onBlur={() => void handleCommitTitle()}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') void handleCommitTitle();
-                if (e.key === 'Escape') {
-                  setTitleDraft(project.draft.name);
-                  setEditingTitle(false);
-                }
-              }}
-              className="h-7 w-44 rounded-md border border-emerald-600 bg-white px-2 text-xs font-semibold text-slate-900 focus:outline-none dark:bg-[#141B26] dark:text-white"
-            />
-          ) : (
-            <button
-              type="button"
-              onClick={() => {
-                if (mode === 'studio') setEditingTitle(true);
-              }}
-              className="truncate text-xs font-semibold text-slate-900 hover:text-emerald-800 dark:text-slate-100 dark:hover:text-emerald-400"
-              title={mode === 'studio' ? 'Click to rename Prism' : activeSnapshot.name}
-            >
-              {activeSnapshot.name}
-            </button>
-          )}
-
-          <span className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-600 dark:border-slate-700 dark:text-slate-300">
-            <span className={`h-1.5 w-1.5 rounded-full ${statusBadge.dot}`} />
-            {statusBadge.label}
-          </span>
-
-          <span
-            className="hidden font-mono text-[11px] text-slate-400 md:inline dark:text-slate-500"
-            title={activeSnapshot.digest}
-          >
-            #{shortPrismDigest(activeSnapshot.digest)}
-          </span>
-        </div>
-
-        <div className="flex items-center gap-1.5">
-          {mode === 'studio' && project.revisions.length > 0 && (
-            <button
-              type="button"
-              onClick={() => void handleUndo()}
-              title={`Undo last change (${project.revisions.length} saved)`}
-              className="inline-flex h-7 items-center gap-1 rounded-md border border-slate-200 bg-white px-2 text-xs font-medium text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-300 dark:hover:bg-slate-800"
-            >
-              <Undo2 className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">Undo</span>
-            </button>
-          )}
-
-          {isPublished && (
-            <div
-              role="group"
-              aria-label="Prism view mode"
-              className="inline-flex h-7 rounded-md border border-slate-200 bg-slate-100/80 p-0.5 text-[11px] font-medium dark:border-slate-700 dark:bg-[#141B26]"
-            >
-              <button
-                type="button"
-                onClick={() => onChangeMode('studio')}
-                className={`rounded px-2 transition-colors ${
-                  mode === 'studio'
-                    ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-800 dark:text-white'
-                    : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'
-                }`}
-              >
-                Studio
-              </button>
-              <button
-                type="button"
-                onClick={() => onChangeMode('app')}
-                className={`rounded px-2 transition-colors ${
-                  mode === 'app'
-                    ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-800 dark:text-white'
-                    : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'
-                }`}
-              >
-                App
-              </button>
-            </div>
-          )}
-
-          {mode === 'studio' && (
-            <button
-              type="button"
-              data-testid="prism-publish-btn"
-              onClick={() => void handlePublish()}
-              className="inline-flex h-7 items-center gap-1.5 rounded-md bg-[#0F5132] px-2.5 text-xs font-medium text-white hover:bg-[#0B3D25] transition-colors"
-            >
-              {justPublished ? (
-                <>
-                  <Check className="h-3.5 w-3.5" />
-                  <span>Published</span>
-                </>
-              ) : (
-                <>
-                  <Play className="h-3 w-3" />
-                  <span>{hasUnpublishedChanges ? 'Republish' : isPublished ? 'Publish' : 'Publish'}</span>
-                </>
-              )}
-            </button>
-          )}
-        </div>
+        )}
       </div>
 
-      {/* Expandable Prism Focus Drawer (collapsed by default) */}
-      {focusExpanded && (
-        <div
-          data-testid="prism-focus-drawer"
-          className="shrink-0 border-b border-slate-200 bg-slate-50/80 px-4 py-3 text-xs dark:border-slate-800 dark:bg-[#111722]"
-        >
+      {/* Tab Body */}
+      {panelTab === 'overview' && (
+        <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-4 text-xs">
+          {/* Description */}
+          <section className="space-y-1.5">
+            <label className="block text-[11px] font-semibold tracking-wide text-slate-500 uppercase dark:text-slate-400">
+              Description
+            </label>
+            {isReadOnlyAppInspect ? (
+              <p className="rounded-lg border border-slate-200 bg-slate-50/70 px-3 py-2 text-xs leading-relaxed text-slate-700 dark:border-slate-800 dark:bg-[#141B26] dark:text-slate-300">
+                {activeSnapshot.summary || 'No description provided.'}
+              </p>
+            ) : (
+              <input
+                type="text"
+                value={summaryDraft}
+                placeholder="Describe what this Prism does so VerdantUI knows when to use it…"
+                onBlur={() => void flushSummaryDraft(summaryDraft)}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setSummaryDraft(val);
+                  if (summaryDebounceRef.current) clearTimeout(summaryDebounceRef.current);
+                  summaryDebounceRef.current = setTimeout(() => {
+                    void flushSummaryDraft(val);
+                  }, 180);
+                }}
+                className="w-full rounded-lg border border-slate-200 bg-[#F8F9FA] px-3 py-2 text-xs text-slate-900 focus:border-emerald-700 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-100"
+              />
+            )}
+          </section>
+
+          {/* Permissions */}
+          <section className="space-y-2">
+            <div className="flex items-center justify-between">
+              <h3 className="text-[11px] font-semibold tracking-wide text-slate-500 uppercase dark:text-slate-400">
+                Permissions
+              </h3>
+              <span className="text-[11px] text-slate-400">Sandboxed · Denial-wins</span>
+            </div>
+            <div className="divide-y divide-slate-100 rounded-xl border border-slate-200 bg-[#F8F9FA]/60 dark:divide-slate-800 dark:border-slate-800 dark:bg-[#141B26]/60">
+              {(
+                [
+                  {
+                    key: 'observer',
+                    label: 'VerdantUI & Threads',
+                    desc: 'Let Threads run this app and let this app call local AI.',
+                  },
+                  {
+                    key: 'storage',
+                    label: 'Local Storage',
+                    desc: 'Save app state privately inside this browser.',
+                  },
+                  {
+                    key: 'browser',
+                    label: 'Browser Actions',
+                    desc: 'Clipboard copy, file downloads, and notifications.',
+                  },
+                  {
+                    key: 'network',
+                    label: 'Internet Access',
+                    desc: 'Allow outbound HTTP fetch requests (off by default).',
+                  },
+                ] as const
+              ).map(({ key, label, desc }) => {
+                const enabled = activeSnapshot.grants[key];
+                return (
+                  <div
+                    key={key}
+                    className="flex items-center justify-between gap-3 px-3.5 py-2.5"
+                  >
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-1.5 font-medium text-slate-900 dark:text-slate-100">
+                        {key === 'network' && (
+                          <Globe className="h-3.5 w-3.5 text-slate-400" />
+                        )}
+                        <span>{label}</span>
+                      </div>
+                      <p className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
+                        {desc}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={enabled}
+                      onClick={async () => {
+                        await store.updateDraft(project.id, (prev) => ({
+                          ...prev,
+                          grants: { ...prev.grants, [key]: !prev.grants[key] },
+                        }));
+                        if (isReadOnlyAppInspect) {
+                          await store.publish(project.id);
+                        }
+                      }}
+                      className={`inline-flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition-colors ${
+                        enabled
+                          ? 'bg-[#0F5132] dark:bg-emerald-600'
+                          : 'bg-slate-300 dark:bg-slate-700'
+                      }`}
+                    >
+                      <span
+                        className={`h-5 w-5 rounded-full bg-white shadow-xs transition-transform ${
+                          enabled ? 'translate-x-5' : 'translate-x-0'
+                        }`}
+                      />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+
+          {/* Quick Test */}
+          <section className="space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="text-[11px] font-semibold tracking-wide text-slate-500 uppercase dark:text-slate-400">
+                Quick Test
+              </h3>
+              <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                In any Thread:{' '}
+                <code className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-slate-800 dark:bg-slate-800 dark:text-slate-200">
+                  @{activeSnapshot.name}
+                </code>
+              </span>
+            </div>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={testInputText}
+                onChange={(e) => setTestInputText(e.target.value)}
+                placeholder='{"action": "status"} or plain text'
+                className="flex-1 rounded-lg border border-slate-200 bg-[#F8F9FA] px-3 py-1.5 font-mono text-[11px] text-slate-900 focus:border-emerald-700 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-100"
+              />
+              <button
+                type="button"
+                disabled={testRunning}
+                onClick={async () => {
+                  setTestRunning(true);
+                  setTestResultText(null);
+                  try {
+                    let parsed: unknown = testInputText;
+                    try {
+                      parsed = JSON.parse(testInputText);
+                    } catch {
+                      parsed = { message: testInputText };
+                    }
+                    const t0 = performance.now();
+                    const { result } = await bus.dispatchToEndpoint(project.id, parsed);
+                    const ms = Math.max(1, Math.round(performance.now() - t0));
+                    setTestResultText(
+                      `${ms}ms · ${typeof result === 'string' ? result : JSON.stringify(result, null, 2)}`,
+                    );
+                  } catch (err) {
+                    setTestResultText(
+                      `Error: ${err instanceof Error ? err.message : String(err)}`,
+                    );
+                  } finally {
+                    setTestRunning(false);
+                  }
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-700 disabled:opacity-50 dark:bg-emerald-700 dark:hover:bg-emerald-600"
+              >
+                <Send className="h-3 w-3" />
+                <span>{testRunning ? 'Running…' : 'Run'}</span>
+              </button>
+            </div>
+            {testResultText && (
+              <pre className="max-h-36 overflow-auto rounded-lg border border-slate-200 bg-[#F8F9FA] p-2.5 font-mono text-[11px] text-slate-700 dark:border-slate-800 dark:bg-[#0B0F14] dark:text-slate-300">
+                {testResultText}
+              </pre>
+            )}
+          </section>
+        </div>
+      )}
+
+      {panelTab === 'code' && (
+        <div className="flex min-h-0 flex-1 flex-col p-4">
           <div className="mb-2.5 flex items-center justify-between gap-2">
             <div className="flex items-center gap-1">
-              {(['streams', 'source', 'package'] as const).map((t) => (
+              {(['html', 'css', 'js'] as const).map((f) => (
                 <button
-                  key={t}
+                  key={f}
                   type="button"
-                  onClick={() => setDrawerTab(t)}
-                  className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
-                    drawerTab === t
-                      ? 'bg-white text-slate-900 shadow-xs ring-1 ring-slate-200 dark:bg-slate-800 dark:text-white dark:ring-slate-700'
-                      : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'
+                  onClick={() => {
+                    if (!isReadOnlyAppInspect) {
+                      void flushSourceDraft(sourceTab, sourceDraft);
+                    }
+                    setSourceTab(f);
+                    setSourceDraft(activeSnapshot.app[f]);
+                    sourceSnapshotPushedRef.current = false;
+                  }}
+                  className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 font-mono text-[11px] font-medium uppercase transition-colors ${
+                    sourceTab === f
+                      ? 'bg-slate-900 text-white dark:bg-emerald-700'
+                      : 'bg-slate-100 text-slate-600 hover:text-slate-900 dark:bg-[#141B26] dark:text-slate-300 dark:hover:text-white'
                   }`}
                 >
-                  {t === 'streams' ? 'Streams & Grants' : t === 'source' ? 'Source' : 'Package (.holo)'}
+                  <Code2 className="h-3 w-3" />
+                  {f}
                 </button>
               ))}
             </div>
-            {isPublished && mode === 'studio' && (
-              <button
-                type="button"
-                onClick={() => void store.unpublish(project.id)}
-                className="text-[11px] font-medium text-slate-500 hover:text-red-600 dark:text-slate-400 dark:hover:text-red-400"
-              >
-                Unpublish
-              </button>
-            )}
+            <span className="text-[11px] text-slate-400">
+              {isReadOnlyAppInspect
+                ? 'Published snapshot (read-only)'
+                : sourceTab === 'css'
+                  ? 'Hot-swaps live without reloading state'
+                  : 'Updates Preview automatically'}
+            </span>
           </div>
+          <textarea
+            readOnly={isReadOnlyAppInspect}
+            value={isReadOnlyAppInspect ? activeSnapshot.app[sourceTab] : sourceDraft}
+            onBlur={() => {
+              if (!isReadOnlyAppInspect) {
+                void flushSourceDraft(sourceTab, sourceDraft);
+                sourceSnapshotPushedRef.current = false;
+              }
+            }}
+            onChange={(e) => {
+              if (isReadOnlyAppInspect) return;
+              const nextVal = e.target.value;
+              setSourceDraft(nextVal);
+              setRuntimeError(null);
+              if (sourceDebounceRef.current) clearTimeout(sourceDebounceRef.current);
+              sourceDebounceRef.current = setTimeout(() => {
+                void flushSourceDraft(sourceTab, nextVal);
+              }, 180);
+            }}
+            spellCheck={false}
+            className="min-h-[260px] flex-1 resize-none rounded-xl border border-slate-200 bg-[#F8F9FA] p-3 font-mono text-[12px] leading-relaxed text-slate-900 focus:border-emerald-700 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-[#0B0F14] dark:text-slate-100"
+          />
+        </div>
+      )}
 
-          {drawerTab === 'streams' && (
-            <div className="grid gap-3 lg:grid-cols-2">
-              <div className="space-y-2.5">
-                <label className="block">
-                  <span className="text-[11px] font-medium text-slate-600 dark:text-slate-400">
-                    Summary (used by VerdantUI to route requests)
-                  </span>
-                  <input
-                    type="text"
-                    value={summaryDraft}
-                    onBlur={() => void flushSummaryDraft(summaryDraft)}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      setSummaryDraft(val);
-                      if (summaryDebounceRef.current) clearTimeout(summaryDebounceRef.current);
-                      summaryDebounceRef.current = setTimeout(() => {
-                        void flushSummaryDraft(val);
-                      }, 180);
-                    }}
-                    className="mt-1 w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-900 dark:border-slate-700 dark:bg-[#0F141C] dark:text-slate-100"
-                  />
-                </label>
-
-                <div className="space-y-1.5">
-                  <div className="text-[11px] font-medium text-slate-600 dark:text-slate-400">
-                    Capability Grants (FK-07 Denial-Wins)
-                  </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {(
-                      [
-                        { key: 'observer', label: 'Observer' },
-                        { key: 'storage', label: 'Storage' },
-                        { key: 'browser', label: 'Browser' },
-                        { key: 'network', label: 'Network' },
-                      ] as const
-                    ).map(({ key, label }) => {
-                      const enabled = project.draft.grants[key];
-                      return (
-                        <button
-                          key={key}
-                          type="button"
-                          role="switch"
-                          aria-checked={enabled}
-                          onClick={() =>
-                            void store.updateDraft(project.id, (prev) => ({
-                              ...prev,
-                              grants: { ...prev.grants, [key]: !prev.grants[key] },
-                            }))
-                          }
-                          className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-medium transition-colors ${
-                            enabled
-                              ? 'border-emerald-700/40 bg-emerald-50 text-emerald-900 dark:border-emerald-500/40 dark:bg-emerald-950/50 dark:text-emerald-200'
-                              : 'border-slate-200 bg-white text-slate-600 dark:border-slate-700 dark:bg-[#0F141C] dark:text-slate-400'
-                          }`}
-                        >
-                          {key === 'network' && <Globe className="h-3 w-3" />}
-                          <span>{label}</span>
-                          <span className="font-mono text-[10px] opacity-80">
-                            {enabled ? 'On' : 'Off'}
-                          </span>
-                        </button>
-                      );
-                    })}
-                  </div>
+      {panelTab === 'package' && (
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4 text-xs">
+          <div className="rounded-xl border border-slate-200 bg-[#F8F9FA]/70 p-4 dark:border-slate-800 dark:bg-[#141B26]/70">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0 space-y-1">
+                <div className="font-semibold text-slate-900 dark:text-white">
+                  {activeSnapshot.name}.holo
                 </div>
-
-                <div className="space-y-1">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[11px] font-medium text-slate-600 dark:text-slate-400">
-                      Test Stream Dispatch (calls window.verdant.onInput)
-                    </span>
-                    <span className="text-[10px] text-slate-400">
-                      Thread syntax: <code>@{project.draft.name}</code>
-                    </span>
-                  </div>
-                  <div className="flex gap-1.5">
-                    <input
-                      type="text"
-                      value={testInputText}
-                      onChange={(e) => setTestInputText(e.target.value)}
-                      className="flex-1 rounded-md border border-slate-200 bg-white px-2 py-1 font-mono text-[11px] text-slate-900 dark:border-slate-700 dark:bg-[#0F141C] dark:text-slate-100"
-                    />
-                    <button
-                      type="button"
-                      disabled={testRunning}
-                      onClick={async () => {
-                        setTestRunning(true);
-                        setTestResultText(null);
-                        try {
-                          let parsed: unknown = testInputText;
-                          try {
-                            parsed = JSON.parse(testInputText);
-                          } catch {
-                            parsed = { message: testInputText };
-                          }
-                          const t0 = performance.now();
-                          const { result } = await bus.dispatchToEndpoint(project.id, parsed);
-                          const ms = Math.max(1, Math.round(performance.now() - t0));
-                          setTestResultText(
-                            `${ms}ms · ${typeof result === 'string' ? result : JSON.stringify(result, null, 2)}`,
-                          );
-                        } catch (err) {
-                          setTestResultText(
-                            `Error: ${err instanceof Error ? err.message : String(err)}`,
-                          );
-                        } finally {
-                          setTestRunning(false);
-                        }
-                      }}
-                      className="inline-flex items-center gap-1 rounded-md bg-slate-900 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-slate-700 disabled:opacity-50 dark:bg-emerald-700 dark:hover:bg-emerald-600"
-                    >
-                      <Send className="h-3 w-3" />
-                      <span>{testRunning ? 'Sending…' : 'Dispatch'}</span>
-                    </button>
-                  </div>
-                  {testResultText && (
-                    <pre className="max-h-24 overflow-auto rounded-md border border-slate-200 bg-white p-2 font-mono text-[11px] text-slate-700 dark:border-slate-700 dark:bg-[#0B0F14] dark:text-slate-300">
-                      {testResultText}
-                    </pre>
-                  )}
-                </div>
-              </div>
-
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <span className="text-[11px] font-medium text-slate-600 dark:text-slate-400">
-                    Input Contract (JSON Schema 2020-12)
-                  </span>
+                <div className="flex items-center gap-1.5 font-mono text-[11px] text-slate-600 dark:text-slate-400">
+                  <span className="truncate">{activeSnapshot.digest}</span>
                   <button
                     type="button"
-                    onClick={() => {
-                      try {
-                        const parsed = JSON.parse(schemaDraft) as JsonSchema2020Object;
-                        if (!parsed || parsed.type !== 'object' || typeof parsed.properties !== 'object') {
-                          throw new Error('Schema must be an object with "type": "object" and "properties".');
-                        }
-                        setSchemaError(null);
-                        void store.updateDraft(project.id, (prev) => ({
-                          ...prev,
-                          streams: { ...prev.streams, inputs: parsed },
-                        }));
-                      } catch (err) {
-                        setSchemaError(err instanceof Error ? err.message : String(err));
-                      }
-                    }}
-                    className="rounded border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#0F141C] dark:text-slate-200"
+                    onClick={handleCopyDigest}
+                    className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded hover:bg-slate-200 dark:hover:bg-slate-700"
+                    title="Copy SHA-256 digest"
                   >
-                    Apply Schema
+                    {digestCopied ? (
+                      <Check className="h-3 w-3 text-emerald-700 dark:text-emerald-400" />
+                    ) : (
+                      <Copy className="h-3 w-3" />
+                    )}
                   </button>
                 </div>
-                <textarea
-                  rows={6}
-                  spellCheck={false}
-                  value={schemaDraft}
-                  onChange={(e) => setSchemaDraft(e.target.value)}
-                  className="w-full rounded-md border border-slate-200 bg-white p-2 font-mono text-[11px] text-slate-900 focus:border-emerald-700 focus:outline-none dark:border-slate-700 dark:bg-[#0B0F14] dark:text-slate-100"
-                />
-                {schemaError && (
-                  <div className="text-[11px] text-red-600 dark:text-red-400">{schemaError}</div>
-                )}
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                  Self-contained, content-addressed Prism package verified by SHA-256.
+                </p>
               </div>
-            </div>
-          )}
-
-          {drawerTab === 'source' && (
-            <div className="space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-1">
-                  {(['html', 'css', 'js'] as const).map((f) => (
-                    <button
-                      key={f}
-                      type="button"
-                      onClick={() => {
-                        void flushSourceDraft(sourceTab, sourceDraft);
-                        setSourceTab(f);
-                        setSourceDraft(project.draft.app[f]);
-                        sourceSnapshotPushedRef.current = false;
-                      }}
-                      className={`inline-flex items-center gap-1 rounded px-2 py-0.5 font-mono text-[11px] uppercase ${
-                        sourceTab === f
-                          ? 'bg-slate-900 text-white dark:bg-emerald-700'
-                          : 'bg-white text-slate-600 ring-1 ring-slate-200 dark:bg-[#0F141C] dark:text-slate-300 dark:ring-slate-700'
-                      }`}
-                    >
-                      <Code2 className="h-3 w-3" />
-                      {f}
-                    </button>
-                  ))}
-                </div>
-                <span className="text-[10px] text-slate-400">
-                  {sourceTab === 'css' ? 'Hot-swaps live without reloading app state' : 'Auto-updates live preview'}
-                </span>
-              </div>
-              <textarea
-                value={sourceDraft}
-                onBlur={() => {
-                  void flushSourceDraft(sourceTab, sourceDraft);
-                  sourceSnapshotPushedRef.current = false;
-                }}
-                onChange={(e) => {
-                  const nextVal = e.target.value;
-                  setSourceDraft(nextVal);
-                  setRuntimeError(null);
-                  if (sourceDebounceRef.current) clearTimeout(sourceDebounceRef.current);
-                  sourceDebounceRef.current = setTimeout(() => {
-                    void flushSourceDraft(sourceTab, nextVal);
-                  }, 180);
-                }}
-                rows={7}
-                spellCheck={false}
-                className="w-full rounded-lg border border-slate-200 bg-white p-2.5 font-mono text-[12px] leading-relaxed text-slate-900 focus:border-emerald-700 focus:outline-none dark:border-slate-700 dark:bg-[#0B0F14] dark:text-slate-100"
-              />
-            </div>
-          )}
-
-          {drawerTab === 'package' && (
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="space-y-0.5">
-                <div className="font-mono text-[11px] text-slate-700 dark:text-slate-300">
-                  {activeSnapshot.digest}
-                </div>
-                <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                  Self-contained <code className="font-mono">.holo</code> archive (JSON Schema 2020-12 streams + SHA-256 integrity).
-                </div>
-                {importError && (
-                  <div className="text-[11px] text-red-600 dark:text-red-400">{importError}</div>
-                )}
-              </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
                   onClick={handleExportHolo}
-                  className="inline-flex h-8 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#0F141C] dark:text-slate-200 dark:hover:bg-slate-800"
+                  className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#0F141C] dark:text-slate-200 dark:hover:bg-slate-800"
                 >
                   <Download className="h-3.5 w-3.5" />
                   <span>Export .holo</span>
@@ -848,7 +789,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                 <button
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
-                  className="inline-flex h-8 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#0F141C] dark:text-slate-200 dark:hover:bg-slate-800"
+                  className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#0F141C] dark:text-slate-200 dark:hover:bg-slate-800"
                 >
                   <Upload className="h-3.5 w-3.5" />
                   <span>Import .holo</span>
@@ -866,9 +807,213 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                 />
               </div>
             </div>
-          )}
+
+            {importError && (
+              <div className="mt-2.5 rounded-lg border border-red-200 bg-red-50 px-3 py-1.5 text-[11px] text-red-700 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-300">
+                {importError}
+              </div>
+            )}
+
+            {isPublished && (
+              <div className="mt-3 flex items-center justify-between border-t border-slate-200/80 pt-3 dark:border-slate-800">
+                <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                  Published Prisms are callable from any Thread and other Prisms.
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAppPrismModalOpen(false);
+                    onChangeMode('studio');
+                    void store.unpublish(project.id);
+                  }}
+                  className="text-[11px] font-medium text-red-600 hover:underline dark:text-red-400"
+                >
+                  Unpublish
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Collapsible Advanced Input Contract (JSON Schema 2020-12) */}
+          <div className="rounded-xl border border-slate-200 dark:border-slate-800">
+            <button
+              type="button"
+              aria-expanded={schemaExpanded}
+              onClick={() => setSchemaExpanded((prev) => !prev)}
+              className="flex w-full items-center justify-between px-3.5 py-2.5 text-left font-medium text-slate-700 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800/60"
+            >
+              <span className="inline-flex items-center gap-1.5">
+                {schemaExpanded ? (
+                  <ChevronDown className="h-3.5 w-3.5 text-slate-400" />
+                ) : (
+                  <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
+                )}
+                <span>Input Contract (JSON Schema 2020-12)</span>
+              </span>
+              <span className="text-[11px] font-normal text-slate-400">Advanced</span>
+            </button>
+            {schemaExpanded && (
+              <div className="space-y-2 border-t border-slate-200 p-3.5 dark:border-slate-800">
+                <textarea
+                  readOnly={isReadOnlyAppInspect}
+                  rows={7}
+                  spellCheck={false}
+                  value={
+                    isReadOnlyAppInspect
+                      ? JSON.stringify(activeSnapshot.streams.inputs, null, 2)
+                      : schemaDraft
+                  }
+                  onChange={(e) => setSchemaDraft(e.target.value)}
+                  className="w-full rounded-lg border border-slate-200 bg-[#F8F9FA] p-2.5 font-mono text-[11px] text-slate-900 focus:border-emerald-700 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-[#0B0F14] dark:text-slate-100"
+                />
+                {schemaError && (
+                  <div className="text-[11px] text-red-600 dark:text-red-400">{schemaError}</div>
+                )}
+                {!isReadOnlyAppInspect && (
+                  <div className="flex justify-end">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        try {
+                          const parsed = JSON.parse(schemaDraft) as JsonSchema2020Object;
+                          if (
+                            !parsed ||
+                            parsed.type !== 'object' ||
+                            typeof parsed.properties !== 'object'
+                          ) {
+                            throw new Error(
+                              'Schema must be an object with "type": "object" and "properties".',
+                            );
+                          }
+                          setSchemaError(null);
+                          void store.updateDraft(project.id, (prev) => ({
+                            ...prev,
+                            streams: { ...prev.streams, inputs: parsed },
+                          }));
+                        } catch (err) {
+                          setSchemaError(err instanceof Error ? err.message : String(err));
+                        }
+                      }}
+                      className="rounded-md bg-slate-900 px-3 py-1 text-[11px] font-medium text-white hover:bg-slate-700 dark:bg-emerald-700 dark:hover:bg-emerald-600"
+                    >
+                      Save Schema
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       )}
+    </div>
+  );
+
+  return (
+    <div className="flex h-full flex-col overflow-hidden bg-[#F8F9FA] dark:bg-[#0B0F14]">
+      {/* Calm Single-Line Workspace Header */}
+      <div className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-slate-200 bg-white px-4 dark:border-slate-800 dark:bg-[#0F141C]">
+        <div className="flex min-w-0 items-center gap-2.5">
+          {editingTitle && mode === 'studio' ? (
+            <input
+              type="text"
+              autoFocus
+              value={titleDraft}
+              onChange={(e) => setTitleDraft(e.target.value)}
+              onBlur={() => void handleCommitTitle()}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void handleCommitTitle();
+                if (e.key === 'Escape') {
+                  setTitleDraft(project.draft.name);
+                  setEditingTitle(false);
+                }
+              }}
+              className="h-7 w-48 rounded-md border border-emerald-600 bg-white px-2 text-xs font-semibold text-slate-900 focus:outline-none dark:bg-[#141B26] dark:text-white"
+            />
+          ) : (
+            <button
+              type="button"
+              onClick={() => {
+                if (mode === 'studio') setEditingTitle(true);
+              }}
+              className="truncate text-[13px] font-semibold text-slate-900 hover:text-emerald-800 dark:text-slate-100 dark:hover:text-emerald-400"
+              title={mode === 'studio' ? 'Click to rename Prism' : activeSnapshot.name}
+            >
+              {activeSnapshot.name}
+            </button>
+          )}
+
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-600 dark:border-slate-700 dark:text-slate-300">
+            <span className={`h-1.5 w-1.5 rounded-full ${statusBadge.dot}`} />
+            {statusBadge.label}
+          </span>
+        </div>
+
+        <div className="flex items-center gap-1.5">
+          {mode === 'studio' && project.revisions.length > 0 && (
+            <button
+              type="button"
+              onClick={() => void handleUndo()}
+              title={`Undo last change (${project.revisions.length} saved)`}
+              className="inline-flex h-7 items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-300 dark:hover:bg-slate-800"
+            >
+              <Undo2 className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">Undo</span>
+            </button>
+          )}
+
+          {mode === 'app' ? (
+            <>
+              <button
+                type="button"
+                data-testid="app-prism-modal-toggle"
+                onClick={() => setAppPrismModalOpen(true)}
+                className="inline-flex h-7 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800"
+              >
+                <Layers className="h-3.5 w-3.5" />
+                <span>Prism</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => onChangeMode('studio')}
+                className="inline-flex h-7 items-center gap-1.5 rounded-md bg-slate-900 px-2.5 text-xs font-medium text-white hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-200"
+              >
+                <span>Edit in Studio</span>
+              </button>
+            </>
+          ) : (
+            <>
+              {isPublished && (
+                <button
+                  type="button"
+                  onClick={() => onChangeMode('app')}
+                  className="inline-flex h-7 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800"
+                >
+                  <ExternalLink className="h-3 w-3" />
+                  <span>Open App</span>
+                </button>
+              )}
+              <button
+                type="button"
+                data-testid="prism-publish-btn"
+                onClick={() => void handlePublish()}
+                className="inline-flex h-7 items-center gap-1.5 rounded-md bg-[#0F5132] px-3 text-xs font-medium text-white hover:bg-[#0B3D25] transition-colors"
+              >
+                {justPublished ? (
+                  <>
+                    <Check className="h-3.5 w-3.5" />
+                    <span>Published</span>
+                  </>
+                ) : (
+                  <>
+                    <Play className="h-3 w-3" />
+                    <span>{hasUnpublishedChanges ? 'Republish' : 'Publish'}</span>
+                  </>
+                )}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
 
       {/* Main Content: App Mode vs Studio Split Mode */}
       {mode === 'app' && project.published ? (
@@ -893,8 +1038,45 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                 onClick={() => onChangeMode('studio')}
                 className="shrink-0 rounded-md bg-red-700 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-red-800"
               >
-                Open in Studio
+                Edit in Studio
               </button>
+            </div>
+          )}
+
+          {/* Refined Centered Prism Modal (App Mode) */}
+          {appPrismModalOpen && (
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label={`${activeSnapshot.name} Prism settings`}
+              className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4 backdrop-blur-[2px]"
+              onClick={() => setAppPrismModalOpen(false)}
+            >
+              <div
+                className="flex max-h-[82vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-800 dark:bg-[#0F141C]"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <Layers className="h-4 w-4 shrink-0 text-emerald-700 dark:text-emerald-400" />
+                    <span className="truncate text-sm font-semibold text-slate-900 dark:text-white">
+                      {activeSnapshot.name}
+                    </span>
+                    <span className="font-mono text-[11px] text-slate-400">
+                      #{shortPrismDigest(activeSnapshot.digest)}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    aria-label="Close Prism modal"
+                    onClick={() => setAppPrismModalOpen(false)}
+                    className="inline-flex h-7 w-7 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+                {renderPrismPanelContent()}
+              </div>
             </div>
           )}
         </div>
@@ -1039,56 +1221,92 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
             </form>
           </div>
 
-          {/* Right Pane: Real-Time Preview + Collapsible OTel Stream Strip */}
+          {/* Right Pane: Real-Time Preview / Prism Toggle + Collapsible OTel Stream Strip */}
           <div className="flex min-h-0 flex-col bg-[#F8F9FA] dark:bg-[#0B0F14]">
-            <div className="flex h-9 shrink-0 items-center justify-between border-b border-slate-200 bg-white/80 px-3 text-xs dark:border-slate-800 dark:bg-[#0F141C]/80">
-              <span className="font-medium text-slate-600 dark:text-slate-400">Live Preview</span>
+            <div className="flex h-10 shrink-0 items-center justify-between border-b border-slate-200 bg-white/90 px-3 text-xs dark:border-slate-800 dark:bg-[#0F141C]/90">
+              <div
+                role="tablist"
+                aria-label="Preview or Prism view"
+                data-testid="prism-view-toggle"
+                className="inline-flex h-7 items-center rounded-lg border border-slate-200 bg-slate-100/80 p-0.5 text-[11px] font-medium dark:border-slate-700 dark:bg-[#141B26]"
+              >
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={previewPaneMode === 'preview'}
+                  onClick={() => setPreviewPaneMode('preview')}
+                  className={`inline-flex h-6 items-center gap-1.5 rounded-md px-2.5 transition-colors ${
+                    previewPaneMode === 'preview'
+                      ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-800 dark:text-white'
+                      : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'
+                  }`}
+                >
+                  <Eye className="h-3.5 w-3.5" />
+                  <span>Preview</span>
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={previewPaneMode === 'prism'}
+                  data-testid="prism-focus-toggle"
+                  onClick={() => setPreviewPaneMode('prism')}
+                  className={`inline-flex h-6 items-center gap-1.5 rounded-md px-2.5 transition-colors ${
+                    previewPaneMode === 'prism'
+                      ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-800 dark:text-white'
+                      : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'
+                  }`}
+                >
+                  <Layers className="h-3.5 w-3.5" />
+                  <span>Prism</span>
+                </button>
+              </div>
+
               <div className="flex items-center gap-1">
-                <button
-                  type="button"
-                  onClick={() => setViewportMode('desktop')}
-                  aria-label="Desktop preview"
-                  className={`inline-flex h-6 w-6 items-center justify-center rounded ${
-                    viewportMode === 'desktop'
-                      ? 'bg-slate-200 text-slate-900 dark:bg-slate-800 dark:text-white'
-                      : 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'
-                  }`}
-                >
-                  <Monitor className="h-3.5 w-3.5" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setViewportMode('mobile')}
-                  aria-label="Mobile preview"
-                  className={`inline-flex h-6 w-6 items-center justify-center rounded ${
-                    viewportMode === 'mobile'
-                      ? 'bg-slate-200 text-slate-900 dark:bg-slate-800 dark:text-white'
-                      : 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'
-                  }`}
-                >
-                  <Smartphone className="h-3.5 w-3.5" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setRuntimeError(null);
-                    setReloadNonce((n) => n + 1);
-                  }}
-                  aria-label="Reload preview"
-                  className="inline-flex h-6 w-6 items-center justify-center rounded text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800"
-                >
-                  <RotateCcw className="h-3.5 w-3.5" />
-                </button>
-                {isPublished && (
-                  <button
-                    type="button"
-                    onClick={() => onChangeMode('app')}
-                    title="Open Published App full-screen"
-                    className="ml-1 inline-flex h-6 items-center gap-1 rounded px-1.5 text-[11px] font-medium text-emerald-800 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/40"
+                {previewPaneMode === 'preview' ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setViewportMode('desktop')}
+                      aria-label="Desktop preview"
+                      className={`inline-flex h-6 w-6 items-center justify-center rounded ${
+                        viewportMode === 'desktop'
+                          ? 'bg-slate-200 text-slate-900 dark:bg-slate-800 dark:text-white'
+                          : 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'
+                      }`}
+                    >
+                      <Monitor className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setViewportMode('mobile')}
+                      aria-label="Mobile preview"
+                      className={`inline-flex h-6 w-6 items-center justify-center rounded ${
+                        viewportMode === 'mobile'
+                          ? 'bg-slate-200 text-slate-900 dark:bg-slate-800 dark:text-white'
+                          : 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'
+                      }`}
+                    >
+                      <Smartphone className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRuntimeError(null);
+                        setReloadNonce((n) => n + 1);
+                      }}
+                      aria-label="Reload preview"
+                      className="inline-flex h-6 w-6 items-center justify-center rounded text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800"
+                    >
+                      <RotateCcw className="h-3.5 w-3.5" />
+                    </button>
+                  </>
+                ) : (
+                  <span
+                    className="font-mono text-[11px] text-slate-400 dark:text-slate-500"
+                    title={project.draft.digest}
                   >
-                    <ExternalLink className="h-3 w-3" />
-                    <span>Open App</span>
-                  </button>
+                    #{shortPrismDigest(project.draft.digest)}
+                  </span>
                 )}
               </div>
             </div>
@@ -1110,7 +1328,12 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
               </div>
             )}
 
-            <div className="flex min-h-0 flex-1 items-stretch justify-center overflow-auto p-0">
+            {/* Keep sandbox mounted when toggling to Prism so app state & Quick Test stay live */}
+            <div
+              className={`min-h-0 flex-1 items-stretch justify-center overflow-auto p-0 ${
+                previewPaneMode === 'preview' ? 'flex' : 'hidden'
+              }`}
+            >
               <div
                 className={
                   viewportMode === 'mobile'
@@ -1130,6 +1353,15 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                 />
               </div>
             </div>
+
+            {previewPaneMode === 'prism' && (
+              <div
+                data-testid="prism-focus-panel"
+                className="flex min-h-0 flex-1 flex-col overflow-hidden"
+              >
+                {renderPrismPanelContent()}
+              </div>
+            )}
 
             {/* Collapsible OpenTelemetry Stream Activity Strip */}
             <div className="shrink-0 border-t border-slate-200 bg-white dark:border-slate-800 dark:bg-[#0F141C]">

@@ -985,7 +985,7 @@ window.verdant.onInput(async (payload) => {
           html: `<main class="empty-stage">
   <div class="empty-card">
     <h1>Untitled Prism</h1>
-    <p class="v-muted">Describe the app you want to build in the chat on the left, pick a starter, or open the <strong>Prism</strong> bar above to edit HTML, CSS, and JS directly.</p>
+    <p class="v-muted">Describe the app you want to build in the chat on the left, pick a starter, or switch to <strong>Prism</strong> in the toolbar above to edit HTML, CSS, and JS directly.</p>
   </div>
 </main>`,
           css: `.empty-stage { min-height: calc(100vh - 40px); display: grid; place-items: center; }
