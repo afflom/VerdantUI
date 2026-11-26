@@ -199,8 +199,8 @@ export function evaluateDesignAccessibility(decl: PrismDeclaration): readonly De
     },
     {
       id: 'req-d9-trace',
-      label: 'Bidirectional Requirement Traceability',
-      wcagRef: 'ISO 42010 / REQ-D9',
+      label: 'Requirement-to-Interface Traceability',
+      wcagRef: 'ISO 42010',
       passed: allElementsTraced,
       detail: allElementsTraced
         ? `All ${decl.view?.elements.length ?? 0} UI element(s) trace to admitted requirements.`
@@ -223,17 +223,17 @@ export function deriveTrustBoundaries(decl: PrismDeclaration): readonly TrustBou
   return [
     {
       id: 'TB-INPUT',
-      name: 'User Input -> WASM Guest',
+      name: 'User Input -> Verified Guest',
       kind: 'input',
       active: (decl.encoding?.fields.length ?? 0) > 0 || decl.concept.opmObjects.some((o) => o.role === 'input'),
-      summary: 'All user values cross a typed JSON Schema 2020-12 boundary into total Nat LexLean rules.',
+      summary: 'All user inputs cross a strict typed validation boundary into total deterministic rules.',
     },
     {
       id: 'TB-SANDBOX',
-      name: 'Zero-Origin View Sandbox',
+      name: 'Isolated View Sandbox',
       kind: 'sandbox',
       active: true,
-      summary: 'Authored prism.design/1 view executes inside an isolated zero-origin iframe with zero rule JS.',
+      summary: 'Interface renders inside an isolated zero-origin sandbox with zero business logic in page scripts.',
     },
     {
       id: 'TB-STORAGE',
@@ -241,25 +241,25 @@ export function deriveTrustBoundaries(decl: PrismDeclaration): readonly TrustBou
       kind: 'storage',
       active: decl.capabilities.storage,
       summary: decl.capabilities.storage
-        ? 'Local IndexedDB KV persistence enabled (scoped strictly to this Prism ID).'
+        ? 'Local browser storage enabled (scoped strictly to this Prism).'
         : 'Disabled (ephemeral in-memory evaluation only).',
     },
     {
       id: 'TB-NETWORK',
-      name: 'Outbound Network Egress',
+      name: 'Outbound Internet Access',
       kind: 'network',
       active: decl.capabilities.network,
       summary: decl.capabilities.network
-        ? 'Explicitly granted — requires spoofing & exfiltration threat review.'
+        ? 'Explicitly granted — requires spoofing & data-transfer review.'
         : 'Denied by default (100% offline execution).',
     },
     {
       id: 'TB-AI',
-      name: 'Local vTensor Model Stream',
+      name: 'On-Device AI Assistance',
       kind: 'ai-stream',
       active: decl.concept.usesLocalAi,
       summary: decl.concept.usesLocalAi
-        ? 'Uses local WASM SIMD inference; deterministic rules remain strictly proved in LexLean.'
+        ? 'Uses on-device AI assistance; all enforceable rules remain strictly proved.'
         : 'Not used — purely deterministic model.',
     },
   ];
@@ -567,7 +567,7 @@ const LAYERED_STANDARD_SPECS: readonly LayeredStandardSpec[] = [
         {
           id: 'EU-AI-TRANSPARENCY',
           title: 'AI Transparency & Proved Guardrail Boundary',
-          detail: 'Document AI assistance clearly and guarantee deterministic LexLean rules enforce final safety bounds.',
+          detail: 'Document AI assistance clearly and guarantee mathematically proved rules enforce final safety bounds.',
           settled,
           autoSatisfied: false,
           evidence: decl.settledObligations['EU-AI-TRANSPARENCY']?.evidence,
@@ -642,7 +642,7 @@ const LAYERED_STANDARD_SPECS: readonly LayeredStandardSpec[] = [
         {
           id: 'NIST-AI-RMF-BOUNDARY',
           title: 'Map & Manage Deterministic Fallback',
-          detail: 'Confirm that all critical outputs and refusals are governed by proved LexLean rules rather than probabilistic generation.',
+          detail: 'Confirm that all critical outputs and refusals are governed by mathematically proved rules rather than probabilistic generation.',
           settled,
           autoSatisfied: false,
           evidence: decl.settledObligations['NIST-AI-RMF-BOUNDARY']?.evidence,
@@ -650,7 +650,7 @@ const LAYERED_STANDARD_SPECS: readonly LayeredStandardSpec[] = [
             op: 'settle-standard-obligation',
             obligationId: 'NIST-AI-RMF-BOUNDARY',
             authority: auth,
-            evidence: 'Confirmed all normative verdicts & refusals compile to Lean-proved WASM guest rules.',
+            evidence: 'Confirmed all normative verdicts & refusals compile to mathematically proved rules.',
           },
         },
       ];
@@ -905,48 +905,7 @@ const LAYERED_STANDARD_SPECS: readonly LayeredStandardSpec[] = [
     },
   },
 
-  // 11. OpenTelemetry Trace API (OTEL-SPEC-1.40.0-TRACE-API)
-  {
-    authority: {
-      id: 'OTEL-SPEC-1.40.0-TRACE-API',
-      name: 'OpenTelemetry Trace API 1.40',
-      edition: '1.40.0',
-      statement: 'Causal W3C Trace Context spans for live model invocations and studio mutations.',
-    },
-    tier: 'layered',
-    facet: 'operations',
-    evaluateTrigger: (decl) => {
-      const multiUser =
-        decl.concept.audience === 'team' ||
-        decl.concept.audience === 'public-adults' ||
-        decl.concept.audience === 'includes-minors';
-      if (decl.capabilities.observer && multiUser && decl.encoding !== null) {
-        return {
-          applicable: true,
-          triggeredBy: ['capabilities.observer=true', `audience=${decl.concept.audience}`],
-          reason: 'Observer Stream tracing is enabled for a team or public Prism.',
-        };
-      }
-      return {
-        applicable: false,
-        exclusionRationale: !multiUser
-          ? 'Excluded: personal offline Prism uses built-in local trace view without team/public telemetry obligations.'
-          : 'Excluded: Observer tracing is disabled or System Model is not yet defined.',
-      };
-    },
-    buildObligations: () => [
-      {
-        id: 'OTEL-SPAN-BINDING',
-        title: 'W3C Trace Context Observer Spans',
-        detail: 'VerdantUI ObserverStreamBus automatically binds causal trace spans to every Prism invoke() call.',
-        settled: true,
-        autoSatisfied: true,
-        evidence: 'Automatically satisfied by VerdantUI ObserverStreamBus.',
-      },
-    ],
-  },
-
-  // 12. Domain Pack: Games & Interactive Media (HUNICKE-MDA-2004 & ESRB-RATINGS-GUIDE)
+  // 11. Domain Pack: Games & Interactive Media (HUNICKE-MDA-2004 & ESRB-RATINGS-GUIDE)
   {
     authority: {
       id: 'HUNICKE-MDA-2004',
@@ -1144,7 +1103,7 @@ export function evaluateVerdantRouting(decl: PrismDeclaration): VerdantRoutingRe
       facet: 'architecture',
       applicable: true,
       triggeredBy: ['Mandatory Verdant Prism Core Spine'],
-      reason: 'Every Verdant Prism compiles its Architecture & Behavior into proved LexLean.',
+      reason: 'Every Verdant Prism compiles its Architecture & Behavior into mathematically proved rules.',
       obligations: [],
       settledCount: archDone,
       totalCount: archTotal,
@@ -1304,9 +1263,9 @@ export function evaluateVerdantRouting(decl: PrismDeclaration): VerdantRoutingRe
     {
       stage: 'standards',
       number: 5,
-      label: `Routed Standards (${activeLayeredStandards.length})`,
+      label: `Applicable Standards (${activeLayeredStandards.length})`,
       shortLabel: `Standards (${activeLayeredStandards.length})`,
-      standardsLabel: 'REQ-D6 · REQ-D11 Applicable Layers',
+      standardsLabel: 'Triggered by Core Model',
       status: standardsStatus,
       completedItems: obligationsSettled,
       totalItems: Math.max(1, obligationsTotal),
@@ -1318,7 +1277,7 @@ export function evaluateVerdantRouting(decl: PrismDeclaration): VerdantRoutingRe
       number: hasLayered ? 6 : 5,
       label: 'Verify & Seal',
       shortLabel: 'Seal',
-      standardsLabel: 'prism-code · Lean 4.32.2 · .holo v6',
+      standardsLabel: 'Formal Proof · Portable .holo',
       status: readyToSeal ? 'complete' : readyToPreview ? 'in-progress' : 'empty',
       completedItems: coreCompleteCount + (standardsMissing.length === 0 ? 1 : 0),
       totalItems: 5,

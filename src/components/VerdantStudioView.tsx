@@ -16,7 +16,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type FC } from 'react';
 import type { ThreadMessage } from '@assistant-ui/react';
 import {
-  Activity,
   AlertTriangle,
   Check,
   CheckCircle2,
@@ -34,13 +33,15 @@ import {
   Play,
   RotateCcw,
   ShieldCheck,
+  SlidersHorizontal,
   Smartphone,
+  Sparkles,
   Undo2,
   Upload,
   X,
 } from 'lucide-react';
 import { formatMessagesForLlama, stripReasoningTags } from '../engine/assistantAdapter';
-import type { ObserverStreamBus, OtelEvent, OtelTraceContext } from '../engine/observerStreamBus';
+import type { ObserverStreamBus, OtelTraceContext } from '../engine/observerStreamBus';
 import type { PrismBuildStage, PrismBuildWorkerClient } from '../engine/prismBuildClient';
 import { compilePrismDeclaration } from '../engine/prismCompiler';
 import type { PrismBridgeRuntime } from '../engine/prismHostPool';
@@ -61,11 +62,19 @@ import {
   type StudioWizardStage,
 } from '../engine/verdantStudioApi';
 import { evaluateVerdantRouting } from '../engine/verdantStandardsRouter';
+import {
+  buildLocalInterviewExtractionPrompt,
+  computeGuidedWizardState,
+  mergeLocalModelExtraction,
+  type ExtractedPrismIntent,
+  type GuidedStepId,
+} from '../engine/prismInterviewEngine';
 import { isInternalBootstrapModel } from '../engine/modelCatalog';
 import type { EngineState, LlamaVTensorWorkerClient } from '../engine/workerClient';
 import { ModelBlueprintCanvas } from './ModelBlueprintCanvas';
 import { PrismSandboxFrame, type HoloviewMountConfig, type PrismRuntimeError } from './PrismSandboxFrame';
 import { StudioDeclarativeBuilder } from './StudioDeclarativeBuilder';
+import { StudioGuidedWizard } from './StudioGuidedWizard';
 
 interface VerdantStudioViewProps {
   project: VerdantPrismProject;
@@ -100,6 +109,8 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   onSelectProject,
 }) => {
   const [previewPaneMode, setPreviewPaneMode] = useState<PreviewPaneMode>('blueprint');
+  const [leftPaneMode, setLeftPaneMode] = useState<'guided' | 'advanced'>('guided');
+  const [guidedStep, setGuidedStep] = useState<GuidedStepId>('anchor-idea');
   const [wizardStage, setWizardStage] = useState<StudioWizardStage>('concept');
   const [appPrismModalOpen, setAppPrismModalOpen] = useState(false);
   const [panelTab, setPanelTab] = useState<PrismPanelTab>('overview');
@@ -107,11 +118,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   const [digestCopied, setDigestCopied] = useState(false);
   const [viewportMode, setViewportMode] = useState<'desktop' | 'mobile'>('desktop');
   const [reloadNonce, setReloadNonce] = useState(0);
-  const [traceOpen, setTraceOpen] = useState(false);
   const [runtimeError, setRuntimeError] = useState<PrismRuntimeError | null>(null);
-  const [recentEvents, setRecentEvents] = useState<readonly OtelEvent[]>(() =>
-    bus.getRecentEvents({ endpointId: project.id }).slice(-12),
-  );
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState(project.draft.name);
   const [justPublished, setJustPublished] = useState(false);
@@ -174,10 +181,15 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     setTestAnswer(null);
     setAppPrismModalOpen(false);
     const initialRouting = project.declaration ? evaluateVerdantRouting(project.declaration) : null;
+    const initialCheck = project.declaration ? checkDeclaration(project.declaration) : null;
     setPreviewPaneMode(initialRouting && !initialRouting.readyToPreview ? 'blueprint' : 'preview');
     setWizardStage(initialRouting ? initialRouting.recommendedStage : 'concept');
-    setRecentEvents(bus.getRecentEvents({ endpointId: project.id }).slice(-12));
-  }, [project.id, project.draft.name, project.declaration?.schema, bus]);
+    if (project.declaration && initialRouting && initialCheck) {
+      setGuidedStep(computeGuidedWizardState(project.declaration, initialRouting, initialCheck).recommendedStep);
+    } else {
+      setGuidedStep('anchor-idea');
+    }
+  }, [project.id, project.draft.name, project.declaration?.schema]);
 
   // Escape closes Prism inspector back to Preview (if ready) or Blueprint (Studio mode) / App (App mode)
   useEffect(() => {
@@ -193,15 +205,6 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [appPrismModalOpen, previewPaneMode, routing?.readyToPreview]);
-
-  // Subscribe to OTel events for this Prism
-  useEffect(() => {
-    return bus.subscribe((ev) => {
-      if (ev.endpointId === project.id || ev.endpointKind === 'studio') {
-        setRecentEvents((prev) => [...prev.slice(-11), ev]);
-      }
-    });
-  }, [bus, project.id]);
 
   // Build `holoview` mount config when we have a compiled declaration or external binary .holo
   const holoviewConfig = useMemo<HoloviewMountConfig | null>(() => {
@@ -623,6 +626,67 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     }
   };
 
+  const hasLocalModelReady =
+    engineState.modelStreamEnabled &&
+    engineState.model !== null &&
+    !isInternalBootstrapModel(engineState.model.id);
+
+  const handleSynthesizeIdeaWithLocalModel = useCallback(
+    async (sentence: string, fallback: ExtractedPrismIntent): Promise<ExtractedPrismIntent> => {
+      if (!hasLocalModelReady || !engineState.model) return fallback;
+      const ac = new AbortController();
+      const timeoutId = setTimeout(() => ac.abort(), 12000);
+      try {
+        const syntheticUser: ThreadMessage = {
+          id: `idea_${Date.now()}`,
+          role: 'user',
+          createdAt: new Date(),
+          content: [{ type: 'text', text: sentence }],
+          attachments: [],
+          metadata: { custom: {} },
+        } as ThreadMessage;
+        const prompt = formatMessagesForLlama(
+          [syntheticUser],
+          engineState.model,
+          engineState.promptMode,
+          buildLocalInterviewExtractionPrompt(sentence),
+          { thinkingMode: 'off' },
+        );
+        let raw = '';
+        for await (const ev of workerClient.streamGenerate(
+          prompt,
+          ac.signal,
+          { ...engineState.sampling, temperature: 0.15, maxTokens: 512 },
+          `studio-interview:${project.id}`,
+        )) {
+          raw = stripReasoningTags(ev.accumulatedText);
+        }
+        return mergeLocalModelExtraction(raw, fallback);
+      } catch {
+        return fallback;
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    },
+    [engineState.model, engineState.promptMode, engineState.sampling, hasLocalModelReady, project.id, workerClient],
+  );
+
+  const handleSelectBlueprintStage = useCallback(
+    (stage: StudioWizardStage) => {
+      setWizardStage(stage);
+      const mapToGuided: Record<StudioWizardStage, GuidedStepId> = {
+        concept: routing?.isUndefined ? 'anchor-idea' : 'confirm-context',
+        architecture: 'refine-rules',
+        security: 'safety-check',
+        design: 'design-feel',
+        standards: 'routed-standards',
+        seal: 'ready-to-seal',
+      };
+      setGuidedStep(mapToGuided[stage]);
+    },
+    [routing?.isUndefined],
+  );
+
   // Dark-only presets (`noir`, `midnight`) must always render in dark mode regardless of host UI mode
   const effectivePreviewDark =
     compiled && !compiled.themeModes.includes('light') ? true : darkMode;
@@ -848,13 +912,12 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                     Unpublish
                   </button>
                 </div>
-                <div className="grid grid-cols-2 gap-1.5 pt-1">
+                <div className="grid grid-cols-3 gap-1.5 pt-1">
                   {(
                     [
-                      ['observer', 'Observer Stream'],
                       ['storage', 'Local Storage'],
                       ['browser', 'Browser Utilities'],
-                      ['network', 'Internet Fetch'],
+                      ['network', 'Internet Access'],
                     ] as const
                   ).map(([key, label]) => (
                     <label
@@ -1296,37 +1359,95 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
         </div>
       ) : (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden lg:flex-row">
-          {/* Left Pane: Guided Verdant Prism Wizard */}
+          {/* Left Pane: Guided Conversational Creator | Advanced Model Editor */}
           <div className="flex h-1/2 min-h-0 min-w-0 w-full flex-col overflow-hidden border-b border-zinc-200 lg:h-full lg:w-[460px] lg:shrink-0 lg:border-r lg:border-b-0 dark:border-zinc-800">
             {isDeclarative && declaration && checkReport && routing ? (
-              <StudioDeclarativeBuilder
-                key={project.id}
-                declaration={declaration}
-                checkReport={checkReport}
-                routing={routing}
-                agenda={agenda}
-                activeStage={wizardStage}
-                onSelectStage={setWizardStage}
-                onDispatchOp={handleDispatchOp}
-                onLoadStarter={handleLoadStarter}
-                onImportHoloFile={() => fileInputRef.current?.click()}
-                onCheckAndBuild={() => void handleCheckAndBuild()}
-                onPublish={() => void handlePublish()}
-                building={building}
-                apiError={apiError}
-                onClearApiError={() => setApiError(null)}
-                modelStreamEnabled={engineState.modelStreamEnabled}
-                onEnableModelStream={onEnableModelStream}
-                proposingOps={proposingOps}
-                proposedOps={proposedOps}
-                onProposeOpsFromPrompt={(p) => void handleProposeOpsFromPrompt(p)}
-                onApplyProposedOps={async () => {
-                  if (!proposedOps) return;
-                  const ok = await handleDispatchOp({ op: 'batch', ops: proposedOps });
-                  if (ok) setProposedOps(null);
-                }}
-                onDismissProposedOps={() => setProposedOps(null)}
-              />
+              <div className="flex h-full min-h-0 min-w-0 flex-col">
+                {/* Compact Guided | Advanced Switcher */}
+                <div className="flex shrink-0 items-center justify-between gap-2 border-b border-zinc-200 bg-zinc-50/70 px-3 py-1.5 dark:border-zinc-800 dark:bg-[#0B0F14]">
+                  <div className="inline-flex rounded-lg border border-zinc-200 bg-white p-0.5 text-[11px] dark:border-zinc-700 dark:bg-zinc-900">
+                    <button
+                      type="button"
+                      onClick={() => setLeftPaneMode('guided')}
+                      className={`inline-flex items-center gap-1 rounded-md px-2.5 py-0.5 font-medium transition-colors ${
+                        leftPaneMode === 'guided'
+                          ? 'bg-emerald-700 text-white shadow-xs'
+                          : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100'
+                      }`}
+                    >
+                      <Sparkles className="h-3 w-3" />
+                      Guided
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setLeftPaneMode('advanced')}
+                      className={`inline-flex items-center gap-1 rounded-md px-2.5 py-0.5 font-medium transition-colors ${
+                        leftPaneMode === 'advanced'
+                          ? 'bg-zinc-900 text-white shadow-xs dark:bg-zinc-100 dark:text-zinc-900'
+                          : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100'
+                      }`}
+                    >
+                      <SlidersHorizontal className="h-3 w-3" />
+                      Advanced
+                    </button>
+                  </div>
+                  <span className="text-[10px] font-medium text-zinc-500">
+                    {routing.readyToSeal
+                      ? 'Ready to prove'
+                      : `${routing.summary.coreComplete}/4 core models`}
+                  </span>
+                </div>
+
+                <div className="min-h-0 flex-1 overflow-hidden">
+                  {leftPaneMode === 'guided' ? (
+                    <StudioGuidedWizard
+                      key={`guided-${project.id}`}
+                      declaration={declaration}
+                      routing={routing}
+                      checkReport={checkReport}
+                      activeStep={guidedStep}
+                      onSelectStep={setGuidedStep}
+                      onDispatchOp={handleDispatchOp}
+                      onSynthesizeWithLocalModel={handleSynthesizeIdeaWithLocalModel}
+                      hasLocalModelReady={hasLocalModelReady}
+                      onOpenPreview={() => setPreviewPaneMode('preview')}
+                      onCheckAndBuild={() => void handleCheckAndBuild()}
+                      onPublish={() => void handlePublish()}
+                      building={building}
+                      onSwitchToAdvanced={() => setLeftPaneMode('advanced')}
+                    />
+                  ) : (
+                    <StudioDeclarativeBuilder
+                      key={project.id}
+                      declaration={declaration}
+                      checkReport={checkReport}
+                      routing={routing}
+                      agenda={agenda}
+                      activeStage={wizardStage}
+                      onSelectStage={setWizardStage}
+                      onDispatchOp={handleDispatchOp}
+                      onLoadStarter={handleLoadStarter}
+                      onImportHoloFile={() => fileInputRef.current?.click()}
+                      onCheckAndBuild={() => void handleCheckAndBuild()}
+                      onPublish={() => void handlePublish()}
+                      building={building}
+                      apiError={apiError}
+                      onClearApiError={() => setApiError(null)}
+                      modelStreamEnabled={engineState.modelStreamEnabled}
+                      onEnableModelStream={onEnableModelStream}
+                      proposingOps={proposingOps}
+                      proposedOps={proposedOps}
+                      onProposeOpsFromPrompt={(p) => void handleProposeOpsFromPrompt(p)}
+                      onApplyProposedOps={async () => {
+                        if (!proposedOps) return;
+                        const ok = await handleDispatchOp({ op: 'batch', ops: proposedOps });
+                        if (ok) setProposedOps(null);
+                      }}
+                      onDismissProposedOps={() => setProposedOps(null)}
+                    />
+                  )}
+                </div>
+              </div>
             ) : (
               <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center text-xs text-zinc-500">
                 <Layers className="h-8 w-8 text-emerald-600/70" />
@@ -1440,19 +1561,6 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                     </button>
                   </>
                 )}
-                <button
-                  type="button"
-                  onClick={() => setTraceOpen((v) => !v)}
-                  className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium ${
-                    traceOpen
-                      ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
-                      : 'text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800'
-                  }`}
-                  title="Toggle OpenTelemetry Stream Trace"
-                >
-                  <Activity className="h-3 w-3" />
-                  <span className="hidden sm:inline">Trace ({recentEvents.length})</span>
-                </button>
               </div>
             </div>
 
@@ -1505,7 +1613,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                     declaration={declaration}
                     routing={routing}
                     activeStage={wizardStage}
-                    onSelectStage={setWizardStage}
+                    onSelectStage={handleSelectBlueprintStage}
                     onOpenPreview={() => setPreviewPaneMode('preview')}
                   />
                 </div>
@@ -1520,29 +1628,6 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                 </div>
               )}
             </div>
-
-            {/* Collapsible OpenTelemetry Stream Trace Strip */}
-            {traceOpen && (
-              <div className="max-h-36 shrink-0 overflow-y-auto border-t border-zinc-200 bg-zinc-50 px-3 py-2 font-mono text-[11px] dark:border-zinc-800 dark:bg-[#080B10]">
-                {recentEvents.length === 0 ? (
-                  <p className="text-zinc-400">No OpenTelemetry events recorded for this Prism yet.</p>
-                ) : (
-                  <div className="space-y-1">
-                    {[...recentEvents].reverse().map((ev) => (
-                      <div key={ev.id} className="flex items-center justify-between gap-2 text-zinc-600 dark:text-zinc-300">
-                        <span className="truncate">
-                          <span className="text-emerald-600 dark:text-emerald-400">{ev.name}</span>{' '}
-                          {ev.body ? JSON.stringify(ev.body).slice(0, 80) : ''}
-                        </span>
-                        <span className="shrink-0 text-[10px] text-zinc-400">
-                          {ev.traceId.slice(0, 8)}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
           </div>
         </div>
       )}

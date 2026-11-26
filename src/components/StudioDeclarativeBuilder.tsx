@@ -1335,13 +1335,12 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                   Runtime System Boundary (Deny by Default)
                 </h4>
               </div>
-              <div className="grid grid-cols-2 gap-1.5">
+              <div className="grid grid-cols-3 gap-1.5">
                 {(
                   [
-                    ['observer', 'Observer Stream'],
                     ['storage', 'Local Storage'],
                     ['browser', 'Browser Utilities'],
-                    ['network', 'Outbound Network'],
+                    ['network', 'Internet Access'],
                   ] as const
                 ).map(([key, label]) => (
                   <label
@@ -2416,7 +2415,7 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
             {/* WCAG 2.2 Automated Baseline Checks */}
             <section className="space-y-1.5 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
               <h4 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
-                WCAG 2.2 &amp; REQ-D9 Baseline
+                WCAG 2.2 &amp; Traceability Baseline
               </h4>
               {routing.designChecks.map((chk) => (
                 <div key={chk.id} className="flex items-start gap-2 rounded bg-zinc-50 px-2.5 py-1.5 dark:bg-zinc-900/60">
@@ -2695,14 +2694,14 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
           <div className="flex items-center justify-between text-[11px] text-zinc-500">
             <span className="inline-flex items-center gap-1">
               <Layers className="h-3 w-3 text-emerald-600" />
-              All edits flow through closed Verdant Studio API ops ({firstReqId})
+              Every change updates your Prism model deterministically
             </span>
             <button
               type="button"
               onClick={onEnableModelStream}
               className="font-medium text-emerald-700 hover:underline dark:text-emerald-400"
             >
-              Enable AI Proposer
+              Enable Local AI Helper
             </button>
           </div>
         )}

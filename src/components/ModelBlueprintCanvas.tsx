@@ -337,7 +337,7 @@ export const ModelBlueprintCanvas: FC<ModelBlueprintCanvasProps> = ({
             <div>
               <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-zinc-500">
                 <Scale className="h-3.5 w-3.5 text-emerald-600" />
-                Standards Applicability Routing (REQ-D6 · REQ-D11)
+                Applicable Standards &amp; Compliance
               </h3>
               <p className="mt-0.5 text-[11px] text-zinc-500">
                 Core weights route to 4 mandatory models + {routing.summary.activeLayeredCount} applicable layered standard(s).

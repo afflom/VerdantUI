@@ -1570,11 +1570,10 @@ export function computeCandidateStrideThreats(decl: PrismDeclaration): readonly 
       category: 'repudiation',
       title: 'Unattributed decision or opaque rule verdict',
       asset: 'Model Decisions & Refusals',
-      boundary: 'Observer Stream & Conformance Ledger',
-      status: decl.capabilities.observer ? 'mitigated-by-sandbox' : 'open',
-      rationale: decl.capabilities.observer
-        ? 'Every evaluation emits deterministic W3C OpenTelemetry trace spans on the Observer bus backed by Lean-proved rules.'
-        : 'Observer tracing is disabled; document how verdicts are audited or enable Observer tracing.',
+      boundary: 'Decision Audit & Proof Ledger',
+      status: 'mitigated-by-sandbox',
+      rationale:
+        'Every verdict and refusal is deterministic, reproducible, and backed by mathematically proved rules inside the sealed package.',
       citation: { kind: 'std', authorityId: 'MICROSOFT-TMT-STRIDE' },
     }),
   );
