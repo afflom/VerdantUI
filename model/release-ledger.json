@@ -71,6 +71,27 @@
         "VUI-FEAT-009"
       ],
       "summary": "Coherent Multimodal Perception, 1-Step Image Synthesis, Modal Audio & Closed-Loop Vision Critique"
+    },
+    {
+      "version": "0.5.0",
+      "tag": "v0.5.0",
+      "releasedAt": "2026-11-26T21:35:52.083Z",
+      "commit": "e049734d03aa99663379631c08aa4e3d688e86c6",
+      "engineTag": "v2.22.4",
+      "studioCommit": "da5083b5ee22e2d9942acee0e03a5b1a0a22e091",
+      "activeFeatureIds": [
+        "VUI-FEAT-001",
+        "VUI-FEAT-002",
+        "VUI-FEAT-003",
+        "VUI-FEAT-004",
+        "VUI-FEAT-005",
+        "VUI-FEAT-006",
+        "VUI-FEAT-007",
+        "VUI-FEAT-008",
+        "VUI-FEAT-009",
+        "VUI-FEAT-010"
+      ],
+      "summary": "Autonomous Prism-Backed Chat Tool-Calls & Natural-Language MediaType Selection"
     }
   ]
 }
