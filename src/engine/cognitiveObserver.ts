@@ -36,6 +36,12 @@ import {
 } from './prismKernel';
 import type { OpfsQuotaSnapshot } from './vramBackingStore';
 import type { VTensorTelemetrySnapshot } from './vtensorProvider';
+import type { OtelEvent } from './observerStreamBus';
+import {
+  prismToolName,
+  shortPrismDigest,
+  type PublishedPrismSummary,
+} from './prismStudio';
 
 export type VerdantThinkingPolicy = 'auto' | 'on' | 'off';
 
@@ -50,7 +56,10 @@ export type BrowserCapabilityOrgan =
   | 'runtime-inspector'
   | 'workspace-notes'
   | 'text-analysis'
-  | 'network-weights';
+  | 'network-weights'
+  | 'prism-runtime'
+  | 'prism-storage'
+  | 'prism-network';
 
 export interface OrganGrantRecord {
   readonly explicitlyDenied: boolean;
@@ -65,6 +74,8 @@ const ALWAYS_SANDBOXED_ORGANS: ReadonlySet<BrowserCapabilityOrgan> = new Set([
   'workspace-notes',
   'text-analysis',
   'network-weights',
+  'prism-runtime',
+  'prism-storage',
 ]);
 
 /**
@@ -110,6 +121,9 @@ export class ContainerGrantMatrix {
       'workspace-notes': this.isAllowed('workspace-notes'),
       'text-analysis': this.isAllowed('text-analysis'),
       'network-weights': this.isAllowed('network-weights'),
+      'prism-runtime': this.isAllowed('prism-runtime'),
+      'prism-storage': this.isAllowed('prism-storage'),
+      'prism-network': this.isAllowed('prism-network'),
     };
   }
 }
@@ -243,12 +257,14 @@ export function computePredictionSurpriseQ10(
 // 3. Direct Deterministic Operator Detection & Safe Execution (LOD0)
 // ============================================================================
 
-export type DirectToolName =
+export type BuiltInDirectToolName =
   | 'calculate'
   | 'current_datetime'
   | 'inspect_runtime'
   | 'workspace_notes'
   | 'analyze_text';
+
+export type DirectToolName = BuiltInDirectToolName | `prism_${string}`;
 
 export interface DirectRouteMatch {
   readonly toolName: DirectToolName;
@@ -256,6 +272,56 @@ export interface DirectRouteMatch {
   readonly organ: BrowserCapabilityOrgan;
   readonly confidenceQ10: number;
   readonly reason: string;
+  readonly prismId?: string;
+  readonly prismName?: string;
+  readonly prismDigest?: string;
+}
+
+/**
+ * Predictable explicit addressing (`@PrismName ...` or `/open PrismName ...`) so Threads can
+ * invoke Published Prisms deterministically without brittle keyword hijacking.
+ */
+export function detectExplicitPrismAddress(
+  text: string,
+  publishedPrisms?: readonly PublishedPrismSummary[],
+): DirectRouteMatch | null {
+  if (!publishedPrisms || publishedPrisms.length === 0) return null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+
+  const isAtMention = trimmed.startsWith('@');
+  const isOpenCmd = /^\/open\s+/i.test(trimmed);
+  if (!isAtMention && !isOpenCmd) return null;
+
+  const rest = isAtMention ? trimmed.slice(1).trim() : trimmed.replace(/^\/open\s+/i, '').trim();
+  if (!rest) return null;
+  const lowerRest = rest.toLowerCase();
+
+  // Match longest Prism name or slug prefix first so "Sensory Monitor" beats "Sensory"
+  const sorted = [...publishedPrisms].sort((a, b) => b.name.length - a.name.length);
+  for (const p of sorted) {
+    const candidates = [p.name.toLowerCase(), p.slug.toLowerCase(), prismToolName(p).toLowerCase()];
+    for (const cand of candidates) {
+      if (!cand) continue;
+      if (lowerRest === cand || lowerRest.startsWith(`${cand} `) || lowerRest.startsWith(`${cand}:`)) {
+        const message = rest
+          .slice(cand.length)
+          .replace(/^[\s:]+/, '')
+          .trim();
+        return {
+          toolName: prismToolName(p) as `prism_${string}`,
+          args: message ? { action: 'input', message } : { action: 'status' },
+          organ: 'prism-runtime',
+          confidenceQ10: 996,
+          reason: `Explicitly addressed Published Prism "${p.name}".`,
+          prismId: p.id,
+          prismName: p.name,
+          prismDigest: p.digest,
+        };
+      }
+    }
+  }
+  return null;
 }
 
 export interface SensoryObservation {
@@ -861,6 +927,7 @@ export interface RouteDecisionContext {
   readonly cachedModelIds: readonly string[];
   readonly isToolContinuationStep: boolean;
   readonly hasImportedHarness: boolean;
+  readonly publishedPrisms?: readonly PublishedPrismSummary[];
 }
 
 /**
@@ -993,8 +1060,10 @@ export class VerdantCognitiveObserver {
       ctx.activeModel !== null && !isInternalBootstrapModel(ctx.activeModel.id);
 
     // Candidate 1: LOD0 Verified Deterministic Route (`REQ-SETTLEMENT`: verified first!)
+    const explicitPrismMatch = detectExplicitPrismAddress(ctx.latestUserText, ctx.publishedPrisms);
+    const effectiveDirectMatch = explicitPrismMatch ?? obs.directMatch;
     {
-      const dm = obs.directMatch;
+      const dm = effectiveDirectMatch;
       const organAllowed = dm ? this.grants.isAllowed(dm.organ) : false;
       const admitted =
         !ctx.isToolContinuationStep &&
@@ -1016,7 +1085,7 @@ export class VerdantCognitiveObserver {
         : 999_999;
       candidates.push({
         routeId: dm ? `lod0:${dm.toolName}` : 'lod0:deterministic',
-        label: dm ? `Verified · ${dm.toolName}` : 'Verified Deterministic',
+        label: dm ? (dm.prismName ? `Prism · ${dm.prismName}` : `Verified · ${dm.toolName}`) : 'Verified Deterministic',
         kind: 'lod0-verified',
         modelId: null,
         admitted,
@@ -1138,7 +1207,7 @@ export class VerdantCognitiveObserver {
 
     const rationale =
       winner.kind === 'lod0-verified'
-        ? obs.directMatch?.reason ?? 'Settled deterministically at LOD0.'
+        ? effectiveDirectMatch?.reason ?? 'Settled deterministically at LOD0.'
         : isRetry
           ? `Regeneration prediction error detected — escalated deductive depth on ${winner.label}.`
           : needsTools
@@ -1157,9 +1226,12 @@ export class VerdantCognitiveObserver {
       kind: winner.kind,
       modelId: winner.modelId,
       thinkingPolicy: winner.kind === 'lod0-verified' ? 'off' : thinkingPolicy,
-      attachTools: winner.kind === 'lod0-verified' ? false : needsTools,
+      attachTools:
+        winner.kind === 'lod0-verified'
+          ? false
+          : needsTools || Boolean(ctx.publishedPrisms && ctx.publishedPrisms.length > 0),
       recommendedSampling,
-      directMatch: winner.kind === 'lod0-verified' ? obs.directMatch : null,
+      directMatch: winner.kind === 'lod0-verified' ? effectiveDirectMatch : null,
       settlementRule,
       freeEnergy: winner.freeEnergy,
       surpriseQ10,
@@ -1219,6 +1291,24 @@ export class VerdantCognitiveObserver {
       ];
     }
     return this.getThreadSnapshot(threadId);
+  }
+
+  /**
+   * Feeds a live OpenTelemetry sensory event (e.g. from a Published Prism) into the Observer's
+   * Global Workspace working memory.
+   */
+  recordSensoryEvent(event: OtelEvent, threadId = 'default-thread'): void {
+    const summary =
+      event.body !== undefined
+        ? typeof event.body === 'string'
+          ? event.body
+          : JSON.stringify(event.body)
+        : event.name;
+    this.recordTurnOutcome(threadId, {
+      factKey: `${event.endpointKind}:${event.endpointId}:${event.name}`,
+      factSummary: summary,
+      hadToolError: event.status === 'error',
+    });
   }
 }
 
@@ -1298,13 +1388,24 @@ export interface RuntimeToolSnapshot {
   readonly lastTokensPerSec: number;
 }
 
+export interface PublishedPrismToolBridge {
+  readonly prisms: readonly PublishedPrismSummary[];
+  dispatchPrism(
+    prismId: string,
+    payload: unknown,
+    signal?: AbortSignal,
+  ): Promise<{ readonly result: unknown; readonly prismName: string; readonly digest: string }>;
+}
+
 /**
- * Creates VerdantUI's 100% client-side `@assistant-ui/react` verified Tool registry.
+ * Creates VerdantUI's 100% client-side `@assistant-ui/react` verified Tool registry,
+ * dynamically registering every Published Prism via its JSON Schema 2020-12 input contract.
  */
 export function createVerdantClientTools(
   getSnapshot: () => RuntimeToolSnapshot,
+  publishedPrismBridge?: PublishedPrismToolBridge,
 ): Record<string, Tool<any, any>> {
-  return {
+  const tools: Record<string, Tool<any, any>> = {
     calculate: {
       description:
         'Evaluate a mathematical expression accurately (supports +, -, *, /, ^, %, parentheses, sqrt, abs, sin, cos, tan, log, ln, exp, floor, ceil, round, min, max, pow, pi, e).',
@@ -1520,11 +1621,47 @@ export function createVerdantClientTools(
       },
     },
   };
+
+  if (publishedPrismBridge) {
+    for (const prism of publishedPrismBridge.prisms) {
+      const name = prismToolName(prism);
+      tools[name] = {
+        description:
+          prism.summary ||
+          `Dispatch an input stream to the Published Prism "${prism.name}" (${shortPrismDigest(prism.digest)}).`,
+        parameters: prism.streams.inputs,
+        execute: async (args: Record<string, unknown>, ctx?: { abortSignal?: AbortSignal }) => {
+          const { result, prismName, digest } = await publishedPrismBridge.dispatchPrism(
+            prism.id,
+            args ?? {},
+            ctx?.abortSignal,
+          );
+          return {
+            __prismInvocation: true,
+            prismId: prism.id,
+            prismName,
+            digest,
+            output: result,
+          };
+        },
+      };
+    }
+  }
+
+  return tools;
 }
 
 /** Formats a concise, grounded Markdown response for a settled LOD0 deterministic operator. */
 export function formatDirectOperatorSummary(toolName: DirectToolName, result: unknown): string {
   const r = result as Record<string, any>;
+  if (toolName.startsWith('prism_') && r && r.__prismInvocation) {
+    const out = r.output;
+    const body =
+      typeof out === 'string'
+        ? out
+        : '```json\n' + JSON.stringify(out, null, 2).slice(0, 1600) + '\n```';
+    return `**${r.prismName}** (\`#${shortPrismDigest(String(r.digest ?? ''))}\`)\n\n${body}`;
+  }
   switch (toolName) {
     case 'calculate':
       return `\`${r.expression}\` = **${r.formatted}**`;
@@ -1561,6 +1698,8 @@ export function formatDirectOperatorSummary(toolName: DirectToolName, result: un
       }
       return `Lines: **${r.lines}** · Words: **${r.words}** · Characters: **${r.chars}**`;
     }
+    default:
+      return '```json\n' + JSON.stringify(r, null, 2).slice(0, 1600) + '\n```';
   }
 }
 

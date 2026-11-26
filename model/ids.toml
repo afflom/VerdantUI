@@ -63,3 +63,9 @@ code = "VUI-OBSERVER-01"
 title = "Unified VerdantUI Cognitive Observer: 8D Q10 harmonic belief state, Predictive Coding surprise, Active Inference Expected Free Energy + Prism CostSurface cross-classified routing, FK-07 capability lattice, and strict per-thread KV isolation"
 owner = "src/engine/cognitiveObserver.ts"
 evidence = "src/engine/cognitiveObserver.test.ts"
+
+[[id]]
+code = "VUI-STUDIO-01"
+title = "Verdant Studio & OpenTelemetry Observer Stream Bus: W3C Trace Context sensory/output routing, canonical SHA-256 .holo packaging, JSON Schema 2020-12 Prism tool contracts, IndexedDB store, and FK-07 sandboxed Prism app execution"
+owner = "src/engine/prismStudio.ts"
+evidence = "src/engine/prismStudio.test.ts"

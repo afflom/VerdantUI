@@ -26,12 +26,14 @@ import {
   ChevronLeft,
   ChevronRight,
   Copy,
+  ExternalLink,
   FileText,
   Loader2,
   Paperclip,
   Pencil,
   RefreshCw,
   SlidersHorizontal,
+  Sparkles,
   Square,
   Wrench,
   X,
@@ -43,6 +45,7 @@ import {
   type CognitiveRouteCertificate,
 } from '../engine/cognitiveObserver';
 import { isInternalBootstrapModel } from '../engine/modelCatalog';
+import { shortPrismDigest } from '../engine/prismStudio';
 import type { EngineState } from '../engine/workerClient';
 
 interface ThreadViewProps {
@@ -51,6 +54,7 @@ interface ThreadViewProps {
   onRetryLoad?: () => void;
   onDismissError?: () => void;
   onToggleInspector: () => void;
+  onOpenPrism?: (prismId: string) => void;
   onSpeculativeDraftChange?: (
     messages: readonly ThreadMessage[],
     draftText: string,
@@ -273,10 +277,68 @@ const VerdantToolCallPart: ToolCallMessagePartComponent = ({
   isError,
   status,
 }) => {
+  const { onOpenPrism } = useContext(AssistantMessageContext);
   const [expanded, setExpanded] = useState(false);
   const isRunning = status?.type === 'running' || (result === undefined && !isError);
   const formattedArgs = argsText?.trim() || formatToolJson(args);
   const formattedResult = formatToolJson(result);
+  const prismPayload =
+    result &&
+    typeof result === 'object' &&
+    (result as Record<string, unknown>).__prismInvocation === true
+      ? (result as {
+          prismId: string;
+          prismName: string;
+          digest: string;
+          output: unknown;
+        })
+      : null;
+
+  if (prismPayload) {
+    return (
+      <div
+        data-testid={`prism-stream-card-${prismPayload.prismId}`}
+        className="my-2.5 rounded-xl border border-emerald-700/30 bg-emerald-50/40 dark:border-emerald-500/30 dark:bg-emerald-950/20"
+      >
+        <div className="flex items-center justify-between gap-2 px-3 py-2">
+          <button
+            type="button"
+            aria-expanded={expanded}
+            onClick={() => setExpanded((prev) => !prev)}
+            className="flex min-w-0 flex-1 items-center gap-1.5 text-left text-xs font-semibold text-emerald-950 dark:text-emerald-200"
+          >
+            {expanded ? (
+              <ChevronDown className="h-3.5 w-3.5 shrink-0 text-emerald-700 dark:text-emerald-400" />
+            ) : (
+              <ChevronRight className="h-3.5 w-3.5 shrink-0 text-emerald-700 dark:text-emerald-400" />
+            )}
+            <Sparkles className="h-3.5 w-3.5 shrink-0 text-emerald-700 dark:text-emerald-400" />
+            <span className="truncate">{prismPayload.prismName}</span>
+            <span className="font-mono text-[10px] font-normal text-emerald-800/75 dark:text-emerald-400/75">
+              #{shortPrismDigest(prismPayload.digest)}
+            </span>
+          </button>
+          {onOpenPrism && (
+            <button
+              type="button"
+              onClick={() => onOpenPrism(prismPayload.prismId)}
+              className="inline-flex shrink-0 items-center gap-1 rounded-md bg-[#0F5132] px-2 py-1 text-[11px] font-medium text-white hover:bg-[#0B3D25] transition-colors"
+            >
+              <ExternalLink className="h-3 w-3" />
+              <span>Open App</span>
+            </button>
+          )}
+        </div>
+        {expanded && (
+          <div className="border-t border-emerald-700/20 px-3 py-2 text-[11px] dark:border-emerald-500/20">
+            <pre className="overflow-x-auto rounded-md bg-white p-2 font-mono text-slate-700 dark:bg-[#0B0F14] dark:text-slate-300">
+              {formatToolJson(prismPayload.output)}
+            </pre>
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div
@@ -451,6 +513,7 @@ const EditComposer: FC = () => (
 interface AssistantMessageContextValue {
   readonly statusDetail: string;
   readonly onInspectRoute: () => void;
+  readonly onOpenPrism?: (prismId: string) => void;
 }
 
 const AssistantMessageContext = createContext<AssistantMessageContextValue>({
@@ -551,6 +614,7 @@ export const ThreadView: FC<ThreadViewProps> = ({
   onRetryLoad,
   onDismissError,
   onToggleInspector,
+  onOpenPrism,
   onSpeculativeDraftChange,
   onCountTokens,
 }) => {
@@ -570,8 +634,9 @@ export const ThreadView: FC<ThreadViewProps> = ({
     () => ({
       statusDetail: engineState.statusDetail,
       onInspectRoute: onToggleInspector,
+      onOpenPrism,
     }),
-    [engineState.statusDetail, onToggleInspector],
+    [engineState.statusDetail, onToggleInspector, onOpenPrism],
   );
 
   return (

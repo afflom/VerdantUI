@@ -19,6 +19,9 @@ import { createLlamaVTensorAdapter } from './engine/assistantAdapter';
 const VTensorInspector = lazy(() =>
   import('./components/VTensorInspector').then((m) => ({ default: m.VTensorInspector })),
 );
+const VerdantStudioView = lazy(() =>
+  import('./components/VerdantStudioView').then((m) => ({ default: m.VerdantStudioView })),
+);
 import type { SamplingConfig } from './engine/llamaRuntime';
 import {
   buildUnifiedVerdantModelContext,
@@ -26,6 +29,13 @@ import {
 } from './engine/cognitiveObserver';
 import type { ImportedHarnessSpec } from './engine/harnessConfig';
 import { isInternalBootstrapModel } from './engine/modelCatalog';
+import { ObserverStreamBus } from './engine/observerStreamBus';
+import { PrismHostPool } from './engine/prismHostPool';
+import {
+  PrismStore,
+  type PublishedPrismSummary,
+  type VerdantPrismProject,
+} from './engine/prismStudio';
 import { createVTensorThreadListAdapter } from './engine/threadStorage';
 import { LlamaVTensorWorkerClient, type EngineState } from './engine/workerClient';
 
@@ -52,20 +62,36 @@ const VerdantModelContextBridge: FC<{
   sampling: SamplingConfig;
   samplingCustomized: boolean;
   workerClient: LlamaVTensorWorkerClient;
-}> = ({ importedHarness, sampling, samplingCustomized, workerClient }) => {
+  publishedPrisms: readonly PublishedPrismSummary[];
+  prismPool: PrismHostPool;
+}> = ({
+  importedHarness,
+  sampling,
+  samplingCustomized,
+  workerClient,
+  publishedPrisms,
+  prismPool,
+}) => {
   const aui = useAui();
   const clientTools = useMemo(
     () =>
-      createVerdantClientTools(() => {
-        const s = workerClient.getState();
-        return {
-          model: s.model,
-          telemetry: s.telemetry,
-          opfsStorage: s.opfsStorage,
-          lastTokensPerSec: s.lastTokensPerSec,
-        };
-      }),
-    [workerClient],
+      createVerdantClientTools(
+        () => {
+          const s = workerClient.getState();
+          return {
+            model: s.model,
+            telemetry: s.telemetry,
+            opfsStorage: s.opfsStorage,
+            lastTokensPerSec: s.lastTokensPerSec,
+          };
+        },
+        {
+          prisms: publishedPrisms,
+          dispatchPrism: (prismId, payload, signal) =>
+            prismPool.dispatchPublishedPrism(prismId, payload, { signal }),
+        },
+      ),
+    [workerClient, publishedPrisms, prismPool],
   );
 
   useEffect(() => {
@@ -91,9 +117,32 @@ const VerdantModelContextBridge: FC<{
   return null;
 };
 
+type ActiveWorkspaceView =
+  | { readonly kind: 'thread' }
+  | { readonly kind: 'prism'; readonly prismId: string; readonly mode: 'studio' | 'app' };
+
 export default function App() {
   const workerClient = useMemo(() => new LlamaVTensorWorkerClient(), []);
-  const modelAdapter = useMemo(() => createLlamaVTensorAdapter(workerClient), [workerClient]);
+  const observerBus = useMemo(() => new ObserverStreamBus(), []);
+  const prismStore = useMemo(() => new PrismStore(), []);
+  const prismPool = useMemo(
+    () =>
+      new PrismHostPool(
+        observerBus,
+        prismStore,
+        workerClient.cognitiveObserver.grants,
+        workerClient,
+      ),
+    [observerBus, prismStore, workerClient],
+  );
+  const modelAdapter = useMemo(
+    () =>
+      createLlamaVTensorAdapter(workerClient, {
+        bus: observerBus,
+        getPublishedPrisms: () => prismStore.listPublishedSummaries(),
+      }),
+    [workerClient, observerBus, prismStore],
+  );
   const attachmentAdapter = useMemo(() => new SimpleTextAttachmentAdapter(), []);
   const threadListAdapter = useMemo(() => createVTensorThreadListAdapter(), []);
 
@@ -114,9 +163,33 @@ export default function App() {
   });
 
   const [engineState, setEngineState] = useState<EngineState>(() => workerClient.getState());
+  const [prisms, setPrisms] = useState<readonly VerdantPrismProject[]>(() => prismStore.list());
+  const [activeView, setActiveView] = useState<ActiveWorkspaceView>({ kind: 'thread' });
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [darkMode, setDarkMode] = useState<boolean>(readInitialDarkMode);
+
+  const publishedPrisms = useMemo(
+    () => prismStore.listPublishedSummaries(),
+    // Recompute whenever `prisms` state updates
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [prismStore, prisms],
+  );
+
+  useEffect(() => {
+    const unsubStore = prismStore.subscribe(setPrisms);
+    void prismStore.hydrate();
+    const unsubBus = observerBus.subscribe((ev) => {
+      if (ev.endpointKind === 'prism') {
+        workerClient.cognitiveObserver.recordSensoryEvent(ev);
+      }
+    });
+    return () => {
+      unsubStore();
+      unsubBus();
+      prismPool.dispose();
+    };
+  }, [prismStore, observerBus, workerClient, prismPool]);
 
   useEffect(() => {
     const unsubscribe = workerClient.subscribe(setEngineState);
@@ -223,6 +296,40 @@ export default function App() {
     await workerClient.runConformanceCheck();
   }, [workerClient]);
 
+  const handleCreatePrism = useCallback(() => {
+    void prismStore.create('blank').then((created) => {
+      setActiveView({ kind: 'prism', prismId: created.id, mode: 'studio' });
+    });
+  }, [prismStore]);
+
+  const handleSelectPrism = useCallback((prismId: string, mode: 'studio' | 'app') => {
+    setActiveView({ kind: 'prism', prismId, mode });
+  }, []);
+
+  const handleOpenPrismApp = useCallback((prismId: string) => {
+    setActiveView({ kind: 'prism', prismId, mode: 'app' });
+  }, []);
+
+  const handleDeletePrism = useCallback(
+    (prismId: string) => {
+      void prismStore.delete(prismId).then(() => {
+        setActiveView((prev) =>
+          prev.kind === 'prism' && prev.prismId === prismId ? { kind: 'thread' } : prev,
+        );
+      });
+    },
+    [prismStore],
+  );
+
+  const handleEnableModelStream = useCallback(() => {
+    void workerClient.setModelStreamEnabled(true).catch(() => {});
+  }, [workerClient]);
+
+  const focusedPrism =
+    activeView.kind === 'prism'
+      ? prisms.find((p) => p.id === activeView.prismId) ?? null
+      : null;
+
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <VerdantModelContextBridge
@@ -230,6 +337,8 @@ export default function App() {
         sampling={engineState.sampling}
         samplingCustomized={engineState.samplingCustomized}
         workerClient={workerClient}
+        publishedPrisms={publishedPrisms}
+        prismPool={prismPool}
       />
       <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#F8F9FA] text-slate-900 dark:bg-[#0B0F14] dark:text-slate-100">
         {/* Top Bar Contract: Single-line brand wordmark on left, concise workspace actions on right */}
@@ -334,18 +443,45 @@ export default function App() {
             mobileOpen={mobileSidebarOpen}
             onCloseMobile={() => setMobileSidebarOpen(false)}
             onOpenInspector={() => setInspectorOpen(true)}
+            activeView={activeView}
+            onSelectThreadView={() => setActiveView({ kind: 'thread' })}
+            prisms={prisms}
+            onCreatePrism={handleCreatePrism}
+            onSelectPrism={handleSelectPrism}
+            onDeletePrism={handleDeletePrism}
           />
 
           <main className="min-w-0 flex-1 overflow-hidden">
-            <ThreadView
-              engineState={engineState}
-              onCancelDownload={handleCancelDownload}
-              onRetryLoad={handleRetryLoad}
-              onDismissError={handleDismissError}
-              onToggleInspector={handleToggleInspector}
-              onSpeculativeDraftChange={handleSpeculativeDraftChange}
-              onCountTokens={handleCountTokens}
-            />
+            {activeView.kind === 'prism' && focusedPrism ? (
+              <Suspense fallback={null}>
+                <VerdantStudioView
+                  project={focusedPrism}
+                  mode={activeView.mode}
+                  onChangeMode={(nextMode) =>
+                    setActiveView({ kind: 'prism', prismId: focusedPrism.id, mode: nextMode })
+                  }
+                  store={prismStore}
+                  bus={observerBus}
+                  bridgeRuntime={prismPool}
+                  workerClient={workerClient}
+                  engineState={engineState}
+                  darkMode={darkMode}
+                  onEnableModelStream={handleEnableModelStream}
+                  onSelectProject={handleSelectPrism}
+                />
+              </Suspense>
+            ) : (
+              <ThreadView
+                engineState={engineState}
+                onCancelDownload={handleCancelDownload}
+                onRetryLoad={handleRetryLoad}
+                onDismissError={handleDismissError}
+                onToggleInspector={handleToggleInspector}
+                onOpenPrism={handleOpenPrismApp}
+                onSpeculativeDraftChange={handleSpeculativeDraftChange}
+                onCountTokens={handleCountTokens}
+              />
+            )}
           </main>
 
           {inspectorOpen && (

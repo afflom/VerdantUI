@@ -31,6 +31,8 @@ import {
   UNIFIED_VERDANT_SYSTEM_PROMPT,
   type VerdantThinkingPolicy,
 } from './cognitiveObserver';
+import type { ObserverStreamBus } from './observerStreamBus';
+import type { PublishedPrismSummary } from './prismStudio';
 import type { LlamaVTensorWorkerClient, PromptFormatMode } from './workerClient';
 
 export type DetectedChatTemplate =
@@ -853,8 +855,14 @@ function hasPendingToolResults(msg: ThreadMessage | null | undefined): boolean {
   );
 }
 
+export interface StudioAdapterBridge {
+  readonly bus: ObserverStreamBus;
+  getPublishedPrisms(): readonly PublishedPrismSummary[];
+}
+
 export function createLlamaVTensorAdapter(
   client: LlamaVTensorWorkerClient,
+  studioBridge?: StudioAdapterBridge,
 ): ChatModelAdapter {
   let roundtripSeq = 0;
 
@@ -873,7 +881,18 @@ export function createLlamaVTensorAdapter(
       const isToolContinuationStep = hasPendingToolResults(pendingAssistantMessage);
       const { text: latestUserText, hasAttachment } = extractLatestUserInput(messages);
 
+      const turnSpan = studioBridge?.bus.startSpan('thread.turn', {
+        endpointKind: 'thread',
+        endpointId: threadId,
+        kind: 'SERVER',
+        attributes: {
+          'verdant.thread.id': threadId,
+          'verdant.input.chars': latestUserText.length,
+        },
+      });
+
       const initialState = client.getState();
+      const publishedPrisms = studioBridge?.getPublishedPrisms() ?? [];
       const { certificate, snapshot } = client.cognitiveObserver.selectRoute({
         threadId,
         messages,
@@ -883,8 +902,13 @@ export function createLlamaVTensorAdapter(
         cachedModelIds: initialState.cachedModelIds,
         isToolContinuationStep,
         hasImportedHarness: initialState.importedHarness !== null,
+        publishedPrisms,
       });
       client.recordCognitiveObservation(certificate, snapshot);
+      turnSpan?.setAttributes({
+        'verdant.route.id': certificate.routeId,
+        'verdant.route.kind': certificate.kind,
+      });
 
       const streamStartTime = Date.now();
 
@@ -911,6 +935,7 @@ export function createLlamaVTensorAdapter(
             });
             client.recordCognitiveObservation(certificate, updatedSnap);
             const totalStreamTime = Date.now() - streamStartTime;
+            turnSpan?.end('ok');
             yield {
               content: [
                 {
@@ -947,6 +972,7 @@ export function createLlamaVTensorAdapter(
             });
             client.recordCognitiveObservation(certificate, updatedSnap);
             const msg = err instanceof Error ? err.message : String(err);
+            turnSpan?.end('error', msg);
             yield {
               content: [{ type: 'text' as const, text: `Unable to evaluate \`${dm.toolName}\`: ${msg}` }],
               status: { type: 'complete', reason: 'stop' },
@@ -968,11 +994,12 @@ export function createLlamaVTensorAdapter(
           client.cognitiveObserver.grants.isAllowed('network-weights');
 
         if (!isAlreadyCachedLocally && !streamAllowed) {
+          turnSpan?.end('ok');
           yield {
             content: [
               {
                 type: 'text' as const,
-                text: 'Model Stream is currently **Off**. Toggle **Model Stream** on in the top bar to stream and cache VerdantUI\'s local neural weights.\n\n*(Verified local actions like exact math, runtime inspection, and JSON validation work immediately even while Model Stream is off.)*',
+                text: 'Model Stream is currently **Off**. Toggle **Model Stream** on in the top bar to stream and cache VerdantUI\'s local neural weights.\n\n*(Verified local actions, Verdant Studio, and Published Prisms addressed with `@PrismName` work immediately even while Model Stream is off.)*',
               },
             ],
             status: { type: 'complete', reason: 'stop' },
@@ -1135,6 +1162,7 @@ export function createLlamaVTensorAdapter(
         idPrefix: stepIdPrefix,
       });
       const totalStreamTime = Date.now() - streamStartTime;
+      turnSpan?.end('ok');
       const toolCallsEmitted = finalParts.filter((p) => p.type === 'tool-call');
       const hasToolCalls = toolCallsEmitted.length > 0;
 

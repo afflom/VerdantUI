@@ -1,0 +1,490 @@
+/**
+ * Prism Host Runtime Pool & FIFO Queued `verdant.ask()` Coordinator.
+ *
+ * Solves two real browser runtime problems cleanly:
+ * 1. Serialized FIFO `verdant.ask()` queue with isolated `threadId = "prism:<id>"` KV namespaces
+ *    so concurrent AI-enabled Prism requests never preempt each other or pollute Thread KV state.
+ * 2. Warm LRU(2) off-screen sandbox pool (60s idle eviction, 3s ready handshake) so Threads can
+ *    invoke Published Prisms deterministically via typed `onInput -> return` RPC even when the
+ *    Prism is not mounted full-screen.
+ */
+
+import type { ContainerGrantMatrix } from './cognitiveObserver';
+import type { ObserverStreamBus, OtelTraceContext } from './observerStreamBus';
+import { buildPrismSandboxDocument } from './prismSandboxHtml';
+import type { PrismStore, VerdantPrismSnapshot } from './prismStudio';
+import { isInternalBootstrapModel } from './modelCatalog';
+import type { LlamaVTensorWorkerClient } from './workerClient';
+
+export interface PrismAskRequest {
+  readonly prismId: string;
+  readonly prompt: string;
+  readonly onToken?: (accumulatedText: string) => void;
+  readonly signal?: AbortSignal;
+  readonly parentContext?: OtelTraceContext;
+}
+
+export interface PrismBridgeRuntime {
+  ask(req: PrismAskRequest): Promise<string>;
+  getKv(prismId: string, grants: VerdantPrismSnapshot['grants'], key: string): Promise<unknown>;
+  setKv(
+    prismId: string,
+    grants: VerdantPrismSnapshot['grants'],
+    key: string,
+    value: unknown,
+  ): Promise<void>;
+  proxiedFetch(
+    prismId: string,
+    grants: VerdantPrismSnapshot['grants'],
+    url: string,
+    init?: { readonly method?: string; readonly headers?: Record<string, string>; readonly body?: string },
+    parentContext?: OtelTraceContext,
+  ): Promise<{ readonly status: number; readonly ok: boolean; readonly text: string }>;
+}
+
+interface PooledPrismInstance {
+  readonly prismId: string;
+  readonly digest: string;
+  readonly channelId: string;
+  readonly iframe: HTMLIFrameElement;
+  readonly readyPromise: Promise<void>;
+  lastUsedAt: number;
+  cleanup: () => void;
+}
+
+const MAX_POOLED_PRISMS = 2;
+const IDLE_EVICT_MS = 60_000;
+const READY_TIMEOUT_MS = 3_000;
+
+export class PrismHostPool implements PrismBridgeRuntime {
+  private askTail: Promise<unknown> = Promise.resolve();
+  private readonly pool = new Map<string, PooledPrismInstance>();
+  private readonly pendingDispatches = new Map<
+    string,
+    { resolve: (v: unknown) => void; reject: (e: Error) => void }
+  >();
+  private dispatchSeq = 1;
+  private evictTimer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(
+    private readonly bus: ObserverStreamBus,
+    private readonly store: PrismStore,
+    private readonly grantsMatrix: ContainerGrantMatrix,
+    private readonly workerClient: LlamaVTensorWorkerClient | null,
+  ) {
+    if (typeof window !== 'undefined') {
+      this.evictTimer = setInterval(() => this.evictIdle(), 15_000);
+    }
+  }
+
+  dispose(): void {
+    if (this.evictTimer !== null) {
+      clearInterval(this.evictTimer);
+      this.evictTimer = null;
+    }
+    for (const inst of this.pool.values()) {
+      inst.cleanup();
+    }
+    this.pool.clear();
+  }
+
+  /**
+   * Serializes `verdant.ask()` calls through a FIFO queue with isolated `prism:<id>` KV state.
+   */
+  ask(req: PrismAskRequest): Promise<string> {
+    const run = async (): Promise<string> => {
+      const span = this.bus.startSpan(`prism.ask:${req.prismId}`, {
+        endpointKind: 'prism',
+        endpointId: req.prismId,
+        kind: 'CLIENT',
+        parentContext: req.parentContext,
+      });
+
+      try {
+        if (!this.workerClient) {
+          throw new Error('VerdantUI inference worker is unavailable.');
+        }
+        const state = this.workerClient.getState();
+        const hasRealModel =
+          state.model !== null && !isInternalBootstrapModel(state.model.id);
+
+        if (!hasRealModel) {
+          const notice = state.modelStreamEnabled
+            ? `Model Stream is initializing (${state.progressPercent}%). Try again once ready.`
+            : 'Model Stream is currently Off. Toggle Model Stream on in the top bar to enable local AI inside Prisms.';
+          span.addEvent('prism.ask.deferred', { reason: notice }, undefined, 'ok');
+          span.end('ok');
+          throw new Error(notice);
+        }
+
+        const prompt = `<|im_start|>system\nYou are VerdantUI assisting a live local Prism app. Be concise and accurate.<|im_end|>\n<|im_start|>user\n${req.prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`;
+        const abortCtrl = new AbortController();
+        const onOuterAbort = () => abortCtrl.abort();
+        if (req.signal) {
+          if (req.signal.aborted) abortCtrl.abort();
+          else req.signal.addEventListener('abort', onOuterAbort, { once: true });
+        }
+
+        let finalText = '';
+        try {
+          for await (const ev of this.workerClient.streamGenerate(
+            prompt,
+            abortCtrl.signal,
+            { ...state.sampling, temperature: 0.4, maxTokens: 512 },
+            `prism:${req.prismId}`,
+          )) {
+            finalText = ev.accumulatedText;
+            req.onToken?.(finalText);
+          }
+        } finally {
+          req.signal?.removeEventListener('abort', onOuterAbort);
+        }
+
+        const cleaned = finalText.trim();
+        span.setAttributes({ 'verdant.output.chars': cleaned.length });
+        span.end('ok');
+        return cleaned;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        span.end('error', msg);
+        throw err;
+      }
+    };
+
+    const next = this.askTail.then(run, run);
+    this.askTail = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
+  async getKv(
+    prismId: string,
+    grants: VerdantPrismSnapshot['grants'],
+    key: string,
+  ): Promise<unknown> {
+    if (!grants.storage || !this.grantsMatrix.isAllowed('prism-storage')) {
+      throw new Error(`Storage grant denied for Prism "${prismId}" (FK-07).`);
+    }
+    return this.store.getKv(prismId, key);
+  }
+
+  async setKv(
+    prismId: string,
+    grants: VerdantPrismSnapshot['grants'],
+    key: string,
+    value: unknown,
+  ): Promise<void> {
+    if (!grants.storage || !this.grantsMatrix.isAllowed('prism-storage')) {
+      throw new Error(`Storage grant denied for Prism "${prismId}" (FK-07).`);
+    }
+    await this.store.setKv(prismId, key, value);
+  }
+
+  async proxiedFetch(
+    prismId: string,
+    grants: VerdantPrismSnapshot['grants'],
+    url: string,
+    init?: { readonly method?: string; readonly headers?: Record<string, string>; readonly body?: string },
+    parentContext?: OtelTraceContext,
+  ): Promise<{ readonly status: number; readonly ok: boolean; readonly text: string }> {
+    const span = this.bus.startSpan(`prism.fetch:${prismId}`, {
+      endpointKind: 'network',
+      endpointId: prismId,
+      kind: 'CLIENT',
+      parentContext,
+      attributes: { 'url.full': url, 'http.request.method': init?.method ?? 'GET' },
+    });
+
+    if (!grants.network) {
+      const msg = `Network grant is Off for this Prism. Enable Network in the Prism Focus drawer to allow fetching ${url}.`;
+      span.end('error', msg);
+      throw new Error(msg);
+    }
+
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(url);
+    } catch {
+      const msg = `Invalid fetch URL "${url}".`;
+      span.end('error', msg);
+      throw new Error(msg);
+    }
+    if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
+      const msg = `Unsupported URL protocol "${parsedUrl.protocol}".`;
+      span.end('error', msg);
+      throw new Error(msg);
+    }
+
+    try {
+      const res = await fetch(parsedUrl.toString(), {
+        method: init?.method ?? 'GET',
+        headers: init?.headers,
+        body: init?.body,
+      });
+      const text = await res.text();
+      span.setAttributes({ 'http.response.status_code': res.status });
+      span.end(res.ok ? 'ok' : 'error');
+      return { status: res.status, ok: res.ok, text: text.slice(0, 128_000) };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      span.end('error', msg);
+      throw err;
+    }
+  }
+
+  /**
+   * Dispatches an input payload to a Published Prism:
+   * - If the Prism is mounted live on screen, uses the mounted `ObserverStreamBus` endpoint.
+   * - Otherwise, boots/reuses a warm off-screen sandboxed iframe (LRU max 2) in the browser,
+   *   or returns a deterministic structured summary in headless Node tests.
+   */
+  async dispatchPublishedPrism(
+    prismId: string,
+    payload: unknown,
+    opts?: { readonly signal?: AbortSignal; readonly parentContext?: OtelTraceContext },
+  ): Promise<{ readonly result: unknown; readonly prismName: string; readonly digest: string }> {
+    const project = this.store.get(prismId);
+    const snapshot = project?.published;
+    if (!project || !snapshot) {
+      throw new Error(`Published Prism "${prismId}" is not available.`);
+    }
+
+    if (this.bus.hasEndpoint(prismId)) {
+      const { result } = await this.bus.dispatchToEndpoint(prismId, payload, {
+        signal: opts?.signal,
+        parentContext: opts?.parentContext,
+      });
+      return { result, prismName: snapshot.name, digest: snapshot.digest };
+    }
+
+    // Headless fallback for Node.js tests where `document` is absent
+    if (typeof document === 'undefined' || typeof window === 'undefined') {
+      const { result } = await this.bus.dispatchToEndpoint(prismId, payload, {
+        signal: opts?.signal,
+        parentContext: opts?.parentContext,
+        fallbackHandler: {
+          endpointId: prismId,
+          endpointKind: 'prism',
+          dispatch: async (input) => ({
+            ok: true,
+            prismId,
+            name: snapshot.name,
+            digest: snapshot.digest,
+            received: input,
+          }),
+        },
+      });
+      return { result, prismName: snapshot.name, digest: snapshot.digest };
+    }
+
+    const instance = this.getOrMountPooledInstance(prismId, snapshot);
+    await instance.readyPromise;
+    instance.lastUsedAt = Date.now();
+
+    const { result } = await this.bus.dispatchToEndpoint(prismId, payload, {
+      signal: opts?.signal,
+      parentContext: opts?.parentContext,
+      fallbackHandler: {
+        endpointId: prismId,
+        endpointKind: 'prism',
+        dispatch: (input, traceContext) =>
+          this.sendDispatchToIframe(instance, input, traceContext),
+      },
+    });
+    return { result, prismName: snapshot.name, digest: snapshot.digest };
+  }
+
+  private getOrMountPooledInstance(
+    prismId: string,
+    snapshot: VerdantPrismSnapshot,
+  ): PooledPrismInstance {
+    const existing = this.pool.get(prismId);
+    if (existing && existing.digest === snapshot.digest) {
+      existing.lastUsedAt = Date.now();
+      return existing;
+    }
+    if (existing) {
+      existing.cleanup();
+      this.pool.delete(prismId);
+    }
+
+    // Evict oldest LRU entry if pool is full
+    if (this.pool.size >= MAX_POOLED_PRISMS) {
+      let oldestKey: string | null = null;
+      let oldestTime = Infinity;
+      for (const [k, v] of this.pool.entries()) {
+        if (v.lastUsedAt < oldestTime) {
+          oldestTime = v.lastUsedAt;
+          oldestKey = k;
+        }
+      }
+      if (oldestKey) {
+        this.pool.get(oldestKey)?.cleanup();
+        this.pool.delete(oldestKey);
+      }
+    }
+
+    const channelId = `pool_${prismId}_${Date.now().toString(36)}`;
+    const iframe = document.createElement('iframe');
+    iframe.setAttribute('sandbox', 'allow-scripts');
+    iframe.setAttribute('aria-hidden', 'true');
+    iframe.style.position = 'fixed';
+    iframe.style.width = '1px';
+    iframe.style.height = '1px';
+    iframe.style.opacity = '0';
+    iframe.style.pointerEvents = 'none';
+    iframe.style.left = '-9999px';
+
+    let resolveReady!: () => void;
+    let rejectReady!: (err: Error) => void;
+    const readyPromise = new Promise<void>((res, rej) => {
+      resolveReady = res;
+      rejectReady = rej;
+    });
+    const readyTimer = setTimeout(() => {
+      rejectReady(new Error(`Background Prism "${snapshot.name}" did not become ready within ${READY_TIMEOUT_MS}ms.`));
+    }, READY_TIMEOUT_MS);
+
+    const onMessage = async (ev: MessageEvent) => {
+      if (ev.source !== iframe.contentWindow) return;
+      const msg = ev.data;
+      if (!msg || !msg.__verdant || msg.channelId !== channelId) return;
+
+      if (msg.type === 'ready') {
+        clearTimeout(readyTimer);
+        resolveReady();
+        return;
+      }
+      if (msg.type === 'emit' && msg.payload) {
+        this.bus.emit({
+          name: String(msg.payload.name ?? 'prism.event'),
+          endpointKind: 'prism',
+          endpointId: prismId,
+          attributes: msg.payload.attributes,
+          body: msg.payload.body,
+        });
+        return;
+      }
+      if (msg.type === 'runtime-error' && msg.payload) {
+        this.bus.emit({
+          name: 'prism.runtime.error',
+          endpointKind: 'prism',
+          endpointId: prismId,
+          status: 'error',
+          attributes: { 'error.message': String(msg.payload.message ?? 'Runtime error') },
+        });
+        return;
+      }
+      if (msg.type === 'dispatch-response' && msg.payload?.reqId) {
+        const waiter = this.pendingDispatches.get(msg.payload.reqId);
+        this.pendingDispatches.delete(msg.payload.reqId);
+        if (!waiter) return;
+        if (msg.payload.ok) waiter.resolve(msg.payload.value);
+        else waiter.reject(new Error(String(msg.payload.error ?? 'Prism handler failed')));
+        return;
+      }
+      if (msg.type === 'rpc' && msg.payload?.reqId) {
+        const { reqId, method, args } = msg.payload as {
+          reqId: string;
+          method: string;
+          args: Record<string, unknown>;
+        };
+        const reply = (ok: boolean, value?: unknown, error?: string) => {
+          iframe.contentWindow?.postMessage(
+            { __verdant: true, channelId, type: 'rpc-result', payload: { reqId, ok, value, error } },
+            '*',
+          );
+        };
+        try {
+          if (method === 'storage.get') {
+            reply(true, await this.getKv(prismId, snapshot.grants, String(args?.key ?? '')));
+          } else if (method === 'storage.set') {
+            await this.setKv(prismId, snapshot.grants, String(args?.key ?? ''), args?.value);
+            reply(true, true);
+          } else if (method === 'ask') {
+            const text = await this.ask({
+              prismId,
+              prompt: String(args?.prompt ?? ''),
+              onToken: (partial) => {
+                iframe.contentWindow?.postMessage(
+                  { __verdant: true, channelId, type: 'rpc-token', payload: { reqId, text: partial } },
+                  '*',
+                );
+              },
+            });
+            reply(true, text);
+          } else if (method === 'fetch') {
+            const res = await this.proxiedFetch(
+              prismId,
+              snapshot.grants,
+              String(args?.url ?? ''),
+              args?.init as { method?: string; headers?: Record<string, string>; body?: string },
+            );
+            reply(true, res);
+          } else {
+            reply(false, undefined, `Unsupported bridge method "${method}".`);
+          }
+        } catch (err) {
+          reply(false, undefined, err instanceof Error ? err.message : String(err));
+        }
+      }
+    };
+
+    window.addEventListener('message', onMessage);
+    iframe.srcdoc = buildPrismSandboxDocument({
+      prismId,
+      channelId,
+      snapshot,
+      darkMode: document.documentElement.classList.contains('dark'),
+    });
+    document.body.appendChild(iframe);
+
+    const instance: PooledPrismInstance = {
+      prismId,
+      digest: snapshot.digest,
+      channelId,
+      iframe,
+      readyPromise,
+      lastUsedAt: Date.now(),
+      cleanup: () => {
+        clearTimeout(readyTimer);
+        window.removeEventListener('message', onMessage);
+        iframe.remove();
+      },
+    };
+    this.pool.set(prismId, instance);
+    return instance;
+  }
+
+  private sendDispatchToIframe(
+    instance: PooledPrismInstance,
+    input: unknown,
+    traceContext: OtelTraceContext,
+  ): Promise<unknown> {
+    const reqId = `disp_${this.dispatchSeq++}`;
+    return new Promise((resolve, reject) => {
+      this.pendingDispatches.set(reqId, { resolve, reject });
+      instance.iframe.contentWindow?.postMessage(
+        {
+          __verdant: true,
+          channelId: instance.channelId,
+          type: 'dispatch-input',
+          payload: { reqId, input, traceContext },
+        },
+        '*',
+      );
+    });
+  }
+
+  private evictIdle(): void {
+    const now = Date.now();
+    for (const [id, inst] of this.pool.entries()) {
+      if (now - inst.lastUsedAt > IDLE_EVICT_MS) {
+        inst.cleanup();
+        this.pool.delete(id);
+      }
+    }
+  }
+}
