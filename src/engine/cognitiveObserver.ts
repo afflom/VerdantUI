@@ -49,6 +49,10 @@ import {
   type ContextCompartmentId,
   type PublishedPrismOrgan,
 } from './unifiedPossessionModel';
+import { detectStudioChatIntent } from './studioChatIntent';
+import type { StudioChatBridge } from './studioChatBridge';
+import type { GalleryMediaType } from './contentGalleryStore';
+import type { UnifiedExpertRegistry } from './unifiedModelBasis';
 
 export type VerdantThinkingPolicy = 'auto' | 'on' | 'off';
 
@@ -269,7 +273,11 @@ export type BuiltInDirectToolName =
   | 'current_datetime'
   | 'inspect_runtime'
   | 'workspace_notes'
-  | 'analyze_text';
+  | 'analyze_text'
+  | 'studio_create_artifact'
+  | 'studio_refine_prism'
+  | 'studio_manage_spaces'
+  | 'studio_browse_gallery';
 
 export type DirectToolName = BuiltInDirectToolName | `prism_${string}`;
 
@@ -651,6 +659,18 @@ function detectDirectOperator(text: string, hasAttachment: boolean): DirectRoute
         reason: 'Deterministic JSON validation & formatting settled at LOD0.',
       };
     }
+  }
+
+  // 6. Direct natural-language Verdant Studio creation, refinement, Space curation & Gallery browsing
+  const studioIntent = detectStudioChatIntent(trimmed, hasAttachment);
+  if (studioIntent) {
+    return {
+      toolName: studioIntent.toolName,
+      args: studioIntent.args,
+      organ: 'prism-runtime',
+      confidenceQ10: studioIntent.confidenceQ10,
+      reason: studioIntent.reason,
+    };
   }
 
   return null;
@@ -1445,27 +1465,28 @@ export class VerdantCognitiveObserver {
 // ============================================================================
 
 export const UNIFIED_VERDANT_SYSTEM_PROMPT = [
-  'You are VerdantUI, a unified private AI assistant running 100% locally in the user\'s browser.',
+  'You are VerdantUI, a unified private AI assistant running 100% locally in the user\'s browser with built-in Verdant Studio multimedia synthesis.',
   'Be accurate, clear, and concise. When working through complex problems inside <think>...</think>, verify edge cases before giving a crisp final answer.',
-  'When <tools> are provided or a specialized interactive app/tool helps fulfill the user\'s request, invoke it with exact JSON inside <tool_call>...</tool_call> and stop immediately after </tool_call> to await <tool_response>. Every tool call runs as a local Prism — if no matching Prism exists yet, VerdantUI will automatically synthesize and run one for you. Never fabricate tool results.',
+  'Whenever the user asks to generate a picture/image, compose music/audio, create a video, build a game or utility, start a structured story/research workspace, or create/organize Spaces and Galleries, ALWAYS invoke the appropriate Verdant Studio tool (`studio_create_artifact`, `studio_refine_prism`, `studio_manage_spaces`, or `studio_browse_gallery`) inside <tool_call>...</tool_call> and stop immediately after </tool_call>. Never claim you cannot create images, audio, video, or interactive apps.',
+  'Every tool call runs as a local Prism in the unified model — if no matching Prism exists yet, VerdantUI will automatically synthesize and run one for you. Never fabricate tool results.',
 ].join('\n');
 
 export const UNIFIED_VERDANT_SUGGESTIONS: readonly HarnessSuggestionSpec[] = [
   {
-    label: 'Quick exact math',
-    prompt: 'Calculate (144 * 37) + sqrt(625)',
+    label: 'Generate a picture',
+    prompt: 'Generate a picture of a misty emerald mountain lake at sunset',
   },
   {
-    label: 'Plan my afternoon',
-    prompt: 'Help me schedule a focused 45-minute project review without conflicting with my busy times.',
+    label: 'Compose stereo audio',
+    prompt: 'Compose a calm ambient dorian synth soundscape at 84 BPM',
   },
   {
-    label: 'Brainstorm a project',
-    prompt: 'Give me 4 creative ideas for a relaxing puzzle game I can build in Studio.',
+    label: 'Build a playable game',
+    prompt: 'Build a playable Breakout arcade game',
   },
   {
-    label: 'Summarize clearly',
-    prompt: 'Explain the key benefits of keeping personal AI completely on-device in 4 short bullet points.',
+    label: 'Create a Space',
+    prompt: 'Create a Space called Alpine Expedition',
   },
 ];
 
@@ -1552,6 +1573,8 @@ export function createVerdantClientTools(
   publishedPrismBridge?: PublishedPrismToolBridge,
   episodicRecallBridge?: EpisodicRecallToolBridge,
   getActiveSpace?: () => ContextCompartmentId,
+  studioChatBridge?: StudioChatBridge | (() => Promise<StudioChatBridge>),
+  expertRegistry?: UnifiedExpertRegistry,
 ): Record<string, Tool<any, any>> {
   const tools: Record<string, Tool<any, any>> = {
     calculate: {
@@ -1831,12 +1854,156 @@ export function createVerdantClientTools(
     };
   }
 
+  if (studioChatBridge) {
+    const resolveStudioBridge = async (): Promise<StudioChatBridge> =>
+      typeof studioChatBridge === 'function' ? studioChatBridge() : studioChatBridge;
+    tools.studio_create_artifact = {
+      description:
+        'Create and synthesize any high-spec multimedia artifact (Picture, Audio, Video, Document, Game, Research workspace, or Utility) through Verdant Studio and index it into its Global MediaType Gallery (and optional Space).',
+      parameters: {
+        type: 'object',
+        properties: {
+          prompt: { type: 'string', description: 'Plain-English description of the artifact to generate.' },
+          title: { type: 'string', description: 'Optional short title.' },
+          spaceName: { type: 'string', description: 'Optional Space name to add the created artifact into.' },
+        },
+        required: ['prompt'],
+      },
+      execute: async (args: { prompt?: string; title?: string; spaceName?: string }) =>
+        (await resolveStudioBridge()).createArtifactFromPrompt({
+          prompt: String(args?.prompt ?? 'Custom creation'),
+          title: typeof args?.title === 'string' ? args.title : undefined,
+          spaceName: typeof args?.spaceName === 'string' ? args.spaceName : undefined,
+        }),
+    };
+    tools.studio_refine_prism = {
+      description:
+        'Refine or update an existing Prism or Space in natural language (e.g. change picture lighting/colors, adjust audio BPM/scale, change game difficulty, or update Space layout).',
+      parameters: {
+        type: 'object',
+        properties: {
+          target: { type: 'string', description: 'Name or ID of the Prism to refine (or "latest").' },
+          instruction: { type: 'string', description: 'What to change.' },
+        },
+        required: ['instruction'],
+      },
+      execute: async (args: { target?: string; instruction?: string }) =>
+        (await resolveStudioBridge()).refinePrismFromPrompt({
+          target: typeof args?.target === 'string' ? args.target : 'latest',
+          instruction: String(args?.instruction ?? ''),
+        }),
+    };
+    tools.studio_manage_spaces = {
+      description:
+        'Create, list, curate (add items to), open, publish, or delete Spaces and Prisms.',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'create', 'add_item', 'open', 'publish', 'delete'],
+          },
+          name: { type: 'string' },
+          target: { type: 'string' },
+          description: { type: 'string' },
+          artifact: { type: 'string' },
+          space: { type: 'string' },
+          addLatest: { type: 'boolean' },
+          spacesOnly: { type: 'boolean' },
+        },
+        required: ['action'],
+      },
+      execute: async (args: Record<string, unknown>) =>
+        (await resolveStudioBridge()).manageSpacesAndPrisms({
+          action: String(args?.action ?? 'list') as 'list' | 'create' | 'add_item' | 'open' | 'publish' | 'delete',
+          name: typeof args?.name === 'string' ? args.name : undefined,
+          target: typeof args?.target === 'string' ? args.target : undefined,
+          description: typeof args?.description === 'string' ? args.description : undefined,
+          artifact: typeof args?.artifact === 'string' ? args.artifact : undefined,
+          space: typeof args?.space === 'string' ? args.space : undefined,
+          addLatest: Boolean(args?.addLatest),
+          spacesOnly: Boolean(args?.spacesOnly),
+        }),
+    };
+    tools.studio_browse_gallery = {
+      description:
+        'Open and list items in a Global MediaType Gallery (picture, video, audio, written-work, interactive-game, research-program, tool-organ).',
+      parameters: {
+        type: 'object',
+        properties: {
+          mediaType: {
+            type: 'string',
+            enum: ['picture', 'video', 'audio', 'written-work', 'interactive-game', 'research-program', 'tool-organ'],
+          },
+          category: { type: 'string' },
+        },
+        required: ['mediaType'],
+      },
+      execute: async (args: { mediaType?: string; category?: string }) =>
+        (await resolveStudioBridge()).browseGallery(
+          (args?.mediaType || 'picture') as GalleryMediaType,
+          typeof args?.category === 'string' ? args.category : undefined,
+        ),
+    };
+  }
+
+  if (expertRegistry) {
+    tools.recall_basis = {
+      description:
+        'Search VerdantUI\'s growing on-device knowledge, skills, Spaces, and previously created artifacts.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Topic, title, or tag to search.' },
+          limit: { type: 'number' },
+        },
+      },
+      execute: async (args: { query?: string; limit?: number }) => ({
+        entries: expertRegistry.basis.recallKnowledge({
+          text: typeof args?.query === 'string' ? args.query : undefined,
+          limit: typeof args?.limit === 'number' ? args.limit : 5,
+        }),
+      }),
+    };
+  }
+
   return tools;
 }
 
 /** Formats a concise, grounded Markdown response for a settled LOD0 deterministic operator. */
 export function formatDirectOperatorSummary(toolName: DirectToolName, result: unknown): string {
   const r = result as Record<string, any>;
+  if (
+    (toolName === 'studio_create_artifact' ||
+      toolName === 'studio_refine_prism' ||
+      toolName === 'studio_manage_spaces' ||
+      toolName === 'studio_browse_gallery') &&
+    r &&
+    r.__prismInvocation
+  ) {
+    if (r.action === 'list' || r.action === 'gallery') {
+      return String(r.summary || 'Opened gallery.');
+    }
+    if (r.action === 'delete' || r.action === 'open' || r.action === 'publish') {
+      return String(r.summary || `Updated **${r.prismName}**.`);
+    }
+    const where = r.spaceName
+      ? `Saved to **${r.galleryLabel ?? 'Galleries'}** and added to Space **${r.spaceName}**.`
+      : r.galleryLabel
+        ? `Saved to **${r.galleryLabel}**.`
+        : '';
+    return [
+      r.action === 'update'
+        ? `Updated **${r.prismName}**.`
+        : r.action === 'space'
+          ? `Space **${r.prismName}** is ready.`
+          : `Created **${r.prismName}**.`,
+      where,
+      r.writtenExcerpt ? `\n${r.writtenExcerpt}` : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
+  }
   if (toolName.startsWith('prism_') && r && r.__prismInvocation) {
     const out = r.output;
     const body =

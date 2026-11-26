@@ -1,4 +1,4 @@
-import { useRef, createContext, useContext, useEffect, useMemo, useState, type ChangeEvent, type FC } from 'react';
+import { Suspense, lazy, useRef, createContext, useContext, useEffect, useMemo, useState, type ChangeEvent, type FC } from 'react';
 import {
   ActionBarPrimitive,
   AttachmentPrimitive,
@@ -27,6 +27,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Copy,
+  Download,
   ExternalLink,
   FileText,
   Image as ImageIcon,
@@ -35,6 +36,7 @@ import {
   MicOff,
   Paperclip,
   Pencil,
+  Play,
   RefreshCw,
   Sparkles,
   Square,
@@ -45,11 +47,17 @@ import {
   UNIFIED_VERDANT_SUGGESTIONS,
   UNIFIED_VERDANT_SYSTEM_PROMPT,
 } from '../engine/cognitiveObserver';
-import { shortPrismDigest, type PublishedPrismSummary } from '../engine/prismStudio';
+import type { ObserverStreamBus } from '../engine/observerStreamBus';
+import type { PrismBridgeRuntime } from '../engine/prismHostPool';
+import { shortPrismDigest, type PublishedPrismSummary, type VerdantPrismProject } from '../engine/prismStudio';
 import { BrowserVoiceRecorder } from '../engine/audioFrontend';
 import type { PerceivedAudioReport } from '../engine/inference.worker';
 import type { PerceivedImageReport } from '../engine/visionCritiqueLoop';
 import type { EngineState } from '../engine/workerClient';
+
+const LazyPrismSandboxFrame = lazy(() =>
+  import('./PrismSandboxFrame').then((m) => ({ default: m.PrismSandboxFrame })),
+);
 
 interface ThreadViewProps {
   engineState: EngineState;
@@ -59,6 +67,10 @@ interface ThreadViewProps {
   onToggleInspector: () => void;
   onOpenPrism?: (prismId: string) => void;
   onEditPrism?: (prismId: string) => void;
+  getPrismById?: (prismId: string) => VerdantPrismProject | null;
+  observerBus?: ObserverStreamBus;
+  bridgeRuntime?: PrismBridgeRuntime;
+  darkMode?: boolean;
   publishedPrisms?: readonly PublishedPrismSummary[];
   onSpeculativeDraftChange?: (
     messages: readonly ThreadMessage[],
@@ -290,8 +302,10 @@ const VerdantToolCallPart: ToolCallMessagePartComponent = ({
   isError,
   status,
 }) => {
-  const { onOpenPrism, onEditPrism } = useContext(AssistantMessageContext);
+  const { onOpenPrism, onEditPrism, getPrismById, observerBus, bridgeRuntime, darkMode } =
+    useContext(AssistantMessageContext);
   const [expanded, setExpanded] = useState(false);
+  const [inlineLive, setInlineLive] = useState(false);
   const isRunning = status?.type === 'running' || (result === undefined && !isError);
   const formattedArgs = argsText?.trim() || formatToolJson(args);
   const formattedResult = formatToolJson(result);
@@ -300,90 +314,230 @@ const VerdantToolCallPart: ToolCallMessagePartComponent = ({
     typeof result === 'object' &&
     (result as Record<string, unknown>).__prismInvocation === true
       ? (result as {
+          action?: string;
           autoCreated?: boolean;
           prismId: string;
           prismName: string;
+          mediaType?: string;
+          galleryLabel?: string;
+          categories?: readonly string[];
+          spaceName?: string;
           digest: string;
+          summary?: string;
+          previewImageDataUrl?: string;
+          previewImageWidth?: number;
+          previewImageHeight?: number;
+          audioWavDataUrl?: string;
+          audioDurationSec?: number;
+          writtenExcerpt?: string;
+          coherenceNote?: string;
+          prismsList?: readonly {
+            readonly id: string;
+            readonly name: string;
+            readonly mediaType: string;
+            readonly published: boolean;
+            readonly summary: string;
+            readonly previewDataUrl?: string;
+          }[];
           output: unknown;
         })
       : null;
 
   if (prismPayload) {
-    const outObj =
-      prismPayload.output && typeof prismPayload.output === 'object' && !Array.isArray(prismPayload.output)
-        ? (prismPayload.output as Record<string, unknown>)
+    const liveProj =
+      prismPayload.action !== 'list' &&
+      prismPayload.action !== 'gallery' &&
+      prismPayload.action !== 'delete' &&
+      getPrismById
+        ? getPrismById(prismPayload.prismId)
         : null;
-    const summaryEntries = outObj
-      ? Object.entries(outObj)
-          .filter(([, v]) => typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean')
-          .slice(0, 4)
-      : [];
+    const liveSnapshot = liveProj ? (liveProj.published ?? liveProj.draft) : null;
+    const canMountInline = Boolean(liveSnapshot && observerBus && bridgeRuntime);
+    const showActionButtons =
+      prismPayload.action !== 'list' &&
+      prismPayload.action !== 'gallery' &&
+      prismPayload.action !== 'delete';
 
     return (
       <div
         data-testid={`prism-stream-card-${prismPayload.prismId}`}
-        className="my-2.5 rounded-xl border border-emerald-700/30 bg-emerald-50/40 dark:border-emerald-500/30 dark:bg-emerald-950/20"
+        className="my-2.5 overflow-hidden rounded-xl border border-emerald-700/30 bg-emerald-50/40 dark:border-emerald-500/30 dark:bg-emerald-950/20"
       >
         <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
-          <button
-            type="button"
-            aria-expanded={expanded}
-            onClick={() => setExpanded((prev) => !prev)}
-            className="flex min-w-0 flex-1 items-center gap-1.5 text-left text-xs font-semibold text-emerald-950 dark:text-emerald-200"
-          >
-            {expanded ? (
-              <ChevronDown className="h-3.5 w-3.5 shrink-0 text-emerald-700 dark:text-emerald-400" />
-            ) : (
-              <ChevronRight className="h-3.5 w-3.5 shrink-0 text-emerald-700 dark:text-emerald-400" />
-            )}
+          <div className="flex min-w-0 flex-1 items-center gap-1.5 text-left text-xs font-semibold text-emerald-950 dark:text-emerald-200">
             <Sparkles className="h-3.5 w-3.5 shrink-0 text-emerald-700 dark:text-emerald-400" />
             <span className="truncate">{prismPayload.prismName}</span>
-            {prismPayload.autoCreated && (
+            {prismPayload.galleryLabel && (
               <span className="rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-800 dark:bg-emerald-900/60 dark:text-emerald-200">
-                Created
+                {prismPayload.galleryLabel}
               </span>
             )}
-            <span className="font-mono text-[10px] font-normal text-emerald-800/75 dark:text-emerald-400/75">
-              #{shortPrismDigest(prismPayload.digest)}
-            </span>
-          </button>
-          <div className="flex shrink-0 items-center gap-1.5">
-            {onEditPrism && (
-              <button
-                type="button"
-                onClick={() => onEditPrism(prismPayload.prismId)}
-                className="inline-flex items-center rounded-md border border-emerald-700/30 bg-white px-2 py-1 text-[11px] font-medium text-emerald-900 hover:bg-emerald-50 dark:border-emerald-500/30 dark:bg-[#0F141C] dark:text-emerald-300 dark:hover:bg-emerald-950/50 transition-colors"
-              >
-                Studio
-              </button>
-            )}
-            {onOpenPrism && (
-              <button
-                type="button"
-                onClick={() => onOpenPrism(prismPayload.prismId)}
-                className="inline-flex items-center gap-1 rounded-md bg-[#0F5132] px-2 py-1 text-[11px] font-medium text-white hover:bg-[#0B3D25] transition-colors"
-              >
-                <ExternalLink className="h-3 w-3" />
-                <span>Open App</span>
-              </button>
+            {prismPayload.spaceName && (
+              <span className="rounded-full bg-white/80 px-1.5 py-0.5 text-[10px] font-medium text-slate-700 dark:bg-slate-800 dark:text-slate-200">
+                {prismPayload.spaceName}
+              </span>
             )}
           </div>
+          {showActionButtons && (
+            <div className="flex shrink-0 items-center gap-1.5">
+              {canMountInline && (
+                <button
+                  type="button"
+                  onClick={() => setInlineLive((v) => !v)}
+                  className="inline-flex items-center gap-1 rounded-md border border-emerald-700/30 bg-white px-2 py-1 text-[11px] font-medium text-emerald-900 hover:bg-emerald-50 dark:border-emerald-500/30 dark:bg-[#0F141C] dark:text-emerald-300 dark:hover:bg-emerald-950/50 transition-colors"
+                >
+                  <Play className="h-3 w-3" />
+                  <span>{inlineLive ? 'Hide Preview' : 'Interact Here'}</span>
+                </button>
+              )}
+              {onEditPrism && (
+                <button
+                  type="button"
+                  onClick={() => onEditPrism(prismPayload.prismId)}
+                  className="inline-flex items-center rounded-md border border-emerald-700/30 bg-white px-2 py-1 text-[11px] font-medium text-emerald-900 hover:bg-emerald-50 dark:border-emerald-500/30 dark:bg-[#0F141C] dark:text-emerald-300 dark:hover:bg-emerald-950/50 transition-colors"
+                >
+                  Studio
+                </button>
+              )}
+              {onOpenPrism && (
+                <button
+                  type="button"
+                  onClick={() => onOpenPrism(prismPayload.prismId)}
+                  className="inline-flex items-center gap-1 rounded-md bg-[#0F5132] px-2 py-1 text-[11px] font-medium text-white hover:bg-[#0B3D25] transition-colors"
+                >
+                  <ExternalLink className="h-3 w-3" />
+                  <span>Open</span>
+                </button>
+              )}
+            </div>
+          )}
         </div>
-        {summaryEntries.length > 0 && !expanded && (
-          <div className="flex flex-wrap gap-x-3 gap-y-1 border-t border-emerald-700/15 px-3 py-1.5 text-[11px] text-slate-700 dark:border-emerald-500/15 dark:text-slate-300">
-            {summaryEntries.map(([k, v]) => (
-              <span key={k}>
-                <span className="text-slate-500 dark:text-slate-400">{k}:</span>{' '}
-                <strong className="font-mono font-medium">{String(v)}</strong>
+
+        {/* Inline Rendered Picture / Video Poster */}
+        {prismPayload.previewImageDataUrl && !inlineLive && (
+          <div className="border-t border-emerald-700/15 bg-slate-950/90 p-2 dark:border-emerald-500/15">
+            <img
+              src={prismPayload.previewImageDataUrl}
+              alt={prismPayload.prismName}
+              className="mx-auto max-h-[420px] w-auto rounded-lg object-contain shadow-sm"
+            />
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 px-1 text-[11px] text-slate-300">
+              <span>{prismPayload.coherenceNote || prismPayload.summary || prismPayload.prismName}</span>
+              <a
+                href={prismPayload.previewImageDataUrl}
+                download={`${prismPayload.prismName.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.png`}
+                className="inline-flex items-center gap-1 rounded-md bg-white/10 px-2 py-1 text-[11px] font-medium text-white hover:bg-white/20"
+              >
+                <Download className="h-3 w-3" />
+                <span>Download PNG</span>
+              </a>
+            </div>
+          </div>
+        )}
+
+        {/* Inline Playable Stereo WAV Audio Player */}
+        {prismPayload.audioWavDataUrl && !inlineLive && (
+          <div className="border-t border-emerald-700/15 bg-white/80 px-3 py-2.5 dark:border-emerald-500/15 dark:bg-[#0F141C]">
+            <audio controls src={prismPayload.audioWavDataUrl} className="w-full" />
+            <div className="mt-1.5 flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400">
+              <span>
+                Stereo WAV{prismPayload.audioDurationSec ? ` · ${prismPayload.audioDurationSec}s` : ''}
               </span>
+              <a
+                href={prismPayload.audioWavDataUrl}
+                download={`${prismPayload.prismName.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.wav`}
+                className="inline-flex items-center gap-1 font-medium text-emerald-700 hover:underline dark:text-emerald-400"
+              >
+                <Download className="h-3 w-3" />
+                <span>Download WAV</span>
+              </a>
+            </div>
+          </div>
+        )}
+
+        {/* Clickable Gallery / Space List */}
+        {prismPayload.prismsList && prismPayload.prismsList.length > 0 && (
+          <div className="divide-y divide-emerald-700/10 border-t border-emerald-700/15 bg-white/75 dark:divide-emerald-500/10 dark:border-emerald-500/15 dark:bg-[#0F141C]">
+            {prismPayload.prismsList.slice(0, 8).map((item) => (
+              <div key={item.id} className="flex items-center justify-between gap-2 px-3 py-2 text-xs">
+                <div className="flex min-w-0 items-center gap-2.5">
+                  {item.previewDataUrl && (
+                    <img
+                      src={item.previewDataUrl}
+                      alt={item.name}
+                      className="h-9 w-12 shrink-0 rounded object-cover"
+                    />
+                  )}
+                  <div className="min-w-0">
+                    <div className="truncate font-medium text-slate-900 dark:text-slate-100">
+                      {item.name}
+                    </div>
+                    <div className="truncate text-[11px] text-slate-500 dark:text-slate-400">
+                      {item.summary}
+                    </div>
+                  </div>
+                </div>
+                <div className="flex shrink-0 items-center gap-1">
+                  {onEditPrism && (
+                    <button
+                      type="button"
+                      onClick={() => onEditPrism(item.id)}
+                      className="rounded border border-slate-200 px-2 py-0.5 text-[11px] text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                    >
+                      Studio
+                    </button>
+                  )}
+                  {onOpenPrism && (
+                    <button
+                      type="button"
+                      onClick={() => onOpenPrism(item.id)}
+                      className="rounded bg-[#0F5132] px-2 py-0.5 text-[11px] font-medium text-white hover:bg-[#0B3D25]"
+                    >
+                      Open
+                    </button>
+                  )}
+                </div>
+              </div>
             ))}
           </div>
         )}
-        {expanded && (
-          <div className="border-t border-emerald-700/20 px-3 py-2 text-[11px] dark:border-emerald-500/20">
-            <pre className="overflow-x-auto rounded-md bg-white p-2 font-mono text-slate-700 dark:bg-[#0B0F14] dark:text-slate-300">
-              {formatToolJson(prismPayload.output)}
-            </pre>
+
+        {/* Inline Live Sandboxed Prism Interaction Frame */}
+        {inlineLive && liveSnapshot && observerBus && bridgeRuntime && (
+          <div className="h-[440px] w-full border-t border-emerald-700/20 bg-white dark:border-emerald-500/20 dark:bg-[#0B0F14]">
+            <Suspense
+              fallback={
+                <div className="flex h-full items-center justify-center text-xs text-slate-500">
+                  Loading preview…
+                </div>
+              }
+            >
+              <LazyPrismSandboxFrame
+                prismId={prismPayload.prismId}
+                snapshot={liveSnapshot}
+                darkMode={Boolean(darkMode)}
+                bus={observerBus}
+                bridgeRuntime={bridgeRuntime}
+                className="h-full w-full"
+              />
+            </Suspense>
+          </div>
+        )}
+
+        {/* Subtle categories footer */}
+        {prismPayload.categories && prismPayload.categories.length > 0 && !inlineLive && (
+          <div className="flex flex-wrap items-center gap-1.5 border-t border-emerald-700/15 px-3 py-1.5 text-[10px] text-slate-600 dark:border-emerald-500/15 dark:text-slate-400">
+            {prismPayload.categories.map((cat) => (
+              <span
+                key={cat}
+                className="rounded-full bg-white/80 px-2 py-0.5 font-medium dark:bg-slate-800/80"
+              >
+                {cat}
+              </span>
+            ))}
+            <span className="ml-auto font-mono opacity-60">
+              #{shortPrismDigest(prismPayload.digest)}
+            </span>
           </div>
         )}
       </div>
@@ -565,6 +719,10 @@ interface AssistantMessageContextValue {
   readonly onInspectRoute: () => void;
   readonly onOpenPrism?: (prismId: string) => void;
   readonly onEditPrism?: (prismId: string) => void;
+  readonly getPrismById?: (prismId: string) => VerdantPrismProject | null;
+  readonly observerBus?: ObserverStreamBus;
+  readonly bridgeRuntime?: PrismBridgeRuntime;
+  readonly darkMode?: boolean;
 }
 
 const AssistantMessageContext = createContext<AssistantMessageContextValue>({
@@ -647,6 +805,10 @@ export const ThreadView: FC<ThreadViewProps> = ({
   onToggleInspector,
   onOpenPrism,
   onEditPrism,
+  getPrismById,
+  observerBus,
+  bridgeRuntime,
+  darkMode,
   publishedPrisms = [],
   onSpeculativeDraftChange,
   onPerceiveImage,
@@ -777,8 +939,12 @@ export const ThreadView: FC<ThreadViewProps> = ({
       onInspectRoute: onToggleInspector,
       onOpenPrism,
       onEditPrism,
+      getPrismById,
+      observerBus,
+      bridgeRuntime,
+      darkMode,
     }),
-    [engineState.statusDetail, onToggleInspector, onOpenPrism, onEditPrism],
+    [engineState.statusDetail, onToggleInspector, onOpenPrism, onEditPrism, getPrismById, observerBus, bridgeRuntime, darkMode],
   );
 
   return (

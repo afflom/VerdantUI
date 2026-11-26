@@ -16,7 +16,14 @@ export interface MusicalNoteEvent {
   readonly durationBeats: number;
   readonly velocity: number; // 0..1
   readonly pan: number; // -1 (left) .. +1 (right)
-  readonly timbre: 'modal-bell' | 'warm-pad' | 'plucked-bass' | 'soft-pulse';
+  readonly timbre:
+    | 'modal-bell'
+    | 'warm-pad'
+    | 'plucked-bass'
+    | 'soft-pulse'
+    | 'crisp-snare'
+    | 'hi-hat'
+    | 'sfx-chime';
 }
 
 export interface MusicalComposition {
@@ -113,14 +120,43 @@ export function composeMultiTrackArrangement(params: {
       pan: Math.sin(stepIdx * 0.7) * 0.45,
       timbre: 'modal-bell',
     });
-    if (params.style === 'rhythm-pulse' && stepIdx % 2 === 0) {
+    if (params.style === 'rhythm-pulse') {
+      if (stepIdx % 2 === 0) {
+        events.push({
+          midi: params.rootMidi - 24,
+          startBeat: beat,
+          durationBeats: 0.28,
+          velocity: 0.44,
+          pan: 0,
+          timbre: 'soft-pulse',
+        });
+      }
+      if (stepIdx % 4 === 2) {
+        events.push({
+          midi: params.rootMidi + 12,
+          startBeat: beat,
+          durationBeats: 0.22,
+          velocity: 0.34,
+          pan: 0.08,
+          timbre: 'crisp-snare',
+        });
+      }
       events.push({
-        midi: params.rootMidi - 24,
+        midi: params.rootMidi + 36,
         startBeat: beat,
-        durationBeats: 0.2,
-        velocity: 0.35,
-        pan: 0,
-        timbre: 'soft-pulse',
+        durationBeats: 0.12,
+        velocity: stepIdx % 2 === 1 ? 0.22 : 0.14,
+        pan: stepIdx % 2 === 1 ? 0.28 : -0.22,
+        timbre: 'hi-hat',
+      });
+    } else if (params.style === 'sound-effects' && stepIdx % 3 === 0) {
+      events.push({
+        midi: params.rootMidi + 19 + scale[(stepIdx * 2) % scale.length]!,
+        startBeat: beat,
+        durationBeats: 0.85,
+        velocity: 0.42,
+        pan: ((stepIdx % 3) - 1) * 0.4,
+        timbre: 'sfx-chime',
       });
     }
     stepIdx += 1;
@@ -171,6 +207,22 @@ export function synthesizeCompositionStereoPcm(
     'soft-pulse': [
       { ratio: 1.0, amp: 1.0, decay: 12.0 },
       { ratio: 1.41, amp: 0.3, decay: 18.0 },
+    ],
+    'crisp-snare': [
+      { ratio: 1.0, amp: 0.7, decay: 16.0 },
+      { ratio: 2.31, amp: 0.55, decay: 22.0 },
+      { ratio: 4.17, amp: 0.42, decay: 28.0 },
+    ],
+    'hi-hat': [
+      { ratio: 1.0, amp: 0.4, decay: 38.0 },
+      { ratio: 1.63, amp: 0.5, decay: 44.0 },
+      { ratio: 2.47, amp: 0.45, decay: 52.0 },
+    ],
+    'sfx-chime': [
+      { ratio: 1.0, amp: 1.0, decay: 3.1 },
+      { ratio: 2.0, amp: 0.55, decay: 4.2 },
+      { ratio: 3.01, amp: 0.35, decay: 5.5 },
+      { ratio: 4.98, amp: 0.2, decay: 7.4 },
     ],
   };
 
@@ -287,4 +339,17 @@ export function encodeStereoWav(
     off += 4;
   }
   return new Uint8Array(buf);
+}
+
+/** Encodes a 16-bit stereo WAV byte buffer as a playable `data:audio/wav;base64,...` data URL. */
+export function encodeStereoWavDataUrl(wavBytes: Uint8Array): string {
+  if (typeof Buffer !== 'undefined') {
+    return `data:audio/wav;base64,${Buffer.from(wavBytes.buffer, wavBytes.byteOffset, wavBytes.byteLength).toString('base64')}`;
+  }
+  let bin = '';
+  const step = 0x8000;
+  for (let i = 0; i < wavBytes.length; i += step) {
+    bin += String.fromCharCode(...wavBytes.subarray(i, Math.min(wavBytes.length, i + step)));
+  }
+  return `data:audio/wav;base64,${btoa(bin)}`;
 }

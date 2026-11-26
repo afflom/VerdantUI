@@ -66,3 +66,8 @@
 
 - **Requirements:** `REQ-AUTO-MEDIATYPE-INFERENCE`, `REQ-PRISM-BACKED-TOOL-CALLS`
 - **Decision:** "Instead of exposing more clutter in the UI/UX such as the mediatype selection buttons, the model will select these for the user based on the user's natural language input. When a model attempts a tool-call, the tool called will be a prism. If no prism exists to meet the model's requirement, the model can create a prism, so that it can use its Prism to perform the task of its tool-call."
+
+## DEC-014 (2026-11-26)
+
+- **Requirements:** `REQ-UNIFIED-EXPERT-BASIS`, `REQ-GLOBAL-MEDIATYPE-GALLERIES`, `REQ-SPACES-AS-PRISMS`
+- **Decision:** "Artifacts are saved to galleries by mediatype and then further categorized from there... Spaces have content and a view of their content. Each Space is a Verdant Prism. All parts of VerdantUI including its language, vision, image, audio, user, and all other models and content are experts and their weights in the VerdantUI unified model. The VerdantUI training basis is never static, so it grows its knowledge and skills as needed."

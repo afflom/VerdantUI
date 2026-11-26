@@ -12,6 +12,7 @@
  */
 
 import type { VerdantCognitiveObserver } from './cognitiveObserver';
+import type { ContentGalleryStore } from './contentGalleryStore';
 import type { PrismHostPool } from './prismHostPool';
 import type { PrismMediaType } from './prismMediaOrgans';
 import {
@@ -24,6 +25,11 @@ import {
   classifyArtifactMediaType,
   parseDiscoveryAgentResponse,
 } from './prismStudioAgent';
+import {
+  StudioChatBridge,
+  type StudioChatArtifactResult,
+} from './studioChatBridge';
+import type { UnifiedExpertRegistry } from './unifiedModelBasis';
 import type { ContextCompartmentId } from './unifiedPossessionModel';
 
 export interface PrismToolInvocationResult {
@@ -34,6 +40,15 @@ export interface PrismToolInvocationResult {
   readonly mediaType: PrismMediaType;
   readonly compartmentId: ContextCompartmentId;
   readonly digest: string;
+  readonly summary?: string;
+  readonly galleryLabel?: string;
+  readonly categories?: readonly string[];
+  readonly previewImageDataUrl?: string;
+  readonly previewImageWidth?: number;
+  readonly previewImageHeight?: number;
+  readonly audioWavDataUrl?: string;
+  readonly audioDurationSec?: number;
+  readonly writtenExcerpt?: string;
   readonly output: unknown;
 }
 
@@ -143,9 +158,12 @@ export async function resolveOrCreatePrismForToolCall(params: {
   readonly store: PrismStore;
   readonly pool: PrismHostPool;
   readonly observer: VerdantCognitiveObserver;
+  readonly galleries?: ContentGalleryStore;
+  readonly registry?: UnifiedExpertRegistry;
+  readonly studioChatBridge?: StudioChatBridge;
   readonly signal?: AbortSignal;
 }): Promise<PrismToolInvocationResult> {
-  const { toolName, args, latestUserText, activeSpace, store, pool, observer, signal } = params;
+  const { toolName, args, latestUserText, activeSpace, store, pool, observer, studioChatBridge, signal } = params;
 
   observer.syncPublishedPrisms(store.list());
   const visiblePublished = observer.getVisiblePublishedPrismsForSpace(
@@ -174,8 +192,36 @@ export async function resolveOrCreatePrismForToolCall(params: {
     };
   }
 
-  // 2. No matching Prism exists in this Space -> procedurally synthesize and publish one!
+  // 2. If full StudioChatBridge is wired, synthesize through Verdant Studio with real inline PNG/WAV/Gallery/Basis integration!
   const { title, description } = buildSynthesisDescription(toolName, args, latestUserText);
+  if (studioChatBridge) {
+    const res: StudioChatArtifactResult = await studioChatBridge.createArtifactFromPrompt({
+      prompt: `${title}. ${description}`,
+      title,
+      weightOverrides: { ...args, compartmentId: activeSpace },
+    });
+    return {
+      __prismInvocation: true,
+      autoCreated: true,
+      prismId: res.prismId,
+      prismName: res.prismName,
+      mediaType: res.mediaType,
+      compartmentId: activeSpace,
+      digest: res.digest,
+      summary: res.summary,
+      galleryLabel: res.galleryLabel,
+      categories: res.categories,
+      previewImageDataUrl: res.previewImageDataUrl,
+      previewImageWidth: res.previewImageWidth,
+      previewImageHeight: res.previewImageHeight,
+      audioWavDataUrl: res.audioWavDataUrl,
+      audioDurationSec: res.audioDurationSec,
+      writtenExcerpt: res.writtenExcerpt,
+      output: res.output,
+    };
+  }
+
+  // 3. Standalone fallback when called without StudioChatBridge (headless unit tests)
   const classified = classifyArtifactMediaType(`${title}. ${description}`);
   const created = await store.createDeclarative('undefined');
   const baseDecl = created.declaration!;

@@ -14,6 +14,23 @@
  */
 
 import type { PrismDeclaration } from './verdantStudioApi';
+import { inferPictureWeightsFromPrompt, type PictureLightingMood } from './proceduralPictureRenderer';
+import {
+  buildArcadeCanvasRuntimeJs,
+  buildCellularSimRuntimeJs,
+  buildGridPuzzleRuntimeJs,
+  buildGridSweepRuntimeJs,
+  buildTurnBoardRuntimeJs,
+} from './prismGameRuntimes';
+import {
+  buildAudioRuntimeJs,
+  buildPictureRuntimeJs,
+  buildResearchProgramRuntimeJs,
+  buildSpaceRuntimeJs,
+  buildToolOrganRuntimeJs,
+  buildVideoRuntimeJs,
+  buildWrittenWorkRuntimeJs,
+} from './prismMediaRuntimes';
 
 export type PrismMediaType =
   | 'picture'
@@ -22,7 +39,8 @@ export type PrismMediaType =
   | 'video'
   | 'interactive-game'
   | 'research-program'
-  | 'tool-organ';
+  | 'tool-organ'
+  | 'space';
 
 export type StudioFeatureOrgan =
   | 'visual-canvas'
@@ -55,6 +73,8 @@ export function requiredCapabilitiesForMediaType(mediaType: PrismMediaType): rea
       return ['language', 'vision'];
     case 'tool-organ':
       return ['language'];
+    case 'space':
+      return ['language', 'vision'];
   }
 }
 
@@ -111,10 +131,17 @@ export const PRISM_MEDIA_CATALOG: Readonly<Record<PrismMediaType, MediaTypeDescr
   },
   'tool-organ': {
     mediaType: 'tool-organ',
-    label: 'Tool',
-    shortSummary: 'Personal utility, habit & schedule guardian, or everyday helper',
+    label: 'Utility',
+    shortSummary: 'Personal utility, habit & schedule guardian, calculator, or workflow helper',
     activeOrgans: ['rule-invariants', 'sensory-stream', 'impulse-emitter', 'privacy-compartment'],
-    activeWizardQuestions: ['core routine or rules', 'space & privacy sharing preference'],
+    activeWizardQuestions: ['core routine or rules', 'metrics or schedule preferences'],
+  },
+  space: {
+    mediaType: 'space',
+    label: 'Space',
+    shortSummary: 'Curated Verdant Prism space organizing arbitrary content with a live custom view',
+    activeOrgans: ['palette-theme', 'narrative-outline', 'evidence-ledger'],
+    activeWizardQuestions: ['space focus & theme', 'layout style & curated sections'],
   },
 };
 
@@ -127,7 +154,16 @@ export function deriveActiveStudioOrgans(mediaType: PrismMediaType): readonly St
 // ============================================================================
 
 export type PictureGeneratorKind =
+  | 'landscape-vista'
+  | 'cosmic-nebula'
+  | 'architectural-scene'
+  | 'botanical-garden'
+  | 'ocean-seascape'
+  | 'abstract-flow'
   | 'geometric-mosaic'
+  | 'constellation-atlas'
+  | 'poster-editorial'
+  | 'pixel-scene'
   | 'botanical-fractal'
   | 'wave-field'
   | 'constellation'
@@ -136,6 +172,7 @@ export type PictureGeneratorKind =
 export interface PictureWeights {
   readonly mediaType: 'picture';
   readonly generator: PictureGeneratorKind;
+  readonly lighting?: PictureLightingMood;
   readonly width: number;
   readonly height: number;
   readonly seed: number;
@@ -313,6 +350,24 @@ export interface ToolOrganWeights {
   readonly metrics: readonly ToolOrganMetricWeight[];
 }
 
+export interface SpaceArtifactEntry {
+  readonly id: string;
+  readonly title: string;
+  readonly mediaType: Exclude<PrismMediaType, 'space'>;
+  readonly summary: string;
+  readonly categories?: readonly string[];
+  readonly previewDataUrl?: string;
+}
+
+export interface SpaceWeights {
+  readonly mediaType: 'space';
+  readonly title: string;
+  readonly description: string;
+  readonly layout: 'grid' | 'board' | 'showcase' | 'timeline';
+  readonly accent: string;
+  readonly items: readonly SpaceArtifactEntry[];
+}
+
 export type ProceduralOrganWeights =
   | PictureWeights
   | AudioWeights
@@ -320,7 +375,8 @@ export type ProceduralOrganWeights =
   | VideoWeights
   | InteractiveGameWeights
   | ResearchProgramWeights
-  | ToolOrganWeights;
+  | ToolOrganWeights
+  | SpaceWeights;
 
 export interface ProceduralOrganSpec {
   readonly mediaType: PrismMediaType;
@@ -402,42 +458,91 @@ export function normalizeOrganWeights(
   const p = rawPatch ?? {};
   const lowerHint = `${titleHint} ${hintText}`.toLowerCase();
 
+  if (mediaType === 'space') {
+    const allowedLayouts: readonly SpaceWeights['layout'][] = ['grid', 'board', 'showcase', 'timeline'];
+    const layout = allowedLayouts.includes(p.layout as SpaceWeights['layout'])
+      ? (p.layout as SpaceWeights['layout'])
+      : /\b(board|kanban|columns?)\b/.test(lowerHint)
+        ? 'board'
+        : /\b(showcase|gallery|hero)\b/.test(lowerHint)
+          ? 'showcase'
+          : /\b(timeline|chronolog|journal)\b/.test(lowerHint)
+            ? 'timeline'
+            : 'grid';
+    const rawItems = Array.isArray(p.items) ? p.items : [];
+    const items: SpaceArtifactEntry[] = rawItems
+      .filter((x): x is Record<string, unknown> => Boolean(x && typeof x === 'object'))
+      .slice(0, 64)
+      .map((it, idx) => ({
+        id: safeStr(it.id, `item_${idx + 1}`, 80),
+        title: safeStr(it.title, `Artifact ${idx + 1}`, 80),
+        mediaType: (typeof it.mediaType === 'string' && it.mediaType !== 'space'
+          ? it.mediaType
+          : 'tool-organ') as SpaceArtifactEntry['mediaType'],
+        summary: safeStr(it.summary, '', 200),
+        categories: Array.isArray(it.categories)
+          ? it.categories.map((c) => safeStr(c, '', 32)).filter(Boolean).slice(0, 4)
+          : [],
+        previewDataUrl: typeof it.previewDataUrl === 'string' ? it.previewDataUrl : undefined,
+      }));
+    return {
+      mediaType: 'space',
+      title: safeStr(p.title, titleHint, 100),
+      description: safeStr(p.description, hintText || `Curated Verdant Space "${titleHint}".`, 240),
+      layout,
+      accent: safeHex(p.accent, '#0f5132'),
+      items,
+    };
+  }
+
   if (mediaType === 'picture') {
+    const inferredPic = inferPictureWeightsFromPrompt(hintText || titleHint, titleHint);
     const allowedGen: readonly PictureGeneratorKind[] = [
+      'landscape-vista',
+      'cosmic-nebula',
+      'architectural-scene',
+      'botanical-garden',
+      'ocean-seascape',
+      'abstract-flow',
       'geometric-mosaic',
+      'constellation-atlas',
+      'poster-editorial',
+      'pixel-scene',
       'botanical-fractal',
       'wave-field',
       'constellation',
       'pixel-sprite',
     ];
-    let defaultGen: PictureGeneratorKind = 'geometric-mosaic';
-    if (/\b(tree|plant|forest|flower|leaf|botanical|fractal|fern)\b/.test(lowerHint)) {
-      defaultGen = 'botanical-fractal';
-    } else if (/\b(wave|ocean|sound|ripple|flow|ribbon|aurora)\b/.test(lowerHint)) {
-      defaultGen = 'wave-field';
-    } else if (/\b(star|space|galaxy|constellation|night|cosmos)\b/.test(lowerHint)) {
-      defaultGen = 'constellation';
-    } else if (/\b(pixel|8-?bit|sprite|retro)\b/.test(lowerHint)) {
-      defaultGen = 'pixel-sprite';
-    }
     const gen = allowedGen.includes(p.generator as PictureGeneratorKind)
       ? (p.generator as PictureGeneratorKind)
-      : defaultGen;
+      : inferredPic.generator;
+    const allowedLights: readonly PictureLightingMood[] = [
+      'golden-hour',
+      'twilight',
+      'midnight',
+      'daylight',
+      'neon',
+      'studio',
+    ];
+    const lighting = allowedLights.includes(p.lighting as PictureLightingMood)
+      ? (p.lighting as PictureLightingMood)
+      : inferredPic.lighting;
     const rawPal = Array.isArray(p.palette) ? p.palette : [];
     const palette: [string, string, string, string] = [
-      safeHex(rawPal[0], '#0b1714'),
-      safeHex(rawPal[1], '#10b981'),
-      safeHex(rawPal[2], '#f59e0b'),
-      safeHex(rawPal[3], '#ecfdf5'),
+      safeHex(rawPal[0], inferredPic.palette[0]),
+      safeHex(rawPal[1], inferredPic.palette[1]),
+      safeHex(rawPal[2], inferredPic.palette[2]),
+      safeHex(rawPal[3], inferredPic.palette[3]),
     ];
     return {
       mediaType: 'picture',
       generator: gen,
-      width: clampInt(p.width, 320, 1600, 768),
-      height: clampInt(p.height, 240, 1200, 512),
-      seed: clampInt(p.seed, 1, 999_999, 4219),
-      symmetry: clampInt(p.symmetry, 1, 16, gen === 'geometric-mosaic' ? 6 : 4),
-      density: clampInt(p.density, 8, 120, 42),
+      lighting,
+      width: clampInt(p.width, 320, 1600, inferredPic.width),
+      height: clampInt(p.height, 240, 1200, inferredPic.height),
+      seed: clampInt(p.seed, 1, 999_999, inferredPic.seed),
+      symmetry: clampInt(p.symmetry, 1, 16, inferredPic.symmetry),
+      density: clampInt(p.density, 8, 120, inferredPic.density),
       palette,
       caption: safeStr(p.caption, titleHint, 140),
     };
@@ -827,10 +932,6 @@ function escHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-function safeJsonForScript(obj: unknown): string {
-  return JSON.stringify(obj).replace(/<\//g, '<\\/');
-}
-
 const PROCEDURAL_BASE_CSS = `
 :root {
   --v-bg: #f8f9fa;
@@ -885,1148 +986,6 @@ canvas.organ-canvas { display: block; width: 100%; height: auto; border-radius: 
 .organ-textarea { width: 100%; min-height: 220px; padding: 12px; border-radius: 10px; border: 1px solid var(--v-border); background: var(--v-bg); color: var(--v-text); font: inherit; font-size: 14px; line-height: 1.65; resize: vertical; }
 `;
 
-function buildGridSweepRuntimeJs(weights: GridSweepGameWeights): string {
-  return `
-const W = ${safeJsonForScript(weights)};
-const root = document.getElementById('organ-root');
-let rows = W.rows, cols = W.cols, mines = W.mines;
-let board = [], revealed = [], flagged = [], firstClick = true, over = false, won = false;
-let flagMode = false, elapsed = 0, timerId = null;
-
-function stopTimer() { if (timerId) { clearInterval(timerId); timerId = null; } }
-function startTimer() {
-  if (!W.showTimer || timerId) return;
-  timerId = setInterval(() => { elapsed += 1; updateHud(); }, 1000);
-}
-function syncModel(statusCode) {
-  try {
-    if (globalThis.prism && typeof globalThis.prism.invoke === 'function') {
-      void globalThis.prism.invoke(rows + ' ' + cols + ' ' + mines + ' ' + statusCode).catch(() => {});
-    }
-  } catch (_) {}
-}
-function neighbors(r, c) {
-  const out = [];
-  for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
-    if (dr === 0 && dc === 0) continue;
-    const nr = r + dr, nc = c + dc;
-    if (nr >= 0 && nr < rows && nc >= 0 && nc < cols) out.push([nr, nc]);
-  }
-  return out;
-}
-function placeMines(safeR, safeC) {
-  const forbidden = new Set();
-  if (W.firstClickSafe) {
-    forbidden.add(safeR + ',' + safeC);
-    for (const [nr, nc] of neighbors(safeR, safeC)) forbidden.add(nr + ',' + nc);
-  }
-  const pool = [];
-  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
-    if (!forbidden.has(r + ',' + c)) pool.push([r, c]);
-  }
-  for (let i = pool.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [pool[i], pool[j]] = [pool[j], pool[i]];
-  }
-  const target = Math.min(mines, pool.length);
-  for (let i = 0; i < target; i++) board[pool[i][0]][pool[i][1]] = -1;
-  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
-    if (board[r][c] === -1) continue;
-    let cnt = 0;
-    for (const [nr, nc] of neighbors(r, c)) if (board[nr][nc] === -1) cnt += 1;
-    board[r][c] = cnt;
-  }
-}
-function initGame(r = rows, c = cols, m = mines) {
-  rows = r; cols = c; mines = Math.min(m, Math.max(1, r * c - 9));
-  stopTimer(); elapsed = 0; firstClick = true; over = false; won = false;
-  board = Array.from({ length: rows }, () => Array(cols).fill(0));
-  revealed = Array.from({ length: rows }, () => Array(cols).fill(false));
-  flagged = Array.from({ length: rows }, () => Array(cols).fill(false));
-  render();
-}
-function revealCell(r, c) {
-  if (over || flagged[r][c]) return;
-  if (firstClick) {
-    firstClick = false;
-    placeMines(r, c);
-    startTimer();
-  }
-  if (revealed[r][c]) {
-    if (W.chordReveal && board[r][c] > 0) {
-      const adj = neighbors(r, c);
-      const adjFlags = adj.filter(([nr, nc]) => flagged[nr][nc]).length;
-      if (adjFlags === board[r][c]) {
-        for (const [nr, nc] of adj) if (!revealed[nr][nc] && !flagged[nr][nc]) revealCell(nr, nc);
-      }
-    }
-    return;
-  }
-  if (board[r][c] === -1) {
-    over = true; won = false; stopTimer();
-    for (let rr = 0; rr < rows; rr++) for (let cc = 0; cc < cols; cc++) {
-      if (board[rr][cc] === -1) revealed[rr][cc] = true;
-    }
-    syncModel(2);
-    render();
-    return;
-  }
-  const queue = [[r, c]];
-  while (queue.length > 0) {
-    const [cr, cc] = queue.shift();
-    if (revealed[cr][cc] || flagged[cr][cc]) continue;
-    revealed[cr][cc] = true;
-    if (W.floodReveal && board[cr][cc] === 0) {
-      for (const [nr, nc] of neighbors(cr, cc)) {
-        if (!revealed[nr][nc] && !flagged[nr][nc]) queue.push([nr, nc]);
-      }
-    }
-  }
-  let safeLeft = 0;
-  for (let rr = 0; rr < rows; rr++) for (let cc = 0; cc < cols; cc++) {
-    if (board[rr][cc] !== -1 && !revealed[rr][cc]) safeLeft += 1;
-  }
-  if (safeLeft === 0) {
-    over = true; won = true; stopTimer();
-    for (let rr = 0; rr < rows; rr++) for (let cc = 0; cc < cols; cc++) {
-      if (board[rr][cc] === -1) flagged[rr][cc] = true;
-    }
-    syncModel(1);
-  }
-  render();
-}
-function toggleFlag(r, c) {
-  if (over || revealed[r][c]) return;
-  flagged[r][c] = !flagged[r][c];
-  render();
-}
-function updateHud() {
-  const t = document.getElementById('ms-timer');
-  if (t) t.textContent = elapsed + 's';
-}
-function render() {
-  const flagCount = flagged.flat().filter(Boolean).length;
-  const remaining = mines - flagCount;
-  const statusText = over ? (won ? 'Cleared! You won!' : 'Hit a mine — try again!') : 'Active';
-  const cellPx = cols > 18 ? 24 : cols > 12 ? 28 : 32;
-  root.innerHTML = '';
-
-  const hud = document.createElement('div');
-  hud.className = 'organ-row';
-  hud.style.justifyContent = 'space-between';
-  hud.style.marginBottom = '12px';
-
-  const stats = document.createElement('div');
-  stats.className = 'organ-row';
-  stats.innerHTML =
-    '<span class="organ-pill">Mines: ' + remaining + '</span>' +
-    (W.showTimer ? '<span class="organ-pill">Time: <span id="ms-timer">' + elapsed + 's</span></span>' : '') +
-    '<span class="organ-pill" style="' + (over ? (won ? 'border-color:#10b981;color:#10b981' : 'border-color:#dc2626;color:#dc2626') : '') + '">' + statusText + '</span>';
-  hud.appendChild(stats);
-
-  const controls = document.createElement('div');
-  controls.className = 'organ-row';
-  const flagBtn = document.createElement('button');
-  flagBtn.type = 'button';
-  flagBtn.className = 'organ-btn' + (flagMode ? ' primary' : '');
-  flagBtn.textContent = flagMode ? 'Flag Mode: ON' : 'Flag Mode';
-  flagBtn.onclick = () => { flagMode = !flagMode; render(); };
-  controls.appendChild(flagBtn);
-
-  const newBtn = document.createElement('button');
-  newBtn.type = 'button';
-  newBtn.className = 'organ-btn primary';
-  newBtn.textContent = 'New Game';
-  newBtn.onclick = () => initGame();
-  controls.appendChild(newBtn);
-  hud.appendChild(controls);
-  root.appendChild(hud);
-
-  if (W.presets && W.presets.length > 0) {
-    const presetRow = document.createElement('div');
-    presetRow.className = 'organ-row';
-    presetRow.style.marginBottom = '12px';
-    for (const pr of W.presets) {
-      const b = document.createElement('button');
-      b.type = 'button';
-      const active = pr.rows === rows && pr.cols === cols && pr.mines === mines;
-      b.className = 'organ-btn' + (active ? ' primary' : '');
-      b.textContent = pr.label + ' (' + pr.rows + '×' + pr.cols + ' · ' + pr.mines + ')';
-      b.onclick = () => initGame(pr.rows, pr.cols, pr.mines);
-      presetRow.appendChild(b);
-    }
-    root.appendChild(presetRow);
-  }
-
-  const wrap = document.createElement('div');
-  wrap.style.overflowX = 'auto';
-  wrap.style.paddingBottom = '6px';
-  const grid = document.createElement('div');
-  grid.className = 'ms-grid';
-  grid.style.gridTemplateColumns = 'repeat(' + cols + ', ' + cellPx + 'px)';
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.style.width = cellPx + 'px';
-      btn.style.height = cellPx + 'px';
-      const isRev = revealed[r][c];
-      const isFlag = flagged[r][c];
-      const val = board[r][c];
-      btn.className = 'ms-cell' + (isRev ? (val === -1 ? ' rev mine' : ' rev ms-n' + val) : isFlag ? ' flag' : '');
-      btn.textContent = isRev ? (val === -1 ? '✹' : val > 0 ? String(val) : '') : (isFlag ? '⚑' : '');
-      btn.setAttribute('aria-label', 'Row ' + (r + 1) + ' Col ' + (c + 1));
-      btn.onclick = () => (flagMode ? toggleFlag(r, c) : revealCell(r, c));
-      btn.oncontextmenu = (ev) => { ev.preventDefault(); toggleFlag(r, c); };
-      grid.appendChild(btn);
-    }
-  }
-  wrap.appendChild(grid);
-  root.appendChild(wrap);
-
-  const hint = document.createElement('p');
-  hint.className = 'organ-sub';
-  hint.style.textAlign = 'center';
-  hint.style.marginTop = '10px';
-  hint.textContent = 'Left-click to reveal · Right-click (or Flag Mode) to mark mines · Click a revealed number to chord';
-  root.appendChild(hint);
-}
-initGame();
-`;
-}
-
-function buildPictureRuntimeJs(weights: PictureWeights): string {
-  return `
-const W = ${safeJsonForScript(weights)};
-const root = document.getElementById('organ-root');
-let seed = W.seed, symmetry = W.symmetry, density = W.density, generator = W.generator;
-
-function mulberry32(a) {
-  return function() {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function drawArtwork(canvas) {
-  const ctx = canvas.getContext('2d');
-  const w = canvas.width, h = canvas.height;
-  const rng = mulberry32(seed);
-  const [bg, c1, c2, c3] = W.palette;
-  ctx.fillStyle = bg;
-  ctx.fillRect(0, 0, w, h);
-
-  const cx = w / 2, cy = h / 2, rad = Math.min(w, h) * 0.44;
-  if (generator === 'wave-field') {
-    for (let i = 0; i < density; i++) {
-      ctx.beginPath();
-      const yBase = (h / (density + 1)) * (i + 1);
-      const amp = 14 + rng() * 36;
-      const freq = 0.008 + rng() * 0.015;
-      const phase = rng() * Math.PI * 2;
-      for (let x = 0; x <= w; x += 6) {
-        const y = yBase + Math.sin(x * freq + phase) * amp;
-        if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-      }
-      ctx.strokeStyle = i % 3 === 0 ? c1 : i % 3 === 1 ? c2 : c3;
-      ctx.globalAlpha = 0.55;
-      ctx.lineWidth = 2 + (i % 3);
-      ctx.stroke();
-    }
-  } else if (generator === 'constellation') {
-    const pts = [];
-    for (let i = 0; i < density; i++) pts.push([rng() * w, rng() * h, 1.5 + rng() * 3.5]);
-    ctx.strokeStyle = c1; ctx.globalAlpha = 0.28; ctx.lineWidth = 1;
-    for (let i = 0; i < pts.length; i++) for (let j = i + 1; j < pts.length; j++) {
-      const dx = pts[i][0] - pts[j][0], dy = pts[i][1] - pts[j][1];
-      if (dx * dx + dy * dy < 14000) { ctx.beginPath(); ctx.moveTo(pts[i][0], pts[i][1]); ctx.lineTo(pts[j][0], pts[j][1]); ctx.stroke(); }
-    }
-    for (let i = 0; i < pts.length; i++) {
-      ctx.globalAlpha = 0.9;
-      ctx.fillStyle = i % 4 === 0 ? c2 : c3;
-      ctx.beginPath(); ctx.arc(pts[i][0], pts[i][1], pts[i][2], 0, Math.PI * 2); ctx.fill();
-    }
-  } else if (generator === 'botanical-fractal') {
-    function branch(x, y, len, angle, depth) {
-      if (depth <= 0 || len < 4) return;
-      const x2 = x + Math.cos(angle) * len, y2 = y + Math.sin(angle) * len;
-      ctx.strokeStyle = depth <= 2 ? c2 : c1;
-      ctx.lineWidth = Math.max(1, depth * 1.4);
-      ctx.globalAlpha = 0.85;
-      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x2, y2); ctx.stroke();
-      const spread = 0.35 + rng() * 0.25;
-      branch(x2, y2, len * 0.72, angle - spread, depth - 1);
-      branch(x2, y2, len * 0.72, angle + spread, depth - 1);
-    }
-    branch(cx, h * 0.92, h * 0.24, -Math.PI / 2, Math.min(9, Math.max(5, Math.floor(symmetry + 3))));
-  } else if (generator === 'pixel-sprite') {
-    const grid = Math.max(8, Math.min(20, symmetry * 2));
-    const cell = Math.floor(Math.min(w, h) * 0.72 / grid);
-    const ox = Math.floor((w - grid * cell) / 2), oy = Math.floor((h - grid * cell) / 2);
-    for (let r = 0; r < grid; r++) for (let c = 0; c < Math.ceil(grid / 2); c++) {
-      if (rng() > 0.45) {
-        ctx.fillStyle = rng() > 0.3 ? c1 : c2;
-        ctx.fillRect(ox + c * cell, oy + r * cell, cell - 2, cell - 2);
-        ctx.fillRect(ox + (grid - 1 - c) * cell, oy + r * cell, cell - 2, cell - 2);
-      }
-    }
-  } else {
-    ctx.save(); ctx.translate(cx, cy);
-    for (let i = 0; i < density; i++) {
-      const r0 = rng() * rad * 0.85, sz = 10 + rng() * 44;
-      const col = i % 3 === 0 ? c1 : i % 3 === 1 ? c2 : c3;
-      const a0 = rng() * Math.PI * 2;
-      for (let s = 0; s < symmetry; s++) {
-        const a = a0 + (s * Math.PI * 2) / symmetry;
-        ctx.save(); ctx.rotate(a);
-        ctx.fillStyle = col; ctx.globalAlpha = 0.32 + rng() * 0.45;
-        ctx.beginPath();
-        ctx.moveTo(r0, 0); ctx.lineTo(r0 + sz, sz * 0.42); ctx.lineTo(r0 + sz * 0.6, -sz * 0.42);
-        ctx.closePath(); ctx.fill();
-        ctx.restore();
-      }
-    }
-    ctx.restore();
-  }
-  ctx.globalAlpha = 1;
-  if (window.verdant?.sense?.inspectCanvas) {
-    try { window.verdant.sense.inspectCanvas(canvas); } catch (_) {}
-  }
-}
-
-function render() {
-  root.innerHTML = '';
-  const bar = document.createElement('div');
-  bar.className = 'organ-row'; bar.style.marginBottom = '12px'; bar.style.justifyContent = 'space-between';
-
-  const left = document.createElement('div'); left.className = 'organ-row';
-  const genBtn = document.createElement('button'); genBtn.className = 'organ-btn primary'; genBtn.textContent = 'New Variation';
-  genBtn.onclick = () => { seed = (seed * 1664525 + 1013904223) % 999999; drawArtwork(canvas); };
-  left.appendChild(genBtn);
-
-  const symBtn = document.createElement('button'); symBtn.className = 'organ-btn'; symBtn.textContent = 'Symmetry: ' + symmetry;
-  symBtn.onclick = () => { symmetry = symmetry >= 12 ? 3 : symmetry + 1; symBtn.textContent = 'Symmetry: ' + symmetry; drawArtwork(canvas); };
-  left.appendChild(symBtn);
-  bar.appendChild(left);
-
-  const expBtn = document.createElement('button'); expBtn.className = 'organ-btn'; expBtn.textContent = 'Download PNG';
-  expBtn.onclick = () => {
-    const a = document.createElement('a');
-    a.href = canvas.toDataURL('image/png');
-    a.download = (W.caption || 'artwork').toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.png';
-    a.click();
-  };
-  bar.appendChild(expBtn);
-  root.appendChild(bar);
-
-  const canvas = document.createElement('canvas');
-  canvas.className = 'organ-canvas';
-  canvas.width = W.width; canvas.height = W.height;
-  root.appendChild(canvas);
-  drawArtwork(canvas);
-}
-render();
-`;
-}
-
-function buildWrittenWorkRuntimeJs(weights: WrittenWorkWeights): string {
-  return `
-const W = ${safeJsonForScript(weights)};
-const root = document.getElementById('organ-root');
-let chapters = W.chapters.map((c) => ({ ...c }));
-let activeIdx = 0;
-
-function totalWords() {
-  return chapters.reduce((acc, c) => acc + (c.body.trim() ? c.body.trim().split(/\\s+/).length : 0), 0);
-}
-function persist() {
-  try { window.verdant?.storage?.set('chapters', chapters); } catch (_) {}
-}
-async function hydrate() {
-  try {
-    const saved = await window.verdant?.storage?.get('chapters');
-    if (Array.isArray(saved) && saved.length > 0) { chapters = saved; render(); }
-  } catch (_) {}
-}
-function render() {
-  const ch = chapters[activeIdx] || chapters[0];
-  const words = totalWords();
-  root.innerHTML = '';
-
-  const top = document.createElement('div');
-  top.className = 'organ-row'; top.style.justifyContent = 'space-between'; top.style.marginBottom = '12px';
-  top.innerHTML =
-    '<div class="organ-row">' +
-    '<span class="organ-pill">' + W.genre + '</span>' +
-    '<span class="organ-pill">Words: ' + words.toLocaleString() + ' / ' + W.targetWordCount.toLocaleString() + '</span>' +
-    '</div>';
-  const actions = document.createElement('div'); actions.className = 'organ-row';
-  const addCh = document.createElement('button'); addCh.className = 'organ-btn'; addCh.textContent = '+ Chapter';
-  addCh.onclick = () => {
-    chapters.push({ title: 'Chapter ' + (chapters.length + 1), beat: 'Scene', summary: 'Next beat', body: '' });
-    activeIdx = chapters.length - 1; persist(); render();
-  };
-  actions.appendChild(addCh);
-  const exp = document.createElement('button'); exp.className = 'organ-btn primary'; exp.textContent = 'Export Markdown';
-  exp.onclick = () => {
-    const md = '# ' + W.title + '\\n\\n' + W.premise + '\\n\\n' + chapters.map((c) => '## ' + c.title + '\\n\\n' + (c.body || c.summary)).join('\\n\\n');
-    if (window.verdant?.downloadFile) { window.verdant.downloadFile(W.title.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.md', md, 'text/markdown'); }
-  };
-  actions.appendChild(exp);
-  top.appendChild(actions);
-  root.appendChild(top);
-
-  const tabs = document.createElement('div');
-  tabs.className = 'organ-row'; tabs.style.marginBottom = '10px';
-  chapters.forEach((c, idx) => {
-    const b = document.createElement('button');
-    b.className = 'organ-btn' + (idx === activeIdx ? ' primary' : '');
-    b.textContent = c.title;
-    b.onclick = () => { activeIdx = idx; render(); };
-    tabs.appendChild(b);
-  });
-  root.appendChild(tabs);
-
-  const meta = document.createElement('p');
-  meta.className = 'organ-sub'; meta.style.marginBottom = '8px';
-  meta.textContent = ch.beat + ' · ' + ch.summary;
-  root.appendChild(meta);
-
-  const ta = document.createElement('textarea');
-  ta.className = 'organ-textarea';
-  ta.placeholder = 'Write ' + ch.title + ' here…';
-  ta.value = ch.body;
-  ta.oninput = () => { ch.body = ta.value; persist(); };
-  root.appendChild(ta);
-
-  if (W.allowLocalAssist && window.verdant?.ask) {
-    const assistBtn = document.createElement('button');
-    assistBtn.className = 'organ-btn'; assistBtn.style.marginTop = '10px';
-    assistBtn.textContent = 'Draft Next Paragraph Locally';
-    assistBtn.onclick = async () => {
-      assistBtn.disabled = true; assistBtn.textContent = 'Drafting…';
-      try {
-        const prompt = 'Continue this ' + W.genre + ' chapter in voice "' + W.voice + '". Premise: ' + W.premise + '. Chapter summary: ' + ch.summary + '. Existing draft:\\n' + ch.body.slice(-600);
-        const reply = await window.verdant.ask(prompt);
-        ch.body = (ch.body ? ch.body + '\\n\\n' : '') + String(reply || '').trim();
-        persist(); render();
-      } catch (_) { assistBtn.disabled = false; assistBtn.textContent = 'Draft Next Paragraph Locally'; }
-    };
-    root.appendChild(assistBtn);
-  }
-}
-render();
-hydrate();
-`;
-}
-
-function buildVideoRuntimeJs(weights: VideoWeights): string {
-  return `
-const W = ${safeJsonForScript(weights)};
-const root = document.getElementById('organ-root');
-const dims = W.aspectRatio === '1:1' ? [540, 540] : W.aspectRatio === '9:16' ? [360, 640] : [640, 360];
-const totalDur = W.scenes.reduce((a, s) => a + s.durationSec, 0) || 6;
-let playing = true, tSec = 0, lastTs = 0;
-let recorder = null, recChunks = [], recording = false, recTimer = null;
-
-root.innerHTML = '';
-const bar = document.createElement('div'); bar.className = 'organ-row'; bar.style.marginBottom = '10px'; bar.style.justifyContent = 'space-between';
-const playBtn = document.createElement('button'); playBtn.className = 'organ-btn primary'; playBtn.textContent = 'Pause';
-const timeEl = document.createElement('span'); timeEl.className = 'organ-pill'; timeEl.textContent = '0.0s / ' + totalDur + 's';
-const left = document.createElement('div'); left.className = 'organ-row'; left.append(playBtn, timeEl);
-const right = document.createElement('div'); right.className = 'organ-row';
-const recBtn = document.createElement('button'); recBtn.className = 'organ-btn'; recBtn.textContent = 'Record WebM';
-const snapBtn = document.createElement('button'); snapBtn.className = 'organ-btn'; snapBtn.textContent = 'Save Frame PNG';
-right.append(recBtn, snapBtn);
-bar.append(left, right);
-root.appendChild(bar);
-
-const canvas = document.createElement('canvas');
-canvas.className = 'organ-canvas'; canvas.width = dims[0]; canvas.height = dims[1];
-root.appendChild(canvas);
-const ctx = canvas.getContext('2d');
-
-playBtn.onclick = () => { playing = !playing; playBtn.textContent = playing ? 'Pause' : 'Play'; };
-snapBtn.onclick = () => { const a = document.createElement('a'); a.href = canvas.toDataURL('image/png'); a.download = 'frame.png'; a.click(); };
-
-function stopRecording() {
-  if (recTimer) { clearTimeout(recTimer); recTimer = null; }
-  if (recorder && recorder.state !== 'inactive') {
-    try { recorder.stop(); } catch (_) {}
-  }
-  recording = false;
-  recBtn.textContent = 'Record WebM';
-  recBtn.className = 'organ-btn';
-}
-
-recBtn.onclick = () => {
-  if (recording) { stopRecording(); return; }
-  if (typeof canvas.captureStream !== 'function' || typeof window.MediaRecorder !== 'function') {
-    recBtn.textContent = 'WebM Unavailable';
-    return;
-  }
-  try {
-    const stream = canvas.captureStream(Math.max(15, Math.min(60, W.fps || 30)));
-    const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
-      ? 'video/webm;codecs=vp9'
-      : MediaRecorder.isTypeSupported('video/webm')
-        ? 'video/webm'
-        : '';
-    recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
-    recChunks = [];
-    recorder.ondataavailable = (ev) => { if (ev.data && ev.data.size > 0) recChunks.push(ev.data); };
-    recorder.onstop = () => {
-      if (recChunks.length === 0) return;
-      const blob = new Blob(recChunks, { type: mime || 'video/webm' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a'); a.href = url; a.download = 'verdant-video.webm'; a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 4000);
-    };
-    tSec = 0; playing = true; playBtn.textContent = 'Pause';
-    recorder.start(250);
-    recording = true;
-    recBtn.textContent = 'Stop Recording…';
-    recBtn.className = 'organ-btn primary';
-    recTimer = setTimeout(stopRecording, Math.round(totalDur * 1000) + 150);
-  } catch (_) {
-    recBtn.textContent = 'WebM Unavailable';
-  }
-};
-
-let sensedOnce = false;
-function drawFrame(sec) {
-  let acc = 0, scene = W.scenes[0], localT = 0;
-  for (const s of W.scenes) {
-    if (sec <= acc + s.durationSec) { scene = s; localT = (sec - acc) / Math.max(0.1, s.durationSec); break; }
-    acc += s.durationSec;
-  }
-  const [w, h] = dims;
-  ctx.fillStyle = W.palette[0]; ctx.fillRect(0, 0, w, h);
-  ctx.save();
-  const cx = w / 2, cy = h / 2;
-  for (let i = 0; i < 6; i++) {
-    const r = 36 + i * 26 + Math.sin(localT * Math.PI * 2 + i) * 14;
-    ctx.strokeStyle = scene.accent; ctx.globalAlpha = 0.22; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.arc(cx + Math.cos(localT * 6 + i) * 24, cy + Math.sin(localT * 4 + i) * 14, r, 0, Math.PI * 2); ctx.stroke();
-  }
-  ctx.globalAlpha = 1;
-  ctx.fillStyle = W.palette[2]; ctx.textAlign = 'center';
-  const yOff = scene.motion === 'rise' ? (1 - Math.min(1, localT * 2)) * 28 : 0;
-  ctx.font = '700 28px Inter, sans-serif'; ctx.fillText(scene.title, cx, cy - 6 + yOff);
-  ctx.fillStyle = scene.accent; ctx.font = '500 15px Inter, sans-serif'; ctx.fillText(scene.subtitle, cx, cy + 24 + yOff);
-  ctx.restore();
-  timeEl.textContent = sec.toFixed(1) + 's / ' + totalDur + 's';
-  if (!sensedOnce && window.verdant?.sense?.inspectCanvas) {
-    sensedOnce = true;
-    try { window.verdant.sense.inspectCanvas(canvas); } catch (_) {}
-  }
-}
-function loop(ts) {
-  if (!lastTs) lastTs = ts;
-  const dt = Math.min(0.1, (ts - lastTs) / 1000);
-  lastTs = ts;
-  if (playing) tSec = (tSec + dt) % totalDur;
-  drawFrame(tSec);
-  requestAnimationFrame(loop);
-}
-requestAnimationFrame(loop);
-`;
-}
-
-function buildTurnBoardRuntimeJs(weights: TurnBoardGameWeights): string {
-  return `
-const W = ${safeJsonForScript(weights)};
-const root = document.getElementById('organ-root');
-let grid = [], turn = 1, winner = 0, draws = 0, score = [0, 0, 0];
-
-function resetBoard() {
-  grid = Array.from({ length: W.rows }, () => Array(W.cols).fill(0));
-  turn = 1; winner = 0; render();
-}
-function checkWin(p) {
-  const dirs = [[0,1],[1,0],[1,1],[1,-1]];
-  for (let r = 0; r < W.rows; r++) for (let c = 0; c < W.cols; c++) {
-    if (grid[r][c] !== p) continue;
-    for (const [dr, dc] of dirs) {
-      let k = 1;
-      while (k < W.winLength) {
-        const nr = r + dr * k, nc = c + dc * k;
-        if (nr < 0 || nr >= W.rows || nc < 0 || nc >= W.cols || grid[nr][nc] !== p) break;
-        k += 1;
-      }
-      if (k >= W.winLength) return true;
-    }
-  }
-  return false;
-}
-function playAt(r, c) {
-  if (winner !== 0) return;
-  let tr = r;
-  if (W.gravity) {
-    tr = -1;
-    for (let rr = W.rows - 1; rr >= 0; rr--) { if (grid[rr][c] === 0) { tr = rr; break; } }
-    if (tr < 0) return;
-  } else if (grid[tr][c] !== 0) return;
-  grid[tr][c] = turn;
-  if (checkWin(turn)) { winner = turn; score[turn] += 1; render(); return; }
-  if (grid.flat().every((v) => v !== 0)) { winner = -1; draws += 1; render(); return; }
-  turn = turn === 1 ? 2 : 1;
-  render();
-  if (W.vsCpu && turn === 2 && winner === 0) {
-    setTimeout(() => {
-      const moves = [];
-      for (let rr = 0; rr < W.rows; rr++) for (let cc = 0; cc < W.cols; cc++) {
-        if (W.gravity ? (rr === 0 && grid[0][cc] === 0) : grid[rr][cc] === 0) moves.push([rr, cc]);
-      }
-      if (moves.length > 0) {
-        const pick = moves[Math.floor(Math.random() * moves.length)];
-        playAt(pick[0], pick[1]);
-      }
-    }, 180);
-  }
-}
-function render() {
-  root.innerHTML = '';
-  const top = document.createElement('div'); top.className = 'organ-row'; top.style.justifyContent = 'space-between'; top.style.marginBottom = '12px';
-  const status = winner === -1 ? 'Draw!' : winner === 1 ? W.p1Label + ' wins!' : winner === 2 ? W.p2Label + ' wins!' : (turn === 1 ? W.p1Label : W.p2Label) + "'s turn";
-  top.innerHTML = '<div class="organ-row"><span class="organ-pill">' + W.p1Label + ': ' + score[1] + '</span><span class="organ-pill">' + W.p2Label + ': ' + score[2] + '</span><span class="organ-pill">' + status + '</span></div>';
-  const btn = document.createElement('button'); btn.className = 'organ-btn primary'; btn.textContent = 'New Round'; btn.onclick = resetBoard;
-  top.appendChild(btn); root.appendChild(top);
-
-  const cellPx = W.cols <= 4 ? 64 : 44;
-  const g = document.createElement('div'); g.className = 'ms-grid';
-  g.style.gridTemplateColumns = 'repeat(' + W.cols + ', ' + cellPx + 'px)';
-  for (let r = 0; r < W.rows; r++) for (let c = 0; c < W.cols; c++) {
-    const b = document.createElement('button'); b.className = 'ms-cell';
-    b.style.width = cellPx + 'px'; b.style.height = cellPx + 'px'; b.style.fontSize = cellPx > 50 ? '24px' : '18px';
-    const v = grid[r][c];
-    b.textContent = v === 1 ? (W.gravity ? '●' : 'X') : v === 2 ? (W.gravity ? '●' : 'O') : '';
-    b.style.color = v === 1 ? '#10b981' : v === 2 ? '#f59e0b' : 'inherit';
-    b.onclick = () => playAt(r, c);
-    g.appendChild(b);
-  }
-  root.appendChild(g);
-}
-resetBoard();
-`;
-}
-
-function buildGridPuzzleRuntimeJs(weights: GridPuzzleGameWeights): string {
-  return `
-const W = ${safeJsonForScript(weights)};
-const root = document.getElementById('organ-root');
-let board = [], moves = 0, score = 0, won = false;
-
-function initLightsOut() {
-  board = Array.from({ length: W.rows }, () => Array(W.cols).fill(false));
-  for (let i = 0; i < W.rows + W.cols; i++) toggleLight(Math.floor(Math.random() * W.rows), Math.floor(Math.random() * W.cols), true);
-  moves = 0; won = false; render();
-}
-function toggleLight(r, c, silent) {
-  for (const [dr, dc] of [[0,0],[1,0],[-1,0],[0,1],[0,-1]]) {
-    const nr = r + dr, nc = c + dc;
-    if (nr >= 0 && nr < W.rows && nc >= 0 && nc < W.cols) board[nr][nc] = !board[nr][nc];
-  }
-  if (!silent) { moves += 1; won = board.flat().every((v) => !v); render(); }
-}
-function init2048() {
-  board = Array.from({ length: W.rows }, () => Array(W.cols).fill(0));
-  score = 0; moves = 0; won = false; spawn2048(); spawn2048(); render();
-}
-function spawn2048() {
-  const empty = [];
-  for (let r = 0; r < W.rows; r++) for (let c = 0; c < W.cols; c++) if (board[r][c] === 0) empty.push([r, c]);
-  if (empty.length > 0) { const [r, c] = empty[Math.floor(Math.random() * empty.length)]; board[r][c] = Math.random() < 0.9 ? 2 : 4; }
-}
-function slideRow(arr) {
-  const nums = arr.filter((v) => v > 0);
-  const out = [];
-  for (let i = 0; i < nums.length; i++) {
-    if (nums[i] === nums[i + 1]) { const m = nums[i] * 2; score += m; if (m >= W.targetScore) won = true; out.push(m); i += 1; }
-    else out.push(nums[i]);
-  }
-  while (out.length < arr.length) out.push(0);
-  return out;
-}
-function move2048(dir) {
-  const before = JSON.stringify(board);
-  if (dir === 'left') for (let r = 0; r < W.rows; r++) board[r] = slideRow(board[r]);
-  if (dir === 'right') for (let r = 0; r < W.rows; r++) board[r] = slideRow([...board[r]].reverse()).reverse();
-  if (dir === 'up') for (let c = 0; c < W.cols; c++) { const col = slideRow(board.map((r) => r[c])); for (let r = 0; r < W.rows; r++) board[r][c] = col[r]; }
-  if (dir === 'down') for (let c = 0; c < W.cols; c++) { const col = slideRow(board.map((r) => r[c]).reverse()).reverse(); for (let r = 0; r < W.rows; r++) board[r][c] = col[r]; }
-  if (JSON.stringify(board) !== before) { moves += 1; spawn2048(); render(); }
-}
-function render() {
-  root.innerHTML = '';
-  const top = document.createElement('div'); top.className = 'organ-row'; top.style.justifyContent = 'space-between'; top.style.marginBottom = '12px';
-  top.innerHTML = '<div class="organ-row"><span class="organ-pill">Moves: ' + moves + '</span>' + (W.variant === 'merge-2048' ? '<span class="organ-pill">Score: ' + score + '</span>' : '') + (won ? '<span class="organ-pill" style="color:#10b981;border-color:#10b981">Solved!</span>' : '') + '</div>';
-  const reset = document.createElement('button'); reset.className = 'organ-btn primary'; reset.textContent = 'Reset';
-  reset.onclick = () => (W.variant === 'lights-out' ? initLightsOut() : init2048());
-  top.appendChild(reset); root.appendChild(top);
-
-  const g = document.createElement('div'); g.className = 'ms-grid';
-  g.style.gridTemplateColumns = 'repeat(' + W.cols + ', 58px)';
-  for (let r = 0; r < W.rows; r++) for (let c = 0; c < W.cols; c++) {
-    const b = document.createElement('button'); b.className = 'ms-cell'; b.style.width = '58px'; b.style.height = '58px';
-    if (W.variant === 'lights-out') {
-      b.style.background = board[r][c] ? 'var(--v-accent)' : 'var(--v-surface-alt)';
-      b.onclick = () => toggleLight(r, c, false);
-    } else {
-      const v = board[r][c];
-      b.textContent = v ? String(v) : '';
-      b.style.fontSize = v >= 1024 ? '14px' : '18px';
-      if (v > 0) b.style.background = 'rgba(16,185,129,' + Math.min(0.85, 0.14 + Math.log2(v) * 0.08) + ')';
-    }
-    g.appendChild(b);
-  }
-  root.appendChild(g);
-  if (W.variant !== 'lights-out') {
-    const ctrls = document.createElement('div'); ctrls.className = 'organ-row'; ctrls.style.justifyContent = 'center'; ctrls.style.marginTop = '12px';
-    for (const d of ['left','up','down','right']) {
-      const b = document.createElement('button'); b.className = 'organ-btn'; b.textContent = d.toUpperCase(); b.onclick = () => move2048(d); ctrls.appendChild(b);
-    }
-    root.appendChild(ctrls);
-  }
-}
-window.addEventListener('keydown', (e) => {
-  if (W.variant === 'lights-out') return;
-  const map = { ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up', ArrowDown: 'down' };
-  if (map[e.key]) { e.preventDefault(); move2048(map[e.key]); }
-});
-if (W.variant === 'lights-out') initLightsOut(); else init2048();
-`;
-}
-
-function buildArcadeCanvasRuntimeJs(weights: ArcadeCanvasGameWeights): string {
-  return `
-const W = ${safeJsonForScript(weights)};
-const root = document.getElementById('organ-root');
-let score = 0, alive = true, dir = [1, 0], snake = [[6, 8], [5, 8], [4, 8]], food = [12, 8];
-
-root.innerHTML = '';
-const bar = document.createElement('div'); bar.className = 'organ-row'; bar.style.justifyContent = 'space-between'; bar.style.marginBottom = '10px';
-const scorePill = document.createElement('span'); scorePill.className = 'organ-pill'; scorePill.textContent = 'Score: 0';
-const resetBtn = document.createElement('button'); resetBtn.className = 'organ-btn primary'; resetBtn.textContent = 'Restart';
-bar.append(scorePill, resetBtn); root.appendChild(bar);
-
-const canvas = document.createElement('canvas'); canvas.className = 'organ-canvas'; canvas.width = 480; canvas.height = 360;
-root.appendChild(canvas);
-const ctx = canvas.getContext('2d');
-const cw = Math.floor(canvas.width / W.gridCols), ch = Math.floor(canvas.height / W.gridRows);
-
-function reset() {
-  score = 0; alive = true; dir = [1, 0]; snake = [[6, 8], [5, 8], [4, 8]];
-  food = [Math.floor(Math.random() * W.gridCols), Math.floor(Math.random() * W.gridRows)];
-  scorePill.textContent = 'Score: 0';
-}
-resetBtn.onclick = reset;
-window.addEventListener('keydown', (e) => {
-  if (e.key === 'ArrowUp' && dir[1] !== 1) dir = [0, -1];
-  else if (e.key === 'ArrowDown' && dir[1] !== -1) dir = [0, 1];
-  else if (e.key === 'ArrowLeft' && dir[0] !== 1) dir = [-1, 0];
-  else if (e.key === 'ArrowRight' && dir[0] !== -1) dir = [1, 0];
-});
-setInterval(() => {
-  if (alive) {
-    let nx = snake[0][0] + dir[0], ny = snake[0][1] + dir[1];
-    if (W.wrapWalls) { nx = (nx + W.gridCols) % W.gridCols; ny = (ny + W.gridRows) % W.gridRows; }
-    if (nx < 0 || nx >= W.gridCols || ny < 0 || ny >= W.gridRows || snake.some(([sx, sy]) => sx === nx && sy === ny)) {
-      alive = false; scorePill.textContent = 'Game Over · Score: ' + score;
-    } else {
-      snake.unshift([nx, ny]);
-      if (nx === food[0] && ny === food[1]) {
-        score += 10; scorePill.textContent = 'Score: ' + score;
-        food = [Math.floor(Math.random() * W.gridCols), Math.floor(Math.random() * W.gridRows)];
-      } else snake.pop();
-    }
-  }
-  ctx.fillStyle = '#0b0f14'; ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.fillStyle = '#f59e0b'; ctx.fillRect(food[0] * cw + 2, food[1] * ch + 2, cw - 4, ch - 4);
-  ctx.fillStyle = '#10b981';
-  for (const [sx, sy] of snake) ctx.fillRect(sx * cw + 1, sy * ch + 1, cw - 2, ch - 2);
-}, Math.max(60, 200 - W.speed * 14));
-`;
-}
-
-function buildCellularSimRuntimeJs(weights: CellularSimGameWeights): string {
-  return `
-const W = ${safeJsonForScript(weights)};
-const root = document.getElementById('organ-root');
-let grid = Array.from({ length: W.rows }, () => Array.from({ length: W.cols }, () => (Math.random() < 0.25 ? 1 : 0)));
-let running = true, gen = 0;
-
-root.innerHTML = '';
-const bar = document.createElement('div'); bar.className = 'organ-row'; bar.style.justifyContent = 'space-between'; bar.style.marginBottom = '10px';
-const genPill = document.createElement('span'); genPill.className = 'organ-pill'; genPill.textContent = 'Gen: 0';
-const playBtn = document.createElement('button'); playBtn.className = 'organ-btn primary'; playBtn.textContent = 'Pause';
-const randBtn = document.createElement('button'); randBtn.className = 'organ-btn'; randBtn.textContent = 'Randomize';
-const left = document.createElement('div'); left.className = 'organ-row'; left.append(playBtn, randBtn);
-bar.append(genPill, left); root.appendChild(bar);
-
-const canvas = document.createElement('canvas'); canvas.className = 'organ-canvas'; canvas.width = W.cols * 14; canvas.height = W.rows * 14;
-root.appendChild(canvas);
-const ctx = canvas.getContext('2d');
-playBtn.onclick = () => { running = !running; playBtn.textContent = running ? 'Pause' : 'Play'; };
-randBtn.onclick = () => { gen = 0; grid = Array.from({ length: W.rows }, () => Array.from({ length: W.cols }, () => (Math.random() < 0.28 ? 1 : 0))); };
-canvas.onclick = (e) => {
-  const rect = canvas.getBoundingClientRect();
-  const c = Math.floor(((e.clientX - rect.left) / rect.width) * W.cols);
-  const r = Math.floor(((e.clientY - rect.top) / rect.height) * W.rows);
-  if (r >= 0 && r < W.rows && c >= 0 && c < W.cols) grid[r][c] = grid[r][c] ? 0 : 1;
-};
-function step() {
-  const next = Array.from({ length: W.rows }, () => Array(W.cols).fill(0));
-  for (let r = 0; r < W.rows; r++) for (let c = 0; c < W.cols; c++) {
-    let n = 0;
-    for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
-      if (dr === 0 && dc === 0) continue;
-      n += grid[(r + dr + W.rows) % W.rows][(c + dc + W.cols) % W.cols];
-    }
-    next[r][c] = grid[r][c] ? (n === 2 || n === 3 ? 1 : 0) : (n === 3 ? 1 : 0);
-  }
-  grid = next; gen += 1; genPill.textContent = 'Gen: ' + gen;
-}
-setInterval(() => {
-  if (running) step();
-  ctx.fillStyle = '#0b0f14'; ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.fillStyle = '#10b981';
-  for (let r = 0; r < W.rows; r++) for (let c = 0; c < W.cols; c++) {
-    if (grid[r][c]) ctx.fillRect(c * 14 + 1, r * 14 + 1, 12, 12);
-  }
-}, W.tickMs);
-`;
-}
-
-function buildResearchProgramRuntimeJs(weights: ResearchProgramWeights): string {
-  return `
-const W = ${safeJsonForScript(weights)};
-const root = document.getElementById('organ-root');
-let hypotheses = W.hypotheses.map((h) => ({ ...h }));
-let milestones = W.milestones.map((m) => ({ ...m }));
-let notes = [];
-
-function persist() { try { window.verdant?.storage?.set('research', { hypotheses, milestones, notes }); } catch (_) {} }
-async function hydrate() {
-  try {
-    const saved = await window.verdant?.storage?.get('research');
-    if (saved && Array.isArray(saved.hypotheses)) { hypotheses = saved.hypotheses; milestones = saved.milestones || milestones; notes = saved.notes || []; render(); }
-  } catch (_) {}
-}
-function render() {
-  root.innerHTML = '';
-  const head = document.createElement('div'); head.className = 'organ-row'; head.style.justifyContent = 'space-between'; head.style.marginBottom = '12px';
-  head.innerHTML = '<div class="organ-row"><span class="organ-pill">Space: ' + W.compartmentId + '</span>' + W.tracks.map((t) => '<span class="organ-pill">' + t + '</span>').join('') + '</div>';
-  root.appendChild(head);
-
-  const q = document.createElement('p'); q.style.margin = '0 0 12px'; q.style.fontWeight = '600'; q.textContent = W.question;
-  root.appendChild(q);
-
-  const hSec = document.createElement('div'); hSec.style.marginBottom = '14px';
-  hSec.innerHTML = '<div class="organ-sub" style="margin-bottom:6px;font-weight:700">HYPOTHESES (click status to cycle)</div>';
-  hypotheses.forEach((h) => {
-    const row = document.createElement('div'); row.className = 'organ-row'; row.style.justifyContent = 'space-between'; row.style.padding = '8px 10px'; row.style.border = '1px solid var(--v-border)'; row.style.borderRadius = '8px'; row.style.marginBottom = '6px';
-    const txt = document.createElement('span'); txt.textContent = h.id + ': ' + h.statement;
-    const st = document.createElement('button'); st.className = 'organ-btn'; st.textContent = h.status;
-    st.onclick = () => { h.status = h.status === 'open' ? 'supported' : h.status === 'supported' ? 'refuted' : 'open'; persist(); render(); };
-    row.append(txt, st); hSec.appendChild(row);
-  });
-  root.appendChild(hSec);
-
-  const mSec = document.createElement('div');
-  mSec.innerHTML = '<div class="organ-sub" style="margin-bottom:6px;font-weight:700">MILESTONES</div>';
-  milestones.forEach((m) => {
-    const row = document.createElement('div'); row.className = 'organ-row'; row.style.justifyContent = 'space-between'; row.style.padding = '8px 10px'; row.style.border = '1px solid var(--v-border)'; row.style.borderRadius = '8px'; row.style.marginBottom = '6px';
-    const txt = document.createElement('span'); txt.textContent = m.title + ' (' + m.dueLabel + ')';
-    const st = document.createElement('button'); st.className = 'organ-btn' + (m.status === 'done' ? ' primary' : ''); st.textContent = m.status;
-    st.onclick = () => { m.status = m.status === 'planned' ? 'in-progress' : m.status === 'in-progress' ? 'done' : 'planned'; persist(); render(); };
-    row.append(txt, st); mSec.appendChild(row);
-  });
-  root.appendChild(mSec);
-}
-render();
-hydrate();
-`;
-}
-
-function buildToolOrganRuntimeJs(weights: ToolOrganWeights): string {
-  return `
-const W = ${safeJsonForScript(weights)};
-const root = document.getElementById('organ-root');
-let windows = W.scheduleWindows.map((w) => ({ ...w }));
-let checkins = 0;
-
-function fmtMin(m) {
-  const hh = String(Math.floor(m / 60)).padStart(2, '0');
-  const mm = String(m % 60).padStart(2, '0');
-  return hh + ':' + mm;
-}
-function emitConstraints() {
-  if (!W.emitsOpaqueConstraints) return;
-  try {
-    window.verdant?.emit?.('constraint', {
-      compartmentId: W.compartmentId,
-      opaqueOnly: true,
-      windows: windows.filter((w) => w.protectedWindow).map((w) => ({
-        startMinuteOfDay: w.startMinuteOfDay,
-        endMinuteOfDay: w.endMinuteOfDay,
-        daysOfWeek: w.daysOfWeek,
-      })),
-    });
-  } catch (_) {}
-}
-function render() {
-  root.innerHTML = '';
-  const top = document.createElement('div'); top.className = 'organ-row'; top.style.justifyContent = 'space-between'; top.style.marginBottom = '12px';
-  top.innerHTML =
-    '<div class="organ-row">' +
-    '<span class="organ-pill">Space: ' + W.compartmentId + '</span>' +
-    (W.emitsOpaqueConstraints ? '<span class="organ-pill" style="border-color:#10b981;color:#10b981">Privacy Shield: Availability only (zero details shared)</span>' : '') +
-    '</div>';
-  root.appendChild(top);
-
-  const summary = document.createElement('p'); summary.style.margin = '0 0 12px'; summary.textContent = W.rulesSummary;
-  root.appendChild(summary);
-
-  const metricRow = document.createElement('div'); metricRow.className = 'organ-row'; metricRow.style.marginBottom = '12px';
-  const checkBtn = document.createElement('button'); checkBtn.className = 'organ-btn primary'; checkBtn.textContent = 'Log Check-In (' + checkins + ')';
-  checkBtn.onclick = () => { checkins += 1; emitConstraints(); render(); };
-  metricRow.appendChild(checkBtn);
-  root.appendChild(metricRow);
-
-  if (windows.length > 0) {
-    const label = document.createElement('div'); label.className = 'organ-sub'; label.style.marginBottom = '6px'; label.style.fontWeight = '700';
-    label.textContent = 'PROTECTED SCHEDULE WINDOWS';
-    root.appendChild(label);
-    windows.forEach((w) => {
-      const row = document.createElement('div'); row.className = 'organ-row'; row.style.justifyContent = 'space-between'; row.style.padding = '8px 10px'; row.style.border = '1px solid var(--v-border)'; row.style.borderRadius = '8px'; row.style.marginBottom = '6px';
-      const txt = document.createElement('span'); txt.textContent = w.label + ' · ' + fmtMin(w.startMinuteOfDay) + ' – ' + fmtMin(w.endMinuteOfDay);
-      const toggle = document.createElement('button'); toggle.className = 'organ-btn' + (w.protectedWindow ? ' primary' : '');
-      toggle.textContent = w.protectedWindow ? 'Protected' : 'Paused';
-      toggle.onclick = () => { w.protectedWindow = !w.protectedWindow; emitConstraints(); render(); };
-      row.append(txt, toggle); root.appendChild(row);
-    });
-  }
-}
-render();
-emitConstraints();
-`;
-}
-
-function buildAudioRuntimeJs(weights: AudioWeights): string {
-  return `
-const W = ${safeJsonForScript(weights)};
-const root = document.getElementById('organ-root');
-const SCALES = {
-  pentatonic: [0, 2, 4, 7, 9, 12],
-  major: [0, 2, 4, 5, 7, 9, 11, 12],
-  minor: [0, 2, 3, 5, 7, 8, 10, 12],
-  dorian: [0, 2, 3, 5, 7, 9, 10, 12],
-};
-const PROG = [0, 3, 4, 2];
-let bpm = W.bpm, playing = false, timer = null, step = 0, ctx = null, masterFilter = null;
-function midiToHz(m) { return 440 * Math.pow(2, (m - 69) / 12); }
-
-function triggerModalVoice(hz, dur, vel, pan, partials) {
-  if (!ctx || !masterFilter) return;
-  const now = ctx.currentTime;
-  const outNode = typeof ctx.createStereoPanner === 'function' ? ctx.createStereoPanner() : ctx.createGain();
-  if ('pan' in outNode && outNode.pan) outNode.pan.setValueAtTime(pan, now);
-  outNode.connect(masterFilter);
-  for (const p of partials) {
-    const osc = ctx.createOscillator();
-    const g = ctx.createGain();
-    osc.type = 'sine';
-    osc.frequency.setValueAtTime(hz * p.ratio, now);
-    g.gain.setValueAtTime(0.0008, now);
-    g.gain.exponentialRampToValueAtTime(Math.max(0.001, vel * p.amp), now + p.atk);
-    g.gain.exponentialRampToValueAtTime(0.0005, now + Math.max(p.atk + 0.05, dur * p.decayScale));
-    osc.connect(g); g.connect(outNode);
-    osc.start(now); osc.stop(now + dur + 0.08);
-  }
-}
-
-function playStep() {
-  if (!ctx) {
-    const AC = window.AudioContext || window.webkitAudioContext;
-    if (!AC) return;
-    ctx = new AC();
-    masterFilter = ctx.createBiquadFilter();
-    masterFilter.type = 'lowpass';
-    masterFilter.frequency.value = 3400;
-    masterFilter.connect(ctx.destination);
-  }
-  if (ctx.state === 'suspended') void ctx.resume();
-  const scale = SCALES[W.scale] || SCALES.pentatonic;
-  const barIdx = Math.floor(step / 8);
-  const chordDeg = PROG[barIdx % PROG.length];
-  const stepDur = Math.max(0.14, (60 / bpm) * 0.5);
-
-  // Voice 1: Warm modal pad chord on bar downbeat
-  if (step % 8 === 0) {
-    for (const [k, off] of [0, 2, 4].entries()) {
-      const deg = (chordDeg + off) % scale.length;
-      const oct = Math.floor((chordDeg + off) / scale.length) * 12;
-      triggerModalVoice(
-        midiToHz(W.rootMidi - 12 + scale[deg] + oct),
-        stepDur * 7.5,
-        0.075,
-        (k - 1) * 0.35,
-        [{ ratio: 1, amp: 1, atk: 0.14, decayScale: 1 }, { ratio: 2, amp: 0.3, atk: 0.18, decayScale: 0.85 }],
-      );
-    }
-  }
-  // Voice 2: Plucked modal bass on quarter beats
-  if (step % 2 === 0) {
-    const bassNote = W.rootMidi - 24 + scale[chordDeg % scale.length] + (step % 4 === 2 ? 7 : 0);
-    triggerModalVoice(
-      midiToHz(bassNote),
-      stepDur * 1.8,
-      0.11,
-      -0.12,
-      [{ ratio: 1, amp: 1, atk: 0.01, decayScale: 0.9 }, { ratio: 2, amp: 0.42, atk: 0.01, decayScale: 0.55 }, { ratio: 3, amp: 0.14, atk: 0.01, decayScale: 0.35 }],
-    );
-  }
-  // Voice 3: Polyphonic modal bell / arpeggio lead
-  if (W.style !== 'ambient-pad' || step % 2 === 0) {
-    const arpIdx = (chordDeg + (step % 5) * 2) % scale.length;
-    const leadHz = midiToHz(W.rootMidi + scale[arpIdx] + (step % 6 === 5 ? 12 : 0));
-    triggerModalVoice(
-      leadHz,
-      stepDur * (W.style === 'ambient-pad' ? 2.8 : 1.3),
-      0.09,
-      Math.sin(step * 0.9) * 0.48,
-      [{ ratio: 1, amp: 1, atk: 0.008, decayScale: 1 }, { ratio: 2.0, amp: 0.38, atk: 0.008, decayScale: 0.65 }, { ratio: 3.01, amp: 0.18, atk: 0.008, decayScale: 0.4 }],
-    );
-  }
-  step += 1;
-  drawWave();
-}
-
-function stopPlay() { playing = false; if (timer) { clearInterval(timer); timer = null; } render(); }
-function startPlay() {
-  playing = true;
-  playStep();
-  timer = setInterval(playStep, Math.max(115, Math.round((60 / bpm) * 500)));
-  render();
-}
-
-function exportWav() {
-  const sr = 22050, durSec = Math.min(12, Math.max(4, W.durationSec)), total = sr * durSec;
-  const left = new Float32Array(total), right = new Float32Array(total);
-  const scale = SCALES[W.scale] || SCALES.pentatonic;
-  const stepSec = (60 / bpm) * 0.5;
-  const numSteps = Math.floor(durSec / stepSec);
-
-  function addModalNote(startSec, noteDur, hz, vel, pan, modes) {
-    const s0 = Math.max(0, Math.floor(startSec * sr));
-    const s1 = Math.min(total, Math.floor((startSec + noteDur) * sr));
-    const angle = (pan + 1) * Math.PI * 0.25;
-    const gL = Math.cos(angle) * vel, gR = Math.sin(angle) * vel;
-    for (let i = s0; i < s1; i++) {
-      const t = (i - s0) / sr;
-      const atk = Math.min(1, t / 0.015);
-      let v = 0;
-      for (let m = 0; m < modes.length; m++) {
-        const md = modes[m];
-        v += md.amp * Math.exp(-md.damp * t) * Math.sin(2 * Math.PI * hz * md.ratio * t);
-      }
-      const s = v * atk;
-      left[i] += s * gL;
-      right[i] += s * gR;
-    }
-  }
-
-  for (let st = 0; st < numSteps; st++) {
-    const t0 = st * stepSec;
-    const chordDeg = PROG[Math.floor(st / 8) % PROG.length];
-    if (st % 8 === 0) {
-      for (const [k, off] of [0, 2, 4].entries()) {
-        const deg = (chordDeg + off) % scale.length;
-        const oct = Math.floor((chordDeg + off) / scale.length) * 12;
-        addModalNote(t0, stepSec * 7.8, midiToHz(W.rootMidi - 12 + scale[deg] + oct), 0.14, (k - 1) * 0.35, [
-          { ratio: 1, amp: 1, damp: 0.45 }, { ratio: 2, amp: 0.28, damp: 0.9 },
-        ]);
-      }
-    }
-    if (st % 2 === 0) {
-      addModalNote(t0, stepSec * 1.8, midiToHz(W.rootMidi - 24 + scale[chordDeg % scale.length]), 0.22, -0.12, [
-        { ratio: 1, amp: 1, damp: 2.8 }, { ratio: 2, amp: 0.4, damp: 4.5 }, { ratio: 3, amp: 0.15, damp: 7 },
-      ]);
-    }
-    if (W.style !== 'ambient-pad' || st % 2 === 0) {
-      const arpIdx = (chordDeg + (st % 5) * 2) % scale.length;
-      addModalNote(t0, stepSec * 1.6, midiToHz(W.rootMidi + scale[arpIdx]), 0.18, Math.sin(st * 0.9) * 0.48, [
-        { ratio: 1, amp: 1, damp: 2.2 }, { ratio: 2, amp: 0.36, damp: 4.2 }, { ratio: 3.01, amp: 0.16, damp: 6.8 },
-      ]);
-    }
-  }
-
-  // 4-channel Hadamard FDN stereo reverb + tanh soft limiter
-  const dLens = [683, 829, 1013, 1217];
-  const bufs = dLens.map((n) => new Float32Array(n));
-  const idxs = [0, 0, 0, 0];
-  for (let i = 0; i < total; i++) {
-    const r0 = bufs[0][idxs[0]], r1 = bufs[1][idxs[1]], r2 = bufs[2][idxs[2]], r3 = bufs[3][idxs[3]];
-    const dryL = left[i], dryR = right[i];
-    const h0 = 0.5 * (r0 + r1 + r2 + r3), h1 = 0.5 * (r0 - r1 + r2 - r3), h2 = 0.5 * (r0 + r1 - r2 - r3), h3 = 0.5 * (r0 - r1 - r2 + r3);
-    bufs[0][idxs[0]] = dryL + h0 * 0.42; bufs[1][idxs[1]] = dryR + h1 * 0.42;
-    bufs[2][idxs[2]] = dryL + h2 * 0.42; bufs[3][idxs[3]] = dryR + h3 * 0.42;
-    for (let k = 0; k < 4; k++) idxs[k] = (idxs[k] + 1) % dLens[k];
-    left[i] = Math.tanh(dryL * 0.8 + (r0 + r2) * 0.16);
-    right[i] = Math.tanh(dryR * 0.8 + (r1 + r3) * 0.16);
-  }
-
-  const dataBytes = total * 4;
-  const buf = new ArrayBuffer(44 + dataBytes), dv = new DataView(buf);
-  const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
-  writeStr(0, 'RIFF'); dv.setUint32(4, 36 + dataBytes, true); writeStr(8, 'WAVE');
-  writeStr(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 2, true);
-  dv.setUint32(24, sr, true); dv.setUint32(28, sr * 4, true); dv.setUint16(32, 4, true); dv.setUint16(34, 16, true);
-  writeStr(36, 'data'); dv.setUint32(40, dataBytes, true);
-  let p = 44;
-  for (let i = 0; i < total; i++) {
-    dv.setInt16(p, Math.max(-32767, Math.min(32767, Math.round(left[i] * 32767))), true); p += 2;
-    dv.setInt16(p, Math.max(-32767, Math.min(32767, Math.round(right[i] * 32767))), true); p += 2;
-  }
-  const blob = new Blob([buf], { type: 'audio/wav' });
-  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'verdant-audio-stereo.wav'; a.click();
-}
-let canvasEl = null;
-function drawWave() {
-  if (!canvasEl) return;
-  const c2d = canvasEl.getContext('2d'), w = canvasEl.width, h = canvasEl.height;
-  c2d.fillStyle = '#0b0f14'; c2d.fillRect(0, 0, w, h);
-  for (const [layer, col, freq, amp] of [[0, '#10b981', 0.032, playing ? 34 : 12], [1, '#38bdf8', 0.055, playing ? 18 : 7]]) {
-    c2d.strokeStyle = col; c2d.lineWidth = layer === 0 ? 2 : 1.25; c2d.beginPath();
-    for (let x = 0; x < w; x += 4) {
-      const y = h / 2 + Math.sin(x * freq + step * (0.8 + layer * 0.4)) * amp * Math.cos(x * 0.011 + layer);
-      if (x === 0) c2d.moveTo(x, y); else c2d.lineTo(x, y);
-    }
-    c2d.stroke();
-  }
-}
-function render() {
-  root.innerHTML = '';
-  const bar = document.createElement('div'); bar.className = 'organ-row'; bar.style.justifyContent = 'space-between'; bar.style.marginBottom = '12px';
-  const left = document.createElement('div'); left.className = 'organ-row';
-  const playBtn = document.createElement('button'); playBtn.className = 'organ-btn primary'; playBtn.textContent = playing ? 'Stop Audio' : 'Play Stereo';
-  playBtn.onclick = () => (playing ? stopPlay() : startPlay());
-  const tempoBtn = document.createElement('button'); tempoBtn.className = 'organ-btn'; tempoBtn.textContent = bpm + ' BPM';
-  tempoBtn.onclick = () => { bpm = bpm >= 160 ? 72 : bpm + 16; if (playing) { stopPlay(); startPlay(); } else render(); };
-  const scalePill = document.createElement('span'); scalePill.className = 'organ-pill'; scalePill.textContent = '3-Track Stereo · ' + W.scale;
-  left.append(playBtn, tempoBtn, scalePill);
-  const wavBtn = document.createElement('button'); wavBtn.className = 'organ-btn'; wavBtn.textContent = 'Download Stereo WAV';
-  wavBtn.onclick = exportWav;
-  bar.append(left, wavBtn); root.appendChild(bar);
-  canvasEl = document.createElement('canvas'); canvasEl.className = 'organ-canvas'; canvasEl.width = 640; canvasEl.height = 140;
-  root.appendChild(canvasEl);
-  drawWave();
-}
-render();
-`;
-}
 
 export function synthesizeProceduralOrganView(
   decl: PrismDeclaration,
@@ -2055,6 +1014,8 @@ export function synthesizeProceduralOrganView(
     runtimeJs = buildResearchProgramRuntimeJs(w);
   } else if (w.mediaType === 'tool-organ') {
     runtimeJs = buildToolOrganRuntimeJs(w);
+  } else if (w.mediaType === 'space') {
+    runtimeJs = buildSpaceRuntimeJs(w);
   } else if (w.archetype === 'grid-sweep') {
     runtimeJs = buildGridSweepRuntimeJs(w);
   } else if (w.archetype === 'turn-board') {

@@ -221,3 +221,55 @@ test('All 7 MediaTypes declare real capability requirements and synthesize clean
     }
   }
 });
+
+test('All previously missing game variants and upgraded organs synthesize dedicated complete runtimes', () => {
+  const empty = createEmptyDeclaration('Complete Organs');
+
+  // 1. Memory Match (must NOT fall back to 2048!)
+  const memW = normalizeOrganWeights('interactive-game', { archetype: 'grid-puzzle', variant: 'memory-match' }, 'memory match cards', 'Memory Match');
+  const memView = synthesizeProceduralOrganView(empty, { mediaType: 'interactive-game', activeOrgans: deriveActiveStudioOrgans('interactive-game'), weights: memW });
+  assert.ok(memView.appJs.includes('initMemory'));
+  assert.ok(memView.appJs.includes('All Matched!'));
+
+  // 2. Breakout (must NOT fall back to Snake!)
+  const brkW = normalizeOrganWeights('interactive-game', { archetype: 'arcade-canvas', variant: 'breakout' }, 'breakout bricks', 'Breakout');
+  const brkView = synthesizeProceduralOrganView(empty, { mediaType: 'interactive-game', activeOrgans: deriveActiveStudioOrgans('interactive-game'), weights: brkW });
+  assert.ok(brkView.appJs.includes('buildBricks'));
+  assert.ok(brkView.appJs.includes('breakoutBest'));
+
+  // 3. Pong (must NOT fall back to Snake!)
+  const pongW = normalizeOrganWeights('interactive-game', { archetype: 'arcade-canvas', variant: 'pong' }, 'pong paddle', 'Pong');
+  const pongView = synthesizeProceduralOrganView(empty, { mediaType: 'interactive-game', activeOrgans: deriveActiveStudioOrgans('interactive-game'), weights: pongW });
+  assert.ok(pongView.appJs.includes('twoPlayer'));
+  assert.ok(pongView.appJs.includes('1P vs AI'));
+
+  // 4. Rule 30 (must NOT fall back to Game of Life!)
+  const r30W = normalizeOrganWeights('interactive-game', { archetype: 'cellular-sim', variant: 'rule-30', ruleNumber: 30 }, 'rule 30 automaton', 'Rule 30');
+  const r30View = synthesizeProceduralOrganView(empty, { mediaType: 'interactive-game', activeOrgans: deriveActiveStudioOrgans('interactive-game'), weights: r30W });
+  assert.ok(r30View.appJs.includes('nextElementaryRow'));
+  assert.ok(r30View.appJs.includes('Rule '));
+
+  // 5. Turn-board tactical minimax AI
+  const tbW = normalizeOrganWeights('interactive-game', { archetype: 'turn-board', rows: 6, cols: 7, winLength: 4, gravity: true }, 'connect 4', 'Connect 4');
+  const tbView = synthesizeProceduralOrganView(empty, { mediaType: 'interactive-game', activeOrgans: deriveActiveStudioOrgans('interactive-game'), weights: tbW });
+  assert.ok(tbView.appJs.includes('chooseTacticalCpuMove'));
+  assert.ok(tbView.appJs.includes('minimax'));
+
+  // 6. Audio live AnalyserNode + 4-track mixer + percussion
+  const audW = normalizeOrganWeights('audio', { style: 'rhythm-pulse', bpm: 120 }, 'lofi beat', 'Beat');
+  const audView = synthesizeProceduralOrganView(empty, { mediaType: 'audio', activeOrgans: deriveActiveStudioOrgans('audio'), weights: audW });
+  assert.ok(audView.appJs.includes('createAnalyser'));
+  assert.ok(audView.appJs.includes('triggerPercussion'));
+
+  // 7. Research Evidence Log + Markdown Export
+  const resW = normalizeOrganWeights('research-program', undefined, 'quantum battery study', 'Battery Study');
+  const resView = synthesizeProceduralOrganView(empty, { mediaType: 'research-program', activeOrgans: deriveActiveStudioOrgans('research-program'), weights: resW });
+  assert.ok(resView.appJs.includes('EVIDENCE & EXPERIMENT LOG'));
+  assert.ok(resView.appJs.includes('Export Report MD'));
+
+  // 8. Space Prism View
+  const spW = normalizeOrganWeights('space', { title: 'Mars Mission', layout: 'showcase', items: [{ id: 'p1', title: 'Nebula', mediaType: 'picture', summary: 'Art' }] }, 'Mars Mission', 'Mars Mission');
+  const spView = synthesizeProceduralOrganView(empty, { mediaType: 'space', activeOrgans: deriveActiveStudioOrgans('space'), weights: spW });
+  assert.ok(spView.appJs.includes('window.verdant?.openPrism'));
+  assert.ok(spView.appJs.includes('Mars Mission'));
+});

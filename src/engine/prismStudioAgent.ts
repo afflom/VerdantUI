@@ -110,7 +110,9 @@ export interface DiscoveryParseResult {
 }
 
 const PICTURE_RE =
-  /\b(picture|image|artwork|poster|illustration|painting|portrait|wallpaper|fractal|mosaic|constellation|sprite|drawing|visual\s+art|svg\s+art)\b/i;
+  /\b(picture|image|artwork|poster|illustration|painting|portrait|wallpaper|fractal|mosaic|constellation|sprite|drawing|visual\s+art|svg\s+art|landscape|nebula|seascape|sunset|sunrise|scenery)\b/i;
+const SPACE_RE =
+  /\b(create\s+(?:a\s+)?(?:new\s+)?space|new\s+space|space\s+called|space\s+named|curated\s+space|project\s+space)\b/i;
 const AUDIO_RE =
   /\b(audio|music|song|soundtrack|soundscape|synth(?:esizer)?|melody|beat|rhythm|podcast|jingle|chime|lofi|lo-?fi|ambient\s+sound|sound\s+effects?|wav)\b/i;
 const WRITTEN_WORK_RE =
@@ -140,6 +142,14 @@ export function classifyArtifactMediaType(sentence: string): ArtifactMediaClassi
       activeOrgans: deriveActiveStudioOrgans('tool-organ'),
       mode: 'structured-model',
       reason: 'Empty input defaults to structured tool model.',
+    };
+  }
+  if (SPACE_RE.test(trimmed)) {
+    return {
+      mediaType: 'space',
+      activeOrgans: deriveActiveStudioOrgans('space'),
+      mode: 'procedural-organ',
+      reason: 'Creates a Verdant Space Prism organizing curated content with a live custom view.',
     };
   }
   if (GAME_RE.test(trimmed)) {
@@ -270,7 +280,7 @@ function formatTranscriptForPrompt(history: readonly AgentChatTurn[]): string {
 export const STUDIO_AGENT_SYSTEM_PREFIX = `You are Verdant Studio, a collaborative 100% on-device Prism designer pairing with a human Creator in plain English.
 Core principles:
 - NEVER write JavaScript, HTML, or CSS code blocks. Verdant Studio procedurally synthesizes the Prism purely from structured JSON weights you route.
-- Identify the requested artifact mediaType ("picture", "written-work", "video", "interactive-game", "research-program", or "tool-organ") so only the relevant Studio features activate.
+- Identify the requested artifact mediaType ("picture", "audio", "written-work", "video", "interactive-game", "research-program", "tool-organ", or "space") so only the relevant Studio features activate.
 - Output ONLY one concise JSON object routing weights and asking at most 1-2 brief, plain-English clarifying questions when helpful.
 - NEVER mention internal engineering terms in user-facing text (never say Observer, OpenTelemetry, vTensor, LexLean, Holon, FK-07, Q10, or REQ-*).`;
 
@@ -284,7 +294,7 @@ function weightSchemaHintForMediaType(mediaType: PrismMediaType): string {
   - arcade-canvas: { "mediaType":"interactive-game", "archetype":"arcade-canvas", "variant":"snake|breakout|pong", "speed":5, "gridCols":20, "gridRows":16, "wrapWalls":false }
   - cellular-sim: { "mediaType":"interactive-game", "archetype":"cellular-sim", "variant":"game-of-life|rule-30", "rows":24, "cols":36, "tickMs":140 }`;
     case 'picture':
-      return `weights schema for picture: { "mediaType":"picture", "generator":"geometric-mosaic|botanical-fractal|wave-field|constellation|pixel-sprite", "symmetry":6, "density":42, "seed":4219, "palette":["#0b1714","#10b981","#f59e0b","#ecfdf5"], "caption":"Title" }`;
+      return `weights schema for picture: { "mediaType":"picture", "generator":"landscape-vista|cosmic-nebula|architectural-scene|botanical-garden|ocean-seascape|abstract-flow|geometric-mosaic|constellation-atlas|poster-editorial|pixel-scene", "lighting":"golden-hour|twilight|midnight|daylight|neon|studio", "width":800, "height":500, "symmetry":6, "density":58, "seed":4219, "palette":["#0b1714","#10b981","#f59e0b","#ecfdf5"], "caption":"Title" }`;
     case 'audio':
       return `weights schema for audio: { "mediaType":"audio", "style":"ambient-pad|melodic-arpeggio|rhythm-pulse|sound-effects", "bpm":96, "rootMidi":60, "scale":"pentatonic|major|minor|dorian", "durationSec":8, "title":"Title" }`;
     case 'written-work':
@@ -294,7 +304,9 @@ function weightSchemaHintForMediaType(mediaType: PrismMediaType): string {
     case 'research-program':
       return `weights schema for research-program: { "mediaType":"research-program", "topic":"...", "question":"...", "compartmentId":"research", "tracks":["..."], "hypotheses":[{"id":"H1","statement":"...","status":"open"}], "milestones":[{"title":"...","status":"planned","dueLabel":"Week 1"}] }`;
     case 'tool-organ':
-      return `weights schema for tool-organ: { "mediaType":"tool-organ", "role":"habit-guardian|schedule-guard|calculator|workflow-helper", "compartmentId":"personal|work|health", "emitsOpaqueConstraints":true, "rulesSummary":"...", "scheduleWindows":[{"label":"...","startMinuteOfDay":1020,"endMinuteOfDay":1080,"daysOfWeek":[0,1,2,3,4,5,6],"protectedWindow":true}], "metrics":[{"label":"...","target":1,"unit":"today"}] }`;
+      return `weights schema for tool-organ: { "mediaType":"tool-organ", "role":"habit-guardian|schedule-guard|calculator|workflow-helper", "compartmentId":"personal", "emitsOpaqueConstraints":true, "rulesSummary":"...", "scheduleWindows":[{"label":"...","startMinuteOfDay":1020,"endMinuteOfDay":1080,"daysOfWeek":[0,1,2,3,4,5,6],"protectedWindow":true}], "metrics":[{"label":"...","target":1,"unit":"today"}] }`;
+    case 'space':
+      return `weights schema for space: { "mediaType":"space", "title":"Space Name", "description":"What this space curates", "layout":"grid|board|showcase|timeline", "accent":"#0f5132", "items":[] }`;
   }
 }
 
@@ -565,6 +577,17 @@ function defaultCoreInputsForMediaType(mediaType: PrismMediaType, weights: Proce
     };
   }
 
+  if (mediaType === 'space') {
+    return {
+      domain: 'education',
+      inputs: [
+        { name: 'items', label: 'Curated items', kind: 'nat', min: 0, max: 500, defaultValue: 0 },
+      ],
+      refusals: [],
+      rules: [{ statement: 'Organize curated Space content cleanly', outcome: 'Space Ready', tone: 'success' }],
+    };
+  }
+
   return {
     domain: 'health',
     inputs: [
@@ -594,7 +617,9 @@ function defaultQuickRepliesForMediaType(mediaType: PrismMediaType): readonly st
     case 'research-program':
       return ['3 hypotheses + weekly milestones — build it', 'Keep in private Research space', 'Build it now'];
     case 'tool-organ':
-      return ['Protect 5pm–6pm daily (availability only)', 'Personal space with daily check-in', 'Build it now'];
+      return ['Protect 5pm–6pm daily', 'Daily habit check-in tracker', 'Build it now'];
+    case 'space':
+      return ['Grid view for mixed content', 'Showcase gallery layout', 'Build it now'];
   }
 }
 
@@ -616,6 +641,7 @@ export function parseDiscoveryAgentResponse(
     'interactive-game',
     'research-program',
     'tool-organ',
+    'space',
   ];
   const parsedMedia =
     parsed && typeof parsed.mediaType === 'string' && allowedMedia.includes(parsed.mediaType as PrismMediaType)
@@ -912,7 +938,6 @@ export function assembleProceduralPrismOps(
   const badges = [
     `${PRISM_MEDIA_CATALOG[spec.mediaType].label}`,
     `${spec.activeOrgans.length} active feature${spec.activeOrgans.length === 1 ? '' : 's'}`,
-    `Space: ${spec.compartmentId}`,
   ];
   return { ops, badges, finalDecl: working };
 }

@@ -110,6 +110,17 @@
       "invariantId": "VUI-STUDIO-02",
       "citation": { "kind": "req", "decisionId": "DEC-013" },
       "publicBenefitImpact": "Eliminates mediatype button clutter by inferring creation types automatically from natural language and resolves every model tool-call in chat through a Space-isolated Prism, autonomously synthesizing missing Prisms on demand."
+    },
+    {
+      "id": "VUI-FEAT-011",
+      "title": "Unified Expert Basis, Global MediaType Galleries, Spaces-as-Prisms & Feature-Complete Media Synthesis",
+      "stage": "active",
+      "introducedIn": "0.6.0",
+      "ownerFile": "src/engine/studioChatBridge.ts",
+      "testFile": "src/engine/studioChatBridge.test.ts",
+      "invariantId": "VUI-STUDIO-02",
+      "citation": { "kind": "req", "decisionId": "DEC-014" },
+      "publicBenefitImpact": "Unifies downloaded neural weights, 10-scene procedural picture synthesis, multi-track percussion/stereo audio, complete 10-variant games, living Spaces-as-Prisms, and global MediaType Galleries into one continually adapting on-device model manageable directly from chat threads."
     }
   ]
 }

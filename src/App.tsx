@@ -23,11 +23,20 @@ const VTensorInspector = lazy(() =>
 const VerdantStudioView = lazy(() =>
   import('./components/VerdantStudioView').then((m) => ({ default: m.VerdantStudioView })),
 );
+const GalleryView = lazy(() =>
+  import('./components/GalleryView').then((m) => ({ default: m.GalleryView })),
+);
 import type { SamplingConfig } from './engine/llamaRuntime';
 import {
   buildUnifiedVerdantModelContext,
   createVerdantClientTools,
 } from './engine/cognitiveObserver';
+import {
+  ContentGalleryStore,
+  GALLERY_LABEL_BY_TYPE,
+  type ContentArtifactRecord,
+  type GalleryMediaType,
+} from './engine/contentGalleryStore';
 import type { ImportedHarnessSpec } from './engine/harnessConfig';
 import { isInternalBootstrapModel } from './engine/modelCatalog';
 import { ObserverStreamBus } from './engine/observerStreamBus';
@@ -38,7 +47,9 @@ import {
   type PublishedPrismSummary,
   type VerdantPrismProject,
 } from './engine/prismStudio';
+import type { StudioChatBridge } from './engine/studioChatBridge';
 import { createVTensorThreadListAdapter } from './engine/threadStorage';
+import { UnifiedExpertRegistry } from './engine/unifiedModelBasis';
 import { LlamaVTensorWorkerClient, type EngineState } from './engine/workerClient';
 
 const THEME_STORAGE_KEY = 'vtensor-assistant:theme:v1';
@@ -66,6 +77,8 @@ const VerdantModelContextBridge: FC<{
   workerClient: LlamaVTensorWorkerClient;
   publishedPrisms: readonly PublishedPrismSummary[];
   prismPool: PrismHostPool;
+  studioChatBridge: () => Promise<StudioChatBridge>;
+  expertRegistry: UnifiedExpertRegistry;
   opaqueConstraintsNotice: string;
 }> = ({
   importedHarness,
@@ -74,6 +87,8 @@ const VerdantModelContextBridge: FC<{
   workerClient,
   publishedPrisms,
   prismPool,
+  studioChatBridge,
+  expertRegistry,
   opaqueConstraintsNotice,
 }) => {
   const aui = useAui();
@@ -99,8 +114,10 @@ const VerdantModelContextBridge: FC<{
             workerClient.cognitiveContext.recallTurns(workerClient.getActiveThreadId(), q),
         },
         () => workerClient.cognitiveObserver.possession.getActiveCompartmentId(),
+        studioChatBridge,
+        expertRegistry,
       ),
-    [workerClient, publishedPrisms, prismPool],
+    [workerClient, publishedPrisms, prismPool, studioChatBridge, expertRegistry],
   );
 
   useEffect(() => {
@@ -134,13 +151,16 @@ const VerdantModelContextBridge: FC<{
 
 type ActiveWorkspaceView =
   | { readonly kind: 'thread' }
-  | { readonly kind: 'prism'; readonly prismId: string; readonly mode: 'studio' | 'app' };
+  | { readonly kind: 'prism'; readonly prismId: string; readonly mode: 'studio' | 'app' }
+  | { readonly kind: 'gallery'; readonly mediaType: GalleryMediaType };
 
 export default function App() {
   const workerClient = useMemo(() => new LlamaVTensorWorkerClient(), []);
   const observerBus = useMemo(() => new ObserverStreamBus(), []);
   const prismBuildClient = useMemo(() => new PrismBuildWorkerClient(observerBus), [observerBus]);
   const prismStore = useMemo(() => new PrismStore(), []);
+  const galleryStore = useMemo(() => new ContentGalleryStore(), []);
+  const expertRegistry = useMemo(() => new UnifiedExpertRegistry(), []);
   const prismPool = useMemo(
     () =>
       new PrismHostPool(
@@ -153,6 +173,31 @@ export default function App() {
       ),
     [observerBus, prismStore, workerClient, prismBuildClient],
   );
+  const getStudioChatBridge = useMemo(() => {
+    let cached: Promise<StudioChatBridge> | null = null;
+    return () => {
+      if (!cached) {
+        cached = import('./engine/studioChatBridge').then(
+          ({ StudioChatBridge }) =>
+            new StudioChatBridge({
+              store: prismStore,
+              pool: prismPool,
+              observer: workerClient.cognitiveObserver,
+              galleries: galleryStore,
+              registry: expertRegistry,
+              synthesizeAudioWav: (params) => workerClient.synthesizeAudioClip(params),
+              onOpenPrism: (prismId) => {
+                setActiveView({ kind: 'prism', prismId, mode: 'app' });
+              },
+              onOpenGallery: (mediaType) => {
+                setActiveView({ kind: 'gallery', mediaType });
+              },
+            }),
+        );
+      }
+      return cached;
+    };
+  }, [prismStore, prismPool, workerClient, galleryStore, expertRegistry]);
   const modelAdapter = useMemo(
     () =>
       createLlamaVTensorAdapter(workerClient, {
@@ -165,7 +210,10 @@ export default function App() {
           setActiveView({ kind: 'prism', prismId, mode: 'app' });
         },
         resolveOrCreatePrismForToolCall: async (toolName, args, meta) => {
-          const { resolveOrCreatePrismForToolCall } = await import('./engine/prismToolResolver');
+          const [{ resolveOrCreatePrismForToolCall }, bridge] = await Promise.all([
+            import('./engine/prismToolResolver'),
+            getStudioChatBridge(),
+          ]);
           return resolveOrCreatePrismForToolCall({
             toolName,
             args,
@@ -174,11 +222,14 @@ export default function App() {
             store: prismStore,
             pool: prismPool,
             observer: workerClient.cognitiveObserver,
+            galleries: galleryStore,
+            registry: expertRegistry,
+            studioChatBridge: bridge,
             signal: meta.signal,
           });
         },
       }),
-    [workerClient, observerBus, prismStore, prismPool],
+    [workerClient, observerBus, prismStore, prismPool, galleryStore, expertRegistry, getStudioChatBridge],
   );
   const attachmentAdapter = useMemo(() => new SimpleTextAttachmentAdapter(), []);
   const threadListAdapter = useMemo(() => createVTensorThreadListAdapter(), []);
@@ -201,6 +252,9 @@ export default function App() {
 
   const [engineState, setEngineState] = useState<EngineState>(() => workerClient.getState());
   const [prisms, setPrisms] = useState<readonly VerdantPrismProject[]>(() => prismStore.list());
+  const [galleryArtifacts, setGalleryArtifacts] = useState<readonly ContentArtifactRecord[]>(() =>
+    galleryStore.listAll(),
+  );
   const [activeView, setActiveView] = useState<ActiveWorkspaceView>({ kind: 'thread' });
   const [prismToast, setPrismToast] = useState<{ title: string; body: string } | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -219,10 +273,15 @@ export default function App() {
     [prismStore, prisms],
   );
 
-  // Sync owned Prisms into the unified possession model and scope visible Prisms cleanly.
-  const { opaqueConstraintsNotice, visiblePublishedPrisms } = useMemo(() => {
+  // Sync owned Prisms into the unified possession model, expert registry, and global gallery index.
+  const { opaqueConstraintsNotice, visiblePublishedPrisms, spacePrisms, galleryCounts } = useMemo(() => {
     const activeSpace = workerClient.cognitiveObserver.possession.getActiveCompartmentId();
     workerClient.cognitiveObserver.syncPublishedPrisms(prisms);
+    expertRegistry.syncPrismsAsExperts(prisms);
+    galleryStore.syncFromPrisms(prisms);
+    const spacesOnly = prisms.filter(
+      (p) => (p.declaration?.view?.proceduralOrgan?.mediaType ?? p.declaration?.concept.mediaType) === 'space',
+    );
     return {
       opaqueConstraintsNotice:
         workerClient.cognitiveObserver.getOpaqueConstraintsPromptForSpace(activeSpace),
@@ -230,8 +289,43 @@ export default function App() {
         publishedPrisms,
         activeSpace,
       ),
+      spacePrisms: spacesOnly,
+      galleryCounts: galleryStore.galleryCounts(),
     };
-  }, [workerClient, prisms, publishedPrisms]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workerClient, expertRegistry, galleryStore, prisms, publishedPrisms, galleryArtifacts]);
+
+  // Register downloaded/resident neural weight experts into the unified VerdantUI model
+  useEffect(() => {
+    if (engineState.model && !isInternalBootstrapModel(engineState.model.id)) {
+      const storedEntry = engineState.opfsStorage?.storedModels.find(
+        (m) => m.modelId === engineState.model!.id,
+      );
+      expertRegistry.registerNeuralWeightExpert({
+        modality: 'language',
+        modelId: engineState.model.id,
+        label: engineState.model.displayName,
+        residency: 'hot-vtensor',
+        residentBytes: storedEntry?.byteLength ?? 0,
+      });
+    }
+    for (const stored of engineState.opfsStorage?.storedModels ?? []) {
+      const mod = /whisper/i.test(stored.modelId)
+        ? 'speech'
+        : /vision|mmproj|siglip|vlm/i.test(stored.modelId)
+          ? 'vision'
+          : /sdxs|taesd/i.test(stored.modelId)
+            ? 'image-neural'
+            : 'language';
+      expertRegistry.registerNeuralWeightExpert({
+        modality: mod,
+        modelId: stored.modelId,
+        label: stored.modelId,
+        residency: engineState.model?.id === stored.modelId ? 'hot-vtensor' : 'warm-opfs',
+        residentBytes: stored.byteLength,
+      });
+    }
+  }, [engineState.model, engineState.opfsStorage, expertRegistry]);
 
   useEffect(() => {
     let toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -246,7 +340,11 @@ export default function App() {
       },
     });
     const unsubStore = prismStore.subscribe(setPrisms);
-    void prismStore.hydrate();
+    const unsubGallery = galleryStore.subscribe(setGalleryArtifacts);
+    void Promise.all([prismStore.hydrate(), galleryStore.hydrate(), expertRegistry.basis.hydrate()]).then(() => {
+      galleryStore.syncFromPrisms(prismStore.list());
+      expertRegistry.syncPrismsAsExperts(prismStore.list());
+    });
     const unsubBus = observerBus.subscribe((ev) => {
       if (ev.endpointKind === 'prism') {
         workerClient.cognitiveObserver.recordSensoryEvent(ev);
@@ -255,11 +353,12 @@ export default function App() {
     return () => {
       if (toastTimer) clearTimeout(toastTimer);
       unsubStore();
+      unsubGallery();
       unsubBus();
       prismPool.dispose();
       prismBuildClient.dispose();
     };
-  }, [prismStore, observerBus, workerClient, prismPool, prismBuildClient]);
+  }, [prismStore, galleryStore, expertRegistry, observerBus, workerClient, prismPool, prismBuildClient]);
 
   useEffect(() => {
     const unsubscribe = workerClient.subscribe(setEngineState);
@@ -384,11 +483,49 @@ export default function App() {
     await workerClient.runConformanceCheck();
   }, [workerClient]);
 
-  const handleCreatePrism = useCallback(() => {
-    void prismStore.createDeclarative('undefined').then((created) => {
-      setActiveView({ kind: 'prism', prismId: created.id, mode: 'studio' });
-    });
-  }, [prismStore]);
+  const handleCreateSpace = useCallback(() => {
+    void getStudioChatBridge()
+      .then((bridge) =>
+        bridge.manageSpacesAndPrisms({
+          action: 'create',
+          name: `Space ${spacePrisms.length + 1}`,
+        }),
+      )
+      .then((res) => {
+        setActiveView({ kind: 'prism', prismId: res.prismId, mode: 'studio' });
+      });
+  }, [getStudioChatBridge, spacePrisms.length]);
+
+  const handleCreateInGallery = useCallback(
+    (mediaType: GalleryMediaType) => {
+      void getStudioChatBridge()
+        .then((bridge) =>
+          bridge.createArtifactFromPrompt({
+            prompt: `Create a new ${GALLERY_LABEL_BY_TYPE[mediaType].toLowerCase()}`,
+            forcedMediaType: mediaType,
+          }),
+        )
+        .then((res) => {
+          setActiveView({ kind: 'prism', prismId: res.prismId, mode: 'studio' });
+        });
+    },
+    [getStudioChatBridge],
+  );
+
+  const handleAssignToSpace = useCallback(
+    (artifactId: string, spaceId: string) => {
+      galleryStore.assignToSpace(artifactId, spaceId);
+      void import('./engine/studioChatBridge').then(({ syncSpacePrismView }) =>
+        syncSpacePrismView(spaceId, {
+          store: prismStore,
+          galleries: galleryStore,
+          observer: workerClient.cognitiveObserver,
+          registry: expertRegistry,
+        }),
+      );
+    },
+    [galleryStore, prismStore, workerClient, expertRegistry],
+  );
 
   const handleImportHoloFile = useCallback(
     async (file: File) => {
@@ -462,6 +599,8 @@ export default function App() {
         workerClient={workerClient}
         publishedPrisms={visiblePublishedPrisms}
         prismPool={prismPool}
+        studioChatBridge={getStudioChatBridge}
+        expertRegistry={expertRegistry}
         opaqueConstraintsNotice={opaqueConstraintsNotice}
       />
       <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#F8F9FA] text-slate-900 dark:bg-[#0B0F14] dark:text-slate-100">
@@ -569,15 +708,31 @@ export default function App() {
             onOpenInspector={() => setSettingsOpen(true)}
             activeView={activeView}
             onSelectThreadView={() => setActiveView({ kind: 'thread' })}
-            prisms={prisms}
-            onCreatePrism={handleCreatePrism}
+            spaces={spacePrisms}
+            galleryCounts={galleryCounts}
+            onCreateSpace={handleCreateSpace}
+            onSelectGallery={(mediaType) => setActiveView({ kind: 'gallery', mediaType })}
             onImportHoloFile={(file) => void handleImportHoloFile(file)}
             onSelectPrism={handleSelectPrism}
             onDeletePrism={handleDeletePrism}
           />
 
           <main className="min-w-0 flex-1 overflow-hidden">
-            {activeView.kind === 'prism' && focusedPrism ? (
+            {activeView.kind === 'gallery' ? (
+              <Suspense fallback={null}>
+                <GalleryView
+                  mediaType={activeView.mediaType}
+                  items={galleryStore.listByGallery(activeView.mediaType)}
+                  categories={galleryStore.listCategoriesForGallery(activeView.mediaType)}
+                  spaces={spacePrisms}
+                  onCreateInGallery={handleCreateInGallery}
+                  onOpenArtifact={(id, mode) => setActiveView({ kind: 'prism', prismId: id, mode })}
+                  onDeleteArtifact={handleDeletePrism}
+                  onAssignToSpace={handleAssignToSpace}
+                  onOpenSpace={(spaceId) => setActiveView({ kind: 'prism', prismId: spaceId, mode: 'app' })}
+                />
+              </Suspense>
+            ) : activeView.kind === 'prism' && focusedPrism ? (
               <Suspense fallback={null}>
                 <VerdantStudioView
                   project={focusedPrism}
@@ -605,6 +760,10 @@ export default function App() {
                 onToggleInspector={handleToggleInspector}
                 onOpenPrism={handleOpenPrismApp}
                 onEditPrism={handleEditPrismStudio}
+                getPrismById={(id) => prismStore.get(id)}
+                observerBus={observerBus}
+                bridgeRuntime={prismPool}
+                darkMode={darkMode}
                 publishedPrisms={visiblePublishedPrisms}
                 onSpeculativeDraftChange={handleSpeculativeDraftChange}
                 onPerceiveImage={handlePerceiveImage}
@@ -636,6 +795,7 @@ export default function App() {
                 onClose={() => setDebugPanelOpen(false)}
                 engineState={engineState}
                 publishedPrisms={publishedPrisms}
+                unifiedModelTelemetry={expertRegistry.telemetry()}
                 observerBus={observerBus}
                 onClearHarness={handleClearHarness}
                 onClearCache={handleClearCache}

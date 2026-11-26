@@ -9,14 +9,25 @@ import {
   ArchiveRestore,
   ChevronDown,
   ChevronRight,
+  FileText,
+  FlaskConical,
+  Gamepad2,
+  Image as ImageIcon,
+  Layers,
+  Music,
   Plus,
   ShieldCheck,
   SlidersHorizontal,
-  Sparkles,
   Trash2,
   Upload,
+  Video,
+  Wrench,
   X,
 } from 'lucide-react';
+import {
+  MEDIA_GALLERIES,
+  type GalleryMediaType,
+} from '../engine/contentGalleryStore';
 import { isInternalBootstrapModel } from '../engine/modelCatalog';
 import type { VerdantPrismProject } from '../engine/prismStudio';
 import type { EngineState } from '../engine/workerClient';
@@ -26,10 +37,15 @@ interface ThreadSidebarProps {
   mobileOpen: boolean;
   onCloseMobile: () => void;
   onOpenInspector: () => void;
-  activeView: { readonly kind: 'thread' } | { readonly kind: 'prism'; readonly prismId: string; readonly mode: 'studio' | 'app' };
+  activeView:
+    | { readonly kind: 'thread' }
+    | { readonly kind: 'prism'; readonly prismId: string; readonly mode: 'studio' | 'app' }
+    | { readonly kind: 'gallery'; readonly mediaType: GalleryMediaType };
   onSelectThreadView: () => void;
-  prisms: readonly VerdantPrismProject[];
-  onCreatePrism: () => void;
+  spaces: readonly VerdantPrismProject[];
+  galleryCounts: Readonly<Record<GalleryMediaType, number>>;
+  onCreateSpace: () => void;
+  onSelectGallery: (mediaType: GalleryMediaType) => void;
   onImportHoloFile?: (file: File) => void;
   onSelectPrism: (prismId: string, mode: 'studio' | 'app') => void;
   onDeletePrism: (prismId: string) => void;
@@ -82,15 +98,18 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
   onOpenInspector,
   activeView,
   onSelectThreadView,
-  prisms,
-  onCreatePrism,
+  spaces,
+  galleryCounts,
+  onCreateSpace,
+  onSelectGallery,
   onImportHoloFile,
   onSelectPrism,
   onDeletePrism,
 }) => {
   const [showArchived, setShowArchived] = useState(false);
   const [threadsExpanded, setThreadsExpanded] = useState(true);
-  const [studioExpanded, setStudioExpanded] = useState(true);
+  const [spacesExpanded, setSpacesExpanded] = useState(true);
+  const [galleriesExpanded, setGalleriesExpanded] = useState(true);
   const holoFileRef = useRef<HTMLInputElement | null>(null);
   const handleHoloPick = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -198,28 +217,28 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
           )}
         </ThreadListPrimitive.Root>
 
-        {/* Section 2: Verdant Studio (Prisms) */}
+        {/* Section 2: Spaces (each Space is a Verdant Prism) */}
         <section
-          aria-label="Verdant Studio Prisms"
-          className={`flex flex-col overflow-hidden p-3 ${studioExpanded ? 'min-h-0 flex-1' : 'shrink-0'}`}
+          aria-label="Spaces"
+          className={`flex flex-col overflow-hidden p-3 ${spacesExpanded ? 'min-h-0 max-h-[34%] shrink-0' : 'shrink-0'}`}
         >
           <div className="mb-2 flex items-center justify-between">
             <button
               type="button"
-              aria-expanded={studioExpanded}
-              onClick={() => setStudioExpanded((prev) => !prev)}
+              aria-expanded={spacesExpanded}
+              onClick={() => setSpacesExpanded((prev) => !prev)}
               className="inline-flex items-center gap-1 text-xs font-semibold tracking-tight text-slate-700 hover:text-slate-950 dark:text-slate-300 dark:hover:text-white"
             >
-              {studioExpanded ? (
+              {spacesExpanded ? (
                 <ChevronDown className="h-3.5 w-3.5 text-slate-400" />
               ) : (
                 <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
               )}
-              <span>Verdant Studio</span>
+              <span>Spaces</span>
             </button>
-            {prisms.length > 0 && (
+            {spaces.length > 0 && (
               <span className="font-mono text-[10px] text-slate-400 tabular-nums">
-                {prisms.length}
+                {spaces.length}
               </span>
             )}
           </div>
@@ -229,13 +248,13 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
               type="button"
               data-testid="new-prism-btn"
               onClick={() => {
-                onCreatePrism();
+                onCreateSpace();
                 onCloseMobile();
               }}
-              className="flex h-9 min-w-0 flex-1 items-center justify-center gap-2 rounded-lg border border-emerald-700/30 bg-emerald-50/70 px-3 text-xs font-semibold text-emerald-950 hover:border-emerald-700/50 hover:bg-emerald-100/70 dark:border-emerald-500/30 dark:bg-emerald-950/40 dark:text-emerald-200 dark:hover:bg-emerald-950/70 transition-colors whitespace-nowrap"
+              className="flex h-8 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-lg border border-emerald-700/30 bg-emerald-50/70 px-3 text-xs font-semibold text-emerald-950 hover:border-emerald-700/50 hover:bg-emerald-100/70 dark:border-emerald-500/30 dark:bg-emerald-950/40 dark:text-emerald-200 dark:hover:bg-emerald-950/70 transition-colors whitespace-nowrap"
             >
-              <Sparkles className="h-3.5 w-3.5" />
-              <span>New Prism</span>
+              <Layers className="h-3.5 w-3.5" />
+              <span>New Space</span>
             </button>
             {onImportHoloFile && (
               <>
@@ -251,7 +270,7 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
                   onClick={() => holoFileRef.current?.click()}
                   title="Import a saved creation"
                   aria-label="Import creation"
-                  className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-[#F8F9FA] text-slate-700 hover:border-slate-300 hover:bg-slate-100 dark:border-slate-800 dark:bg-[#141B26] dark:text-slate-300 dark:hover:bg-slate-800 transition-colors"
+                  className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-[#F8F9FA] text-slate-700 hover:border-slate-300 hover:bg-slate-100 dark:border-slate-800 dark:bg-[#141B26] dark:text-slate-300 dark:hover:bg-slate-800 transition-colors"
                 >
                   <Upload className="h-3.5 w-3.5" />
                 </button>
@@ -259,27 +278,20 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
             )}
           </div>
 
-          {studioExpanded && (
-            <div className="mt-2.5 flex-1 space-y-1 overflow-y-auto">
-              {prisms.length === 0 ? (
-                <p className="px-2 py-2 text-[11px] leading-relaxed text-slate-400 dark:text-slate-500">
-                  Create a Prism app to preview live and publish to VerdantUI.
+          {spacesExpanded && (
+            <div className="mt-2 space-y-1 overflow-y-auto">
+              {spaces.length === 0 ? (
+                <p className="px-2 py-1.5 text-[11px] leading-relaxed text-slate-400 dark:text-slate-500">
+                  Group pictures, audio, documents, games, and utilities into custom Spaces.
                 </p>
               ) : (
-                prisms.map((p) => {
-                  const isActive =
-                    activeView.kind === 'prism' && activeView.prismId === p.id;
+                spaces.map((p) => {
+                  const isActive = activeView.kind === 'prism' && activeView.prismId === p.id;
                   const isPub = p.published !== null;
-                  const isMod = isPub && p.published!.digest !== p.draft.digest;
-                  const dotClass = !isPub
-                    ? 'bg-slate-400 dark:bg-slate-500'
-                    : isMod
-                      ? 'bg-amber-500'
-                      : 'bg-emerald-600 dark:bg-emerald-400';
                   return (
                     <div
                       key={p.id}
-                      className={`group flex items-center gap-1 rounded-lg px-2 py-1.5 text-sm transition-colors ${
+                      className={`group flex items-center gap-1 rounded-lg px-2 py-1 text-sm transition-colors ${
                         isActive
                           ? 'bg-slate-200/75 font-medium text-slate-950 dark:bg-slate-800 dark:text-white'
                           : 'text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800/70'
@@ -292,13 +304,9 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
                           onCloseMobile();
                         }}
                         className="flex min-w-0 flex-1 items-center gap-2 py-0.5 text-left text-[13px]"
-                        title={
-                          isPub
-                            ? `${p.published!.name} (Published — click to open app)`
-                            : `${p.draft.name} (Draft — click to edit in Studio)`
-                        }
+                        title={p.draft.name}
                       >
-                        <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotClass}`} />
+                        <Layers className="h-3.5 w-3.5 shrink-0 text-emerald-700 dark:text-emerald-400" />
                         <span className="truncate">{p.draft.name}</span>
                         {(p.publishedHolo?.proved || p.sealedDraft?.proved) && (
                           <ShieldCheck
@@ -309,7 +317,7 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
                       </button>
                       <button
                         type="button"
-                        aria-label={`Delete Prism ${p.draft.name}`}
+                        aria-label={`Delete Space ${p.draft.name}`}
                         onClick={(e) => {
                           e.stopPropagation();
                           onDeletePrism(p.id);
@@ -323,6 +331,76 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
                 })
               )}
             </div>
+          )}
+        </section>
+
+        {/* Section 3: Global MediaType Galleries */}
+        <section
+          aria-label="Galleries"
+          className="flex shrink-0 flex-col overflow-hidden p-3"
+        >
+          <div className="mb-1.5 flex items-center justify-between">
+            <button
+              type="button"
+              aria-expanded={galleriesExpanded}
+              onClick={() => setGalleriesExpanded((prev) => !prev)}
+              className="inline-flex items-center gap-1 text-xs font-semibold tracking-tight text-slate-700 hover:text-slate-950 dark:text-slate-300 dark:hover:text-white"
+            >
+              {galleriesExpanded ? (
+                <ChevronDown className="h-3.5 w-3.5 text-slate-400" />
+              ) : (
+                <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
+              )}
+              <span>Galleries</span>
+            </button>
+          </div>
+
+          {galleriesExpanded && (
+            <nav aria-label="Media Galleries" className="space-y-0.5">
+              {MEDIA_GALLERIES.map((g) => {
+                const isActive = activeView.kind === 'gallery' && activeView.mediaType === g.mediaType;
+                const count = galleryCounts[g.mediaType] ?? 0;
+                const Icon =
+                  g.mediaType === 'picture'
+                    ? ImageIcon
+                    : g.mediaType === 'video'
+                      ? Video
+                      : g.mediaType === 'audio'
+                        ? Music
+                        : g.mediaType === 'written-work'
+                          ? FileText
+                          : g.mediaType === 'interactive-game'
+                            ? Gamepad2
+                            : g.mediaType === 'research-program'
+                              ? FlaskConical
+                              : Wrench;
+                return (
+                  <button
+                    key={g.mediaType}
+                    type="button"
+                    onClick={() => {
+                      onSelectGallery(g.mediaType);
+                      onCloseMobile();
+                    }}
+                    className={`flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-left text-[13px] transition-colors ${
+                      isActive
+                        ? 'bg-emerald-50 font-medium text-emerald-950 dark:bg-emerald-950/50 dark:text-emerald-200'
+                        : 'text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800/70'
+                    }`}
+                  >
+                    <span className="inline-flex items-center gap-2 truncate">
+                      <Icon className="h-3.5 w-3.5 shrink-0 text-slate-500 dark:text-slate-400" />
+                      <span className="truncate">{g.label}</span>
+                    </span>
+                    {count > 0 && (
+                      <span className="font-mono text-[10px] text-slate-400 tabular-nums">
+                        {count}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </nav>
           )}
         </section>
       </div>

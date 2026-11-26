@@ -6,6 +6,7 @@ import type { ObserverStreamBus } from '../engine/observerStreamBus';
 import type { PrecisionContractMode } from '../engine/performanceContract';
 import { COGNITIVE_AXIS_LABELS } from '../engine/cognitiveObserver';
 import type { PublishedPrismSummary } from '../engine/prismStudio';
+import type { UnifiedModelTelemetrySnapshot } from '../engine/unifiedModelBasis';
 import type { WeightResidencyPolicy } from '../engine/vramWeightPager';
 import type { EngineState, PromptFormatMode } from '../engine/workerClient';
 import { VTENSOR_CONTRACT } from '../engine/vtensorProvider';
@@ -15,6 +16,7 @@ interface VTensorInspectorProps {
   onClose: () => void;
   engineState: EngineState;
   publishedPrisms?: readonly PublishedPrismSummary[];
+  unifiedModelTelemetry?: UnifiedModelTelemetrySnapshot;
   observerBus?: ObserverStreamBus;
   onClearHarness: () => void;
   onClearCache?: () => Promise<void>;
@@ -33,6 +35,7 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
   onClose,
   engineState,
   publishedPrisms = [],
+  unifiedModelTelemetry,
   observerBus,
   onClearHarness,
   onClearCache,
@@ -1321,6 +1324,36 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
                   Zephyr, or Story continuation).
                 </p>
               </div>
+
+              {unifiedModelTelemetry && (
+                <div className="border-t border-slate-100 pt-4 dark:border-slate-800">
+                  <span className="block font-medium text-slate-700 dark:text-slate-300">
+                    Unified Model &amp; Living Basis
+                  </span>
+                  <div className="mt-2 grid grid-cols-2 gap-1.5 text-[11px]">
+                    <div className="rounded-md border border-slate-200 bg-slate-50 px-2 py-1.5 dark:border-slate-800 dark:bg-[#141B26]">
+                      <div className="text-slate-500">Total Experts</div>
+                      <div className="font-mono font-semibold tabular-nums">{unifiedModelTelemetry.totalExperts}</div>
+                    </div>
+                    <div className="rounded-md border border-slate-200 bg-slate-50 px-2 py-1.5 dark:border-slate-800 dark:bg-[#141B26]">
+                      <div className="text-slate-500">Adaptations</div>
+                      <div className="font-mono font-semibold tabular-nums">{unifiedModelTelemetry.adaptationSteps}</div>
+                    </div>
+                    <div className="rounded-md border border-slate-200 bg-slate-50 px-2 py-1.5 dark:border-slate-800 dark:bg-[#141B26]">
+                      <div className="text-slate-500">Neural / Procedural</div>
+                      <div className="font-mono font-semibold tabular-nums">
+                        {unifiedModelTelemetry.neuralExperts} / {unifiedModelTelemetry.proceduralExperts}
+                      </div>
+                    </div>
+                    <div className="rounded-md border border-slate-200 bg-slate-50 px-2 py-1.5 dark:border-slate-800 dark:bg-[#141B26]">
+                      <div className="text-slate-500">Spaces / Content</div>
+                      <div className="font-mono font-semibold tabular-nums">
+                        {unifiedModelTelemetry.spaceExperts} / {unifiedModelTelemetry.contentExperts}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         )}

@@ -943,6 +943,16 @@ export interface StudioAdapterBridge {
     readonly prismId: string;
     readonly prismName: string;
     readonly digest: string;
+    readonly mediaType?: string;
+    readonly summary?: string;
+    readonly galleryLabel?: string;
+    readonly categories?: readonly string[];
+    readonly previewImageDataUrl?: string;
+    readonly previewImageWidth?: number;
+    readonly previewImageHeight?: number;
+    readonly audioWavDataUrl?: string;
+    readonly audioDurationSec?: number;
+    readonly writtenExcerpt?: string;
     readonly output: unknown;
   }>;
 }
