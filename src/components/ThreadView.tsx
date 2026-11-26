@@ -210,25 +210,54 @@ const ComposerPrismMentionPicker: FC<{
 }> = ({ publishedPrisms, forceOpen, onClose }) => {
   const aui = useAui();
   const composerText = useAuiState((s) => s.composer.text);
-
-  if (publishedPrisms.length === 0) return null;
+  const [activeIdx, setActiveIdx] = useState(0);
 
   const trimmed = composerText.trimStart();
   const atMatch = trimmed.match(/^@([^\n:]*)$/);
   const query = atMatch ? atMatch[1].toLowerCase() : '';
-  const open = forceOpen || Boolean(atMatch);
-  if (!open) return null;
+  const open = publishedPrisms.length > 0 && (forceOpen || Boolean(atMatch));
 
-  const matches = publishedPrisms.filter((p) => {
-    if (!query) return true;
-    return (
-      p.name.toLowerCase().includes(query) ||
-      p.slug.toLowerCase().includes(query) ||
-      p.summary.toLowerCase().includes(query)
-    );
-  });
+  const matches = useMemo(() => {
+    if (!open) return [];
+    return publishedPrisms.filter((p) => {
+      if (!query) return true;
+      return (
+        p.name.toLowerCase().includes(query) ||
+        p.slug.toLowerCase().includes(query) ||
+        p.summary.toLowerCase().includes(query)
+      );
+    });
+  }, [open, publishedPrisms, query]);
 
-  if (matches.length === 0) return null;
+  useEffect(() => {
+    setActiveIdx(0);
+  }, [query, open]);
+
+  useEffect(() => {
+    if (!open || matches.length === 0) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setActiveIdx((i) => (i + 1) % matches.length);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setActiveIdx((i) => (i - 1 + matches.length) % matches.length);
+      } else if (e.key === 'Tab') {
+        e.preventDefault();
+        const picked = matches[activeIdx] ?? matches[0];
+        if (picked) {
+          aui.composer().setText(`@${picked.name} `);
+          onClose();
+        }
+      } else if (e.key === 'Escape') {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [open, matches, activeIdx, aui, onClose]);
+
+  if (!open || matches.length === 0) return null;
 
   return (
     <div
@@ -237,7 +266,7 @@ const ComposerPrismMentionPicker: FC<{
       className="mx-3 mt-2 rounded-lg border border-slate-200 bg-slate-50/90 p-1.5 shadow-xs dark:border-slate-700 dark:bg-[#0F141C]"
     >
       <div className="mb-1 flex items-center justify-between px-2 text-[10px] font-semibold tracking-wide text-slate-500 uppercase dark:text-slate-400">
-        <span>Published Prisms</span>
+        <span>Published Prisms · Tab to insert</span>
         {forceOpen && (
           <button
             type="button"
@@ -249,16 +278,22 @@ const ComposerPrismMentionPicker: FC<{
         )}
       </div>
       <div className="space-y-0.5">
-        {matches.map((p) => (
+        {matches.map((p, idx) => (
           <button
             key={p.id}
             type="button"
             role="option"
+            aria-selected={idx === activeIdx}
+            onMouseEnter={() => setActiveIdx(idx)}
             onClick={() => {
               aui.composer().setText(`@${p.name} `);
               onClose();
             }}
-            className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-emerald-50 dark:hover:bg-emerald-950/50 transition-colors"
+            className={`flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors ${
+              idx === activeIdx
+                ? 'bg-emerald-50 dark:bg-emerald-950/60'
+                : 'hover:bg-emerald-50/60 dark:hover:bg-emerald-950/30'
+            }`}
           >
             <span className="inline-flex min-w-0 items-center gap-1.5 font-medium text-slate-900 dark:text-slate-100">
               <Sparkles className="h-3.5 w-3.5 shrink-0 text-emerald-700 dark:text-emerald-400" />

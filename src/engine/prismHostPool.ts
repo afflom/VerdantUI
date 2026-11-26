@@ -77,6 +77,7 @@ export interface PrismBridgeRuntime {
     onChunk?: (accumulatedText: string) => void,
     signal?: AbortSignal,
   ): Promise<{ readonly status: number; readonly ok: boolean; readonly text: string }>;
+  evictPrism(prismId: string): void;
 }
 
 interface PooledPrismInstance {
@@ -384,8 +385,10 @@ export class PrismHostPool implements PrismBridgeRuntime {
     if (chain.includes(targetId)) {
       throw new Error(`Cyclic Prism-to-Prism call refused (${[...chain, targetId].join(' -> ')}).`);
     }
+    const nextChain = [...chain, targetId];
     const { result } = await this.dispatchPublishedPrism(targetId, payload, {
       parentContext,
+      callChain: nextChain,
     });
     return result;
   }
@@ -499,7 +502,11 @@ export class PrismHostPool implements PrismBridgeRuntime {
   async dispatchPublishedPrism(
     prismId: string,
     payload: unknown,
-    opts?: { readonly signal?: AbortSignal; readonly parentContext?: OtelTraceContext },
+    opts?: {
+      readonly signal?: AbortSignal;
+      readonly parentContext?: OtelTraceContext;
+      readonly callChain?: readonly string[];
+    },
   ): Promise<{ readonly result: unknown; readonly prismName: string; readonly digest: string }> {
     const project = this.store.get(prismId);
     const snapshot = project?.published;
@@ -507,10 +514,14 @@ export class PrismHostPool implements PrismBridgeRuntime {
       throw new Error(`Published Prism "${prismId}" is not available.`);
     }
 
+    const parentContext = opts?.parentContext ?? this.bus.getActiveTraceContext();
+    const callChain = opts?.callChain ?? [prismId];
+
     if (this.bus.hasEndpoint(prismId)) {
       const { result } = await this.bus.dispatchToEndpoint(prismId, payload, {
         signal: opts?.signal,
-        parentContext: opts?.parentContext,
+        parentContext,
+        callChain,
       });
       return { result, prismName: snapshot.name, digest: snapshot.digest };
     }
@@ -519,7 +530,8 @@ export class PrismHostPool implements PrismBridgeRuntime {
     if (typeof document === 'undefined' || typeof window === 'undefined') {
       const { result } = await this.bus.dispatchToEndpoint(prismId, payload, {
         signal: opts?.signal,
-        parentContext: opts?.parentContext,
+        parentContext,
+        callChain,
         fallbackHandler: {
           endpointId: prismId,
           endpointKind: 'prism',
@@ -547,12 +559,13 @@ export class PrismHostPool implements PrismBridgeRuntime {
 
     const { result } = await this.bus.dispatchToEndpoint(prismId, payload, {
       signal: opts?.signal,
-      parentContext: opts?.parentContext,
+      parentContext,
+      callChain,
       fallbackHandler: {
         endpointId: prismId,
         endpointKind: 'prism',
-        dispatch: (input, traceContext, signal) =>
-          this.sendDispatchToIframe(instance, input, traceContext, signal),
+        dispatch: (input, traceContext, signal, chain) =>
+          this.sendDispatchToIframe(instance, input, traceContext, signal, chain),
       },
     });
     return { result, prismName: snapshot.name, digest: snapshot.digest };
@@ -630,6 +643,7 @@ export class PrismHostPool implements PrismBridgeRuntime {
           name: String(msg.payload.name ?? 'prism.event'),
           endpointKind: 'prism',
           endpointId: prismId,
+          traceContext: msg.payload.traceContext ?? undefined,
           attributes: msg.payload.attributes,
           body: msg.payload.body,
         });
@@ -654,10 +668,12 @@ export class PrismHostPool implements PrismBridgeRuntime {
         return;
       }
       if (msg.type === 'rpc' && msg.payload?.reqId) {
-        const { reqId, method, args } = msg.payload as {
+        const { reqId, method, args, traceContext, callChain } = msg.payload as {
           reqId: string;
           method: string;
           args: Record<string, unknown>;
+          traceContext?: OtelTraceContext;
+          callChain?: readonly string[];
         };
         const reply = (ok: boolean, value?: unknown, error?: string) => {
           iframe.contentWindow?.postMessage(
@@ -675,6 +691,7 @@ export class PrismHostPool implements PrismBridgeRuntime {
             const text = await this.ask({
               prismId,
               prompt: String(args?.prompt ?? ''),
+              parentContext: traceContext,
               signal: instanceAbort.signal,
               onToken: (partial) => {
                 iframe.contentWindow?.postMessage(
@@ -717,6 +734,8 @@ export class PrismHostPool implements PrismBridgeRuntime {
                 snapshot.grants,
                 String(args?.target ?? ''),
                 args?.payload,
+                traceContext,
+                callChain,
               ),
             );
           } else if (method === 'ui.openPrism') {
@@ -727,7 +746,7 @@ export class PrismHostPool implements PrismBridgeRuntime {
               snapshot.grants,
               String(args?.url ?? ''),
               args?.init as { method?: string; headers?: Record<string, string>; body?: string },
-              undefined,
+              traceContext,
               (partial) => {
                 iframe.contentWindow?.postMessage(
                   { __verdant: true, channelId, type: 'rpc-token', payload: { reqId, text: partial } },
@@ -783,6 +802,7 @@ export class PrismHostPool implements PrismBridgeRuntime {
     input: unknown,
     traceContext: OtelTraceContext,
     signal?: AbortSignal,
+    callChain?: readonly string[],
   ): Promise<unknown> {
     const reqId = `disp_${this.dispatchSeq++}`;
     return new Promise((resolve, reject) => {
@@ -810,7 +830,7 @@ export class PrismHostPool implements PrismBridgeRuntime {
           __verdant: true,
           channelId: instance.channelId,
           type: 'dispatch-input',
-          payload: { reqId, input, traceContext },
+          payload: { reqId, input, traceContext, callChain: callChain ?? [instance.prismId] },
         },
         '*',
       );

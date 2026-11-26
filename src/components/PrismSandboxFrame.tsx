@@ -115,6 +115,9 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
 
   // Wire postMessage bridge + live ObserverStreamBus endpoint registration
   useEffect(() => {
+    // Evict any stale background pooled iframe for this Prism now that the live frame is active
+    bridgeRuntime.evictPrism(prismId);
+
     const pendingDispatches = new Map<
       string,
       { resolve: (v: unknown) => void; reject: (e: Error) => void }
@@ -169,6 +172,7 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
           name: String(msg.payload.name ?? 'prism.event'),
           endpointKind: 'prism',
           endpointId: prismId,
+          traceContext: msg.payload.traceContext ?? undefined,
           attributes: msg.payload.attributes,
           body: msg.payload.body,
         });
@@ -206,10 +210,12 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
       }
 
       if (msg.type === 'rpc' && msg.payload?.reqId) {
-        const { reqId, method, args } = msg.payload as {
+        const { reqId, method, args, traceContext, callChain } = msg.payload as {
           reqId: string;
           method: string;
           args: Record<string, unknown>;
+          traceContext?: OtelTraceContext;
+          callChain?: readonly string[];
         };
         const reply = (ok: boolean, value?: unknown, error?: string) => {
           iframeRef.current?.contentWindow?.postMessage(
@@ -223,6 +229,7 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
             reply(true, await bridgeRuntime.getKv(prismId, grants, String(args?.key ?? '')));
           } else if (method === 'storage.set') {
             await bridgeRuntime.setKv(prismId, grants, String(args?.key ?? ''), args?.value);
+            bridgeRuntime.evictPrism(prismId);
             reply(true, true);
           } else if (method === 'ask') {
             if (!grants.observer) {
@@ -231,6 +238,7 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
             const text = await bridgeRuntime.ask({
               prismId,
               prompt: String(args?.prompt ?? ''),
+              parentContext: traceContext,
               signal: frameAbort.signal,
               onToken: (partial) => {
                 iframeRef.current?.contentWindow?.postMessage(
@@ -273,6 +281,8 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
                 grants,
                 String(args?.target ?? ''),
                 args?.payload,
+                traceContext,
+                callChain,
               ),
             );
           } else if (method === 'ui.openPrism') {
@@ -283,7 +293,7 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
               grants,
               String(args?.url ?? ''),
               args?.init as { method?: string; headers?: Record<string, string>; body?: string },
-              undefined,
+              traceContext,
               (partial) => {
                 iframeRef.current?.contentWindow?.postMessage(
                   { __verdant: true, channelId, type: 'rpc-token', payload: { reqId, text: partial } },
@@ -310,7 +320,12 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
         endpointId: prismId,
         endpointKind: 'prism',
         priority: 10, // Mounted live frame takes priority over warm background pool
-        dispatch: async (input: unknown, traceContext: OtelTraceContext, signal?: AbortSignal) => {
+        dispatch: async (
+          input: unknown,
+          traceContext: OtelTraceContext,
+          signal?: AbortSignal,
+          callChain?: readonly string[],
+        ) => {
           if (!isReady) {
             await readyPromise;
           }
@@ -344,7 +359,7 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
                 __verdant: true,
                 channelId,
                 type: 'dispatch-input',
-                payload: { reqId, input, traceContext },
+                payload: { reqId, input, traceContext, callChain: callChain ?? [prismId] },
               },
               '*',
             );

@@ -22,6 +22,7 @@ import {
   computePrismDigest,
   createStarterSnapshot,
   extractPrismPatchFromModelOutput,
+  matchStarterFromPrompt,
   parseHoloArchive,
   prismToolName,
   serializeHoloArchive,
@@ -329,7 +330,8 @@ test('Reliability hardening: unclosed code-fence salvage, KV cleanup on delete, 
 
   // 3. Indirect cycle detection (B -> C -> B) via callChain
   const c = await store.create('focus', 'Timer C');
-  await store.publish(c.id);
+  const cPublished = await store.publish(c.id);
+  assert.ok(cPublished?.published);
   await assert.rejects(
     () => pool.callPrism(c.id, c.draft.grants, 'Budget B', {}, undefined, [b.id, c.id]),
     /Cyclic Prism-to-Prism call refused/,
@@ -342,6 +344,55 @@ test('Reliability hardening: unclosed code-fence salvage, KV cleanup on delete, 
     () => pool.ask({ prismId: c.id, prompt: 'hello', signal: aborted.signal }),
     /cancelled/i,
   );
+
+  // 5. App-mode permission toggle (`updatePublishedGrants`) NEVER leaks unfinished draft code
+  const publishedHtmlBefore = cPublished!.published!.app.html;
+  await store.updateDraft(c.id, (prev) => ({
+    ...prev,
+    app: { ...prev.app, html: '<div>UNPUBLISHED DRAFT</div>' },
+  }));
+  const afterGrant = await store.updatePublishedGrants(c.id, (g) => ({ ...g, network: true }));
+  assert.ok(afterGrant?.published);
+  assert.equal(afterGrant!.published!.grants.network, true);
+  assert.equal(afterGrant!.draft.grants.network, true);
+  assert.equal(afterGrant!.published!.app.html, publishedHtmlBefore);
+  assert.notEqual(afterGrant!.published!.digest, afterGrant!.draft.digest);
+
+  // 6. End-to-end W3C Trace Context propagation through runWithTraceContext -> dispatchPublishedPrism
+  const turnSpan = bus.startSpan('thread.turn', {
+    endpointKind: 'thread',
+    endpointId: 'thread-trace',
+    kind: 'SERVER',
+  });
+  await bus.runWithTraceContext(turnSpan.context, () =>
+    pool.dispatchPublishedPrism(c.id, { action: 'status' }),
+  );
+  turnSpan.end('ok');
+  const dispatchSpans = bus.getRecentSpans(c.id).filter((s) => s.name === `endpoint.dispatch:${c.id}`);
+  assert.ok(dispatchSpans.length >= 1);
+  const latestDispatch = dispatchSpans[dispatchSpans.length - 1];
+  assert.equal(latestDispatch.traceId, turnSpan.context.traceId);
+  assert.equal(latestDispatch.parentSpanId, turnSpan.context.spanId);
+
+  // 7. Sandbox forwards activeTraceContext & activeCallChain; offline starter matching & clearMessages work
+  const sandboxHtml = buildPrismSandboxDocument({
+    prismId: c.id,
+    channelId: 'ch-trace',
+    snapshot: afterGrant!.published!,
+    darkMode: false,
+  });
+  assert.ok(sandboxHtml.includes('activeTraceContext'));
+  assert.ok(sandboxHtml.includes('activeCallChain'));
+  assert.equal(matchStarterFromPrompt('Build a kanban task board'), 'kanban');
+  assert.equal(matchStarterFromPrompt('Make a pomodoro focus timer'), 'focus');
+  assert.equal(matchStarterFromPrompt('Create an expense tracker'), 'budget');
+  assert.equal(matchStarterFromPrompt('Build an AI writing assistant'), 'writer');
+  assert.equal(matchStarterFromPrompt('Build a 3D flight simulator'), null);
+
+  await store.appendMessage(c.id, { role: 'user', content: 'test' });
+  assert.equal(store.get(c.id)?.messages.length, 1);
+  await store.clearMessages(c.id);
+  assert.equal(store.get(c.id)?.messages.length, 0);
 
   pool.dispose();
 });

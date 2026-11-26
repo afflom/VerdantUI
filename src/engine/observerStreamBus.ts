@@ -73,6 +73,7 @@ export interface StreamEndpointHandler {
     payload: unknown,
     context: OtelTraceContext,
     signal?: AbortSignal,
+    callChain?: readonly string[],
   ): Promise<unknown>;
 }
 
@@ -192,7 +193,26 @@ export class ObserverStreamBus {
   private readonly listeners = new Set<{ filter?: StreamFilter; fn: StreamListener }>();
   private readonly spanListeners = new Set<SpanListener>();
   private readonly endpoints = new Map<string, StreamEndpointHandler[]>();
+  private activeTraceContext: OtelTraceContext | undefined;
   private eventSeq = 1;
+
+  setActiveTraceContext(ctx: OtelTraceContext | undefined): void {
+    this.activeTraceContext = ctx;
+  }
+
+  getActiveTraceContext(): OtelTraceContext | undefined {
+    return this.activeTraceContext;
+  }
+
+  async runWithTraceContext<T>(ctx: OtelTraceContext | undefined, fn: () => Promise<T>): Promise<T> {
+    const prev = this.activeTraceContext;
+    this.activeTraceContext = ctx;
+    try {
+      return await fn();
+    } finally {
+      this.activeTraceContext = prev;
+    }
+  }
 
   emit(input: {
     readonly name: string;
@@ -392,15 +412,17 @@ export class ObserverStreamBus {
       readonly signal?: AbortSignal;
       readonly parentContext?: OtelTraceContext;
       readonly timeoutMs?: number;
+      readonly callChain?: readonly string[];
       readonly fallbackHandler?: StreamEndpointHandler;
     },
   ): Promise<{ readonly result: unknown; readonly span: OtelSpan }> {
     const registered = this.endpoints.get(endpointId)?.[0] ?? opts?.fallbackHandler;
+    const parentContext = opts?.parentContext ?? this.activeTraceContext;
     const spanHandle = this.startSpan(`endpoint.dispatch:${endpointId}`, {
       endpointKind: registered?.endpointKind ?? 'prism',
       endpointId,
       kind: 'CLIENT',
-      parentContext: opts?.parentContext,
+      parentContext,
       attributes: {
         'verdant.endpoint.id': endpointId,
       },
@@ -427,7 +449,12 @@ export class ObserverStreamBus {
     }
 
     try {
-      const dispatchPromise = registered.dispatch(payload, spanHandle.context, abortCtrl.signal);
+      const dispatchPromise = registered.dispatch(
+        payload,
+        spanHandle.context,
+        abortCtrl.signal,
+        opts?.callChain,
+      );
       const result = await new Promise<unknown>((resolve, reject) => {
         if (abortCtrl.signal.aborted) {
           reject(new Error(`Stream dispatch to "${endpointId}" aborted.`));

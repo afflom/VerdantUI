@@ -924,11 +924,15 @@ export function createLlamaVTensorAdapter(
           const toolCallId = `${stepIdPrefix}_lod0`;
           const argsText = JSON.stringify(dm.args);
           try {
-            const result = await toolDef.execute(dm.args as never, {
-              toolCallId,
-              abortSignal,
-              human: async () => undefined,
-            } as never);
+            const runTool = () =>
+              toolDef.execute!(dm.args as never, {
+                toolCallId,
+                abortSignal,
+                human: async () => undefined,
+              } as never);
+            const result = studioBridge
+              ? await studioBridge.bus.runWithTraceContext(turnSpan?.context, runTool)
+              : await runTool();
             if (dm.prismId && /^\/open\s+/i.test(latestUserText.trim())) {
               studioBridge?.onOpenPrism?.(dm.prismId);
             }
@@ -1166,9 +1170,15 @@ export function createLlamaVTensorAdapter(
         idPrefix: stepIdPrefix,
       });
       const totalStreamTime = Date.now() - streamStartTime;
-      turnSpan?.end('ok');
       const toolCallsEmitted = finalParts.filter((p) => p.type === 'tool-call');
       const hasToolCalls = toolCallsEmitted.length > 0;
+      if (hasToolCalls && studioBridge && turnSpan) {
+        // Keep active W3C trace context available while Assistant-UI's ToolInvocationTracker runs tools
+        studioBridge.bus.setActiveTraceContext(turnSpan.context);
+      } else {
+        studioBridge?.bus.setActiveTraceContext(undefined);
+      }
+      turnSpan?.end('ok');
 
       if (finalParts.length > 0) {
         yield {

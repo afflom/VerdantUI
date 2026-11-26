@@ -131,6 +131,8 @@ export function buildPrismSandboxDocument(opts: {
   const pending = new Map();
   const tokenCallbacks = new Map();
   const inputHandlers = new Set();
+  let activeTraceContext = null;
+  let activeCallChain = [];
 
   function post(type, payload) {
     try {
@@ -143,7 +145,13 @@ export function buildPrismSandboxDocument(opts: {
     if (typeof onToken === 'function') tokenCallbacks.set(reqId, onToken);
     return new Promise((resolve, reject) => {
       pending.set(reqId, { resolve, reject });
-      post('rpc', { reqId, method, args });
+      post('rpc', {
+        reqId,
+        method,
+        args,
+        traceContext: activeTraceContext,
+        callChain: activeCallChain,
+      });
     });
   }
 
@@ -174,7 +182,11 @@ export function buildPrismSandboxDocument(opts: {
       return;
     }
     if (msg.type === 'dispatch-input' && msg.payload) {
-      const { reqId, input, traceContext } = msg.payload;
+      const { reqId, input, traceContext, callChain } = msg.payload;
+      const prevTrace = activeTraceContext;
+      const prevChain = activeCallChain;
+      activeTraceContext = traceContext || null;
+      activeCallChain = Array.isArray(callChain) ? callChain.slice() : [];
       try {
         let lastResult = { ok: true, prismId: PRISM_ID, received: input };
         for (const handler of inputHandlers) {
@@ -185,6 +197,9 @@ export function buildPrismSandboxDocument(opts: {
       } catch (err) {
         const message = err && err.message ? err.message : String(err);
         post('dispatch-response', { reqId, ok: false, error: message });
+      } finally {
+        activeTraceContext = prevTrace;
+        activeCallChain = prevChain;
       }
     }
   });
@@ -210,7 +225,12 @@ export function buildPrismSandboxDocument(opts: {
     prismId: PRISM_ID,
     digest: DIGEST,
     emit(name, body, attributes) {
-      post('emit', { name: String(name || 'prism.event'), body, attributes });
+      post('emit', {
+        name: String(name || 'prism.event'),
+        body,
+        attributes,
+        traceContext: activeTraceContext,
+      });
     },
     onInput(handler) {
       if (typeof handler !== 'function') return () => {};

@@ -117,6 +117,19 @@ export const PRISM_STARTERS: readonly PrismStarterSpec[] = [
   },
 ];
 
+/** Matches an explicit request for a built-in starter app when Model Stream is Off. */
+export function matchStarterFromPrompt(prompt: string): PrismStarterId | null {
+  const lower = prompt.trim().toLowerCase();
+  if (!lower) return null;
+  if (/\b(kanban|task\s*board|todo\s*board|to-do\s*board)\b/.test(lower)) return 'kanban';
+  if (/\b(pomodoro|focus\s*timer|countdown\s*timer|study\s*timer)\b/.test(lower)) return 'focus';
+  if (/\b(expense|budget\s*tracker|spending\s*tracker|expense\s*sheet)\b/.test(lower)) return 'budget';
+  if (/\b(writing\s*assistant|text\s*summarizer|draft\s*refiner|grammar\s*polish)\b/.test(lower)) {
+    return 'writer';
+  }
+  return null;
+}
+
 export const DEFAULT_PRISM_GRANTS: PrismGrants = Object.freeze({
   observer: true,
   storage: true,
@@ -1422,6 +1435,52 @@ export class PrismStore {
       ...existing,
       published: null,
       publishedAt: null,
+      updatedAt: Date.now(),
+    };
+    this.projects.set(id, updated);
+    this.notify();
+    await this.persistProject(updated);
+    return updated;
+  }
+
+  /**
+   * Updates permissions on the live published snapshot (and mirrors them onto draft)
+   * WITHOUT publishing unrelated unpublished draft code edits!
+   */
+  async updatePublishedGrants(
+    id: string,
+    updater: (prev: PrismGrants) => PrismGrants,
+  ): Promise<VerdantPrismProject | null> {
+    const existing = this.projects.get(id);
+    if (!existing) return null;
+    const nextDraft = buildSnapshot({
+      ...existing.draft,
+      grants: updater(existing.draft.grants),
+    });
+    const nextPublished = existing.published
+      ? buildSnapshot({
+          ...existing.published,
+          grants: updater(existing.published.grants),
+        })
+      : null;
+    const updated: VerdantPrismProject = {
+      ...existing,
+      draft: nextDraft,
+      published: nextPublished,
+      updatedAt: Date.now(),
+    };
+    this.projects.set(id, updated);
+    this.notify();
+    await this.persistProject(updated);
+    return updated;
+  }
+
+  async clearMessages(id: string): Promise<VerdantPrismProject | null> {
+    const existing = this.projects.get(id);
+    if (!existing || existing.messages.length === 0) return existing ?? null;
+    const updated: VerdantPrismProject = {
+      ...existing,
+      messages: [],
       updatedAt: Date.now(),
     };
     this.projects.set(id, updated);

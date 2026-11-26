@@ -50,6 +50,7 @@ import {
   buildStudioSystemPrompt,
   createStarterSnapshot,
   extractPrismPatchFromModelOutput,
+  matchStarterFromPrompt,
   shortPrismDigest,
   type JsonSchema2020Object,
   type PrismStarterId,
@@ -240,6 +241,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     await flushSummaryDraft(summaryDraft);
     await flushSourceDraft(sourceTab, sourceDraft);
     await store.publish(project.id);
+    bridgeRuntime.evictPrism(project.id);
     const updated = store.get(project.id);
     bus.emit({
       name: 'prism.published',
@@ -260,6 +262,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     sourceTab,
     sourceDraft,
     store,
+    bridgeRuntime,
     bus,
     project.id,
     project.draft.name,
@@ -345,9 +348,28 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       });
 
       if (!hasRealModel) {
+        const matchedStarter = matchStarterFromPrompt(trimmed);
+        if (matchedStarter) {
+          const snap = createStarterSnapshot(matchedStarter);
+          await store.updateDraft(project.id, () => ({
+            name: snap.name,
+            summary: snap.summary,
+            streams: snap.streams,
+            grants: snap.grants,
+            app: snap.app,
+          }));
+          await store.appendMessage(project.id, {
+            role: 'assistant',
+            content: `Scaffolded **${snap.name}** in your live preview. Toggle **Model Stream** on for custom AI edits, or switch to **Prism → Code** to customize directly.`,
+            updatedSections: ['html', 'css', 'js', 'meta'],
+          });
+          span.setAttributes({ 'verdant.studio.starter': matchedStarter });
+          span.end('ok');
+          return;
+        }
         const msg = engineState.modelStreamEnabled
           ? `Model Stream is initializing (${engineState.progressPercent}%). Wait for it to finish, or switch the preview to Prism to edit code directly.`
-          : 'Model Stream is currently **Off**. Toggle **Model Stream** on in the top bar for freeform AI app generation—or pick a starter below / toggle **Prism** in the preview bar to edit HTML, CSS, and JS directly.';
+          : 'Model Stream is currently **Off**. Toggle **Model Stream** on in the top bar for freeform AI app generation—or pick a starter / toggle **Prism** in the preview bar to edit HTML, CSS, and JS directly.';
         await store.appendMessage(project.id, { role: 'assistant', content: msg });
         span.end('ok');
         return;
@@ -361,14 +383,25 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       try {
         const currentProj = store.get(project.id) ?? project;
         const sysPrompt = buildStudioSystemPrompt(currentProj.draft);
-        const historyMessages: ThreadMessage[] = currentProj.messages.slice(-6).map((m) => ({
-          id: m.id,
-          role: m.role,
-          createdAt: new Date(m.createdAt),
-          content: [{ type: 'text', text: m.content }],
-          attachments: [],
-          metadata: { custom: {} },
-        })) as ThreadMessage[];
+        // Exclude transient Model Stream Off notices from model context
+        const historyMessages: ThreadMessage[] = currentProj.messages
+          .filter(
+            (m) =>
+              !(
+                m.role === 'assistant' &&
+                (m.content.startsWith('Model Stream is currently') ||
+                  m.content.startsWith('Model Stream is initializing'))
+              ),
+          )
+          .slice(-6)
+          .map((m) => ({
+            id: m.id,
+            role: m.role,
+            createdAt: new Date(m.createdAt),
+            content: [{ type: 'text', text: m.content }],
+            attachments: [],
+            metadata: { custom: {} },
+          })) as ThreadMessage[];
         const fullPrompt = formatMessagesForLlama(
           historyMessages,
           engineState.model!,
@@ -601,12 +634,18 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                       role="switch"
                       aria-checked={enabled}
                       onClick={async () => {
-                        await store.updateDraft(project.id, (prev) => ({
-                          ...prev,
-                          grants: { ...prev.grants, [key]: !prev.grants[key] },
-                        }));
                         if (isReadOnlyAppInspect) {
-                          await store.publish(project.id);
+                          // Update published & draft grants WITHOUT accidentally publishing unfinished draft code!
+                          await store.updatePublishedGrants(project.id, (prev) => ({
+                            ...prev,
+                            [key]: !prev[key],
+                          }));
+                          bridgeRuntime.evictPrism(project.id);
+                        } else {
+                          await store.updateDraft(project.id, (prev) => ({
+                            ...prev,
+                            grants: { ...prev.grants, [key]: !prev.grants[key] },
+                          }));
                         }
                       }}
                       className={`inline-flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition-colors ${
@@ -794,17 +833,6 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                   <Upload className="h-3.5 w-3.5" />
                   <span>Import .holo</span>
                 </button>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".holo,.json"
-                  className="hidden"
-                  onChange={(e) => {
-                    const file = e.target.files?.[0];
-                    if (file) void handleImportHoloFile(file);
-                    e.target.value = '';
-                  }}
-                />
               </div>
             </div>
 
@@ -823,6 +851,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                   type="button"
                   onClick={() => {
                     setAppPrismModalOpen(false);
+                    bridgeRuntime.evictPrism(project.id);
                     onChangeMode('studio');
                     void store.unpublish(project.id);
                   }}
@@ -910,6 +939,17 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
 
   return (
     <div className="flex h-full flex-col overflow-hidden bg-[#F8F9FA] dark:bg-[#0B0F14]">
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".holo,.json"
+        className="hidden"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) void handleImportHoloFile(file);
+          e.target.value = '';
+        }}
+      />
       {/* Calm Single-Line Workspace Header */}
       <div className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-slate-200 bg-white px-4 dark:border-slate-800 dark:bg-[#0F141C]">
         <div className="flex min-w-0 items-center gap-2.5">
@@ -1128,6 +1168,20 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                       </button>
                     ))}
                   </div>
+
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-slate-300 bg-white/60 px-3 py-2 text-xs font-medium text-slate-600 hover:border-emerald-700/50 hover:text-emerald-800 dark:border-slate-700 dark:bg-[#141B26]/60 dark:text-slate-300 dark:hover:border-emerald-500/50 dark:hover:text-emerald-400 transition-colors"
+                  >
+                    <Upload className="h-3.5 w-3.5" />
+                    <span>Import existing .holo package</span>
+                  </button>
+                  {importError && (
+                    <div className="rounded-lg border border-red-200 bg-red-50 px-2.5 py-1.5 text-[11px] text-red-700 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-300">
+                      {importError}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -1184,6 +1238,17 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
               onSubmit={handleSubmitChat}
               className="shrink-0 border-t border-slate-200 p-3 dark:border-slate-800"
             >
+              {project.messages.length > 0 && !generating && (
+                <div className="mb-1.5 flex justify-end">
+                  <button
+                    type="button"
+                    onClick={() => void store.clearMessages(project.id)}
+                    className="text-[10px] font-medium text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+                  >
+                    Clear chat
+                  </button>
+                </div>
+              )}
               <div className="flex items-end gap-2 rounded-xl border border-slate-200 bg-[#F8F9FA] p-1.5 focus-within:border-emerald-700 dark:border-slate-700 dark:bg-[#141B26]">
                 <textarea
                   rows={2}

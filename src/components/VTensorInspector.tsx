@@ -1,4 +1,4 @@
-import { useState, type FC } from 'react';
+import { useEffect, useState, type FC } from 'react';
 import { CheckCircle2, Play, RotateCcw, ShieldCheck, X, XCircle } from 'lucide-react';
 import { formatBytes } from '../engine/modelCatalog';
 import type { SamplingConfig } from '../engine/llamaRuntime';
@@ -45,6 +45,17 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
 }) => {
   const [tab, setTab] = useState<InspectorTab>('sampling');
   const [clearingCache, setClearingCache] = useState(false);
+  const [, setOtelTick] = useState(0);
+
+  useEffect(() => {
+    if (!open || !observerBus) return;
+    const unsubEv = observerBus.subscribe(() => setOtelTick((t) => t + 1));
+    const unsubSp = observerBus.subscribeSpans(() => setOtelTick((t) => t + 1));
+    return () => {
+      unsubEv();
+      unsubSp();
+    };
+  }, [open, observerBus]);
 
   if (!open) return null;
 
@@ -833,6 +844,37 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
                     </dd>
                   </div>
                 </dl>
+                {observerBus.getRecentSpans().length > 0 && (
+                  <ul className="mt-2 divide-y divide-slate-100 rounded-lg border border-slate-200 font-mono text-[10px] dark:divide-slate-800 dark:border-slate-800">
+                    {observerBus
+                      .getRecentSpans()
+                      .slice(-6)
+                      .reverse()
+                      .map((sp) => (
+                        <li
+                          key={sp.spanId}
+                          className="flex items-center justify-between gap-2 px-2.5 py-1.5"
+                        >
+                          <span className="truncate text-slate-700 dark:text-slate-300">
+                            <span
+                              className={
+                                sp.status === 'error'
+                                  ? 'mr-1 text-red-600 dark:text-red-400'
+                                  : 'mr-1 text-emerald-700 dark:text-emerald-400'
+                              }
+                            >
+                              ●
+                            </span>
+                            {sp.name}
+                          </span>
+                          <span className="shrink-0 text-slate-400 tabular-nums">
+                            {sp.durationMs !== undefined ? `${sp.durationMs}ms` : '…'} ·{' '}
+                            {sp.traceId.slice(0, 6)}
+                          </span>
+                        </li>
+                      ))}
+                  </ul>
+                )}
               </section>
             )}
 
