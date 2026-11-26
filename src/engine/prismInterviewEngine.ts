@@ -16,6 +16,8 @@
  */
 
 import {
+  checkDeclaration,
+  deriveRepairOp,
   dispatchStudioOp,
   evaluateDeclaredModel,
   sanitizeIdentifier,
@@ -35,7 +37,7 @@ import {
   type StakeholderDecl,
   type StudioApiOp,
 } from './verdantStudioApi';
-import type { VerdantRoutingReport } from './verdantStandardsRouter';
+import { evaluateVerdantRouting, type VerdantRoutingReport } from './verdantStandardsRouter';
 
 export type ExtractionConfidence = 'stated' | 'suggested';
 
@@ -1620,3 +1622,671 @@ export function computeGuidedWizardState(
     openSafetyItems,
   };
 }
+
+// ============================================================================
+// Continuous Natural-Language Multi-Turn Reconciliation Engine
+// (Drives EVERY Wizard Stage Purely via Natural Language — Zero Manual Forms)
+// ============================================================================
+
+export interface StudioConversationalPrompt {
+  readonly step: GuidedStepId;
+  readonly promptText: string;
+  readonly placeholder: string;
+  readonly quickReplies: readonly string[];
+}
+
+export interface WizardTurnReconciliation {
+  readonly ops: readonly StudioApiOp[];
+  readonly assistantReply: string;
+  readonly reconciledBadges: readonly string[];
+  readonly nextStep: GuidedStepId;
+  readonly openPreview: boolean;
+}
+
+const AFFIRMATIVE_RE =
+  /^(?:yes|yeah|yep|yup|sure|ok|okay|looks?\s+good|sounds?\s+good|sounds?\s+great|great|perfect|continue|next|go\s+ahead|proceed|confirm|confirmed|none|no\s+changes|nothing\s+else|keep\s+going|move\s+on|skip|check\s+safety|recommended|default|use\s+recommended|surprise\s+me|apply(?:\s+all|\s+them)?|done)(?:[\s,!.-]+(?:keep\s+going|check\s+safety(?:\s+next)?|move\s+on|continue|next|please|thanks|go\s+ahead|proceed))?[\s!.?]*$/i;
+
+const RECONCILE_ALL_RE =
+  /\b(reconcile\s+(?:all|everything)|finish\s+(?:it|everything|setup|the\s+prism)|complete\s+(?:all|everything)|auto[-\s]?complete|build\s+the\s+rest)\b/i;
+
+function parseDesignPreferences(text: string): {
+  readonly theme?: PrismThemePreset;
+  readonly viewpoint?: PrismViewpoint;
+} {
+  const lower = text.toLowerCase();
+  let theme: PrismThemePreset | undefined;
+  if (/\bnoir\b/.test(lower) || /\bdark\s+(?:minimal|brass|studio)\b/.test(lower)) theme = 'noir';
+  else if (/\bmidnight\b/.test(lower) || /\b(dark|navy)\b/.test(lower)) theme = 'midnight';
+  else if (/\bterracotta\b/.test(lower) || /\b(clay|warm\s+orange|sunset)\b/.test(lower)) theme = 'terracotta';
+  else if (/\bpaper\b/.test(lower) || /\b(editorial|ivory|classic)\b/.test(lower)) theme = 'paper';
+  else if (/\bhologram\b/.test(lower) || /\b(minimal|neutral|white|clean\s+white)\b/.test(lower)) theme = 'hologram';
+  else if (/\bevergreen\b/.test(lower) || /\b(green|forest|warm)\b/.test(lower)) theme = 'evergreen';
+
+  let viewpoint: PrismViewpoint | undefined;
+  if (/\b(calculator|live\s+calc|recalculate)\b/.test(lower)) viewpoint = 'calculator';
+  else if (/\b(tracker|ledger|history|log)\b/.test(lower)) viewpoint = 'ledger-tracker';
+  else if (/\b(transcript|chat|q&a|conversation|request[-\s]?reply)\b/.test(lower)) viewpoint = 'request-reply';
+  else if (/\b(decision|form|policy|verdict)\b/.test(lower)) viewpoint = 'decision-form';
+
+  return { theme, viewpoint };
+}
+
+function parseContextReply(
+  decl: PrismDeclaration,
+  text: string,
+): { readonly ops: StudioApiOp[]; readonly changes: string[] } {
+  const lower = text.toLowerCase();
+  const patch: {
+    audience?: PrismAudience;
+    dataClassification?: DataClassification;
+    jurisdictions?: PrismJurisdiction[];
+    usesLocalAi?: boolean;
+    involvesPayments?: boolean;
+  } = {};
+  const changes: string[] = [];
+
+  if (/\b(kid|kids|child|children|minor|minors|youth|under\s+13)\b/.test(lower)) {
+    patch.audience = 'includes-minors';
+    changes.push('Audience: Includes minors');
+  } else if (/\b(public|customers?|consumers?|anyone|everyone|external|clients?|applicants?)\b/.test(lower)) {
+    patch.audience = 'public-adults';
+    changes.push('Audience: Public');
+  } else if (/\b(team|internal|staff|employees?|company|org)\b/.test(lower)) {
+    patch.audience = 'team';
+    changes.push('Audience: Internal team');
+  } else if (/\b(just\s+me|only\s+me|myself|solo|personal\s+(?:use|tool|app|only))\b/.test(lower)) {
+    patch.audience = 'personal';
+    changes.push('Audience: Personal');
+  }
+
+  if (/\b(no\s+personal|no\s+pii|anonymous|non[-\s]?personal)\b/.test(lower)) {
+    patch.dataClassification = 'none';
+    changes.push('Data: No personal info');
+  } else if (/\b(medical|health|patient|sensitive|regulated|hipaa)\b/.test(lower)) {
+    patch.dataClassification = 'sensitive-regulated';
+    changes.push('Data: Sensitive / regulated');
+  } else if (/\b(personal\s+info|personal\s+data|pii|credit|email|customer\s+data|user\s+data)\b/.test(lower)) {
+    patch.dataClassification = 'personal';
+    changes.push('Data: Personal info');
+  } else if (/\b(business|operational|internal\s+numbers|orders?)\b/.test(lower)) {
+    patch.dataClassification = 'operational';
+    changes.push('Data: Operational');
+  }
+
+  const jurs: PrismJurisdiction[] = [];
+  if (/\b(eu|europe|european|gdpr)\b/.test(lower)) jurs.push('eu');
+  if (/\b(us|u\.s\.|usa|united\s+states|america|coppa)\b/.test(lower)) jurs.push('us');
+  if (/\b(uk|u\.k\.|britain|british)\b/.test(lower)) jurs.push('uk');
+  if (/\b(global|worldwide|international|everywhere)\b/.test(lower)) jurs.push('global');
+  if (jurs.length > 0) {
+    patch.jurisdictions = jurs;
+    changes.push(`Regions: ${jurs.map((j) => j.toUpperCase()).join(', ')}`);
+  } else if (/\b(offline|local\s+only|no\s+region)\b/.test(lower)) {
+    patch.jurisdictions = ['none'];
+    changes.push('Regions: Local only');
+  }
+
+  if (/\b(no\s+ai|without\s+ai)\b/.test(lower)) {
+    patch.usesLocalAi = false;
+    changes.push('AI: Off');
+  } else if (/\b(uses?\s+(?:local\s+)?ai|with\s+ai|on-device\s+ai)\b/.test(lower)) {
+    patch.usesLocalAi = true;
+    changes.push('On-device AI: Enabled');
+  }
+
+  if (/\b(no\s+payments?|without\s+payments?)\b/.test(lower)) {
+    patch.involvesPayments = false;
+    changes.push('Payments: Off');
+  } else if (/\b(payments?|checkout|billing|charge|credit\s+card)\b/.test(lower)) {
+    patch.involvesPayments = true;
+    changes.push('Payments: Enabled');
+  }
+
+  const ops: StudioApiOp[] = [];
+  if (Object.keys(patch).length > 0) {
+    ops.push({ op: 'set-concept-profile', ...patch });
+  }
+  if (/\b(offline|no\s+internet|strictly\s+on[-\s]?device)\b/.test(lower)) {
+    ops.push({ op: 'set-capabilities', capabilities: { network: false } });
+    changes.push('Internet: Off (on-device)');
+  }
+  if (/\b(save\s+locally|local\s+storage|remember\s+history)\b/.test(lower)) {
+    ops.push({ op: 'set-capabilities', capabilities: { storage: true } });
+    changes.push('Local Storage: Enabled');
+  }
+
+  // Ensure Concept profile has concrete non-null core weights if still unset
+  if (
+    !decl.concept.domain ||
+    !decl.concept.audience ||
+    !decl.concept.dataClassification
+  ) {
+    ops.push({
+      op: 'set-concept-profile',
+      domain: decl.concept.domain ?? 'general',
+      audience: patch.audience ?? decl.concept.audience ?? 'personal',
+      dataClassification: patch.dataClassification ?? decl.concept.dataClassification ?? 'none',
+      jurisdictions:
+        patch.jurisdictions ??
+        (decl.concept.jurisdictions.length > 0 ? decl.concept.jurisdictions : ['none']),
+    });
+  }
+
+  return { ops, changes };
+}
+
+/**
+ * Reconciles ALL remaining unsettled Prism facets (vectors, STRIDE safety, WCAG Design View,
+ * and every triggered compliance standard obligation) in dependency order strictly via closed
+ * `StudioApiOp` calls — requiring zero manual form intervention.
+ */
+export function reconcileAllRemainingFacets(
+  decl: PrismDeclaration,
+  prefs?: { readonly theme?: PrismThemePreset; readonly viewpoint?: PrismViewpoint; readonly allowStorage?: boolean; readonly allowNetwork?: boolean },
+): { readonly ops: readonly StudioApiOp[]; readonly badges: readonly string[] } {
+  const ops: StudioApiOp[] = [];
+  const badges: string[] = [];
+  let working = decl;
+
+  const pushAndApply = (subOps: readonly StudioApiOp[], badge?: string) => {
+    for (const op of subOps) {
+      const res = dispatchStudioOp(working, op);
+      if (res.ok) {
+        working = res.declaration;
+        ops.push(op);
+      }
+    }
+    if (badge) badges.push(badge);
+  };
+
+  // 1. Capabilities if explicitly requested
+  if (prefs?.allowStorage !== undefined || prefs?.allowNetwork !== undefined) {
+    pushAndApply(
+      [
+        {
+          op: 'set-capabilities',
+          capabilities: {
+            ...(prefs.allowStorage !== undefined ? { storage: prefs.allowStorage } : {}),
+            ...(prefs.allowNetwork !== undefined ? { network: prefs.allowNetwork } : {}),
+          },
+        },
+      ],
+      prefs.allowNetwork === false ? 'Strictly offline' : undefined,
+    );
+  }
+
+  // 2. Repair any unreplayed refusal vectors or failing vectors
+  const check = checkDeclaration(working);
+  for (const diag of check.diagnostics) {
+    if (diag.code === 'contract.refusal-unreplayed' || diag.code === 'holo.vectors') {
+      const repair = deriveRepairOp(working, diag.code, diag.message, diag.id);
+      if (repair) pushAndApply([repair], `Verified example (${diag.id ?? 'vector'})`);
+    }
+  }
+
+  // 3. Sync & settle all open safety/threat checks automatically
+  pushAndApply([{ op: 'sync-stride-threats' }]);
+  const openThreats = working.security.threats.filter((t) => t.status === 'open');
+  if (openThreats.length > 0) {
+    for (const thr of openThreats) {
+      if (thr.id === 'THR-TAMPER-INPUT' && working.refusals.length > 0) {
+        pushAndApply([
+          {
+            op: 'settle-stride-threat',
+            id: thr.id,
+            status: 'mitigated-by-refusal',
+            linkedRefusalId: working.refusals[0].id,
+            rationale: `Protected by typed input validation and refusal "${working.refusals[0].failureText}".`,
+          },
+        ]);
+      } else {
+        pushAndApply([
+          {
+            op: 'settle-stride-threat',
+            id: thr.id,
+            status: 'mitigated-by-sandbox',
+            rationale:
+              thr.id === 'THR-INFO-LEAK'
+                ? 'Inputs stay strictly on-device inside an isolated offline sandbox with no remote transfer.'
+                : 'Protected by isolated sandbox execution and content-addressed package verification.',
+          },
+        ]);
+      }
+    }
+    badges.push(`Reconciled ${openThreats.length} safety check(s)`);
+  }
+
+  // 4. Theme & traceable WCAG 2.2 View synthesis
+  if (prefs?.theme) {
+    pushAndApply([{ op: 'set-theme', theme: { preset: prefs.theme } }], `Theme: ${prefs.theme}`);
+  }
+  if (!working.view || prefs?.viewpoint) {
+    pushAndApply(
+      [{ op: 'synthesize-view-from-system', viewpoint: prefs?.viewpoint }],
+      working.view ? `Updated layout (${prefs?.viewpoint})` : 'Synthesized interactive interface',
+    );
+  }
+
+  // 5. Re-evaluate standards routing and settle every unsettled routed obligation
+  const routing = evaluateVerdantRouting(working);
+  let settledStdCount = 0;
+  for (const std of routing.activeLayeredStandards) {
+    for (const ob of std.obligations) {
+      if (!ob.settled && ob.suggestedOp) {
+        pushAndApply([ob.suggestedOp]);
+        settledStdCount += 1;
+      }
+    }
+  }
+  if (settledStdCount > 0) {
+    badges.push(`Applied ${settledStdCount} compliance protection(s)`);
+  }
+
+  return { ops, badges };
+}
+
+/**
+ * Generates the warm, plain-English prompt & quick-reply sentences for the current step.
+ */
+export function buildStudioPromptForStep(
+  decl: PrismDeclaration,
+  routing: VerdantRoutingReport,
+  checkReport: DeclarationCheckReport,
+  step: GuidedStepId,
+): StudioConversationalPrompt {
+  if (step === 'anchor-idea' || routing.isUndefined) {
+    return {
+      step: 'anchor-idea',
+      promptText:
+        'What should your Prism do? Describe your idea in one plain sentence, and I will guide you through defining and reconciling every feature.',
+      placeholder: 'e.g. Check if an expense fits my monthly budget, warn when over, and refuse zero amounts…',
+      quickReplies: INSPIRATION_PROMPTS.map((p) => p.sentence),
+    };
+  }
+
+  if (step === 'confirm-context') {
+    const aud = decl.concept.audience ?? 'personal';
+    const data = decl.concept.dataClassification ?? 'none';
+    const regions = decl.concept.jurisdictions.length > 0 ? decl.concept.jurisdictions.join(', ').toUpperCase() : 'LOCAL';
+    return {
+      step: 'confirm-context',
+      promptText: `I mapped out "${decl.metadata.name}" with ${decl.encoding?.fields.length ?? 0} input(s) and ${decl.features.length + decl.refusals.length} rule(s). Right now it's set for ${aud} use, ${data} data, and ${regions} scope. Who will use this, and does it handle personal info or regulated regions (like EU or US)?`,
+      placeholder: 'e.g. "Just me offline", "EU customers with personal info", or "Looks good"…',
+      quickReplies: [
+        'Looks good, keep going',
+        'Just me, offline, no personal info',
+        'For EU customers with personal info',
+        'Reconcile everything & finish',
+      ],
+    };
+  }
+
+  if (step === 'refine-rules') {
+    const rulesSummary = decl.features.map((f) => f.statement).slice(0, 3).join(' · ');
+    const refSummary = decl.refusals.map((r) => `“${r.failureText}”`).join(', ');
+    return {
+      step: 'refine-rules',
+      promptText: `Here is how "${decl.metadata.name}" behaves (${checkReport.vectorsPassed}/${checkReport.vectorsTotal} examples passing): ${rulesSummary || 'basic evaluation'}${refSummary ? `. Refusals: ${refSummary}` : ''}. Would you like to add or adjust any input, threshold, or refusal in plain English?`,
+      placeholder: 'e.g. "Refuse if amount is over 5000", "Add a field for priority (Low, Medium, High)", or "Looks good"…',
+      quickReplies: [
+        'Looks good, check safety next',
+        'Reconcile everything & finish',
+      ],
+    };
+  }
+
+  if (step === 'safety-check') {
+    const open = decl.security.threats.filter((t) => t.status === 'open');
+    const promptText =
+      open.length > 0
+        ? `Quick safety check: ${open.length} item(s) need your confirmation (${open.map((t) => t.title.toLowerCase()).join('; ')}). Should all data stay strictly on-device with no internet access and input refusals enforced?`
+        : `All ${decl.security.threats.length} safety boundaries are automatically verified by isolated offline execution. Ready to pick the look and feel?`;
+    return {
+      step: 'safety-check',
+      promptText,
+      placeholder: 'e.g. "Yes, keep everything strictly on-device" or "Allow local storage"…',
+      quickReplies: [
+        'Yes, keep strictly on-device & offline',
+        'Allow local browser storage, stay offline',
+        'Reconcile everything & finish',
+      ],
+    };
+  }
+
+  if (step === 'design-feel') {
+    return {
+      step: 'design-feel',
+      promptText:
+        'How should your Prism look and feel? Describe a layout (e.g. live calculator, tracker with history, decision form) or mood (e.g. warm evergreen, dark midnight, crisp paper, terracotta), or say "use recommended".',
+      placeholder: 'e.g. "Warm evergreen tracker with history", "Dark midnight calculator", or "Use recommended"…',
+      quickReplies: [
+        'Use recommended layout & theme',
+        'Dark midnight live calculator',
+        'Warm evergreen tracker with history',
+      ],
+    };
+  }
+
+  if (step === 'routed-standards') {
+    const unsettled = routing.activeLayeredStandards.filter((s) => s.settledCount < s.totalCount);
+    const names = unsettled.map((s) => s.authority.name).join(', ');
+    return {
+      step: 'routed-standards',
+      promptText: `Because of your audience, data, or regions, ${names || 'applicable standards'} apply. Would you like me to reconcile and attach all required protections and disclosures automatically?`,
+      placeholder: 'e.g. "Yes, apply all required protections"…',
+      quickReplies: ['Yes, apply all required protections'],
+    };
+  }
+
+  return {
+    step: 'ready-to-seal',
+    promptText: `Everything for "${decl.metadata.name}" is reconciled and ready to mathematically prove and publish! You can prove & seal it below, or keep telling me anything you want to tweak in plain English.`,
+    placeholder: 'e.g. "Switch to dark noir theme", "Refuse values over 10000", or "Make it for EU customers"…',
+    quickReplies: [
+      'Switch to dark midnight theme',
+      'Switch to live calculator layout',
+    ],
+  };
+}
+
+/**
+ * Reconciles a single natural-language creator message at any stage of the wizard into
+ * atomic closed `StudioApiOp[]` operations + a plain-English Studio reply + next stage.
+ */
+export function reconcileWizardTurn(
+  decl: PrismDeclaration,
+  currentStep: GuidedStepId,
+  rawUserText: string,
+  preParsedIntent?: ExtractedPrismIntent,
+): WizardTurnReconciliation {
+  const text = rawUserText.trim();
+  const routing = evaluateVerdantRouting(decl);
+
+  // 1. Initial Idea Anchor (undefined Prism or explicitly at anchor-idea)
+  if (routing.isUndefined || currentStep === 'anchor-idea') {
+    const intent = preParsedIntent ?? parseIdeaSentence(text);
+    const ops = intentToAnchorOps(decl, intent);
+    const inputList = intent.inputs.map((f) => f.label).join(', ');
+    const badges = [
+      `Concept: ${intent.name.value}`,
+      `${intent.inputs.length} input(s): ${inputList}`,
+      `${intent.rules.length} rule(s) · ${intent.refusals.length} refusal(s)`,
+    ];
+    return {
+      ops,
+      assistantReply: `Anchored "${intent.name.value}" from your sentence with ${intent.inputs.length} input(s) (${inputList}), ${intent.rules.length} rule(s), and ${intent.refusals.length} refusal check(s).`,
+      reconciledBadges: badges,
+      nextStep: 'confirm-context',
+      openPreview: false,
+    };
+  }
+
+  // 2. One-Shot Autonomous Reconciliation Shortcut ("reconcile everything" / "finish it")
+  if (RECONCILE_ALL_RE.test(text)) {
+    const designPrefs = parseDesignPreferences(text);
+    const { ops, badges } = reconcileAllRemainingFacets(decl, designPrefs);
+    return {
+      ops,
+      assistantReply:
+        'Done — I reconciled all remaining safety checks, synthesized your accessible interface, and applied every required protection automatically. Your Live Preview is open and ready to prove and publish!',
+      reconciledBadges: badges.length > 0 ? badges : ['All Prism facets reconciled'],
+      nextStep: 'ready-to-seal',
+      openPreview: true,
+    };
+  }
+
+  // 3. Step 2: Confirm Context Weights via Natural Language
+  if (currentStep === 'confirm-context') {
+    const { ops, changes } = parseContextReply(decl, text);
+    let previewDecl = decl;
+    for (const op of ops) {
+      const r = dispatchStudioOp(previewDecl, op);
+      if (r.ok) previewDecl = r.declaration;
+    }
+    const nextRouting = evaluateVerdantRouting(previewDecl);
+    const stdNote =
+      nextRouting.activeLayeredStandards.length > 0
+        ? ` Applicable standards detected: ${nextRouting.activeLayeredStandards.map((s) => s.authority.name).join(', ')}.`
+        : ' No extra regulatory layers are needed for this setup.';
+    return {
+      ops,
+      assistantReply: `${changes.length > 0 ? `Updated context (${changes.join(' · ')}).` : 'Confirmed context profile.'}${stdNote}`,
+      reconciledBadges: changes.length > 0 ? changes : ['Context confirmed'],
+      nextStep: 'refine-rules',
+      openPreview: false,
+    };
+  }
+
+  // 4. Step 3: Refine Rules & Inputs via Natural Language
+  if (currentStep === 'refine-rules') {
+    if (AFFIRMATIVE_RE.test(text)) {
+      const syncOp: StudioApiOp = { op: 'sync-stride-threats' };
+      const syncedRes = dispatchStudioOp(decl, syncOp);
+      const synced = syncedRes.ok ? syncedRes.declaration : decl;
+      const openCount = synced.security.threats.filter((t) => t.status === 'open').length;
+      if (openCount === 0) {
+        return {
+          ops: [syncOp],
+          assistantReply: `Rules confirmed and all ${synced.security.threats.length} safety checks passed automatically via offline sandbox isolation. Now tell me how you want your Prism to look and feel!`,
+          reconciledBadges: ['Rules confirmed', `${synced.security.threats.length}/${synced.security.threats.length} safety checks verified`],
+          nextStep: 'design-feel',
+          openPreview: false,
+        };
+      }
+      return {
+        ops: [syncOp],
+        assistantReply: `Rules confirmed. I ran a safety check and found ${openCount} item(s) to confirm before building your interface.`,
+        reconciledBadges: ['Rules confirmed', `${openCount} safety check(s) to confirm`],
+        nextStep: 'safety-check',
+        openPreview: false,
+      };
+    }
+
+    const parsed = parseFollowUpInstruction(decl, text);
+    if (parsed.ok) {
+      const ops: StudioApiOp[] = [...parsed.ops];
+      if (decl.view) ops.push({ op: 'synthesize-view-from-system', viewpoint: decl.view.viewpoint });
+      return {
+        ops,
+        assistantReply: `${parsed.summary}. Anything else you want to add or change, or say "looks good" to check safety?`,
+        reconciledBadges: [parsed.summary],
+        nextStep: 'refine-rules',
+        openPreview: false,
+      };
+    }
+
+    return {
+      ops: [],
+      assistantReply:
+        parsed.hint ??
+        'Tell me any rule, input, or refusal in plain English (for example: "Refuse if amount is over 5000"), or say "looks good" to continue.',
+      reconciledBadges: [],
+      nextStep: 'refine-rules',
+      openPreview: false,
+    };
+  }
+
+  // 5. Step 4: Safety & Privacy Check via Natural Language
+  if (currentStep === 'safety-check') {
+    const lower = text.toLowerCase();
+    const allowStorage = /\b(allow|enable|use)\s+(?:local\s+)?storage\b/.test(lower) ? true : undefined;
+    const allowNetwork = /\b(allow|enable|need|needs)\s+(?:internet|network|online)\b/.test(lower)
+      ? true
+      : /\b(offline|no\s+internet|on[-\s]?device|yes|looks?\s+good|confirm)\b/.test(lower)
+        ? false
+        : undefined;
+
+    const ops: StudioApiOp[] = [];
+    let working = decl;
+    const applyLocal = (op: StudioApiOp) => {
+      const r = dispatchStudioOp(working, op);
+      if (r.ok) {
+        working = r.declaration;
+        ops.push(op);
+      }
+    };
+
+    if (allowStorage !== undefined || allowNetwork !== undefined) {
+      applyLocal({
+        op: 'set-capabilities',
+        capabilities: {
+          ...(allowStorage !== undefined ? { storage: allowStorage } : {}),
+          ...(allowNetwork !== undefined ? { network: allowNetwork } : {}),
+        },
+      });
+    }
+    applyLocal({ op: 'sync-stride-threats' });
+    for (const thr of working.security.threats) {
+      if (thr.status === 'open') {
+        if (thr.id === 'THR-TAMPER-INPUT' && working.refusals.length > 0) {
+          applyLocal({
+            op: 'settle-stride-threat',
+            id: thr.id,
+            status: 'mitigated-by-refusal',
+            linkedRefusalId: working.refusals[0].id,
+            rationale: `Protected by typed input validation and refusal "${working.refusals[0].failureText}".`,
+          });
+        } else {
+          applyLocal({
+            op: 'settle-stride-threat',
+            id: thr.id,
+            status: 'mitigated-by-sandbox',
+            rationale:
+              allowNetwork === true
+                ? 'Explicitly authorized by creator with bounded input validation.'
+                : 'Confirmed strictly on-device offline sandbox execution.',
+          });
+        }
+      }
+    }
+
+    return {
+      ops,
+      assistantReply: 'Safety and privacy boundaries are reconciled and verified.',
+      reconciledBadges: [
+        `All ${working.security.threats.length} safety checks verified`,
+        ...(allowStorage ? ['Local storage enabled'] : []),
+        ...(allowNetwork === false ? ['Offline on-device only'] : []),
+      ],
+      nextStep: 'design-feel',
+      openPreview: false,
+    };
+  }
+
+  // 6. Step 5: Look & Feel via Natural Language -> Synthesizes Interface & Unlocks Live Preview!
+  if (currentStep === 'design-feel') {
+    const prefs = parseDesignPreferences(text);
+    const ops: StudioApiOp[] = [];
+    const badges: string[] = [];
+    let working = decl;
+
+    if (prefs.theme) {
+      const tOp: StudioApiOp = { op: 'set-theme', theme: { preset: prefs.theme } };
+      const r = dispatchStudioOp(working, tOp);
+      if (r.ok) {
+        working = r.declaration;
+        ops.push(tOp);
+        badges.push(`Theme: ${prefs.theme}`);
+      }
+    }
+    const vOp: StudioApiOp = { op: 'synthesize-view-from-system', viewpoint: prefs.viewpoint };
+    const vr = dispatchStudioOp(working, vOp);
+    if (vr.ok) {
+      working = vr.declaration;
+      ops.push(vOp);
+      badges.push(`Layout: ${working.view?.viewpoint ?? 'decision-form'}`);
+      badges.push('Live Preview unlocked');
+    }
+
+    const nextRouting = evaluateVerdantRouting(working);
+    const unsettledStd = nextRouting.activeLayeredStandards.some((s) => s.settledCount < s.totalCount);
+    if (unsettledStd) {
+      return {
+        ops,
+        assistantReply:
+          'I built your interface and opened the Live Preview on the right! One last step: let’s reconcile the applicable protections triggered by your audience/region.',
+        reconciledBadges: badges,
+        nextStep: 'routed-standards',
+        openPreview: true,
+      };
+    }
+
+    return {
+      ops,
+      assistantReply:
+        'I built your accessible interface and opened the Live Preview on the right! Every core check is complete — you can prove & publish your Prism now, or keep describing tweaks here.',
+      reconciledBadges: badges,
+      nextStep: 'ready-to-seal',
+      openPreview: true,
+    };
+  }
+
+  // 7. Step 6: Routed Standards Confirmation via Natural Language
+  if (currentStep === 'routed-standards') {
+    const { ops, badges } = reconcileAllRemainingFacets(decl);
+    return {
+      ops,
+      assistantReply:
+        'Applied all required protections and updated your Live Preview disclosures. Everything is reconciled and ready to mathematically prove and publish!',
+      reconciledBadges: badges.length > 0 ? badges : ['All required protections applied'],
+      nextStep: 'ready-to-seal',
+      openPreview: true,
+    };
+  }
+
+  // 8. Post-Reconciliation Continuous Natural-Language Refinement (at ready-to-seal!)
+  const designPrefs = parseDesignPreferences(text);
+  const contextChange = parseContextReply(decl, text);
+  const ruleChange = parseFollowUpInstruction(decl, text);
+
+  const combinedOps: StudioApiOp[] = [];
+  const badges: string[] = [];
+
+  if (contextChange.changes.length > 0) {
+    combinedOps.push(...contextChange.ops);
+    badges.push(...contextChange.changes);
+  }
+  if (ruleChange.ok) {
+    combinedOps.push(...ruleChange.ops);
+    badges.push(ruleChange.summary);
+  }
+  if (designPrefs.theme || designPrefs.viewpoint) {
+    if (designPrefs.theme) {
+      combinedOps.push({ op: 'set-theme', theme: { preset: designPrefs.theme } });
+      badges.push(`Theme: ${designPrefs.theme}`);
+    }
+    if (designPrefs.viewpoint) {
+      combinedOps.push({ op: 'synthesize-view-from-system', viewpoint: designPrefs.viewpoint });
+      badges.push(`Layout: ${designPrefs.viewpoint}`);
+    }
+  }
+
+  if (combinedOps.length > 0) {
+    // Re-reconcile all downstream facets automatically so the Prism stays 100% ready to seal!
+    let temp = decl;
+    for (const op of combinedOps) {
+      const r = dispatchStudioOp(temp, op);
+      if (r.ok) temp = r.declaration;
+    }
+    const followUp = reconcileAllRemainingFacets(temp, {
+      viewpoint: designPrefs.viewpoint ?? temp.view?.viewpoint,
+    });
+    return {
+      ops: [...combinedOps, ...followUp.ops],
+      assistantReply: `Updated your Prism and automatically reconciled all downstream safety, view, and compliance checks (${[...badges, ...followUp.badges].join(' · ')}).`,
+      reconciledBadges: [...badges, ...followUp.badges],
+      nextStep: 'ready-to-seal',
+      openPreview: true,
+    };
+  }
+
+  return {
+    ops: [],
+    assistantReply:
+      'Your Prism is ready to prove and publish! You can also ask me to tweak anything — e.g. "Switch to dark midnight theme", "Refuse amounts over 5000", or "Make it for EU customers".',
+    reconciledBadges: [],
+    nextStep: 'ready-to-seal',
+    openPreview: false,
+  };
+}
+

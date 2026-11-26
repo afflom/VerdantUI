@@ -12,11 +12,14 @@ import {
 } from './verdantStudioApi';
 import { evaluateVerdantRouting } from './verdantStandardsRouter';
 import {
+  buildStudioPromptForStep,
   computeGuidedWizardState,
   intentToAnchorOps,
   mergeLocalModelExtraction,
   parseFollowUpInstruction,
   parseIdeaSentence,
+  reconcileWizardTurn,
+  type GuidedStepId,
 } from './prismInterviewEngine';
 import { compilePrismDeclaration, instantiateAppFoundation } from './prismCompiler';
 
@@ -204,4 +207,96 @@ test('parseFollowUpInstruction and mergeLocalModelExtraction handle incremental 
   assert.equal(mergedGood.name.value, 'Hydration Coach');
   assert.equal(mergedGood.domain.value, 'health');
   assert.equal(mergedGood.outputName, 'Hydration Status');
+});
+
+test('full multi-turn natural-language conversation reconciles a regulated EU Prism from undefined to readyToSeal + Lean WASM proof with ZERO manual form edits', async () => {
+  let decl = createUndefinedDeclaration();
+  let step: GuidedStepId = 'anchor-idea';
+
+  const turns = [
+    'Check loan eligibility by age and credit score, refusing applicants under 18 and approving scores 75 or higher.',
+    'This is for EU customers and handles personal info, strictly offline.',
+    'Also refuse if credit score is over 850.',
+    'Looks good, check safety next.',
+    'Yes, keep strictly on-device and offline.',
+    'Use a crisp paper decision form.',
+    'Yes, apply all required protections.',
+  ];
+
+  for (const userMsg of turns) {
+    const res = reconcileWizardTurn(decl, step, userMsg);
+    if (res.ops.length > 0) {
+      decl = applyOps(decl, res.ops);
+    }
+    step = res.nextStep;
+  }
+
+  assert.equal(step, 'ready-to-seal');
+  const routing = evaluateVerdantRouting(decl);
+  assert.equal(routing.readyToPreview, true);
+  assert.equal(
+    routing.readyToSeal,
+    true,
+    `Expected full NL conversation to reach readyToSeal: ${JSON.stringify(routing.stages)}`,
+  );
+  // EU + personal info -> GDPR + CRA + Digital Content + EN 301 549 routed AND settled purely via NL!
+  const activeIds = new Set(routing.activeLayeredStandards.map((s) => s.authority.id));
+  assert.ok(activeIds.has('EU-REG-2016-679'));
+  assert.ok(activeIds.has('EU-REG-2024-2847'));
+  assert.equal(routing.summary.obligationsSettled, routing.summary.obligationsTotal);
+  assert.equal(decl.theme.preset, 'paper');
+  assert.equal(decl.view?.viewpoint, 'decision-form');
+
+  // Post-seal natural-language tweak automatically re-reconciles everything and stays readyToSeal!
+  const tweak = reconcileWizardTurn(decl, step, 'Switch to dark midnight live calculator');
+  decl = applyOps(decl, tweak.ops);
+  assert.equal(decl.theme.preset, 'midnight');
+  assert.equal(decl.view?.viewpoint, 'calculator');
+  assert.equal(evaluateVerdantRouting(decl).readyToSeal, true);
+
+  // Verify the NL-reconciled Prism compiles & proves cleanly in real WASM Lean 4.32.2!
+  const buildCore = await import(path.join(PRISM_CODE_ROOT, 'src/journey/build-core.mjs'));
+  const modelProve = await import(path.join(PRISM_CODE_ROOT, 'src/journey/model-prove.mjs'));
+  const proveCore = await import(path.join(PRISM_CODE_ROOT, 'src/journey/prove-core.mjs'));
+  const lexleanGz = fs.readFileSync(
+    path.join(PRISM_CODE_ROOT, 'wasm/pinned/4f/302c18e02a46b0d015c57bd389a0754b301ec876aa7a637f786c4562274ecb'),
+  );
+  const lexleanModule = await WebAssembly.compile(gunzipSync(lexleanGz));
+  const evaluatorBytes = new Uint8Array(
+    fs.readFileSync(path.join(PRISM_CODE_ROOT, 'src/journey/guest/evaluator.wasm')),
+  );
+  const kernel = await modelProve.openModelKernel();
+  const foundation = loadFoundationFiles();
+  const compiled = compilePrismDeclaration(decl);
+  assert.ok(compiled !== null);
+
+  const built = await buildCore.buildFromFiles({
+    files: { ...instantiateAppFoundation(foundation, decl.metadata.slug), ...compiled.appFiles },
+    lexlean: lexleanModule,
+    evaluator: evaluatorBytes,
+    prove: proveCore.kernelProver(kernel, { record: true }),
+  });
+  assert.equal(built.ok, true, `NL-reconciled Prism failed WASM proof at ${built.stage}: ${built.message}`);
+  assert.equal(built.proved, true);
+});
+
+test('2-turn autonomous shortcut ("Reconcile everything & finish") settles all remaining facets cleanly', () => {
+  let decl = createUndefinedDeclaration();
+  const t1 = reconcileWizardTurn(
+    decl,
+    'anchor-idea',
+    'Split a restaurant bill with tip percent across diners and refuse zero diners.',
+  );
+  decl = applyOps(decl, t1.ops);
+
+  const prompt2 = buildStudioPromptForStep(decl, evaluateVerdantRouting(decl), checkDeclaration(decl), t1.nextStep);
+  assert.ok(!/observer|vtensor|lexlean|opentelemetry/i.test(prompt2.promptText));
+
+  const t2 = reconcileWizardTurn(decl, t1.nextStep, 'Reconcile everything & finish with terracotta theme');
+  decl = applyOps(decl, t2.ops);
+
+  assert.equal(t2.nextStep, 'ready-to-seal');
+  assert.equal(t2.openPreview, true);
+  assert.equal(decl.theme.preset, 'terracotta');
+  assert.equal(evaluateVerdantRouting(decl).readyToSeal, true);
 });
