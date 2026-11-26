@@ -476,6 +476,45 @@ export const INTERNAL_BOOTSTRAP_MODEL: CatalogModel = {
   },
 };
 
+export interface MultimodalCoreModelSpec {
+  readonly id: string;
+  readonly modality: 'vision' | 'audio' | 'image-synthesis';
+  readonly name: string;
+  readonly approximateBytes: number;
+  readonly url: string;
+  readonly companionUrl?: string;
+}
+
+/**
+ * Verified open-weight multimodal core models automatically managed on-device via OPFS
+ * and executed on VerdantUI's shared vTensor WASM SIMD substrate (zero user model uploads).
+ */
+export const MULTIMODAL_CORE_MODELS: readonly MultimodalCoreModelSpec[] = [
+  {
+    id: 'smolvlm2-256m-video-mmproj-q8',
+    modality: 'vision',
+    name: 'SmolVLM2 256M Vision & Video Projector (Q8_0)',
+    approximateBytes: 109_000_000,
+    url: 'https://huggingface.co/ggml-org/SmolVLM2-256M-Video-Instruct-GGUF/resolve/main/mmproj-SmolVLM2-256M-Video-Instruct-Q8_0.gguf',
+    companionUrl:
+      'https://huggingface.co/ggml-org/SmolVLM2-256M-Video-Instruct-GGUF/resolve/main/SmolVLM2-256M-Video-Instruct-Q8_0.gguf',
+  },
+  {
+    id: 'whisper-tiny-en-q8',
+    modality: 'audio',
+    name: 'Whisper Tiny EN Speech Encoder-Decoder (Q8_0)',
+    approximateBytes: 43_600_000,
+    url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en-q8_0.bin',
+  },
+  {
+    id: 'sdxs-512-q4-taesd',
+    modality: 'image-synthesis',
+    name: 'SDXS-512 1-Step Distilled Diffusion + TAESD',
+    approximateBytes: 640_000_000,
+    url: 'https://huggingface.co/concedo/sdxs-512-tinySDdistilled-GGUF/resolve/main/sdxs-512-0.9-q4_0.gguf',
+  },
+];
+
 export function isInternalBootstrapModel(modelId: string | null | undefined): boolean {
   return !modelId || modelId === INTERNAL_BOOTSTRAP_MODEL.id;
 }

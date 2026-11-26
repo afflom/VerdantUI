@@ -626,7 +626,12 @@ export class LlamaVTensorRuntime {
   private singleAsyncPlan: SingleAsyncGraphPlan | null = null;
   private batchAsyncPlan: Batch4AsyncGraphPlan | null = null;
   private preloadedHotTensors: ReadonlyMap<string, Uint8Array> | null = null;
-  private readonly singleExec = { tokenId: 0, pos: 0, seqLen: 1 };
+  private readonly singleExec: {
+    tokenId: number;
+    pos: number;
+    seqLen: number;
+    externalEmbedding: Float32Array | null;
+  } = { tokenId: 0, pos: 0, seqLen: 1, externalEmbedding: null };
   private readonly batchExec = { tokens: new Int32Array(PREFILL_BATCH_SIZE), startPos: 0 };
 
   // Verdant 16,666 µs FrameBudgetProfiler + zero-clamp MessageChannel cooperative yielder (Theorem T7)
@@ -3162,6 +3167,10 @@ export class LlamaVTensorRuntime {
       shapeDesc: wp.streamEmbeddings ? `[${dim}] <- OPFS row` : `[${dim}] <- token`,
       srcType: wp.streamEmbeddings ? `${embdTrait.name} OPFS` : embdTrait.name,
       execute: () => {
+        if (execState.externalEmbedding) {
+          s.x.buffer.f32View(s.x).set(execState.externalEmbedding);
+          return;
+        }
         if (pinnedTokenEmbd) {
           if (arena && sxPtr >= 0 && pinnedEmbdWasmPtr >= 0) {
             if (pinnedTokenEmbd.type === GgmlType.F32) {
@@ -5024,6 +5033,7 @@ export class LlamaVTensorRuntime {
     this.singleExec.tokenId = tokenId;
     this.singleExec.pos = pos;
     this.singleExec.seqLen = pos + 1;
+    this.singleExec.externalEmbedding = null;
 
     this.backend.executeCompiledGraph(this.compiledSingleGraph, {
       captureTrace,
@@ -5046,6 +5056,91 @@ export class LlamaVTensorRuntime {
     }
 
     return this.scratch.logits.buffer.f32View(this.scratch.logits);
+  }
+
+  /**
+   * Decodes one token's F32 embedding vector directly from the model's `token_embd` tensor.
+   * Useful for multimodal interleaving and exact verification tests.
+   */
+  decodeTokenEmbedding(tokenId: number): Float32Array {
+    if (!this.hparams || !this.weightPager) {
+      throw new Error('Cannot decode token embedding before a GGUF model is loaded.');
+    }
+    const dim = this.hparams.embeddingLength;
+    const out = new Float32Array(dim);
+    const pinned = this.weightPager.getPinnedTokenEmbd();
+    if (pinned) {
+      const trait = getGgmlTypeTrait(pinned.type);
+      const rowBytes = (dim / trait.blockSize) * trait.typeSizeBytes;
+      verdantDecodeRow(pinned.buffer.rawBytes(), pinned.byteOffset + tokenId * rowBytes, pinned.type, dim, out);
+      return out;
+    }
+    const { handle, rowIndex } = this.weightPager.acquireEmbeddingRow(tokenId);
+    const trait = getGgmlTypeTrait(handle.type);
+    const rowBytes = (dim / trait.blockSize) * trait.typeSizeBytes;
+    verdantDecodeRow(handle.buffer.rawBytes(), handle.byteOffset + rowIndex * rowBytes, handle.type, dim, out);
+    return out;
+  }
+
+  /**
+   * Injects a real external multimodal embedding vector (e.g. from Vision `SigLIP` `mmproj`)
+   * directly into Layer 0 of the compiled `vTensor` graph at position `pos` with zero
+   * serialization and bit-exact KV-cache continuity.
+   */
+  evalEmbedding(
+    embedding: Float32Array,
+    pos: number,
+    computeLogits = false,
+  ): Float32Array {
+    if (!this.compiledSingleGraph || !this.scratch || !this.hparams) {
+      throw new Error('Cannot evaluate external embedding before a GGUF model is loaded.');
+    }
+    const dim = this.hparams.embeddingLength;
+    if (embedding.length !== dim) {
+      throw new Error(
+        `Multimodal embedding dimension mismatch: got ${embedding.length}, expected ${dim}.`,
+      );
+    }
+    if (pos < 0 || pos >= this.maxContextWindow) {
+      throw new Error(
+        `Embedding position ${pos} exceeds vTensor KV-cache context window (${this.maxContextWindow}).`,
+      );
+    }
+
+    this.singleExec.tokenId = 0;
+    this.singleExec.pos = pos;
+    this.singleExec.seqLen = pos + 1;
+    this.singleExec.externalEmbedding = embedding;
+    try {
+      this.backend.executeCompiledGraph(this.compiledSingleGraph, {
+        captureTrace: false,
+        profilePerOp: false,
+        nodeLimit: computeLogits ? undefined : this.singleGraphBodyNodeCount,
+      });
+    } finally {
+      this.singleExec.externalEmbedding = null;
+    }
+    return this.scratch.logits.buffer.f32View(this.scratch.logits);
+  }
+
+  /**
+   * Prefills a contiguous sequence of multimodal embeddings (e.g. visual tokens from `visionEncoder`)
+   * directly into the active KV cache starting at `startPos`, returning the next KV position.
+   */
+  prefillEmbeddingSequence(
+    embeddings: readonly Float32Array[],
+    startPos: number,
+    computeFinalLogits = false,
+  ): { readonly nextPos: number; readonly logits: Float32Array | null } {
+    let pos = startPos;
+    let lastLogits: Float32Array | null = null;
+    for (let i = 0; i < embeddings.length; i++) {
+      const isLast = i === embeddings.length - 1;
+      const logits = this.evalEmbedding(embeddings[i]!, pos, computeFinalLogits && isLast);
+      if (isLast && computeFinalLogits) lastLogits = logits;
+      pos += 1;
+    }
+    return { nextPos: pos, logits: lastLogits };
   }
 
   /**

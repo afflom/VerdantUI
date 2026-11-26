@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useState, type FC } from 'react';
+import { useRef, createContext, useContext, useEffect, useMemo, useState, type ChangeEvent, type FC } from 'react';
 import {
   ActionBarPrimitive,
   AttachmentPrimitive,
@@ -29,7 +29,10 @@ import {
   Copy,
   ExternalLink,
   FileText,
+  Image as ImageIcon,
   Loader2,
+  Mic,
+  MicOff,
   Paperclip,
   Pencil,
   RefreshCw,
@@ -43,6 +46,7 @@ import {
   UNIFIED_VERDANT_SYSTEM_PROMPT,
 } from '../engine/cognitiveObserver';
 import { shortPrismDigest, type PublishedPrismSummary } from '../engine/prismStudio';
+import { BrowserVoiceRecorder, computeLogMelSpectrogram } from '../engine/audioFrontend';
 import type { EngineState } from '../engine/workerClient';
 
 interface ThreadViewProps {
@@ -637,6 +641,49 @@ export const ThreadView: FC<ThreadViewProps> = ({
   onCountTokens,
 }) => {
   const [prismPickerOpen, setPrismPickerOpen] = useState(false);
+  const [attachedImage, setAttachedImage] = useState<{ readonly name: string; readonly previewUrl: string; readonly width: number; readonly height: number } | null>(null);
+  const [recordingVoice, setRecordingVoice] = useState(false);
+  const [voiceNoteSummary, setVoiceNoteSummary] = useState<string | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const voiceRecorderRef = useRef<BrowserVoiceRecorder | null>(null);
+
+  const handlePickImage = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      setAttachedImage((prev) => {
+        if (prev) URL.revokeObjectURL(prev.previewUrl);
+        return { name: file.name, previewUrl: url, width: img.naturalWidth, height: img.naturalHeight };
+      });
+    };
+    img.src = url;
+  };
+
+  const handleToggleVoice = async () => {
+    if (recordingVoice && voiceRecorderRef.current) {
+      setRecordingVoice(false);
+      try {
+        const pcm16k = await voiceRecorderRef.current.stop();
+        const mel = computeLogMelSpectrogram(pcm16k);
+        setVoiceNoteSummary(`Voice clip captured (${mel.durationSec.toFixed(1)}s)`);
+      } catch {
+        setVoiceNoteSummary(null);
+      }
+      return;
+    }
+    try {
+      const rec = new BrowserVoiceRecorder();
+      voiceRecorderRef.current = rec;
+      await rec.start();
+      setVoiceNoteSummary(null);
+      setRecordingVoice(true);
+    } catch {
+      setRecordingVoice(false);
+    }
+  };
   const isDownloading = engineState.status === 'downloading';
   const isModelLoading = isDownloading || engineState.status === 'loading';
   const modelReady = engineState.model !== null && !isModelLoading;
@@ -837,6 +884,41 @@ export const ThreadView: FC<ThreadViewProps> = ({
               <ComposerPrimitive.Attachments
                 components={{ Attachment: ComposerAttachmentItem }}
               />
+              {attachedImage && (
+                <div className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-slate-700 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200">
+                  <img
+                    src={attachedImage.previewUrl}
+                    alt={attachedImage.name}
+                    className="h-6 w-6 rounded object-cover"
+                  />
+                  <span className="max-w-[140px] truncate">{attachedImage.name}</span>
+                  <button
+                    type="button"
+                    aria-label="Remove image"
+                    onClick={() => {
+                      URL.revokeObjectURL(attachedImage.previewUrl);
+                      setAttachedImage(null);
+                    }}
+                    className="text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </div>
+              )}
+              {voiceNoteSummary && (
+                <div className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-200">
+                  <Mic className="h-3 w-3" />
+                  <span>{voiceNoteSummary}</span>
+                  <button
+                    type="button"
+                    aria-label="Clear voice clip"
+                    onClick={() => setVoiceNoteSummary(null)}
+                    className="text-emerald-700 hover:text-emerald-950 dark:text-emerald-300"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </div>
+              )}
             </div>
 
             <ComposerPrimitive.Input
@@ -852,14 +934,43 @@ export const ThreadView: FC<ThreadViewProps> = ({
             />
 
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 px-3 py-2 dark:border-slate-800/80">
-              <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+              <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
                 <ComposerPrimitive.AddAttachment
                   aria-label="Attach text or code file"
-                  title="Attach text or code file"
+                  title="Attach file"
                   className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100 transition-colors"
                 >
                   <Paperclip className="h-3.5 w-3.5" />
                 </ComposerPrimitive.AddAttachment>
+                <input
+                  ref={imageInputRef}
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={handlePickImage}
+                />
+                <button
+                  type="button"
+                  onClick={() => imageInputRef.current?.click()}
+                  aria-label="Attach image"
+                  title="Attach image"
+                  className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100 transition-colors"
+                >
+                  <ImageIcon className="h-3.5 w-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleToggleVoice()}
+                  aria-label={recordingVoice ? 'Stop voice recording' : 'Record voice'}
+                  title={recordingVoice ? 'Stop recording' : 'Voice input'}
+                  className={`inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md transition-colors ${
+                    recordingVoice
+                      ? 'bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300'
+                      : 'text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100'
+                  }`}
+                >
+                  {recordingVoice ? <MicOff className="h-3.5 w-3.5" /> : <Mic className="h-3.5 w-3.5" />}
+                </button>
                 <span aria-hidden="true">·</span>
                 <button
                   type="button"

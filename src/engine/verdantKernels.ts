@@ -1311,3 +1311,232 @@ export function verdantMean(x: Float32Array, n: number): number {
   }
   return Math.fround(acc / n);
 }
+
+// ============================================================================
+// Multimodal Neural Tensor Kernels (Shared vTensor Substrate for Vision, Audio & Image)
+// ============================================================================
+
+/**
+ * Exact F64-accumulated LayerNorm (`(x - mean) / sqrt(var + eps) * weight + bias`).
+ * Used by SigLIP/ViT vision encoders, Whisper audio encoders, and CLIP text encoders.
+ */
+export function verdantLayerNorm(
+  x: Float32Array,
+  weight: Float32Array | null,
+  bias: Float32Array | null,
+  out: Float32Array,
+  n: number,
+  eps = 1e-5,
+  xOffset = 0,
+  outOffset = 0,
+): void {
+  if (n <= 0) return;
+  let sum = 0.0;
+  for (let i = 0; i < n; i++) sum += x[xOffset + i]!;
+  const mean = sum / n;
+  let varAcc = 0.0;
+  for (let i = 0; i < n; i++) {
+    const d = x[xOffset + i]! - mean;
+    varAcc += d * d;
+  }
+  const invStd = 1.0 / Math.sqrt(varAcc / n + eps);
+  for (let i = 0; i < n; i++) {
+    let v = (x[xOffset + i]! - mean) * invStd;
+    if (weight) v *= weight[i]!;
+    if (bias) v += bias[i]!;
+    out[outOffset + i] = Math.fround(v);
+  }
+}
+
+const SQRT_2_OVER_PI = Math.sqrt(2.0 / Math.PI);
+
+/**
+ * Exact tanh-approximated GELU (or QuickGELU `x * sigmoid(1.702 * x)` when `quick = true`).
+ * Used by SigLIP ViT, Whisper, and CLIP MLP blocks.
+ */
+export function verdantGelu(
+  x: Float32Array,
+  out: Float32Array,
+  n: number,
+  quick = false,
+  xOffset = 0,
+  outOffset = 0,
+): void {
+  if (quick) {
+    for (let i = 0; i < n; i++) {
+      const v = x[xOffset + i]!;
+      out[outOffset + i] = Math.fround(v / (1.0 + Math.exp(-1.702 * v)));
+    }
+    return;
+  }
+  for (let i = 0; i < n; i++) {
+    const v = x[xOffset + i]!;
+    const inner = SQRT_2_OVER_PI * (v + 0.044715 * v * v * v);
+    out[outOffset + i] = Math.fround(0.5 * v * (1.0 + Math.tanh(inner)));
+  }
+}
+
+/** Elementwise SiLU / Swish (`x / (1 + exp(-x))`) used by UNet & VAE residual blocks. */
+export function verdantSiLu(
+  x: Float32Array,
+  out: Float32Array,
+  n: number,
+  xOffset = 0,
+  outOffset = 0,
+): void {
+  for (let i = 0; i < n; i++) {
+    const v = x[xOffset + i]!;
+    out[outOffset + i] = Math.fround(v / (1.0 + Math.exp(-v)));
+  }
+}
+
+/**
+ * F64-accumulated GroupNorm over CHW tensor `[channels, spatialSize]`.
+ * Used by distilled latent diffusion UNet and TAESD autoencoder blocks.
+ */
+export function verdantGroupNorm(
+  x: Float32Array,
+  weight: Float32Array | null,
+  bias: Float32Array | null,
+  out: Float32Array,
+  channels: number,
+  groups: number,
+  spatialSize: number,
+  eps = 1e-5,
+): void {
+  const gCount = Math.max(1, Math.min(groups, channels));
+  const cPerGroup = Math.floor(channels / gCount);
+  const groupElems = cPerGroup * spatialSize;
+  if (groupElems <= 0) return;
+
+  for (let g = 0; g < gCount; g++) {
+    const cStart = g * cPerGroup;
+    const cEnd = g === gCount - 1 ? channels : cStart + cPerGroup;
+    const count = (cEnd - cStart) * spatialSize;
+    let sum = 0.0;
+    for (let c = cStart; c < cEnd; c++) {
+      const base = c * spatialSize;
+      for (let s = 0; s < spatialSize; s++) sum += x[base + s]!;
+    }
+    const mean = sum / count;
+    let varAcc = 0.0;
+    for (let c = cStart; c < cEnd; c++) {
+      const base = c * spatialSize;
+      for (let s = 0; s < spatialSize; s++) {
+        const d = x[base + s]! - mean;
+        varAcc += d * d;
+      }
+    }
+    const invStd = 1.0 / Math.sqrt(varAcc / count + eps);
+    for (let c = cStart; c < cEnd; c++) {
+      const base = c * spatialSize;
+      const w = weight ? weight[c]! : 1.0;
+      const b = bias ? bias[c]! : 0.0;
+      for (let s = 0; s < spatialSize; s++) {
+        out[base + s] = Math.fround((x[base + s]! - mean) * invStd * w + b);
+      }
+    }
+  }
+}
+
+/**
+ * Exact F64-accumulated 1D Convolution over `[inC, length]` -> `[outC, outLength]`.
+ * Weight layout: `[outC, inC, kernelSize]`. Used by Whisper's audio spectrogram stem.
+ */
+export function verdantConv1d(
+  input: Float32Array,
+  weight: Float32Array,
+  bias: Float32Array | null,
+  out: Float32Array,
+  inC: number,
+  outC: number,
+  length: number,
+  kernelSize: number,
+  stride = 1,
+  padding = 0,
+): number {
+  const outLen = Math.floor((length + 2 * padding - kernelSize) / stride) + 1;
+  if (outLen <= 0) return 0;
+  const wStrideOut = inC * kernelSize;
+  for (let oc = 0; oc < outC; oc++) {
+    const wBaseOc = oc * wStrideOut;
+    const oBase = oc * outLen;
+    const bVal = bias ? bias[oc]! : 0.0;
+    for (let ox = 0; ox < outLen; ox++) {
+      const ixStart = ox * stride - padding;
+      let acc = bVal;
+      for (let ic = 0; ic < inC; ic++) {
+        const inBase = ic * length;
+        const wBase = wBaseOc + ic * kernelSize;
+        for (let k = 0; k < kernelSize; k++) {
+          const ix = ixStart + k;
+          if (ix >= 0 && ix < length) {
+            acc += input[inBase + ix]! * weight[wBase + k]!;
+          }
+        }
+      }
+      out[oBase + ox] = Math.fround(acc);
+    }
+  }
+  return outLen;
+}
+
+/**
+ * Exact F64-accumulated 2D Convolution over CHW `[inC, H, W]` -> `[outC, outH, outW]`.
+ * Weight layout: `[outC, inC, kH, kW]`. Used by SigLIP patch embeddings, SDXS UNet, and TAESD VAE.
+ */
+export function verdantConv2d(
+  input: Float32Array,
+  weight: Float32Array,
+  bias: Float32Array | null,
+  out: Float32Array,
+  inC: number,
+  outC: number,
+  height: number,
+  width: number,
+  kH: number,
+  kW: number,
+  stride = 1,
+  padding = 0,
+): { readonly outH: number; readonly outW: number } {
+  const outH = Math.floor((height + 2 * padding - kH) / stride) + 1;
+  const outW = Math.floor((width + 2 * padding - kW) / stride) + 1;
+  if (outH <= 0 || outW <= 0) return { outH: 0, outW: 0 };
+
+  const inPlane = height * width;
+  const outPlane = outH * outW;
+  const kPlane = kH * kW;
+  const wStrideOut = inC * kPlane;
+
+  for (let oc = 0; oc < outC; oc++) {
+    const wBaseOc = oc * wStrideOut;
+    const oBase = oc * outPlane;
+    const bVal = bias ? bias[oc]! : 0.0;
+    for (let oy = 0; oy < outH; oy++) {
+      const iyStart = oy * stride - padding;
+      const oRow = oBase + oy * outW;
+      for (let ox = 0; ox < outW; ox++) {
+        const ixStart = ox * stride - padding;
+        let acc = bVal;
+        for (let ic = 0; ic < inC; ic++) {
+          const inBase = ic * inPlane;
+          const wBase = wBaseOc + ic * kPlane;
+          for (let ky = 0; ky < kH; ky++) {
+            const iy = iyStart + ky;
+            if (iy < 0 || iy >= height) continue;
+            const inRow = inBase + iy * width;
+            const wRow = wBase + ky * kW;
+            for (let kx = 0; kx < kW; kx++) {
+              const ix = ixStart + kx;
+              if (ix >= 0 && ix < width) {
+                acc += input[inRow + ix]! * weight[wRow + kx]!;
+              }
+            }
+          }
+        }
+        out[oRow + ox] = Math.fround(acc);
+      }
+    }
+  }
+  return { outH, outW };
+}
