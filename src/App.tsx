@@ -29,6 +29,7 @@ import {
   createVerdantClientTools,
 } from './engine/cognitiveObserver';
 import type { ImportedHarnessSpec } from './engine/harnessConfig';
+import { isInternalBootstrapModel } from './engine/modelCatalog';
 import type { CatalogModel } from './engine/modelCatalog';
 import { createVTensorThreadListAdapter } from './engine/threadStorage';
 import { LlamaVTensorWorkerClient, type EngineState } from './engine/workerClient';
@@ -221,8 +222,13 @@ export default function App() {
     workerClient.setImportedHarness(null);
   }, [workerClient]);
 
+  const handleToggleModelStream = useCallback(() => {
+    const next = !workerClient.getState().modelStreamEnabled;
+    void workerClient.setModelStreamEnabled(next).catch(() => {});
+  }, [workerClient]);
+
   const handleCancelDownload = useCallback(() => {
-    workerClient.cancelDownload();
+    void workerClient.setModelStreamEnabled(false).catch(() => {});
   }, [workerClient]);
 
   const handleRetryLoad = useCallback(() => {
@@ -295,6 +301,59 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
+            {(() => {
+              const streamOn = engineState.modelStreamEnabled;
+              const isStreaming =
+                engineState.status === 'downloading' || engineState.status === 'loading';
+              const hasRealModel =
+                engineState.model !== null && !isInternalBootstrapModel(engineState.model.id);
+              const hasError = streamOn && engineState.errorMessage !== null;
+              const statusLabel = !streamOn
+                ? 'Off'
+                : isStreaming
+                  ? `${engineState.progressPercent}%`
+                  : hasError
+                    ? 'Error'
+                    : hasRealModel
+                      ? 'Ready'
+                      : 'On';
+              return (
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={streamOn}
+                  data-testid="model-stream-toggle"
+                  title={
+                    streamOn
+                      ? `Model Stream enabled (${engineState.statusDetail}). Click to pause/disable.`
+                      : 'Model Stream disabled (remembers setting across reloads). Click to stream local neural weights.'
+                  }
+                  onClick={handleToggleModelStream}
+                  className={`inline-flex h-9 items-center gap-2 rounded-lg border px-2.5 sm:px-3 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                    streamOn
+                      ? 'border-emerald-700/40 bg-emerald-50 text-emerald-950 hover:bg-emerald-100/80 dark:border-emerald-500/40 dark:bg-emerald-950/50 dark:text-emerald-200 dark:hover:bg-emerald-950/80'
+                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-300 dark:hover:bg-slate-800'
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-2 w-2 rounded-full ${
+                      !streamOn
+                        ? 'bg-slate-400 dark:bg-slate-500'
+                        : hasError
+                          ? 'bg-red-500'
+                          : isStreaming
+                            ? 'animate-pulse bg-emerald-500'
+                            : 'bg-emerald-600 dark:bg-emerald-400'
+                    }`}
+                  />
+                  <span>Model Stream</span>
+                  <span className="font-mono text-[11px] tabular-nums opacity-80">
+                    {statusLabel}
+                  </span>
+                </button>
+              );
+            })()}
+
             <button
               type="button"
               onClick={handleOpenStorageModels}

@@ -10,6 +10,7 @@ import { formatSpeculativePrefixForLlama } from './assistantAdapter';
 import {
   UNIFIED_VERDANT_SYSTEM_PROMPT,
   VerdantCognitiveObserver,
+  pickDefaultNeuralCatalogModel,
   type CognitiveObserverSnapshot,
   type CognitiveRouteCertificate,
 } from './cognitiveObserver';
@@ -47,6 +48,27 @@ import {
 const LEGACY_GGUF_CACHE_NAME = 'vtensor-gguf-models-v1';
 const PREFS_STORAGE_KEY = 'vtensor-assistant:prefs:v1';
 const LAST_MODEL_STORAGE_KEY = 'vtensor-assistant:last-model:v1';
+const MODEL_STREAM_STORAGE_KEY = 'verdant-ui:model-stream-enabled:v1';
+
+export function loadSavedModelStreamEnabled(): boolean {
+  if (typeof window === 'undefined' || typeof window.localStorage === 'undefined') {
+    return false;
+  }
+  try {
+    return window.localStorage.getItem(MODEL_STREAM_STORAGE_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+export function saveModelStreamEnabled(enabled: boolean): void {
+  if (typeof window === 'undefined' || typeof window.localStorage === 'undefined') return;
+  try {
+    window.localStorage.setItem(MODEL_STREAM_STORAGE_KEY, enabled ? 'true' : 'false');
+  } catch {
+    // Ignore storage errors
+  }
+}
 
 export type EngineStatus = 'idle' | 'downloading' | 'loading' | 'ready' | 'generating' | 'error';
 export type PromptFormatMode = 'auto' | 'chatml' | 'continuation' | 'instruct';
@@ -75,6 +97,7 @@ export interface EngineState {
   readonly promptMode: PromptFormatMode;
   readonly precisionMode: PrecisionContractMode;
   readonly weightResidencyPolicy: WeightResidencyPolicy;
+  readonly modelStreamEnabled: boolean;
   readonly lastRouteCertificate: CognitiveRouteCertificate | null;
   readonly observerSnapshot: CognitiveObserverSnapshot | null;
   readonly importedHarness: ImportedHarnessSpec | null;
@@ -273,10 +296,17 @@ export class LlamaVTensorWorkerClient {
   constructor() {
     const saved = loadSavedPrefs();
     const savedHarness = loadSavedHarness();
+    const savedStreamEnabled = loadSavedModelStreamEnabled();
+    if (!savedStreamEnabled) {
+      this.cognitiveObserver.grants.deny('network-weights');
+    } else {
+      this.cognitiveObserver.grants.reset('network-weights');
+      this.cognitiveObserver.grants.grant('network-weights');
+    }
     this.state = {
       status: 'idle',
       progressPercent: 0,
-      statusDetail: 'Initializing runtime',
+      statusDetail: savedStreamEnabled ? 'Initializing model stream' : 'Model stream off (LOD0 ready)',
       errorMessage: null,
       model: null,
       telemetry: INITIAL_TELEMETRY,
@@ -291,6 +321,7 @@ export class LlamaVTensorWorkerClient {
       promptMode: saved.promptMode,
       precisionMode: saved.precisionMode,
       weightResidencyPolicy: saved.weightResidencyPolicy,
+      modelStreamEnabled: savedStreamEnabled,
       lastRouteCertificate: null,
       observerSnapshot: null,
       importedHarness: savedHarness,
@@ -382,14 +413,59 @@ export class LlamaVTensorWorkerClient {
 
     const storage = await this.refreshOpfsStorage().catch(() => INITIAL_OPFS_STORAGE);
     const cachedIds = computeCachedIds(storage);
-    const lastId = readLastModelId();
-    if (lastId && cachedIds.includes(lastId)) {
-      const remembered = MODEL_CATALOG.find((m) => m.id === lastId);
-      if (remembered) {
-        return this.loadCatalogModel(remembered);
+    // Respect persisted Model Stream toggle: disabled upon first entry (never auto-downloads).
+    // When enabled across reload, immediately resume/load the remembered or unified default model!
+    if (this.state.modelStreamEnabled) {
+      const lastId = readLastModelId();
+      if (lastId && cachedIds.includes(lastId)) {
+        const remembered = MODEL_CATALOG.find((m) => m.id === lastId);
+        if (remembered) {
+          return this.loadCatalogModel(remembered);
+        }
       }
+      const target = pickDefaultNeuralCatalogModel(cachedIds);
+      return this.loadCatalogModel(target);
     }
     return this.loadCatalogModel(INTERNAL_BOOTSTRAP_MODEL);
+  }
+
+  /**
+   * Toggles the persistent Model Stream setting (`false` on first visit, remembered across reloads).
+   * - Turning ON grants `network-weights` and immediately starts streaming/activating the unified model.
+   * - Turning OFF cancels any in-flight stream and denies `network-weights` (`FK-07`).
+   */
+  async setModelStreamEnabled(enabled: boolean): Promise<void> {
+    saveModelStreamEnabled(enabled);
+    if (enabled) {
+      this.cognitiveObserver.grants.reset('network-weights');
+      this.cognitiveObserver.grants.grant('network-weights');
+      this.patchState({ modelStreamEnabled: true, errorMessage: null });
+
+      const activeId = this.state.model?.id;
+      const alreadyLoadedRealModel =
+        activeId !== undefined && activeId !== INTERNAL_BOOTSTRAP_MODEL.id;
+      if (!alreadyLoadedRealModel && this.state.status !== 'downloading' && this.state.status !== 'loading') {
+        const storage = await this.refreshOpfsStorage().catch(() => this.state.opfsStorage);
+        const cachedIds = computeCachedIds(storage);
+        const lastId = readLastModelId();
+        const remembered =
+          lastId && cachedIds.includes(lastId)
+            ? MODEL_CATALOG.find((m) => m.id === lastId)
+            : undefined;
+        const target = remembered ?? pickDefaultNeuralCatalogModel(cachedIds);
+        await this.loadCatalogModel(target);
+      }
+    } else {
+      this.cognitiveObserver.grants.deny('network-weights');
+      this.cancelDownload();
+      this.patchState({
+        modelStreamEnabled: false,
+        status: this.state.model ? 'ready' : 'idle',
+        progressPercent: 0,
+        statusDetail: 'Model stream off',
+        errorMessage: null,
+      });
+    }
   }
 
   /**

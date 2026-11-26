@@ -385,4 +385,21 @@ test('evaluateMathExpression, all 5 client tools, and unified ModelContext run d
   assert.equal(ctx.system, UNIFIED_VERDANT_SYSTEM_PROMPT);
   assert.equal(ctx.callSettings?.temperature, 0.4);
   assert.ok(ctx.tools && Object.keys(ctx.tools).length === 5);
+
+  // When Model Stream is disabled (`network-weights` denied on cold browser), LOD0 verified routes
+  // still settle instantaneously while cold network promotion is refused by FK-07.
+  const coldObserver = new VerdantCognitiveObserver();
+  coldObserver.grants.deny('network-weights');
+  const coldMath = coldObserver.selectRoute({
+    threadId: 'cold-stream-off',
+    messages: [makeUserMsg('Calculate 9 * 9')],
+    latestUserText: 'Calculate 9 * 9',
+    hasAttachment: false,
+    activeModel: null,
+    cachedModelIds: [],
+    isToolContinuationStep: false,
+    hasImportedHarness: false,
+  });
+  assert.equal(coldMath.certificate.kind, 'lod0-verified');
+  assert.equal(coldObserver.grants.isAllowed('network-weights'), false);
 });

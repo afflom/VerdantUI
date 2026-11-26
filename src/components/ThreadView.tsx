@@ -606,11 +606,15 @@ export const ThreadView: FC<ThreadViewProps> = ({
 
                 <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500 dark:text-slate-400 tabular-nums">
                   <span>
-                    Substrate:{' '}
+                    Model Stream:{' '}
                     <strong className="font-medium text-slate-800 dark:text-slate-200">
-                      {isBootstrapUnbound
-                        ? 'LOD0 Instant (neural streams on demand)'
-                        : (engineState.model?.displayName ?? 'VerdantUI')}
+                      {!engineState.modelStreamEnabled && isBootstrapUnbound
+                        ? 'Off (LOD0 instant actions active)'
+                        : isModelLoading
+                          ? `${engineState.statusDetail} (${engineState.progressPercent}%)`
+                          : isBootstrapUnbound
+                            ? 'Ready'
+                            : (engineState.model?.displayName ?? 'VerdantUI')}
                     </strong>
                   </span>
                   {!isBootstrapUnbound && engineState.model && (

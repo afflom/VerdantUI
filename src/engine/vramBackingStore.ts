@@ -1418,6 +1418,50 @@ export interface SyncAccessHandleCapableFile {
  *  2. Cross-tab / page-reload `BroadcastChannel` lease handover + bounded exponential backoff
  *     so reloading the page NEVER fails due to an old worker still tearing down its OPFS handle.
  */
+/** Races a promise against a bounded timeout and optional AbortSignal so OPFS calls can never hang. */
+async function withTimeoutAndAbort<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+  timeoutMessage: string,
+): Promise<T> {
+  if (signal?.aborted) {
+    throw new DOMException('Aborted', 'AbortError');
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener('abort', onAbort);
+      reject(new Error(timeoutMessage));
+    }, timeoutMs);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (val) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        resolve(val);
+      },
+      (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
 export async function openSyncAccessHandleWithRetry(
   fileHandle: SyncAccessHandleCapableFile,
   options?: {
@@ -1426,6 +1470,7 @@ export async function openSyncAccessHandleWithRetry(
     senderId?: string;
     signal?: AbortSignal;
     retryDelaysMs?: readonly number[];
+    openTimeoutMs?: number;
   },
 ): Promise<SyncAccessHandleLike> {
   if (typeof fileHandle.createSyncAccessHandle !== 'function') {
@@ -1433,20 +1478,36 @@ export async function openSyncAccessHandleWithRetry(
   }
   const mode = options?.mode ?? 'readwrite';
   const delays = options?.retryDelaysMs ?? DEFAULT_OPFS_LOCK_RETRY_DELAYS_MS;
+  const openTimeoutMs = options?.openTimeoutMs ?? 4_000;
 
   const tryOpenOnce = async (): Promise<SyncAccessHandleLike> => {
     if (mode === 'read-only') {
       try {
-        return await fileHandle.createSyncAccessHandle!({ mode: 'read-only' });
+        return await withTimeoutAndAbort(
+          fileHandle.createSyncAccessHandle!({ mode: 'read-only' }),
+          openTimeoutMs,
+          options?.signal,
+          'OPFS read-only access handle timed out (locked).',
+        );
       } catch (err) {
         // Older browsers reject the options dictionary with TypeError -> retry 0-arg default mode
         if (err instanceof TypeError) {
-          return await fileHandle.createSyncAccessHandle!();
+          return await withTimeoutAndAbort(
+            fileHandle.createSyncAccessHandle!(),
+            openTimeoutMs,
+            options?.signal,
+            'OPFS access handle timed out (locked).',
+          );
         }
         throw err;
       }
     }
-    return await fileHandle.createSyncAccessHandle!();
+    return await withTimeoutAndAbort(
+      fileHandle.createSyncAccessHandle!(),
+      openTimeoutMs,
+      options?.signal,
+      'OPFS write access handle timed out (locked).',
+    );
   };
 
   let lastErr: unknown;
@@ -2477,27 +2538,33 @@ export async function streamUrlToVramBacking(
         const metaName = `${fileName}.part.meta`;
         const incompleteMarkerName = `${fileName}.incomplete`;
 
-        // Detect whether FileSystemFileHandle.move() is supported so browsers without move()
-        // write directly into `<id>.gguf` guarded by `.incomplete` (eliminating 2× copy spikes!).
-        const probeHandle = (await dir.getFileHandle(tmpName, {
-          create: true,
-        })) as FileSystemFileHandle & {
+        // In real browser OPFS (`!options?.opfsDirectoryOverride`), prefer zero-copy direct-write
+        // into `<id>.gguf` guarded by `<id>.gguf.incomplete` (unless a legacy non-empty `.part`
+        // file already exists on disk). This avoids Chromium's multi-GB `FileSystemFileHandle.move()`
+        // lock/copy stalls at commit time while keeping 100% crash-safe resumability.
+        const hasLegacyPart =
+          !options?.opfsDirectoryOverride && (await hasOpfsEntry(dir, tmpName));
+        let legacyPartSize = 0;
+        if (hasLegacyPart) {
+          try {
+            const lh = await dir.getFileHandle(tmpName, { create: false });
+            legacyPartSize = (await lh.getFile()).size;
+          } catch {
+            legacyPartSize = 0;
+          }
+        }
+        const preferDirectWrite = !options?.opfsDirectoryOverride && legacyPartSize === 0;
+
+        let supportsAtomicMove = false;
+        let activeFileName = fileName;
+        let activeHandle: FileSystemFileHandle & {
           move?: (name: string) => Promise<void>;
           createSyncAccessHandle: () => Promise<SyncAccessHandleLike>;
         };
-        const supportsAtomicMove = typeof probeHandle.move === 'function';
-        let activeFileName = tmpName;
-        let activeHandle = probeHandle;
 
-        if (!supportsAtomicMove) {
-          // Clean up empty probe `.part` if we're using zero-copy direct-write mode
-          try {
-            const pf = await probeHandle.getFile();
-            if (pf.size === 0) {
-              await dir.removeEntry(tmpName).catch(() => {});
-            }
-          } catch {
-            // Ignore
+        if (preferDirectWrite) {
+          if (hasLegacyPart) {
+            await dir.removeEntry(tmpName).catch(() => {});
           }
           activeFileName = fileName;
           activeHandle = (await dir.getFileHandle(fileName, {
@@ -2506,8 +2573,36 @@ export async function streamUrlToVramBacking(
             move?: (name: string) => Promise<void>;
             createSyncAccessHandle: () => Promise<SyncAccessHandleLike>;
           };
-          // Mark `.gguf` as incomplete until verified & committed
           await dir.getFileHandle(incompleteMarkerName, { create: true });
+        } else {
+          const probeHandle = (await dir.getFileHandle(tmpName, {
+            create: true,
+          })) as FileSystemFileHandle & {
+            move?: (name: string) => Promise<void>;
+            createSyncAccessHandle: () => Promise<SyncAccessHandleLike>;
+          };
+          supportsAtomicMove = typeof probeHandle.move === 'function';
+          activeFileName = tmpName;
+          activeHandle = probeHandle;
+
+          if (!supportsAtomicMove) {
+            try {
+              const pf = await probeHandle.getFile();
+              if (pf.size === 0) {
+                await dir.removeEntry(tmpName).catch(() => {});
+              }
+            } catch {
+              // Ignore
+            }
+            activeFileName = fileName;
+            activeHandle = (await dir.getFileHandle(fileName, {
+              create: true,
+            })) as FileSystemFileHandle & {
+              move?: (name: string) => Promise<void>;
+              createSyncAccessHandle: () => Promise<SyncAccessHandleLike>;
+            };
+            await dir.getFileHandle(incompleteMarkerName, { create: true });
+          }
         }
 
         const existingMeta = await readPartMeta(dir, metaName);
@@ -3042,7 +3137,7 @@ export async function streamUrlToVramBacking(
             }
           }
 
-          // 3. Verify GGUF v2/v3 magic header BEFORE committing
+          // 3. Verify GGUF v2/v3 magic header BEFORE committing (fast 24B + 4KiB sync read)
           options?.onProgress?.({
             receivedBytes: writtenOffset,
             totalBytes: knownTotalBytes || writtenOffset,
@@ -3064,40 +3159,126 @@ export async function streamUrlToVramBacking(
           }
 
           const headerHash64 = computeSyncHandleHeaderFingerprint64(syncHandle);
-          syncHandle.flush();
+          // Stream loop already flushed on exit; close handle cleanly before committing!
           closeHandleSafe();
 
-          // 4. Zero-copy atomic commit
-          if (supportsAtomicMove && typeof activeHandle.move === 'function') {
-            await activeHandle.move(fileName);
-          } else {
-            // Direct-write mode: file is ALREADY at `fileName` — just remove the `.incomplete` guard!
-            await dir.removeEntry(incompleteMarkerName).catch(() => {});
-          }
-          await dir.removeEntry(metaName).catch(() => {});
-          await writeCommittedMeta(dir, `${base}.meta`, {
-            version: 1,
-            modelId,
-            url,
+          options?.onProgress?.({
+            receivedBytes: writtenOffset,
             totalBytes: knownTotalBytes || writtenOffset,
-            etag: knownEtag,
-            lastModified: knownLastModified,
-            headerHash64,
-            committedAt: Date.now(),
+            percent: 96,
+            backingKind: 'opfs-sync',
+            stage: 'verifying',
+            note: 'Committing local cache',
           });
 
-          const committed = await openOpfsModelBacking(modelId, options?.opfsDirectoryOverride);
-          if (!committed) {
+          // 4. Hang-proof atomic commit (zero-copy direct-write or bounded move with lock-release yield)
+          let committedBacking: VramBackingStore | null = null;
+          if (supportsAtomicMove && typeof activeHandle.move === 'function') {
+            // Yield briefly so Chromium's Mojo IPC finishes releasing the SyncAccessHandle lock
+            if (!options?.opfsDirectoryOverride) {
+              await sleepWithAbort(30, options?.signal);
+            }
+            const moveTimeoutMs = options?.stallTimeoutMs
+              ? Math.min(8_000, Math.max(500, options.stallTimeoutMs))
+              : 8_000;
+            let moved = false;
+            let lastMoveErr: unknown;
+            for (const delay of [0, 60, 180]) {
+              if (delay > 0) await sleepWithAbort(delay, options?.signal);
+              try {
+                await withTimeoutAndAbort(
+                  activeHandle.move(fileName),
+                  moveTimeoutMs,
+                  options?.signal,
+                  `OPFS commit move timed out for "${modelId}".`,
+                );
+                moved = true;
+                break;
+              } catch (err) {
+                if (isAbortError(err)) throw err;
+                lastMoveErr = err;
+                if (!isOpfsLockError(err)) break;
+              }
+            }
+            if (!moved) {
+              // Fallback: if Chromium's `.move()` stalled/failed on a multi-GB `.part`, open the
+              // verified `.part` directly lock-free via FileReaderSync so 2.5 GB is NEVER wasted or hung!
+              if (isFileReaderSyncSupported() && typeof activeHandle.getFile === 'function') {
+                const blob = await withTimeoutAndAbort(
+                  activeHandle.getFile(),
+                  4_000,
+                  options?.signal,
+                  `OPFS getFile timed out for "${modelId}".`,
+                );
+                if (blob.size >= 24) {
+                  committedBacking = new LocalFileSyncBackingStore(modelId, blob);
+                }
+              }
+              if (!committedBacking) {
+                throw lastMoveErr instanceof Error
+                  ? lastMoveErr
+                  : new Error(`Failed to commit OPFS file for "${modelId}".`);
+              }
+            }
+          } else {
+            // Direct-write mode: file is ALREADY at `fileName` — just remove the 0-byte `.incomplete` guard!
+            await withTimeoutAndAbort(
+              dir.removeEntry(incompleteMarkerName).catch(() => {}),
+              4_000,
+              options?.signal,
+              `OPFS marker cleanup timed out for "${modelId}".`,
+            );
+          }
+
+          await withTimeoutAndAbort(
+            dir.removeEntry(metaName).catch(() => {}),
+            3_000,
+            options?.signal,
+            'OPFS part metadata cleanup timed out.',
+          ).catch(() => {});
+
+          if (!committedBacking) {
+            await withTimeoutAndAbort(
+              writeCommittedMeta(dir, `${base}.meta`, {
+                version: 1,
+                modelId,
+                url,
+                totalBytes: knownTotalBytes || writtenOffset,
+                etag: knownEtag,
+                lastModified: knownLastModified,
+                headerHash64,
+                committedAt: Date.now(),
+              }),
+              4_000,
+              options?.signal,
+              'OPFS metadata write timed out.',
+            ).catch(() => {});
+
+            options?.onProgress?.({
+              receivedBytes: writtenOffset,
+              totalBytes: knownTotalBytes || writtenOffset,
+              percent: 97,
+              backingKind: 'opfs-sync',
+              stage: 'verifying',
+              note: 'Opening cached model',
+            });
+
+            committedBacking = await openOpfsModelBacking(modelId, options?.opfsDirectoryOverride, {
+              signal: options?.signal,
+            });
+          }
+
+          if (!committedBacking) {
             throw new Error(`Failed to open committed storage backing for "${modelId}".`);
           }
           options?.onProgress?.({
-            receivedBytes: committed.byteLength,
-            totalBytes: committed.byteLength,
+            receivedBytes: committedBacking.byteLength,
+            totalBytes: committedBacking.byteLength,
             percent: 100,
-            backingKind: 'opfs-sync',
+            backingKind: committedBacking.kind,
             stage: 'cached',
           });
-          return committed;
+          return committedBacking;
         } catch (err) {
           closeHandleSafe();
           throw err;

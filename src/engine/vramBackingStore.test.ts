@@ -1412,3 +1412,38 @@ test('Persistent OPFS hot-metadata bundle (<stem>.hot.bin) eliminates direct Ran
     rt2.unload();
   }
 });
+
+test('streamUrlToVramBacking never hangs if OPFS move() stalls during verification commit', async () => {
+  const payload = makeFakeGgufPayload(64 * 1024);
+  const { dir } = createMockOpfsDir({ supportMove: true });
+  const origGetFileHandle = dir.getFileHandle.bind(dir);
+  dir.getFileHandle = (async (name: string, opts?: { create?: boolean }) => {
+    const h = await origGetFileHandle(name, opts);
+    if (name.endsWith('.part')) {
+      (h as unknown as { move: () => Promise<void> }).move = () => new Promise<void>(() => {});
+    }
+    return h;
+  }) as FileSystemDirectoryHandle['getFileHandle'];
+
+  const stages: string[] = [];
+  const p = streamUrlToVramBacking('stalled-move-model', 'https://example.test/stalled.gguf', {
+    opfsDirectoryOverride: dir,
+    stallTimeoutMs: 500,
+    fetchFn: (async () =>
+      new Response(payload.slice(), {
+        status: 200,
+        headers: { 'content-length': String(payload.byteLength) },
+      })) as typeof fetch,
+    onProgress: (ev) => {
+      if (ev.note) stages.push(ev.note);
+    },
+  });
+
+  await assert.rejects(
+    p,
+    /OPFS commit move timed out|Failed to commit OPFS file/,
+    'Stalled OPFS move() must time out cleanly instead of hanging forever at Verifying model file integrity',
+  );
+  assert.ok(stages.some((s) => s.includes('Verifying model file integrity')));
+  assert.ok(stages.some((s) => s.includes('Committing local cache')));
+});

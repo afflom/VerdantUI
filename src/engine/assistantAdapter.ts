@@ -958,18 +958,61 @@ export function createLlamaVTensorAdapter(
       }
 
       // ---------------------------------------------------------------------
-      // Path B: Seamless Progressive Promotion (`REQ-SETTLEMENT-PROMOTE`)
-      // Automatically activates/streams the CostSurface-selected neural route inline
+      // Path B: Neural Stream Gate (`FK-07` ContainerGrantMatrix + persistent Model Stream toggle)
+      // NEVER start a surprise network download when submitting a prompt while Model Stream is Off!
       // ---------------------------------------------------------------------
       if (certificate.kind === 'neural-on-demand' && certificate.modelId) {
+        const isAlreadyCachedLocally = initialState.cachedModelIds.includes(certificate.modelId);
+        const streamAllowed =
+          initialState.modelStreamEnabled &&
+          client.cognitiveObserver.grants.isAllowed('network-weights');
+
+        if (!isAlreadyCachedLocally && !streamAllowed) {
+          yield {
+            content: [
+              {
+                type: 'text' as const,
+                text: 'Model Stream is currently **Off**. Toggle **Model Stream** on in the top bar to stream and cache VerdantUI\'s local neural weights, or open a local `.gguf` file in **Storage**.\n\n*(Verified local actions like exact math, runtime inspection, and JSON validation work immediately even while Model Stream is off.)*',
+              },
+            ],
+            status: { type: 'complete', reason: 'stop' },
+            metadata: { custom: { prismRoute: certificate } },
+          };
+          return;
+        }
+
+        if (initialState.status === 'downloading' || initialState.status === 'loading') {
+          yield {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Model Stream is still initializing (${initialState.progressPercent}% · ${initialState.statusDetail}). Wait for it to finish and send again.`,
+              },
+            ],
+            status: { type: 'complete', reason: 'stop' },
+            metadata: { custom: { prismRoute: certificate } },
+          };
+          return;
+        }
+
         if (abortSignal.aborted) return;
         await client.ensureUnifiedNeuralRoute(certificate.modelId, abortSignal);
         if (abortSignal.aborted) return;
       }
 
       const state = client.getState();
-      if (!state.model) {
-        throw new Error('VerdantUI neural route is unavailable. Please check browser storage or network.');
+      if (!state.model || state.model.id === 'stories260k-f32') {
+        yield {
+          content: [
+            {
+              type: 'text' as const,
+              text: 'Model Stream is currently **Off**. Toggle **Model Stream** on in the top bar to activate local neural inference.',
+            },
+          ],
+          status: { type: 'complete', reason: 'stop' },
+          metadata: { custom: { prismRoute: certificate } },
+        };
+        return;
       }
 
       // ---------------------------------------------------------------------
