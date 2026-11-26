@@ -14,13 +14,16 @@
 import { useMemo, useState, type FC, type FormEvent } from 'react';
 import {
   AlertTriangle,
+  ArrowDown,
   ArrowRight,
+  ArrowUp,
   Check,
   CheckCircle2,
   Database,
   Layers,
   Loader2,
   Palette,
+  Pencil,
   Plus,
   Shield,
   Sparkles,
@@ -102,9 +105,12 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
   const [reqOrigin, setReqOrigin] = useState<RequirementOrigin>('identity');
 
   const [addingRule, setAddingRule] = useState(false);
+  const [editingRuleId, setEditingRuleId] = useState<string | null>(null);
   const [ruleStatement, setRuleStatement] = useState('');
   const [ruleField, setRuleField] = useState(() => declaration.encoding?.fields[0]?.name ?? 'amount');
   const [ruleOp, setRuleOp] = useState<CompareOp>('gte');
+  const [ruleRhsMode, setRuleRhsMode] = useState<'const' | 'field'>('const');
+  const [ruleRhsField, setRuleRhsField] = useState(() => declaration.encoding?.fields[1]?.name ?? declaration.encoding?.fields[0]?.name ?? 'amount');
   const [ruleThreshold, setRuleThreshold] = useState('100');
   const [ruleHasCondition, setRuleHasCondition] = useState(true);
   const [ruleOutcomeKind, setRuleOutcomeKind] = useState<'label' | 'formula'>('label');
@@ -191,48 +197,119 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
     const numericThresh = Math.max(0, Number.parseInt(ruleThreshold, 10) || 0);
     const numericRight = Math.max(0, Number.parseInt(ruleFormulaRight, 10) || 0);
     const label = ruleOutcomeLabel.trim() || 'Result';
-    const ok = await onDispatchOp({
-      op: 'admit-feature',
-      feature: {
-        id: nextAppId,
-        level: 'build',
-        statement:
-          ruleStatement.trim() ||
-          (ruleHasCondition
-            ? `When ${targetField} ${COMPARE_LABELS[ruleOp]} ${numericThresh}, answer ${label}.`
-            : `Default outcome: ${label}.`),
-        condition: {
-          all: ruleHasCondition ? [{ field: targetField, op: ruleOp, value: numericThresh }] : [],
-        },
-        outcome:
-          ruleOutcomeKind === 'label'
-            ? {
-                kind: 'label',
-                code: declaration.features.length + 1,
-                label,
-                tone: 'success',
-              }
-            : {
-                kind: 'formula',
-                label,
-                unit: ruleUnit.trim() || undefined,
-                expr:
-                  ruleFormulaOp === 'field'
-                    ? { op: 'field', field: targetField }
-                    : {
-                        op: ruleFormulaOp,
-                        left: { op: 'field', field: targetField },
-                        right: { op: 'const', value: numericRight },
-                      },
-              },
-        priority: declaration.features.length + 1,
-        citation: { kind: 'req', requirementId: firstReqId },
-      },
-    });
+    const rhsFieldName =
+      ruleRhsMode === 'field' && fields.some((f) => f.name === ruleRhsField)
+        ? ruleRhsField
+        : undefined;
+    const rhsDisplay = rhsFieldName ?? String(numericThresh);
+    const condition = {
+      all: ruleHasCondition
+        ? [{ field: targetField, op: ruleOp, value: numericThresh, ...(rhsFieldName ? { rhsField: rhsFieldName } : {}) }]
+        : [],
+    };
+    const outcome =
+      ruleOutcomeKind === 'label'
+        ? {
+            kind: 'label' as const,
+            code: declaration.features.length + 1,
+            label,
+            tone: 'success' as const,
+          }
+        : {
+            kind: 'formula' as const,
+            label,
+            unit: ruleUnit.trim() || undefined,
+            expr:
+              ruleFormulaOp === 'field'
+                ? ({ op: 'field', field: targetField } as const)
+                : ({
+                    op: ruleFormulaOp,
+                    left: { op: 'field', field: targetField },
+                    right: { op: 'const', value: numericRight },
+                  } as const),
+          };
+    const statement =
+      ruleStatement.trim() ||
+      (ruleHasCondition
+        ? `When ${targetField} ${COMPARE_LABELS[ruleOp]} ${rhsDisplay}, answer ${label}.`
+        : `Default outcome: ${label}.`);
+
+    const ok = editingRuleId
+      ? await onDispatchOp({
+          op: 'update-feature',
+          id: editingRuleId,
+          patch: { statement, condition, outcome },
+        })
+      : await onDispatchOp({
+          op: 'admit-feature',
+          feature: {
+            id: nextAppId,
+            level: 'build',
+            statement,
+            condition,
+            outcome,
+            priority: declaration.features.length + 1,
+            citation: { kind: 'req', requirementId: firstReqId },
+          },
+        });
     if (ok) {
       setRuleStatement('');
+      setEditingRuleId(null);
       setAddingRule(false);
     }
+  };
+
+  const handleStartEditRule = (featId: string) => {
+    const feat = declaration.features.find((f) => f.id === featId);
+    if (!feat) return;
+    setEditingRuleId(feat.id);
+    setRuleStatement(feat.statement);
+    const firstPred = feat.condition.all[0];
+    if (firstPred) {
+      setRuleHasCondition(true);
+      setRuleField(firstPred.field);
+      setRuleOp(firstPred.op);
+      if (firstPred.rhsField) {
+        setRuleRhsMode('field');
+        setRuleRhsField(firstPred.rhsField);
+      } else {
+        setRuleRhsMode('const');
+        setRuleThreshold(String(firstPred.value));
+      }
+    } else {
+      setRuleHasCondition(false);
+    }
+    setRuleOutcomeKind(feat.outcome.kind);
+    setRuleOutcomeLabel(feat.outcome.label);
+    if (feat.outcome.kind === 'formula') {
+      setRuleUnit(feat.outcome.unit ?? '');
+      if (feat.outcome.expr.op === 'field') {
+        setRuleFormulaOp('field');
+      } else if (
+        feat.outcome.expr.op === 'pct' ||
+        feat.outcome.expr.op === 'add' ||
+        feat.outcome.expr.op === 'sub' ||
+        feat.outcome.expr.op === 'mul'
+      ) {
+        setRuleFormulaOp(feat.outcome.expr.op);
+        if (feat.outcome.expr.right.op === 'const') {
+          setRuleFormulaRight(String(feat.outcome.expr.right.value));
+        }
+      }
+    }
+    setAddingRule(true);
+  };
+
+  const handleMoveFeature = async (featId: string, dir: -1 | 1) => {
+    const ordered = [...declaration.features].sort(
+      (a, b) => a.priority - b.priority || a.id.localeCompare(b.id),
+    );
+    const idx = ordered.findIndex((f) => f.id === featId);
+    const target = idx + dir;
+    if (idx < 0 || target < 0 || target >= ordered.length) return;
+    const ids = ordered.map((f) => f.id);
+    [ids[idx], ids[target]] = [ids[target], ids[idx]];
+    await onDispatchOp({ op: 'reorder-features', orderedIds: ids });
   };
 
   const handleAddRefusal = async (e: FormEvent) => {
@@ -594,39 +671,98 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                       When condition holds
                     </label>
                   </div>
-                  {ruleHasCondition && fields.length > 0 && (
-                    <div className="grid grid-cols-3 gap-1.5">
-                      <select
-                        value={ruleField}
-                        onChange={(e) => setRuleField(e.target.value)}
-                        className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
-                      >
-                        {fields.map((f) => (
-                          <option key={f.name} value={f.name}>
-                            {f.label}
-                          </option>
-                        ))}
-                      </select>
-                      <select
-                        value={ruleOp}
-                        onChange={(e) => setRuleOp(e.target.value as CompareOp)}
-                        className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
-                      >
-                        {(['gte', 'gt', 'lte', 'lt', 'eq', 'neq'] as CompareOp[]).map((op) => (
-                          <option key={op} value={op}>
-                            {COMPARE_LABELS[op]}
-                          </option>
-                        ))}
-                      </select>
-                      <input
-                        type="number"
-                        min={0}
-                        value={ruleThreshold}
-                        onChange={(e) => setRuleThreshold(e.target.value)}
-                        className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
-                      />
-                    </div>
-                  )}
+                  {ruleHasCondition && fields.length > 0 && (() => {
+                    const selectedField = fields.find((f) => f.name === ruleField) ?? fields[0];
+                    return (
+                      <div className="space-y-1.5">
+                        <div className="grid grid-cols-3 gap-1.5">
+                          <select
+                            value={ruleField}
+                            onChange={(e) => setRuleField(e.target.value)}
+                            className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
+                          >
+                            {fields.map((f) => (
+                              <option key={f.name} value={f.name}>
+                                {f.label}
+                              </option>
+                            ))}
+                          </select>
+                          <select
+                            value={ruleOp}
+                            onChange={(e) => setRuleOp(e.target.value as CompareOp)}
+                            className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
+                          >
+                            {(['gte', 'gt', 'lte', 'lt', 'eq', 'neq'] as CompareOp[]).map((op) => (
+                              <option key={op} value={op}>
+                                {COMPARE_LABELS[op]}
+                              </option>
+                            ))}
+                          </select>
+                          {ruleRhsMode === 'field' ? (
+                            <select
+                              value={ruleRhsField}
+                              onChange={(e) => setRuleRhsField(e.target.value)}
+                              className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
+                            >
+                              {fields.map((f) => (
+                                <option key={f.name} value={f.name}>
+                                  {f.label}
+                                </option>
+                              ))}
+                            </select>
+                          ) : selectedField?.kind === 'choice' && selectedField.choices ? (
+                            <select
+                              value={ruleThreshold}
+                              onChange={(e) => setRuleThreshold(e.target.value)}
+                              className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
+                            >
+                              {selectedField.choices.map((c, idx) => (
+                                <option key={idx} value={String(idx)}>
+                                  {c}
+                                </option>
+                              ))}
+                            </select>
+                          ) : selectedField?.kind === 'bool' ? (
+                            <select
+                              value={ruleThreshold}
+                              onChange={(e) => setRuleThreshold(e.target.value)}
+                              className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
+                            >
+                              <option value="1">Yes</option>
+                              <option value="0">No</option>
+                            </select>
+                          ) : (
+                            <input
+                              type="number"
+                              min={0}
+                              value={ruleThreshold}
+                              onChange={(e) => setRuleThreshold(e.target.value)}
+                              className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
+                            />
+                          )}
+                        </div>
+                        {fields.length > 1 && (
+                          <div className="flex items-center gap-2 text-[11px] text-zinc-500">
+                            <span>Compare to:</span>
+                            <button
+                              type="button"
+                              onClick={() => setRuleRhsMode('const')}
+                              className={`rounded px-1.5 py-0.5 ${ruleRhsMode === 'const' ? 'bg-emerald-700 text-white' : 'bg-zinc-200/70 dark:bg-zinc-800'}`}
+                            >
+                              Value
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setRuleRhsMode('field')}
+                              className={`rounded px-1.5 py-0.5 ${ruleRhsMode === 'field' ? 'bg-emerald-700 text-white' : 'bg-zinc-200/70 dark:bg-zinc-800'}`}
+                            >
+                              Another Field
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
                   <div className="grid grid-cols-2 gap-1.5">
                     <select
                       value={ruleOutcomeKind}
@@ -684,7 +820,10 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                   <div className="flex justify-end gap-1.5">
                     <button
                       type="button"
-                      onClick={() => setAddingRule(false)}
+                      onClick={() => {
+                        setEditingRuleId(null);
+                        setAddingRule(false);
+                      }}
                       className="rounded px-2 py-1 text-[11px] text-zinc-600 hover:bg-zinc-200/70 dark:text-zinc-400 dark:hover:bg-zinc-800"
                     >
                       Cancel
@@ -693,20 +832,32 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                       type="submit"
                       className="rounded bg-emerald-700 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-emerald-800"
                     >
-                      Admit Rule ({nextAppId})
+                      {editingRuleId ? `Save ${editingRuleId}` : `Admit Rule (${nextAppId})`}
                     </button>
                   </div>
                 </form>
               )}
 
               <div className="space-y-1.5">
-                {declaration.features.map((feat) => {
+                {[...declaration.features]
+                  .sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id))
+                  .map((feat, idx, arr) => {
                   const locked = declaration.lockedIds.includes(feat.id);
                   const condText =
                     feat.condition.all.length === 0
                       ? 'Default fallback'
                       : feat.condition.all
-                          .map((p) => `${p.field} ${COMPARE_LABELS[p.op]} ${p.value}`)
+                          .map((p) => {
+                            const f = fields.find((x) => x.name === p.field);
+                            const rhs = p.rhsField
+                              ? p.rhsField
+                              : f?.kind === 'choice' && f.choices?.[p.value]
+                                ? f.choices[p.value]
+                                : f?.kind === 'bool'
+                                  ? p.value === 1 ? 'Yes' : 'No'
+                                  : String(p.value);
+                            return `${p.field} ${COMPARE_LABELS[p.op]} ${rhs}`;
+                          })
                           .join(' ∧ ');
                   return (
                     <div
@@ -730,16 +881,48 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                           {feat.statement}
                         </p>
                       </div>
-                      {!locked && (
+                      <div className="flex shrink-0 items-center gap-0.5">
+                        {arr.length > 1 && (
+                          <>
+                            <button
+                              type="button"
+                              disabled={idx === 0}
+                              onClick={() => void handleMoveFeature(feat.id, -1)}
+                              title="Evaluate earlier"
+                              className="rounded p-1 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700 disabled:opacity-30 dark:hover:bg-zinc-800"
+                            >
+                              <ArrowUp className="h-3 w-3" />
+                            </button>
+                            <button
+                              type="button"
+                              disabled={idx === arr.length - 1}
+                              onClick={() => void handleMoveFeature(feat.id, 1)}
+                              title="Evaluate later"
+                              className="rounded p-1 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700 disabled:opacity-30 dark:hover:bg-zinc-800"
+                            >
+                              <ArrowDown className="h-3 w-3" />
+                            </button>
+                          </>
+                        )}
                         <button
                           type="button"
-                          onClick={() => void onDispatchOp({ op: 'remove-feature', id: feat.id })}
-                          title="Remove draft rule"
-                          className="shrink-0 rounded p-1 text-zinc-400 hover:bg-zinc-100 hover:text-red-600 dark:hover:bg-zinc-800"
+                          onClick={() => handleStartEditRule(feat.id)}
+                          title="Refine rule via update-feature"
+                          className="rounded p-1 text-zinc-400 hover:bg-zinc-100 hover:text-emerald-700 dark:hover:bg-zinc-800"
                         >
-                          <Trash2 className="h-3.5 w-3.5" />
+                          <Pencil className="h-3 w-3" />
                         </button>
-                      )}
+                        {!locked && (
+                          <button
+                            type="button"
+                            onClick={() => void onDispatchOp({ op: 'remove-feature', id: feat.id })}
+                            title="Remove draft rule"
+                            className="rounded p-1 text-zinc-400 hover:bg-zinc-100 hover:text-red-600 dark:hover:bg-zinc-800"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        )}
+                      </div>
                     </div>
                   );
                 })}
@@ -893,18 +1076,51 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                     {fields.map((f) => (
                       <label key={f.name} className="space-y-0.5 text-[11px] text-zinc-600 dark:text-zinc-300">
                         <span>{f.label}</span>
-                        <input
-                          type="number"
-                          min={0}
-                          value={vecInputs[f.name] ?? f.defaultValue}
-                          onChange={(e) =>
-                            setVecInputs((prev) => ({
-                              ...prev,
-                              [f.name]: Math.max(0, Number.parseInt(e.target.value, 10) || 0),
-                            }))
-                          }
-                          className="w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-950"
-                        />
+                        {f.kind === 'choice' && f.choices ? (
+                          <select
+                            value={vecInputs[f.name] ?? f.defaultValue}
+                            onChange={(e) =>
+                              setVecInputs((prev) => ({
+                                ...prev,
+                                [f.name]: Number.parseInt(e.target.value, 10) || 0,
+                              }))
+                            }
+                            className="w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-950"
+                          >
+                            {f.choices.map((c, idx) => (
+                              <option key={idx} value={idx}>
+                                {c}
+                              </option>
+                            ))}
+                          </select>
+                        ) : f.kind === 'bool' ? (
+                          <select
+                            value={vecInputs[f.name] ?? f.defaultValue}
+                            onChange={(e) =>
+                              setVecInputs((prev) => ({
+                                ...prev,
+                                [f.name]: Number.parseInt(e.target.value, 10) || 0,
+                              }))
+                            }
+                            className="w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-950"
+                          >
+                            <option value={1}>Yes</option>
+                            <option value={0}>No</option>
+                          </select>
+                        ) : (
+                          <input
+                            type="number"
+                            min={0}
+                            value={vecInputs[f.name] ?? f.defaultValue}
+                            onChange={(e) =>
+                              setVecInputs((prev) => ({
+                                ...prev,
+                                [f.name]: Math.max(0, Number.parseInt(e.target.value, 10) || 0),
+                              }))
+                            }
+                            className="w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-950"
+                          />
+                        )}
                       </label>
                     ))}
                   </div>
@@ -1358,20 +1574,67 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                 </button>
               </div>
               <div className="space-y-1">
-                {declaration.view.elements.map((el) => (
+                {declaration.view.elements.map((el, idx) => (
                   <div
                     key={el.id}
-                    className="flex items-center justify-between rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-[11px] dark:border-zinc-800 dark:bg-zinc-900/70"
+                    className="flex items-center justify-between gap-2 rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-[11px] dark:border-zinc-800 dark:bg-zinc-900/70"
                   >
-                    <div className="flex items-center gap-1.5">
-                      <span className="font-medium text-zinc-800 dark:text-zinc-100">{el.label}</span>
-                      <span className="rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] text-zinc-500 dark:bg-zinc-800">
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      <span className="truncate font-medium text-zinc-800 dark:text-zinc-100">{el.label}</span>
+                      <span className="shrink-0 rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] text-zinc-500 dark:bg-zinc-800">
                         {el.slot}
                       </span>
                     </div>
-                    <span className="font-mono text-[10px] text-emerald-700 dark:text-emerald-400">
-                      {el.requirementId}
-                    </span>
+                    <div className="flex shrink-0 items-center gap-1">
+                      <select
+                        value={el.requirementId}
+                        onChange={(e) =>
+                          void onDispatchOp({
+                            op: 'declare-view',
+                            view: {
+                              ...declaration.view,
+                              elements: declaration.view.elements.map((item) =>
+                                item.id === el.id ? { ...item, requirementId: e.target.value } : item,
+                              ),
+                            },
+                          })
+                        }
+                        aria-label={`Requirement for ${el.label}`}
+                        className="rounded border border-zinc-200 bg-transparent px-1 py-0.5 font-mono text-[10px] text-emerald-700 dark:border-zinc-700 dark:text-emerald-400"
+                      >
+                        {declaration.requirements.map((r) => (
+                          <option key={r.id} value={r.id}>
+                            {r.id}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        disabled={idx === 0}
+                        onClick={() => {
+                          const next = [...declaration.view.elements];
+                          [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
+                          void onDispatchOp({ op: 'declare-view', view: { ...declaration.view, elements: next } });
+                        }}
+                        className="rounded p-0.5 text-zinc-400 hover:bg-zinc-100 disabled:opacity-30 dark:hover:bg-zinc-800"
+                        title="Move up"
+                      >
+                        <ArrowUp className="h-3 w-3" />
+                      </button>
+                      <button
+                        type="button"
+                        disabled={idx === declaration.view.elements.length - 1}
+                        onClick={() => {
+                          const next = [...declaration.view.elements];
+                          [next[idx + 1], next[idx]] = [next[idx], next[idx + 1]];
+                          void onDispatchOp({ op: 'declare-view', view: { ...declaration.view, elements: next } });
+                        }}
+                        className="rounded p-0.5 text-zinc-400 hover:bg-zinc-100 disabled:opacity-30 dark:hover:bg-zinc-800"
+                        title="Move down"
+                      >
+                        <ArrowDown className="h-3 w-3" />
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>

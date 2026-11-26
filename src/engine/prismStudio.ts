@@ -1357,7 +1357,7 @@ export class PrismStore {
         slug,
         name: proj.published.name,
         summary: proj.published.summary,
-        digest: proj.published.digest,
+        digest: proj.publishedHolo?.address ?? proj.published.digest,
         streams: proj.published.streams,
         grants: proj.published.grants,
       });

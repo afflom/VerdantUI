@@ -1,4 +1,4 @@
-import { useState, type FC } from 'react';
+import { useRef, useState, type ChangeEvent, type FC } from 'react';
 import {
   ThreadListItemPrimitive,
   ThreadListPrimitive,
@@ -11,9 +11,11 @@ import {
   ChevronRight,
   FileJson,
   Plus,
+  ShieldCheck,
   SlidersHorizontal,
   Sparkles,
   Trash2,
+  Upload,
   X,
 } from 'lucide-react';
 import { isInternalBootstrapModel } from '../engine/modelCatalog';
@@ -29,6 +31,7 @@ interface ThreadSidebarProps {
   onSelectThreadView: () => void;
   prisms: readonly VerdantPrismProject[];
   onCreatePrism: () => void;
+  onImportHoloFile?: (file: File) => void;
   onSelectPrism: (prismId: string, mode: 'studio' | 'app') => void;
   onDeletePrism: (prismId: string) => void;
 }
@@ -82,12 +85,22 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
   onSelectThreadView,
   prisms,
   onCreatePrism,
+  onImportHoloFile,
   onSelectPrism,
   onDeletePrism,
 }) => {
   const [showArchived, setShowArchived] = useState(false);
   const [threadsExpanded, setThreadsExpanded] = useState(true);
   const [studioExpanded, setStudioExpanded] = useState(true);
+  const holoFileRef = useRef<HTMLInputElement | null>(null);
+  const handleHoloPick = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (file && onImportHoloFile) {
+      onImportHoloFile(file);
+      onCloseMobile();
+    }
+  };
   const archivedCount = useAuiState((s) => s.threads.archivedThreadIds.length);
   const isBootstrapUnbound = isInternalBootstrapModel(engineState.model?.id);
   const importedHarness = engineState.importedHarness;
@@ -214,18 +227,40 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
             )}
           </div>
 
-          <button
-            type="button"
-            data-testid="new-prism-btn"
-            onClick={() => {
-              onCreatePrism();
-              onCloseMobile();
-            }}
-            className="flex h-9 w-full items-center justify-center gap-2 rounded-lg border border-emerald-700/30 bg-emerald-50/70 px-3 text-xs font-semibold text-emerald-950 hover:border-emerald-700/50 hover:bg-emerald-100/70 dark:border-emerald-500/30 dark:bg-emerald-950/40 dark:text-emerald-200 dark:hover:bg-emerald-950/70 transition-colors whitespace-nowrap"
-          >
-            <Sparkles className="h-3.5 w-3.5" />
-            <span>New Prism</span>
-          </button>
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              data-testid="new-prism-btn"
+              onClick={() => {
+                onCreatePrism();
+                onCloseMobile();
+              }}
+              className="flex h-9 min-w-0 flex-1 items-center justify-center gap-2 rounded-lg border border-emerald-700/30 bg-emerald-50/70 px-3 text-xs font-semibold text-emerald-950 hover:border-emerald-700/50 hover:bg-emerald-100/70 dark:border-emerald-500/30 dark:bg-emerald-950/40 dark:text-emerald-200 dark:hover:bg-emerald-950/70 transition-colors whitespace-nowrap"
+            >
+              <Sparkles className="h-3.5 w-3.5" />
+              <span>New Prism</span>
+            </button>
+            {onImportHoloFile && (
+              <>
+                <input
+                  ref={holoFileRef}
+                  type="file"
+                  accept=".holo,.json,application/octet-stream,application/json"
+                  className="hidden"
+                  onChange={handleHoloPick}
+                />
+                <button
+                  type="button"
+                  onClick={() => holoFileRef.current?.click()}
+                  title="Import & verify a binary .holo archive"
+                  aria-label="Import .holo archive"
+                  className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-[#F8F9FA] text-slate-700 hover:border-slate-300 hover:bg-slate-100 dark:border-slate-800 dark:bg-[#141B26] dark:text-slate-300 dark:hover:bg-slate-800 transition-colors"
+                >
+                  <Upload className="h-3.5 w-3.5" />
+                </button>
+              </>
+            )}
+          </div>
 
           {studioExpanded && (
             <div className="mt-2.5 flex-1 space-y-1 overflow-y-auto">
@@ -268,6 +303,12 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
                       >
                         <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotClass}`} />
                         <span className="truncate">{p.draft.name}</span>
+                        {(p.publishedHolo?.proved || p.sealedDraft?.proved) && (
+                          <ShieldCheck
+                            className="h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400"
+                            aria-label="Proved .holo"
+                          />
+                        )}
                       </button>
                       <button
                         type="button"

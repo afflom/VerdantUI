@@ -440,14 +440,43 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     if (!activeHolo) return;
     setBuilding(true);
     setBuildStage('verifying');
-    setBuildDetail('Re-verifying BLAKE3 identities & replaying acceptance vectors…');
+    setBuildDetail('Verifying BLAKE3 identities, replaying vectors & re-proving with Lean WASM…');
     try {
-      const res = await buildClient.verifyArchive({ prismId: project.id, holoBytes: activeHolo.bytes });
+      const res = await buildClient.verifyArchive({
+        prismId: project.id,
+        holoBytes: activeHolo.bytes,
+        reprove: activeHolo.carries.snapshot,
+        onStage: (stage, detail) => {
+          setBuildStage(stage);
+          setBuildDetail(detail);
+        },
+      });
+      if (res.reproved) {
+        const updatedSealed: SealedHoloRecord = {
+          ...activeHolo,
+          proved: res.reproved.passed,
+          theorems: res.reproved.theorems.map((t) => ({
+            theorem: t.name.split('.').pop() ?? t.name,
+            status: t.status,
+            axioms: t.axioms,
+          })),
+          vectorsPassed: res.vectorsPassed,
+          vectorsTotal: res.vectorsTotal,
+        };
+        await store.saveSealedDraft(project.id, updatedSealed);
+      }
+      const reproveMsg = res.reproved
+        ? res.reproved.passed
+          ? ` · Lean re-proved ${res.reproved.theorems.length} theorem(s)`
+          : ` · Re-proof failed (${res.reproved.reason ?? 'refused'})`
+        : '';
+      const srcMsg =
+        res.sourcesMatch === true ? ' · sources match snapshot' : res.sourcesMatch === false ? ' · sources mismatch' : '';
       setBuildBanner({
         ok: res.ok,
         text: res.ok
-          ? `Offline verification PASSED · ${res.address.slice(0, 19)}… · ${res.vectorsPassed}/${res.vectorsTotal} vectors replayed.`
-          : `Offline verification FAILED · ${res.vectorsPassed}/${res.vectorsTotal} vectors passed.`,
+          ? `Offline verification PASSED · ${res.address.slice(0, 19)}… · ${res.vectorsPassed}/${res.vectorsTotal} vectors${reproveMsg}${srcMsg}`
+          : `Offline verification FAILED · ${res.vectorsPassed}/${res.vectorsTotal} vectors${reproveMsg}${srcMsg}`,
       });
     } catch (err) {
       setBuildBanner({ ok: false, text: err instanceof Error ? err.message : String(err) });
@@ -533,6 +562,10 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       setProposingOps(false);
     }
   };
+
+  // Dark-only presets (`noir`, `midnight`) must always render in dark mode regardless of host UI mode
+  const effectivePreviewDark =
+    compiled && !compiled.themeModes.includes('light') ? true : darkMode;
 
   const displayAddress = activeHolo?.address ?? activeSnapshot.digest;
   const isPublished = project.published !== null;
@@ -683,6 +716,58 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
               </div>
             )}
 
+            {/* Live Published Capabilities (App Mode quick controls) */}
+            {mode === 'app' && isPublished && (
+              <div className="space-y-1.5 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-semibold text-zinc-600 dark:text-zinc-300">
+                    Runtime Capabilities (Deny by Default)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      bridgeRuntime.evictPrism(project.id);
+                      await store.unpublish(project.id);
+                      setAppPrismModalOpen(false);
+                      onChangeMode('studio');
+                    }}
+                    className="rounded px-2 py-0.5 text-[11px] text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950/40"
+                  >
+                    Unpublish
+                  </button>
+                </div>
+                <div className="grid grid-cols-2 gap-1.5 pt-1">
+                  {(
+                    [
+                      ['observer', 'Observer Stream'],
+                      ['storage', 'Local Storage'],
+                      ['browser', 'Browser Utilities'],
+                      ['network', 'Internet Fetch'],
+                    ] as const
+                  ).map(([key, label]) => (
+                    <label
+                      key={key}
+                      className="flex cursor-pointer items-center justify-between rounded border border-zinc-200 px-2 py-1.5 text-[11px] dark:border-zinc-800"
+                    >
+                      <span>{label}</span>
+                      <input
+                        type="checkbox"
+                        checked={activeSnapshot.grants[key]}
+                        onChange={(e) => {
+                          bridgeRuntime.evictPrism(project.id);
+                          void store.updatePublishedGrants(project.id, (prev) => ({
+                            ...prev,
+                            [key]: e.target.checked,
+                          }));
+                        }}
+                        className="h-3.5 w-3.5 accent-emerald-600"
+                      />
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* Quick Live Model Invocation Test */}
             {holoviewConfig && (
               <div className="space-y-1.5 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
@@ -744,7 +829,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                       className="inline-flex items-center gap-1 rounded-md border border-zinc-200 px-2.5 py-1 text-xs font-medium hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
                     >
                       <ShieldCheck className="h-3.5 w-3.5 text-emerald-600" />
-                      Verify Offline
+                      Verify &amp; Re-Prove
                     </button>
                   )}
                   <button
@@ -1003,7 +1088,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
             prismId={project.id}
             snapshot={activeSnapshot}
             holoview={holoviewConfig}
-            darkMode={darkMode}
+            darkMode={effectivePreviewDark}
             bus={bus}
             bridgeRuntime={bridgeRuntime}
             reloadNonce={reloadNonce}
@@ -1211,7 +1296,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                     prismId={project.id}
                     snapshot={activeSnapshot}
                     holoview={holoviewConfig}
-                    darkMode={darkMode}
+                    darkMode={effectivePreviewDark}
                     bus={bus}
                     bridgeRuntime={bridgeRuntime}
                     reloadNonce={reloadNonce}

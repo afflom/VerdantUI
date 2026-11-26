@@ -323,6 +323,36 @@ export default function App() {
     });
   }, [prismStore]);
 
+  const handleImportHoloFile = useCallback(
+    async (file: File) => {
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        if (bytes[0] === 0x7b) {
+          const imported = await prismStore.importHolo(new TextDecoder().decode(bytes), false);
+          setActiveView({ kind: 'prism', prismId: imported.id, mode: 'studio' });
+          return;
+        }
+        const verified = await prismBuildClient.verifyArchive({ holoBytes: bytes });
+        if (!verified.identitiesVerified) {
+          setPrismToast({ title: 'Import refused', body: `${file.name} failed BLAKE3 integrity verification.` });
+          return;
+        }
+        const imported = await prismStore.importBinaryHolo(bytes, verified, true);
+        setActiveView({ kind: 'prism', prismId: imported.id, mode: 'app' });
+        setPrismToast({
+          title: `Verified ${verified.name}`,
+          body: `${verified.vectorsPassed}/${verified.vectorsTotal} acceptance vectors passed.`,
+        });
+      } catch (err) {
+        setPrismToast({
+          title: 'Import failed',
+          body: err instanceof Error ? err.message : String(err),
+        });
+      }
+    },
+    [prismBuildClient, prismStore],
+  );
+
   const handleSelectPrism = useCallback((prismId: string, mode: 'studio' | 'app') => {
     setActiveView({ kind: 'prism', prismId, mode });
   }, []);
@@ -473,6 +503,7 @@ export default function App() {
             onSelectThreadView={() => setActiveView({ kind: 'thread' })}
             prisms={prisms}
             onCreatePrism={handleCreatePrism}
+            onImportHoloFile={(file) => void handleImportHoloFile(file)}
             onSelectPrism={handleSelectPrism}
             onDeletePrism={handleDeletePrism}
           />

@@ -4,12 +4,13 @@
  */
 
 import { inspect, loadArchive, parseArchive, resolveArchive } from 'prism-code';
+import { relex, reprove, type KernelProofTheorem, type OpenKernel } from 'prism-code/reprove';
 import { kappa } from '@prism-code-internal/blake3.mjs';
 import { buildFromFiles, type BuildDiagnostic, type BuildTheoremResult } from '@prism-code-internal/journey/build-core.mjs';
 import { kernelProver } from '@prism-code-internal/journey/prove-core.mjs';
 import { decodeHoloview } from '@prism-code-internal/view.mjs';
 import { instantiateAppFoundation } from './prismCompiler';
-import { loadPrismToolchain } from './prismToolchain';
+import { LEXLEAN_PIN, loadPrismToolchain } from './prismToolchain';
 
 export type PrismBuildStage =
   | 'loading-toolchain'
@@ -30,6 +31,8 @@ export type PrismWorkerRequest =
       readonly id: string;
       readonly type: 'verify';
       readonly holoBytes: Uint8Array;
+      readonly baseUrl?: string;
+      readonly reprove?: boolean;
     }
   | {
       readonly id: string;
@@ -78,6 +81,12 @@ export interface WorkerVerifyPayload {
     readonly passed: boolean;
   }[];
   readonly carries: { readonly snapshot: boolean; readonly sources: boolean; readonly proof: boolean };
+  readonly reproved?: {
+    readonly passed: boolean;
+    readonly theorems: readonly KernelProofTheorem[];
+    readonly reason: string | null;
+  } | null;
+  readonly sourcesMatch?: boolean | null;
   readonly viewFiles: Readonly<Record<string, string>> | null;
   readonly viewEntry: string | null;
   readonly error?: string;
@@ -232,7 +241,32 @@ self.onmessage = async (event: MessageEvent<PrismWorkerRequest>) => {
         });
       }
 
-      const ok = app.identities.verified === true && failedSet.size === 0;
+      let reprovedSummary: WorkerVerifyPayload['reproved'] = null;
+      let sourcesMatch: boolean | null = null;
+      if (req.reprove && req.baseUrl && inspected.carries?.snapshot) {
+        post({ id: req.id, event: 'stage', stage: 'proving', detail: 'Re-proving embedded model snapshot with Lean 4.32.2 WASM kernel…' });
+        const tools = await loadPrismToolchain(req.baseUrl, (detail) => {
+          post({ id: req.id, event: 'stage', stage: 'loading-toolchain', detail });
+        });
+        const rp = await reprove(bytes, { kernel: tools.kernel as OpenKernel });
+        reprovedSummary = {
+          passed: rp.passed,
+          theorems: rp.theorems,
+          reason: rp.reason,
+        };
+        if (inspected.carries?.sources) {
+          const rl = await relex(bytes, {
+            lexlean: { module: tools.lexlean, kappa: LEXLEAN_PIN.kappa },
+          });
+          sourcesMatch = rl.matchesSnapshot;
+        }
+      }
+
+      const ok =
+        app.identities.verified === true &&
+        failedSet.size === 0 &&
+        (reprovedSummary === null || reprovedSummary.passed) &&
+        (sourcesMatch === null || sourcesMatch);
       const result: WorkerVerifyPayload = {
         ok,
         address,
@@ -253,6 +287,8 @@ self.onmessage = async (event: MessageEvent<PrismWorkerRequest>) => {
           sources: Boolean(inspected.carries?.sources),
           proof: Boolean(inspected.carries?.proof),
         },
+        reproved: reprovedSummary,
+        sourcesMatch,
         viewFiles,
         viewEntry,
       };

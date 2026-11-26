@@ -69,8 +69,8 @@ test('end-to-end real WASM LexLean check + Lean 4.32.2 kernel proof + binary pri
   const kernel = await modelProve.openModelKernel();
   const foundation = loadFoundationFiles();
 
-  // Prove and seal two representative multi-rule starters (formula + refusal + decision table)
-  for (const kind of ['budget-guard', 'eligibility-gate'] as const) {
+  // Prove and seal ALL 5 curated declarative starters (including field-vs-field rules, formulas, choices, refusals)
+  for (const kind of ['budget-guard', 'pricing-rules', 'eligibility-gate', 'split-calc', 'blank'] as const) {
     const decl = createDeclarativeStarter(kind);
     const compiled = compilePrismDeclaration(decl);
     const mergedApp = {

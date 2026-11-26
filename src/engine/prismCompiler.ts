@@ -17,6 +17,7 @@
 
 import { compileDesign } from '@prism-code-internal/design/compile.mjs';
 import { checkDesign, type DesignDiagnostic } from '@prism-code-internal/design/gate.mjs';
+import { resolveTheme } from '@prism-code-internal/design/system.mjs';
 import {
   type ArithmeticExpr,
   type EncodedField,
@@ -44,6 +45,8 @@ export interface CompiledPrismWorkspace {
   readonly designSlots: readonly string[];
   /** `prism.design/1` gate diagnostics (0 errors on valid mechanical output). */
   readonly designDiagnostics: readonly DesignDiagnostic[];
+  /** Supported theme modes from `resolveTheme` (e.g. `['dark', 'immersive']` for `noir` / `midnight`). */
+  readonly themeModes: readonly string[];
   /** Theorem names generated in `App.lex.tex` mapped by feature/refusal ID. */
   readonly theoremMap: Readonly<Record<string, string>>;
 }
@@ -82,14 +85,16 @@ function formulaIdent(id: string): string {
 
 function compilePredicateLex(pred: FieldPredicate): string {
   const fieldExpr = `(project input ${sanitizeIdentifier(pred.field)})`;
-  const val = String(Math.max(0, Math.floor(pred.value)));
+  const rhsExpr = pred.rhsField
+    ? `(project input ${sanitizeIdentifier(pred.rhsField)})`
+    : String(Math.max(0, Math.floor(pred.value)));
   switch (pred.op) {
-    case 'eq': return `(${fieldExpr} =? ${val})`;
-    case 'neq': return `(not (${fieldExpr} =? ${val}))`;
-    case 'lt': return `(${fieldExpr} <? ${val})`;
-    case 'lte': return `(${fieldExpr} <=? ${val})`;
-    case 'gt': return `(${val} <? ${fieldExpr})`;
-    case 'gte': return `(${val} <=? ${fieldExpr})`;
+    case 'eq': return `(${fieldExpr} =? ${rhsExpr})`;
+    case 'neq': return `(not (${fieldExpr} =? ${rhsExpr}))`;
+    case 'lt': return `(${fieldExpr} <? ${rhsExpr})`;
+    case 'lte': return `(${fieldExpr} <=? ${rhsExpr})`;
+    case 'gt': return `(${rhsExpr} <? ${fieldExpr})`;
+    case 'gte': return `(${rhsExpr} <=? ${fieldExpr})`;
   }
 }
 
@@ -663,7 +668,106 @@ ${radios}
       ? 'wallet'
       : decl.view.viewpoint === 'calculator'
         ? 'calculator'
-        : 'sparkles';
+        : decl.view.viewpoint === 'request-reply'
+          ? 'message-square'
+          : 'sparkles';
+
+  const isCalculator = decl.view.viewpoint === 'calculator';
+  const isLedger = decl.view.viewpoint === 'ledger-tracker';
+  const isRequestReply = decl.view.viewpoint === 'request-reply';
+
+  const ledgerSummaryRow = isLedger
+    ? `
+      <section class="grid gap-4 sm:grid-cols-3" aria-label="Summary figures">
+        <div data-slot="card">
+          <div data-slot="card-content" class="pt-4">
+            <div data-slot="stat">
+              <p data-slot="stat-label">${escapeHtml(resultLabel)}</p>
+              <p data-slot="stat-value" id="summary-latest">—</p>
+            </div>
+          </div>
+        </div>
+        <div data-slot="card">
+          <div data-slot="card-content" class="pt-4">
+            <div data-slot="stat">
+              <p data-slot="stat-label">Checks Run</p>
+              <p data-slot="stat-value" id="summary-count">0</p>
+            </div>
+          </div>
+        </div>
+        <div data-slot="card">
+          <div data-slot="card-content" class="pt-4">
+            <div data-slot="stat">
+              <p data-slot="stat-label">Refusals Caught</p>
+              <p data-slot="stat-value" id="summary-refusals">0</p>
+            </div>
+          </div>
+        </div>
+      </section>`
+    : '';
+
+  const mainStage = isRequestReply
+    ? `      <section data-slot="card" aria-labelledby="thread-heading">
+        <div data-slot="card-header">
+          <h2 data-slot="card-title" id="thread-heading">Model Conversation</h2>
+          <p data-slot="card-description">Each line is evaluated directly by the proved model.</p>
+        </div>
+        <div data-slot="card-content" class="grid gap-4">
+          <div data-slot="stat" id="result-stat">
+            <p data-slot="stat-label">${escapeHtml(resultLabel)}</p>
+            <p data-slot="stat-value" id="result-value">—</p>
+          </div>
+          <div data-slot="alert" data-variant="destructive" id="refusal-alert" role="alert" hidden>
+            <p data-slot="alert-title">Model refused request</p>
+            <p data-slot="alert-description" id="refusal-text"></p>
+          </div>
+          <ol data-slot="thread" id="reply-thread" aria-live="polite" aria-label="Requests and answers"></ol>
+          <p class="text-xs text-muted-foreground" id="protocol-trace">Ready.</p>
+        </div>
+      </section>
+      <form data-slot="card" id="model-form" autocomplete="off">
+        <div data-slot="card-content" class="grid gap-4 pt-4">
+${controlBlocks.join('\n')}
+        </div>
+        <div data-slot="card-footer" class="flex items-center justify-between gap-3">
+          <button data-slot="button" id="submit-btn" type="submit">${escapeHtml(decl.view.submitLabel)}</button>
+          <button data-slot="button" data-variant="ghost" id="reset-btn" type="button">Reset</button>
+        </div>
+      </form>`
+    : `${ledgerSummaryRow}
+      <section class="grid gap-6 md:grid-cols-2 items-start">
+        <form data-slot="card" id="model-form" autocomplete="off">
+          <div data-slot="card-header">
+            <h2 data-slot="card-title">${isCalculator ? 'Parameters' : 'Inputs'}</h2>
+            <p data-slot="card-description">${isCalculator ? 'Adjust any value to recalculate live through the proved model.' : 'Values are sent directly to the proved model.'}</p>
+          </div>
+          <div data-slot="card-content" class="grid gap-4">
+${controlBlocks.join('\n')}
+          </div>
+          <div data-slot="card-footer" class="flex items-center justify-between gap-3">
+            <button data-slot="button" id="submit-btn" type="submit">${escapeHtml(decl.view.submitLabel)}</button>
+            <button data-slot="button" data-variant="ghost" id="reset-btn" type="button">Reset</button>
+          </div>
+        </form>
+
+        <section data-slot="card" aria-labelledby="result-heading">
+          <div data-slot="card-header">
+            <h2 data-slot="card-title" id="result-heading">${escapeHtml(resultLabel)}</h2>
+            <p data-slot="card-description">Computed deterministically by the model</p>
+          </div>
+          <div data-slot="card-content" class="grid gap-4">
+            <div data-slot="stat" id="result-stat">
+              <p data-slot="stat-label">${escapeHtml(resultLabel)}</p>
+              <p data-slot="stat-value" id="result-value">—</p>
+            </div>
+            <div data-slot="alert" data-variant="destructive" id="refusal-alert" role="alert" hidden>
+              <p data-slot="alert-title">Model refused request</p>
+              <p data-slot="alert-description" id="refusal-text"></p>
+            </div>
+            <p class="text-xs text-muted-foreground" id="protocol-trace">Ready.</p>
+          </div>
+        </section>
+      </section>`;
 
   const indexHtml = `<!doctype html>
 <html lang="en">
@@ -694,39 +798,7 @@ ${radios}
         <p>${escapeHtml(decl.view.subtitle)}</p>
       </header>
 
-      <section class="grid gap-6 md:grid-cols-2 items-start">
-        <form data-slot="card" id="model-form" autocomplete="off">
-          <div data-slot="card-header">
-            <h2 data-slot="card-title">Inputs</h2>
-            <p data-slot="card-description">Values are sent directly to the proved model.</p>
-          </div>
-          <div data-slot="card-content" class="grid gap-4">
-${controlBlocks.join('\n')}
-          </div>
-          <div data-slot="card-footer" class="flex items-center justify-between gap-3">
-            <button data-slot="button" id="submit-btn" type="submit">${escapeHtml(decl.view.submitLabel)}</button>
-            <button data-slot="button" data-variant="ghost" id="reset-btn" type="button">Reset</button>
-          </div>
-        </form>
-
-        <section data-slot="card" aria-labelledby="result-heading">
-          <div data-slot="card-header">
-            <h2 data-slot="card-title" id="result-heading">${escapeHtml(resultLabel)}</h2>
-            <p data-slot="card-description">Computed deterministically by the model</p>
-          </div>
-          <div data-slot="card-content" class="grid gap-4">
-            <div data-slot="stat" id="result-stat">
-              <p data-slot="stat-label">${escapeHtml(resultLabel)}</p>
-              <p data-slot="stat-value" id="result-value">—</p>
-            </div>
-            <div data-slot="alert" data-variant="destructive" id="refusal-alert" role="alert" hidden>
-              <p data-slot="alert-title">Model refused request</p>
-              <p data-slot="alert-description" id="refusal-text"></p>
-            </div>
-            <p class="text-xs text-muted-foreground" id="protocol-trace">Ready.</p>
-          </div>
-        </section>
-      </section>
+${mainStage}
 ${historySection}
       <p class="text-center text-xs text-muted-foreground">The model's rules are proved. This page is compiled from the declaration and only displays what the model answers.</p>
     </main>
@@ -765,8 +837,14 @@ const protocolTrace = document.getElementById('protocol-trace');
 const historyList = document.getElementById('history-list');
 const historyEmpty = document.getElementById('history-empty');
 const historyCount = document.getElementById('history-count');
+const summaryLatest = document.getElementById('summary-latest');
+const summaryCount = document.getElementById('summary-count');
+const summaryRefusals = document.getElementById('summary-refusals');
+const replyThread = document.getElementById('reply-thread');
+const LIVE_CALC = ${isCalculator ? 'true' : 'false'};
 
 const historyEntries = [];
+let refusalTotal = 0;
 
 function clearErrors() {
   refusalAlert.hidden = true;
@@ -831,7 +909,15 @@ async function evaluateCurrent() {
       resultValue.textContent = answer;
     }
     protocolTrace.textContent = 'Request "' + line + '" -> "' + answer + '"';
+    if (isRefusal) refusalTotal += 1;
     historyEntries.unshift({ request: line, answer, refused: isRefusal });
+    if (summaryLatest) summaryLatest.textContent = isRefusal ? 'Refused' : answer;
+    if (summaryCount) summaryCount.textContent = String(historyEntries.length);
+    if (summaryRefusals) summaryRefusals.textContent = String(refusalTotal);
+    if (replyThread) {
+      replyThread.append(h('li', { slot: 'bubble', from: 'me' }, line));
+      replyThread.append(h('li', { slot: 'bubble', from: 'them', ...(isRefusal ? { 'data-failed': true } : {}) }, answer));
+    }
     renderHistory();
   } catch (error) {
     refusalAlert.hidden = false;
@@ -845,6 +931,15 @@ form.addEventListener('submit', (event) => {
   event.preventDefault();
   evaluateCurrent();
 });
+
+if (LIVE_CALC) {
+  let calcTimer = null;
+  form.addEventListener('input', () => {
+    if (calcTimer) clearTimeout(calcTimer);
+    calcTimer = setTimeout(() => evaluateCurrent(), 80);
+  });
+  form.addEventListener('change', () => evaluateCurrent());
+}
 
 resetBtn.addEventListener('click', () => {
   form.reset();
@@ -922,6 +1017,7 @@ export function compilePrismDeclaration(decl: PrismDeclaration): CompiledPrismWo
   const themeBytes = enc.encode(themeJson);
   const compiled = compileDesign(pageMap, themeBytes);
   const designDiagnostics = checkDesign(pageMap, themeBytes);
+  const resolvedTheme = resolveTheme(themeBytes);
 
   const appFiles: Record<string, string> = {
     'src/App.lex.tex': appLexTex,
@@ -951,6 +1047,7 @@ export function compilePrismDeclaration(decl: PrismDeclaration): CompiledPrismWo
     compiledUiJs: compiled.js,
     designSlots: compiled.slots,
     designDiagnostics,
+    themeModes: resolvedTheme.modes,
     theoremMap,
   };
 }

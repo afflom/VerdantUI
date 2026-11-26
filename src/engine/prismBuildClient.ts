@@ -145,6 +145,7 @@ export class PrismBuildWorkerClient {
   async verifyArchive(opts: {
     readonly prismId?: string;
     readonly holoBytes: Uint8Array;
+    readonly reprove?: boolean;
     readonly onStage?: (stage: PrismBuildStage, detail: string) => void;
     readonly parentContext?: OtelTraceContext;
   }): Promise<WorkerVerifyPayload> {
@@ -156,7 +157,12 @@ export class PrismBuildWorkerClient {
     });
     try {
       const result = await this.call<WorkerVerifyPayload>(
-        { type: 'verify', holoBytes: opts.holoBytes },
+        {
+          type: 'verify',
+          holoBytes: opts.holoBytes,
+          baseUrl: opts.reprove ? this.resolveBaseUrl() : undefined,
+          reprove: opts.reprove,
+        },
         opts.onStage,
       );
       span.setAttributes({

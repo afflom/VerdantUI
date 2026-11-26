@@ -157,3 +157,24 @@ test('propose-encoding accepts raw JSON Schema 2020-12 and normalizes typed fiel
   assert.deepEqual(res.declaration.encoding?.fields[1].choices, ['Fixed', 'Variable']);
   assert.equal(res.declaration.encoding?.fields[2].kind, 'bool');
 });
+
+test('field-vs-field comparisons, reorder-features, and update-refusal work deterministically', () => {
+  const budget = createDeclarativeStarter('budget-guard');
+  assert.equal(evaluateDeclaredModel(budget, '500 100 650 2').response, 'Over Budget');
+  assert.equal(evaluateDeclaredModel(budget, '2000 850 120 0').response, 'Remaining Budget: 1030 USD');
+
+  const reordered = dispatchStudioOp(budget, {
+    op: 'reorder-features',
+    orderedIds: ['APP-04', 'APP-03'],
+  });
+  assert.equal(reordered.ok, true);
+  assert.equal(reordered.declaration.features[0].id, 'APP-04');
+
+  const updatedRefusal = dispatchStudioOp(budget, {
+    op: 'update-refusal',
+    id: 'APP-01',
+    patch: { failureText: 'Expense cannot be zero.' },
+  });
+  assert.equal(updatedRefusal.ok, true);
+  assert.equal(evaluateDeclaredModel(updatedRefusal.declaration, '2000 100 0 0').response, 'Expense cannot be zero.');
+});

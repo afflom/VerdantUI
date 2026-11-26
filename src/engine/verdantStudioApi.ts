@@ -106,6 +106,8 @@ export interface FieldPredicate {
   readonly field: string;
   readonly op: CompareOp;
   readonly value: number;
+  /** Optional second field to compare against instead of a constant `value`. */
+  readonly rhsField?: string;
 }
 
 export interface RuleCondition {
@@ -284,12 +286,21 @@ export type StudioApiOp =
       readonly patch: Partial<Omit<StudioFeature, 'id' | 'citation'>>;
     }
   | {
+      readonly op: 'reorder-features';
+      readonly orderedIds: readonly string[];
+    }
+  | {
       readonly op: 'remove-feature';
       readonly id: string;
     }
   | {
       readonly op: 'admit-refusal';
       readonly refusal: StudioRefusal;
+    }
+  | {
+      readonly op: 'update-refusal';
+      readonly id: string;
+      readonly patch: Partial<Omit<StudioRefusal, 'id' | 'citation'>>;
     }
   | {
       readonly op: 'remove-refusal';
@@ -588,7 +599,9 @@ export function parseRequestLine(
 
 export function evalPredicate(pred: FieldPredicate, values: Readonly<Record<string, number>>): boolean {
   const lhs = Math.max(0, Math.floor(values[pred.field] ?? 0));
-  const rhs = Math.max(0, Math.floor(pred.value));
+  const rhs = pred.rhsField
+    ? Math.max(0, Math.floor(values[pred.rhsField] ?? 0))
+    : Math.max(0, Math.floor(pred.value));
   switch (pred.op) {
     case 'eq': return lhs === rhs;
     case 'neq': return lhs !== rhs;
@@ -838,6 +851,15 @@ export function checkDeclaration(decl: PrismDeclaration): DeclarationCheckReport
           id: ownerId,
           message: `Rule "${ownerId}" references undeclared field "${pred.field}".`,
           remediation: `Add "${pred.field}" via propose-encoding or update rule "${ownerId}".`,
+        });
+      }
+      if (pred.rhsField && !fieldNames.has(pred.rhsField)) {
+        diagnostics.push({
+          code: 'rule.unknown-field',
+          severity: 'error',
+          id: ownerId,
+          message: `Rule "${ownerId}" compares against undeclared field "${pred.rhsField}".`,
+          remediation: `Add "${pred.rhsField}" via propose-encoding or update rule "${ownerId}".`,
         });
       }
     }
@@ -1479,6 +1501,19 @@ export function dispatchStudioOp(decl: PrismDeclaration, op: StudioApiOp): Studi
       return { ok: true, declaration: next, message: `Updated feature ${op.id}.` };
     }
 
+    case 'reorder-features': {
+      const rank = new Map(op.orderedIds.map((id, idx) => [id, idx + 1]));
+      const nextFeatures = [...decl.features]
+        .map((f) => ({ ...f, priority: rank.get(f.id) ?? f.priority + 100 }))
+        .sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id));
+      const next: PrismDeclaration = {
+        ...decl,
+        features: nextFeatures,
+        auditLog: appendAudit(decl, op.op, `Reordered ${nextFeatures.length} feature priorities`),
+      };
+      return { ok: true, declaration: next, message: 'Reordered feature evaluation priority.' };
+    }
+
     case 'remove-feature': {
       if (decl.lockedIds.includes(op.id)) {
         return {
@@ -1547,6 +1582,35 @@ export function dispatchStudioOp(decl: PrismDeclaration, op: StudioApiOp): Studi
         auditLog: appendAudit(decl, op.op, `Admitted refusal ${id}`),
       };
       return { ok: true, declaration: next, message: `Admitted typed refusal ${id}.` };
+    }
+
+    case 'update-refusal': {
+      const existing = decl.refusals.find((r) => r.id === op.id);
+      if (!existing) {
+        return {
+          ok: false,
+          code: 'refusal.not-found',
+          message: `Refusal "${op.id}" does not exist.`,
+          remediation: 'Admit the refusal first.',
+        };
+      }
+      const nextFailure = op.patch.failureText !== undefined ? op.patch.failureText.trim() : existing.failureText;
+      if (!nextFailure) {
+        return {
+          ok: false,
+          code: 'contract.negative',
+          message: `Refusal "${op.id}" cannot have an empty refusal message.`,
+          remediation: 'Provide the exact refusal sentence (R5).',
+        };
+      }
+      const next: PrismDeclaration = {
+        ...decl,
+        refusals: decl.refusals.map((r) =>
+          r.id === op.id ? { ...r, ...op.patch, failureText: nextFailure } : r,
+        ),
+        auditLog: appendAudit(decl, op.op, `Updated refusal ${op.id}`),
+      };
+      return { ok: true, declaration: next, message: `Updated refusal ${op.id}.` };
     }
 
     case 'remove-refusal': {
@@ -1775,6 +1839,18 @@ export function createDeclarativeStarter(kind: DeclarativeStarterId): PrismDecla
         feature: {
           id: 'APP-03',
           level: 'build',
+          statement: 'Flag when the new expense alone exceeds the monthly budget.',
+          condition: { all: [{ field: 'expense', op: 'gt', value: 0, rhsField: 'budget' }] },
+          outcome: { kind: 'label', code: 1, label: 'Over Budget', tone: 'destructive' },
+          priority: 1,
+          citation: { kind: 'req', requirementId: 'REQ-02' },
+        },
+      },
+      {
+        op: 'admit-feature',
+        feature: {
+          id: 'APP-04',
+          level: 'build',
           statement: 'Compute remaining budget after adding the new expense.',
           condition: { all: [] },
           outcome: {
@@ -1801,6 +1877,16 @@ export function createDeclarativeStarter(kind: DeclarativeStarterId): PrismDecla
           id: 'vec_within',
           inputs: { budget: 2000, spent: 850, expense: 120, category: 0 },
           expectedResponse: 'Remaining Budget: 1030 USD',
+          forFeatureId: 'APP-04',
+          isRefusal: false,
+        },
+      },
+      {
+        op: 'admit-vector',
+        vector: {
+          id: 'vec_over',
+          inputs: { budget: 500, spent: 100, expense: 650, category: 2 },
+          expectedResponse: 'Over Budget',
           forFeatureId: 'APP-03',
           isRefusal: false,
         },
