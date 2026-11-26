@@ -332,15 +332,23 @@ function render() {
   const aspectSel = document.createElement('select'); aspectSel.className = 'organ-input';
   for (const [lbl, aw, ah] of ASPECTS) { const o = document.createElement('option'); o.value = aw + 'x' + ah; o.textContent = lbl; if (Math.abs(curW / curH - aw / ah) < 0.15) o.selected = true; aspectSel.appendChild(o); }
   aspectSel.onchange = () => { const [aw, ah] = aspectSel.value.split('x').map(Number); curW = aw; curH = ah; canvas.width = curW * hiDpi; canvas.height = curH * hiDpi; drawArtwork(canvas); };
+  const lightSel = document.createElement('select'); lightSel.className = 'organ-input';
+  for (const [id, lbl] of [['golden-hour','Golden Hour'],['twilight','Twilight'],['midnight','Midnight'],['daylight','Daylight'],['neon','Neon'],['studio','Studio']]) {
+    const o = document.createElement('option'); o.value = id; o.textContent = lbl; if (id === lighting) o.selected = true; lightSel.appendChild(o);
+  }
+  lightSel.onchange = () => { lighting = lightSel.value; drawArtwork(canvas); };
+  const detailBtn = document.createElement('button'); detailBtn.className = 'organ-btn';
+  detailBtn.textContent = density >= 76 ? 'Detail: High' : density <= 38 ? 'Detail: Low' : 'Detail: Med';
+  detailBtn.onclick = () => { density = density >= 76 ? 34 : density <= 38 ? 58 : 84; detailBtn.textContent = density >= 76 ? 'Detail: High' : density <= 38 ? 'Detail: Low' : 'Detail: Med'; drawArtwork(canvas); };
   const dpiBtn = document.createElement('button'); dpiBtn.className = 'organ-btn'; dpiBtn.textContent = hiDpi === 2 ? '2× HiDPI' : '1× Standard';
   dpiBtn.onclick = () => { hiDpi = hiDpi === 1 ? 2 : 1; dpiBtn.textContent = hiDpi === 2 ? '2× HiDPI' : '1× Standard'; canvas.width = Math.min(1600, curW * hiDpi); canvas.height = Math.min(1200, curH * hiDpi); drawArtwork(canvas); };
-  left.append(genBtn, sceneSel, aspectSel, dpiBtn);
+  left.append(genBtn, sceneSel, aspectSel, lightSel, detailBtn, dpiBtn);
 
   const right = document.createElement('div'); right.className = 'organ-row';
   const expPng = document.createElement('button'); expPng.className = 'organ-btn'; expPng.textContent = 'Download PNG';
   expPng.onclick = () => { const a = document.createElement('a'); a.href = canvas.toDataURL('image/png'); a.download = (W.caption || 'artwork').toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.png'; a.click(); };
   const expSpec = document.createElement('button'); expSpec.className = 'organ-btn'; expSpec.textContent = 'Export JSON';
-  expSpec.onclick = () => { window.verdant?.downloadFile?.((W.caption || 'artwork').toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.json', JSON.stringify({ ...W, generator, seed, width: curW, height: curH, lighting }, null, 2), 'application/json'); };
+  expSpec.onclick = () => { const dl = window.verdant?.browser?.downloadFile || window.verdant?.downloadFile; dl?.((W.caption || 'artwork').toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.json', JSON.stringify({ ...W, generator, seed, width: curW, height: curH, lighting, density }, null, 2), 'application/json'); };
   right.append(expPng, expSpec);
   bar.append(left, right); root.appendChild(bar);
 
@@ -619,6 +627,12 @@ function renderChrome() {
     chip.onclick = () => { selectedIdx = idx; tSec = startAt + 0.05; renderChrome(); };
     sceneRow.appendChild(chip);
   });
+  const addSceneBtn = document.createElement('button'); addSceneBtn.className = 'organ-btn'; addSceneBtn.textContent = '+ Scene';
+  addSceneBtn.onclick = () => {
+    scenes.push({ title: 'Scene ' + (scenes.length + 1), subtitle: 'New motion beat', durationSec: 4, motion: 'rise', accent: '#10b981' });
+    selectedIdx = scenes.length - 1; renderChrome();
+  };
+  sceneRow.appendChild(addSceneBtn);
   root.appendChild(sceneRow);
 
   const curSc = scenes[selectedIdx] || scenes[0];
@@ -627,7 +641,10 @@ function renderChrome() {
   tIn.oninput = () => { curSc.title = tIn.value; };
   const sIn = document.createElement('input'); sIn.className = 'organ-input'; sIn.style.flex = '1'; sIn.value = curSc.subtitle; sIn.placeholder = 'Scene subtitle';
   sIn.oninput = () => { curSc.subtitle = sIn.value; };
-  ed.append(tIn, sIn); root.appendChild(ed);
+  const motSel = document.createElement('select'); motSel.className = 'organ-input';
+  for (const m of ['rise','pan','pulse','orbit']) { const o = document.createElement('option'); o.value = m; o.textContent = 'Motion: ' + m; if (curSc.motion === m) o.selected = true; motSel.appendChild(o); }
+  motSel.onchange = () => { curSc.motion = motSel.value; };
+  ed.append(tIn, sIn, motSel); root.appendChild(ed);
 
   snapBtn.onclick = () => { const a = document.createElement('a'); a.href = canvas.toDataURL('image/png'); a.download = 'verdant-frame.png'; a.click(); };
   recBtn.onclick = () => toggleRecord(canvas, recBtn);
@@ -773,13 +790,13 @@ function render() {
   const addCh = document.createElement('button'); addCh.className = 'organ-btn'; addCh.textContent = '+ Chapter';
   addCh.onclick = () => { chapters.push({ title: 'Chapter ' + (chapters.length + 1), beat: 'Scene', summary: 'Describe this chapter beat.', body: '' }); activeIdx = chapters.length - 1; persist(); render(); };
   const copyBtn = document.createElement('button'); copyBtn.className = 'organ-btn'; copyBtn.textContent = 'Copy';
-  copyBtn.onclick = () => { window.verdant?.copyText?.(fullMarkdown()); copyBtn.textContent = 'Copied!'; setTimeout(() => (copyBtn.textContent = 'Copy'), 1200); };
+  copyBtn.onclick = () => { (window.verdant?.browser?.copyText || window.verdant?.copyText)?.(fullMarkdown()); copyBtn.textContent = 'Copied!'; setTimeout(() => (copyBtn.textContent = 'Copy'), 1200); };
   const expMd = document.createElement('button'); expMd.className = 'organ-btn primary'; expMd.textContent = 'Export MD';
-  expMd.onclick = () => { window.verdant?.downloadFile?.(W.title.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.md', fullMarkdown(), 'text/markdown'); };
+  expMd.onclick = () => { (window.verdant?.browser?.downloadFile || window.verdant?.downloadFile)?.(W.title.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.md', fullMarkdown(), 'text/markdown'); };
   const expHtml = document.createElement('button'); expHtml.className = 'organ-btn'; expHtml.textContent = 'Export HTML';
   expHtml.onclick = () => {
     const html = '<!doctype html><html><head><meta charset="utf-8"><title>' + W.title + '</title><style>body{max-width:720px;margin:40px auto;font-family:Georgia,serif;line-height:1.7;padding:0 16px}</style></head><body>' + renderSimpleMarkdown(fullMarkdown()) + '</body></html>';
-    window.verdant?.downloadFile?.(W.title.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.html', html, 'text/html');
+    (window.verdant?.browser?.downloadFile || window.verdant?.downloadFile)?.(W.title.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.html', html, 'text/html');
   };
   actions.append(addCh, copyBtn, expMd, expHtml); top.appendChild(actions); root.appendChild(top);
 
@@ -868,7 +885,8 @@ function exportMarkdown() {
     '## Evidence & Experiment Log', ...(notes.length ? notes.map((n) => '- [' + n.verdict + '] (' + n.hypothesisId + ') ' + n.text + ' — _' + n.date + '_') : ['- No entries logged yet.']), '',
     '## Milestones', ...milestones.map((m) => '- [' + (m.status === 'done' ? 'x' : ' ') + '] ' + m.title + ' (' + m.dueLabel + ' · ' + m.status + ')')
   ].join('\\n');
-  window.verdant?.downloadFile?.((W.topic || 'research').toLowerCase().replace(/[^a-z0-9]+/g, '-') + '-report.md', md, 'text/markdown');
+  const dl = window.verdant?.browser?.downloadFile || window.verdant?.downloadFile;
+  dl?.((W.topic || 'research').toLowerCase().replace(/[^a-z0-9]+/g, '-') + '-report.md', md, 'text/markdown');
 }
 
 function render() {
@@ -877,9 +895,22 @@ function render() {
   const head = document.createElement('div'); head.className = 'organ-row'; head.style.justifyContent = 'space-between'; head.style.marginBottom = '12px';
   head.innerHTML = '<div class="organ-row">' + W.tracks.map((t) => '<span class="organ-pill">' + t + '</span>').join('') + '<span class="organ-pill">Progress: ' + doneCount + '/' + milestones.length + '</span></div>';
   const expRow = document.createElement('div'); expRow.className = 'organ-row';
+  if (window.verdant?.ask) {
+    const synthBtn = document.createElement('button'); synthBtn.className = 'organ-btn'; synthBtn.textContent = 'Synthesize Findings';
+    synthBtn.onclick = async () => {
+      synthBtn.disabled = true; synthBtn.textContent = 'Synthesizing…';
+      try {
+        const prompt = 'Synthesize concise research findings for "' + W.topic + '" (' + W.question + '). Hypotheses: ' + hypotheses.map((h) => h.id + ' [' + h.status + ']: ' + h.statement).join('; ') + '. Evidence: ' + notes.map((n) => n.verdict + ': ' + n.text).join('; ');
+        const reply = await window.verdant.ask(prompt);
+        notes.unshift({ hypothesisId: 'Synthesis', verdict: 'observation', text: String(reply || '').trim(), date: new Date().toLocaleDateString() });
+        persist(); render();
+      } catch (_) { synthBtn.disabled = false; synthBtn.textContent = 'Synthesize Findings'; }
+    };
+    expRow.appendChild(synthBtn);
+  }
   const mdBtn = document.createElement('button'); mdBtn.className = 'organ-btn primary'; mdBtn.textContent = 'Export Report MD'; mdBtn.onclick = exportMarkdown;
   const jsonBtn = document.createElement('button'); jsonBtn.className = 'organ-btn'; jsonBtn.textContent = 'Export JSON';
-  jsonBtn.onclick = () => window.verdant?.downloadFile?.('research-data.json', JSON.stringify({ topic: W.topic, question: W.question, hypotheses, notes, milestones }, null, 2), 'application/json');
+  jsonBtn.onclick = () => (window.verdant?.browser?.downloadFile || window.verdant?.downloadFile)?.('research-data.json', JSON.stringify({ topic: W.topic, question: W.question, hypotheses, notes, milestones }, null, 2), 'application/json');
   expRow.append(mdBtn, jsonBtn); head.appendChild(expRow); root.appendChild(head);
 
   const q = document.createElement('p'); q.style.margin = '0 0 14px'; q.style.fontWeight = '600'; q.textContent = W.question; root.appendChild(q);
@@ -1020,7 +1051,7 @@ function render() {
     const top = document.createElement('div'); top.className = 'organ-row'; top.style.justifyContent = 'space-between'; top.style.marginBottom = '12px';
     top.innerHTML = '<span class="organ-pill">Completed: ' + done + ' / ' + state.steps.length + '</span>';
     const exp = document.createElement('button'); exp.className = 'organ-btn'; exp.textContent = 'Export Markdown';
-    exp.onclick = () => window.verdant?.downloadFile?.('workflow-checklist.md', state.steps.map((s) => '- [' + (s.done ? 'x' : ' ') + '] ' + s.text).join('\\n'), 'text/markdown');
+    exp.onclick = () => (window.verdant?.browser?.downloadFile || window.verdant?.downloadFile)?.('workflow-checklist.md', state.steps.map((s) => '- [' + (s.done ? 'x' : ' ') + '] ' + s.text).join('\\n'), 'text/markdown');
     top.appendChild(exp); root.appendChild(top);
 
     state.steps.forEach((st, idx) => {
@@ -1044,7 +1075,7 @@ function render() {
   const checkBtn = document.createElement('button'); checkBtn.className = 'organ-btn primary'; checkBtn.textContent = 'Log Today (' + state.checkins + ')';
   checkBtn.onclick = () => { state.checkins += 1; state.streakDays[state.streakDays.length - 1] = true; emitConstraints(); persist(); render(); };
   const expBtn = document.createElement('button'); expBtn.className = 'organ-btn'; expBtn.textContent = 'Export JSON';
-  expBtn.onclick = () => window.verdant?.downloadFile?.('habit-schedule-log.json', JSON.stringify(state, null, 2), 'application/json');
+  expBtn.onclick = () => (window.verdant?.browser?.downloadFile || window.verdant?.downloadFile)?.('habit-schedule-log.json', JSON.stringify(state, null, 2), 'application/json');
   metricRow.append(checkBtn, expBtn); root.appendChild(metricRow);
 
   // 14-day streak heatmap
@@ -1079,6 +1110,29 @@ function render() {
     const rm = document.createElement('button'); rm.className = 'organ-btn'; rm.textContent = '×'; rm.onclick = () => { state.windows.splice(idx, 1); emitConstraints(); persist(); render(); };
     ctrls.append(toggle, rm); row.append(txt, ctrls); root.appendChild(row);
   });
+
+  // Add Window + Live Slot Conflict Checker
+  const addWinRow = document.createElement('div'); addWinRow.className = 'organ-row'; addWinRow.style.marginTop = '8px';
+  const wLbl = document.createElement('input'); wLbl.className = 'organ-input'; wLbl.style.flex = '1'; wLbl.placeholder = 'New protected block (e.g. Deep Focus)';
+  const wStart = document.createElement('input'); wStart.type = 'time'; wStart.className = 'organ-input'; wStart.value = '09:00';
+  const wEnd = document.createElement('input'); wEnd.type = 'time'; wEnd.className = 'organ-input'; wEnd.value = '10:30';
+  const toMin = (hhmm) => { const [h, m] = String(hhmm || '09:00').split(':').map(Number); return (h || 0) * 60 + (m || 0); };
+  const addWinBtn = document.createElement('button'); addWinBtn.className = 'organ-btn primary'; addWinBtn.textContent = '+ Add Block';
+  addWinBtn.onclick = () => {
+    const s = toMin(wStart.value), e = toMin(wEnd.value);
+    if (e <= s) return;
+    state.windows.push({ label: wLbl.value.trim() || 'Protected Block', startMinuteOfDay: s, endMinuteOfDay: e, daysOfWeek: [0,1,2,3,4,5,6], protectedWindow: true });
+    emitConstraints(); persist(); render();
+  };
+  const chkBtn = document.createElement('button'); chkBtn.className = 'organ-btn'; chkBtn.textContent = 'Check Conflict';
+  const chkOut = document.createElement('span'); chkOut.className = 'organ-sub';
+  chkBtn.onclick = () => {
+    const s = toMin(wStart.value), e = toMin(wEnd.value);
+    const hits = state.windows.filter((w) => w.protectedWindow && s < w.endMinuteOfDay && e > w.startMinuteOfDay);
+    chkOut.textContent = hits.length > 0 ? 'Conflicts with ' + hits.length + ' protected block(s)' : 'Slot is open ✓';
+  };
+  addWinRow.append(wLbl, wStart, wEnd, addWinBtn, chkBtn, chkOut);
+  root.appendChild(addWinRow);
 }
 render();
 hydrate();
@@ -1108,7 +1162,7 @@ function render() {
     filters.appendChild(b);
   }
   const layouts = document.createElement('div'); layouts.className = 'organ-row';
-  for (const [id, lbl] of [['grid','Grid'],['showcase','Showcase'],['timeline','List']]) {
+  for (const [id, lbl] of [['grid','Grid'],['board','Board'],['showcase','Showcase'],['timeline','List']]) {
     const b = document.createElement('button'); b.className = 'organ-btn' + (layout === id ? ' primary' : '');
     b.textContent = lbl; b.onclick = () => { layout = id; render(); };
     layouts.appendChild(b);
@@ -1124,11 +1178,7 @@ function render() {
     return;
   }
 
-  const container = document.createElement('div');
-  container.style.display = 'grid'; container.style.gap = '12px';
-  container.style.gridTemplateColumns = layout === 'timeline' ? '1fr' : layout === 'showcase' ? 'repeat(auto-fill, minmax(280px, 1fr))' : 'repeat(auto-fill, minmax(210px, 1fr))';
-
-  for (const item of visible) {
+  function makeCard(item) {
     const card = document.createElement('div');
     card.style.border = '1px solid var(--v-border)'; card.style.borderRadius = '12px'; card.style.overflow = 'hidden'; card.style.background = 'var(--v-bg)';
     card.style.display = 'flex'; card.style.flexDirection = 'column';
@@ -1144,10 +1194,37 @@ function render() {
     const title = document.createElement('div'); title.style.fontWeight = '700'; title.style.fontSize = '14px'; title.textContent = item.title;
     const sum = document.createElement('div'); sum.className = 'organ-sub'; sum.textContent = item.summary || '';
     const openBtn = document.createElement('button'); openBtn.className = 'organ-btn primary'; openBtn.style.marginTop = 'auto'; openBtn.textContent = 'Open';
-    openBtn.onclick = () => { try { window.verdant?.openPrism?.(item.id); } catch (_) {} };
+    openBtn.onclick = () => { try { (window.verdant?.ui?.openPrism || window.verdant?.openPrism)?.(item.id); } catch (_) {} };
     body.append(meta, title, sum, openBtn); card.appendChild(body);
-    container.appendChild(card);
+    return card;
   }
+
+  if (layout === 'board') {
+    const groups = new Map();
+    for (const it of visible) {
+      const key = labelForType(it.mediaType);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(it);
+    }
+    const board = document.createElement('div');
+    board.style.display = 'grid'; board.style.gap = '12px'; board.style.gridTemplateColumns = 'repeat(auto-fit, minmax(230px, 1fr))';
+    for (const [colName, colItems] of groups.entries()) {
+      const col = document.createElement('div');
+      col.style.border = '1px solid var(--v-border)'; col.style.borderRadius = '12px'; col.style.padding = '10px'; col.style.background = 'var(--v-surface-alt)';
+      col.style.display = 'flex'; col.style.flexDirection = 'column'; col.style.gap = '10px';
+      const hdr = document.createElement('div'); hdr.style.fontWeight = '700'; hdr.style.fontSize = '12px'; hdr.textContent = colName + ' (' + colItems.length + ')';
+      col.appendChild(hdr);
+      for (const it of colItems) col.appendChild(makeCard(it));
+      board.appendChild(col);
+    }
+    root.appendChild(board);
+    return;
+  }
+
+  const container = document.createElement('div');
+  container.style.display = 'grid'; container.style.gap = '12px';
+  container.style.gridTemplateColumns = layout === 'timeline' ? '1fr' : layout === 'showcase' ? 'repeat(auto-fill, minmax(280px, 1fr))' : 'repeat(auto-fill, minmax(210px, 1fr))';
+  for (const item of visible) container.appendChild(makeCard(item));
   root.appendChild(container);
 }
 render();

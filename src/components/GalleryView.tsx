@@ -14,6 +14,7 @@ import {
   Image as ImageIcon,
   Layers,
   Music,
+  Play,
   Plus,
   Search,
   Sparkles,
@@ -76,6 +77,28 @@ export const GalleryView: FC<GalleryViewProps> = ({
   const [activeCategory, setActiveCategory] = useState<string>('all');
   const [spaceFilter, setSpaceFilter] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState('');
+  const [playingAudioUrl, setPlayingAudioUrl] = useState<Record<string, string>>({});
+
+  const handleQuickPlayAudio = async (item: ContentArtifactRecord) => {
+    if (playingAudioUrl[item.id]) return;
+    const { composeMultiTrackArrangement, synthesizeCompositionStereoPcm, encodeStereoWav, encodeStereoWavDataUrl } =
+      await import('../engine/audioSynthesisEngine');
+    const comp = composeMultiTrackArrangement({
+      title: item.title,
+      style: item.categories.includes('Beats & Rhythm')
+        ? 'rhythm-pulse'
+        : item.categories.includes('Melodic')
+          ? 'melodic-arpeggio'
+          : 'ambient-pad',
+      bpm: 92,
+      rootMidi: 60,
+      scale: 'pentatonic',
+      durationSec: Math.min(8, item.audioDurationSec ?? 6),
+    });
+    const pcm = synthesizeCompositionStereoPcm(comp, 22_050);
+    const wav = encodeStereoWav(pcm.left, pcm.right, pcm.sampleRate);
+    setPlayingAudioUrl((prev) => ({ ...prev, [item.id]: encodeStereoWavDataUrl(wav) }));
+  };
 
   const descriptor = useMemo(
     () => MEDIA_GALLERIES.find((g) => g.mediaType === mediaType) ?? MEDIA_GALLERIES[0]!,
@@ -256,6 +279,28 @@ export const GalleryView: FC<GalleryViewProps> = ({
                       <p className="mt-1 line-clamp-2 text-xs text-slate-500 dark:text-slate-400">
                         {item.summary}
                       </p>
+                    )}
+
+                    {item.mediaType === 'audio' && (
+                      <div className="mt-2.5">
+                        {playingAudioUrl[item.id] ? (
+                          <audio
+                            controls
+                            autoPlay
+                            src={playingAudioUrl[item.id]}
+                            className="h-8 w-full"
+                          />
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => void handleQuickPlayAudio(item)}
+                            className="inline-flex items-center gap-1.5 rounded-md border border-emerald-700/30 bg-emerald-50/70 px-2.5 py-1 text-[11px] font-medium text-emerald-900 hover:bg-emerald-100 dark:border-emerald-500/30 dark:bg-emerald-950/40 dark:text-emerald-200"
+                          >
+                            <Play className="h-3 w-3" />
+                            <span>Quick Preview</span>
+                          </button>
+                        )}
+                      </div>
                     )}
 
                     <div className="mt-2.5 flex flex-wrap gap-1">

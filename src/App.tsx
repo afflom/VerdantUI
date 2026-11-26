@@ -15,7 +15,7 @@ import { Menu, Moon, SlidersHorizontal, Sun } from 'lucide-react';
 import { SettingsDrawer } from './components/SettingsDrawer';
 import { ThreadSidebar } from './components/ThreadSidebar';
 import { ThreadView } from './components/ThreadView';
-import { createLlamaVTensorAdapter } from './engine/assistantAdapter';
+import { createLlamaVTensorAdapter, formatMessagesForLlama, stripReasoningTags } from './engine/assistantAdapter';
 
 const VTensorInspector = lazy(() =>
   import('./components/VTensorInspector').then((m) => ({ default: m.VTensorInspector })),
@@ -185,6 +185,37 @@ export default function App() {
               observer: workerClient.cognitiveObserver,
               galleries: galleryStore,
               registry: expertRegistry,
+              runLocalStudioPrompt: async (systemPrompt, userPrompt, maxTokens) => {
+                const st = workerClient.getState();
+                if (!st.model || isInternalBootstrapModel(st.model.id)) return '';
+                const formatted = formatMessagesForLlama(
+                  [
+                    {
+                      id: `studio_chat_${Date.now()}`,
+                      role: 'user',
+                      createdAt: new Date(),
+                      content: [{ type: 'text', text: userPrompt }],
+                      attachments: [],
+                      metadata: { custom: {} },
+                    },
+                  ],
+                  st.model,
+                  st.promptMode,
+                  systemPrompt,
+                  { thinkingMode: 'off' },
+                );
+                const ctrl = new AbortController();
+                let out = '';
+                for await (const ev of workerClient.streamGenerate(
+                  formatted,
+                  ctrl.signal,
+                  { ...st.sampling, temperature: 0.25, maxTokens },
+                  'studio:chat-router',
+                )) {
+                  out = stripReasoningTags(ev.accumulatedText);
+                }
+                return out;
+              },
               synthesizeAudioWav: (params) => workerClient.synthesizeAudioClip(params),
               onOpenPrism: (prismId) => {
                 setActiveView({ kind: 'prism', prismId, mode: 'app' });
@@ -294,6 +325,50 @@ export default function App() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workerClient, expertRegistry, galleryStore, prisms, publishedPrisms, galleryArtifacts]);
+
+  // Couple Living Training Basis user facets into VerdantCognitiveObserver active inference
+  useEffect(() => {
+    workerClient.cognitiveObserver.setUserBasisFacetsProvider(() =>
+      expertRegistry.basis.getUserFacetsQ10(),
+    );
+    return () => {
+      workerClient.cognitiveObserver.setUserBasisFacetsProvider(null);
+    };
+  }, [workerClient, expertRegistry]);
+
+  // Auto-generate missing Gallery preview thumbnails for Pictures created/edited in Studio directly
+  useEffect(() => {
+    const missingPic = prisms.find((p) => {
+      const w = p.declaration?.view?.proceduralOrgan?.weights;
+      if (!w || w.mediaType !== 'picture') return false;
+      const rec = galleryStore.get(p.id);
+      return !rec?.previewDataUrl;
+    });
+    if (!missingPic) return;
+    const weights = missingPic.declaration?.view?.proceduralOrgan?.weights;
+    if (!weights || weights.mediaType !== 'picture') return;
+    let cancelled = false;
+    void import('./engine/proceduralPictureRenderer').then(async ({ renderPictureWithCoherenceCheck }) => {
+      const rendered = await renderPictureWithCoherenceCheck(weights, { maxPreviewDim: 480 });
+      if (cancelled) return;
+      galleryStore.setArtifactMeta(missingPic.id, { previewDataUrl: rendered.pngDataUrl });
+      const rec = galleryStore.get(missingPic.id);
+      if (rec && rec.spaceIds.length > 0) {
+        const { syncSpacePrismView } = await import('./engine/studioChatBridge');
+        for (const sid of rec.spaceIds) {
+          await syncSpacePrismView(sid, {
+            store: prismStore,
+            galleries: galleryStore,
+            observer: workerClient.cognitiveObserver,
+            registry: expertRegistry,
+          });
+        }
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [prisms, galleryStore, prismStore, workerClient, expertRegistry]);
 
   // Register downloaded/resident neural weight experts into the unified VerdantUI model
   useEffect(() => {
@@ -761,6 +836,8 @@ export default function App() {
                 onOpenPrism={handleOpenPrismApp}
                 onEditPrism={handleEditPrismStudio}
                 getPrismById={(id) => prismStore.get(id)}
+                spaces={spacePrisms}
+                onAssignToSpace={handleAssignToSpace}
                 observerBus={observerBus}
                 bridgeRuntime={prismPool}
                 darkMode={darkMode}

@@ -68,6 +68,8 @@ interface ThreadViewProps {
   onOpenPrism?: (prismId: string) => void;
   onEditPrism?: (prismId: string) => void;
   getPrismById?: (prismId: string) => VerdantPrismProject | null;
+  spaces?: readonly VerdantPrismProject[];
+  onAssignToSpace?: (artifactId: string, spaceId: string) => void;
   observerBus?: ObserverStreamBus;
   bridgeRuntime?: PrismBridgeRuntime;
   darkMode?: boolean;
@@ -302,8 +304,16 @@ const VerdantToolCallPart: ToolCallMessagePartComponent = ({
   isError,
   status,
 }) => {
-  const { onOpenPrism, onEditPrism, getPrismById, observerBus, bridgeRuntime, darkMode } =
-    useContext(AssistantMessageContext);
+  const {
+    onOpenPrism,
+    onEditPrism,
+    getPrismById,
+    spaces = [],
+    onAssignToSpace,
+    observerBus,
+    bridgeRuntime,
+    darkMode,
+  } = useContext(AssistantMessageContext);
   const [expanded, setExpanded] = useState(false);
   const [inlineLive, setInlineLive] = useState(false);
   const isRunning = status?.type === 'running' || (result === undefined && !isError);
@@ -380,6 +390,26 @@ const VerdantToolCallPart: ToolCallMessagePartComponent = ({
           </div>
           {showActionButtons && (
             <div className="flex shrink-0 items-center gap-1.5">
+              {onAssignToSpace && spaces.length > 0 && prismPayload.mediaType !== 'space' && (
+                <select
+                  aria-label={`Add ${prismPayload.prismName} to Space`}
+                  defaultValue=""
+                  onChange={(e) => {
+                    if (e.target.value) {
+                      onAssignToSpace(prismPayload.prismId, e.target.value);
+                      e.target.value = '';
+                    }
+                  }}
+                  className="h-6 rounded-md border border-emerald-700/30 bg-white px-1.5 text-[11px] font-medium text-emerald-900 dark:border-emerald-500/30 dark:bg-[#0F141C] dark:text-emerald-300"
+                >
+                  <option value="">+ Space</option>
+                  {spaces.map((sp) => (
+                    <option key={sp.id} value={sp.id}>
+                      {sp.published?.name ?? sp.draft.name}
+                    </option>
+                  ))}
+                </select>
+              )}
               {canMountInline && (
                 <button
                   type="button"
@@ -720,6 +750,8 @@ interface AssistantMessageContextValue {
   readonly onOpenPrism?: (prismId: string) => void;
   readonly onEditPrism?: (prismId: string) => void;
   readonly getPrismById?: (prismId: string) => VerdantPrismProject | null;
+  readonly spaces?: readonly VerdantPrismProject[];
+  readonly onAssignToSpace?: (artifactId: string, spaceId: string) => void;
   readonly observerBus?: ObserverStreamBus;
   readonly bridgeRuntime?: PrismBridgeRuntime;
   readonly darkMode?: boolean;
@@ -806,6 +838,8 @@ export const ThreadView: FC<ThreadViewProps> = ({
   onOpenPrism,
   onEditPrism,
   getPrismById,
+  spaces = [],
+  onAssignToSpace,
   observerBus,
   bridgeRuntime,
   darkMode,
@@ -940,11 +974,13 @@ export const ThreadView: FC<ThreadViewProps> = ({
       onOpenPrism,
       onEditPrism,
       getPrismById,
+      spaces,
+      onAssignToSpace,
       observerBus,
       bridgeRuntime,
       darkMode,
     }),
-    [engineState.statusDetail, onToggleInspector, onOpenPrism, onEditPrism, getPrismById, observerBus, bridgeRuntime, darkMode],
+    [engineState.statusDetail, onToggleInspector, onOpenPrism, onEditPrism, getPrismById, spaces, onAssignToSpace, observerBus, bridgeRuntime, darkMode],
   );
 
   return (

@@ -257,11 +257,20 @@ export function buildPrismSandboxDocument(opts: {
         return callHost('browser.notify', { title: String(title || ''), body: String(body || '') });
       },
     }),
+    copyText(text) { return callHost('browser.copyText', { text: String(text || '') }); },
+    downloadFile(filename, content, mimeType) {
+      return callHost('browser.downloadFile', {
+        filename: String(filename || 'export.txt'),
+        content: String(content || ''),
+        mimeType: String(mimeType || 'text/plain'),
+      });
+    },
     ui: Object.freeze({
       getState() { return callHost('ui.getState', {}); },
       callPrism(target, payload) { return callHost('ui.callPrism', { target: String(target || ''), payload }); },
       openPrism(target) { return callHost('ui.openPrism', { target: String(target || '') }); },
     }),
+    openPrism(target) { return callHost('ui.openPrism', { target: String(target || '') }); },
     sense: Object.freeze({
       inspectCanvas(canvas) {
         if (!canvas || typeof canvas.getContext !== 'function') return null;
@@ -492,6 +501,7 @@ export function buildHoloviewSandboxDocument(opts: {
         return callHost('browser.notify', { title: String(title || ''), body: String(body || '') });
       },
     }),
+    copyText(text) { return callHost('browser.copyText', { text: String(text || '') }); },
     downloadFile(filename, content, mimeType) {
       return callHost('browser.downloadFile', {
         filename: String(filename || 'export.txt'),
@@ -504,6 +514,7 @@ export function buildHoloviewSandboxDocument(opts: {
       callPrism(target, payload) { return callHost('ui.callPrism', { target: String(target || ''), payload }); },
       openPrism(target) { return callHost('ui.openPrism', { target: String(target || '') }); },
     }),
+    openPrism(target) { return callHost('ui.openPrism', { target: String(target || '') }); },
     sense: Object.freeze({
       inspectCanvas(canvas) {
         if (!canvas || typeof canvas.getContext !== 'function') return null;

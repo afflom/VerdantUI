@@ -5,6 +5,7 @@ import {
   UnifiedExpertRegistry,
   facetsQ10ForMediaType,
 } from './unifiedModelBasis';
+import { VerdantCognitiveObserver } from './cognitiveObserver';
 
 test('UnifiedExpertRegistry unifies neural weights, procedural organs, user basis, and growing skills', () => {
   const basis = new LivingTrainingBasis();
@@ -66,4 +67,30 @@ test('UnifiedExpertRegistry unifies neural weights, procedural organs, user basi
   assert.equal(tele.warmOpfsBytes, 92_000_000);
   assert.equal(tele.acquiredSkills, 1);
   assert.equal(tele.knowledgeEntries, 1);
+
+  // Verify LivingTrainingBasis couples into VerdantCognitiveObserver active inference routing
+  const obsBaseline = new VerdantCognitiveObserver();
+  const obsAdapted = new VerdantCognitiveObserver();
+  obsAdapted.setUserBasisFacetsProvider(() => basis.getUserFacetsQ10());
+  const rBase = obsBaseline.selectRoute({
+    threadId: 'basis-test',
+    messages: [],
+    latestUserText: 'Plan an artistic creative direction',
+    hasAttachment: false,
+    activeModel: null,
+    cachedModelIds: [],
+    isToolContinuationStep: false,
+    hasImportedHarness: false,
+  });
+  const rAdapt = obsAdapted.selectRoute({
+    threadId: 'basis-test',
+    messages: [],
+    latestUserText: 'Plan an artistic creative direction',
+    hasAttachment: false,
+    activeModel: null,
+    cachedModelIds: [],
+    isToolContinuationStep: false,
+    hasImportedHarness: false,
+  });
+  assert.notDeepEqual(rBase.snapshot.belief, rAdapt.snapshot.belief);
 });

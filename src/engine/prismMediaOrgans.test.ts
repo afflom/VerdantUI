@@ -261,15 +261,23 @@ test('All previously missing game variants and upgraded organs synthesize dedica
   assert.ok(audView.appJs.includes('createAnalyser'));
   assert.ok(audView.appJs.includes('triggerPercussion'));
 
-  // 7. Research Evidence Log + Markdown Export
+  // 7. Research Evidence Log + Local AI Synthesis + Markdown Export
   const resW = normalizeOrganWeights('research-program', undefined, 'quantum battery study', 'Battery Study');
   const resView = synthesizeProceduralOrganView(empty, { mediaType: 'research-program', activeOrgans: deriveActiveStudioOrgans('research-program'), weights: resW });
   assert.ok(resView.appJs.includes('EVIDENCE & EXPERIMENT LOG'));
+  assert.ok(resView.appJs.includes('Synthesize Findings'));
   assert.ok(resView.appJs.includes('Export Report MD'));
 
-  // 8. Space Prism View
-  const spW = normalizeOrganWeights('space', { title: 'Mars Mission', layout: 'showcase', items: [{ id: 'p1', title: 'Nebula', mediaType: 'picture', summary: 'Art' }] }, 'Mars Mission', 'Mars Mission');
+  // 8. Space Prism View (with Board layout + window.verdant.ui.openPrism bridge)
+  const spW = normalizeOrganWeights('space', { title: 'Mars Mission', layout: 'board', items: [{ id: 'p1', title: 'Nebula', mediaType: 'picture', summary: 'Art' }] }, 'Mars Mission', 'Mars Mission');
   const spView = synthesizeProceduralOrganView(empty, { mediaType: 'space', activeOrgans: deriveActiveStudioOrgans('space'), weights: spW });
-  assert.ok(spView.appJs.includes('window.verdant?.openPrism'));
+  assert.ok(spView.appJs.includes('window.verdant?.ui?.openPrism'));
+  assert.ok(spView.appJs.includes("layout === 'board'"));
   assert.ok(spView.appJs.includes('Mars Mission'));
+
+  // 9. Schedule/Habit Utility with + Add Block & Live Conflict Checker
+  const toolW = normalizeOrganWeights('tool-organ', { role: 'schedule-guard' }, 'protect 5pm to 6pm daily', 'Focus Guard');
+  const toolView = synthesizeProceduralOrganView(empty, { mediaType: 'tool-organ', activeOrgans: deriveActiveStudioOrgans('tool-organ'), weights: toolW });
+  assert.ok(toolView.appJs.includes('+ Add Block'));
+  assert.ok(toolView.appJs.includes('Check Conflict'));
 });

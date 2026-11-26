@@ -971,6 +971,12 @@ export class VerdantCognitiveObserver {
   readonly grants = new ContainerGrantMatrix();
   /** Unified possession hierarchy (`Observer ⊇ User ⊇ {Threads, Prisms, ContextCompartments}`) & non-leaking boundary. */
   readonly possession = new ObserverPossessionStore('personal');
+  private userBasisFacetsProvider: (() => CognitiveVector) | null = null;
+
+  /** Connects the non-static `LivingTrainingBasis` Q10 vector into active inference routing. */
+  setUserBasisFacetsProvider(provider: (() => CognitiveVector) | null): void {
+    this.userBasisFacetsProvider = provider;
+  }
 
   /**
    * Registers all Published Prisms as active Observer cognitive weight organs, prunes any
@@ -1123,16 +1129,24 @@ export class VerdantCognitiveObserver {
     const obs = observeInputSensoryState(ctx.messages, ctx.latestUserText, ctx.hasAttachment);
 
     // Couple active Space's Published Prism cognitive weights (`PublishedPrismOrgan.cognitiveWeightsQ10`)
-    // into the unified model's prior belief (1/8 exact Q10 blend) strictly within the owning Space!
+    // AND the non-static Living Training Basis user vector into the unified model's prior belief!
     const spaceOrgans = this.possession.listPublishedOrgans(activeSpace);
     let effectivePrior = mem.belief;
+    if (this.userBasisFacetsProvider) {
+      const userBasis = this.userBasisFacetsProvider();
+      const mixed: number[] = new Array(COGNITIVE_DIM);
+      for (let i = 0; i < COGNITIVE_DIM; i++) {
+        mixed[i] = clampQ10((effectivePrior[i] * 7 + userBasis[i]) >> 3);
+      }
+      effectivePrior = mixed as unknown as CognitiveVector;
+    }
     if (spaceOrgans.length > 0) {
       const blended: number[] = new Array(COGNITIVE_DIM);
       for (let i = 0; i < COGNITIVE_DIM; i++) {
         let sum = 0;
         for (const o of spaceOrgans) sum += o.cognitiveWeightsQ10[i];
         const meanOrganQ10 = Math.round(sum / spaceOrgans.length);
-        blended[i] = clampQ10((mem.belief[i] * 7 + meanOrganQ10) >> 3);
+        blended[i] = clampQ10((effectivePrior[i] * 7 + meanOrganQ10) >> 3);
       }
       effectivePrior = blended as unknown as CognitiveVector;
     }

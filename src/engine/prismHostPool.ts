@@ -559,9 +559,11 @@ export class PrismHostPool implements PrismBridgeRuntime {
     if (!grants.observer) {
       throw new Error(`Observer grant is Off for Prism "${callerPrismId}".`);
     }
-    const targetId = this.resolveTargetPrismId(targetNameOrId);
+    const clean = targetNameOrId.trim();
+    const direct = clean ? this.store.get(clean) : null;
+    const targetId = direct ? direct.id : this.resolveTargetPrismId(targetNameOrId);
     if (!targetId) {
-      throw new Error(`Published Prism "${targetNameOrId}" not found.`);
+      throw new Error(`Prism "${targetNameOrId}" not found.`);
     }
     this.callbacks.onOpenPrism?.(targetId);
     return true;
