@@ -29,6 +29,7 @@ import {
   sanitizeIdentifier,
 } from './verdantStudioApi';
 import { evaluateVerdantRouting, isPrismSynthesizable } from './verdantStandardsRouter';
+import { synthesizeProceduralOrganView } from './prismMediaOrgans';
 import { sha256HexSync } from './prismStudio';
 
 const enc = new TextEncoder();
@@ -628,7 +629,18 @@ export function emitDesignView(decl: PrismDeclaration): {
   }
   const view = decl.view;
 
-  // Custom authored interactive app (`prism.app-view/1`)
+  // Procedural MediaType Organ view (DEC-009: 100% procedurally synthesized from declarative weights, zero LLM JS)
+  if (view.proceduralOrgan) {
+    const synth = synthesizeProceduralOrganView(decl, view.proceduralOrgan);
+    return {
+      indexHtml: synth.indexHtml,
+      stylesCss: synth.stylesCss,
+      appJs: synth.appJs,
+      isAuthoredApp: true,
+    };
+  }
+
+  // Legacy read-only custom authored interactive app (`prism.app-view/1`)
   if (view.authoredView) {
     const disclosureHtml = view.disclosure?.trim()
       ? `\n  <footer class="v-prism-disclosure" role="note">${escapeHtml(view.disclosure.trim())}</footer>`

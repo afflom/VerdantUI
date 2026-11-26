@@ -1,20 +1,25 @@
 /**
- * Continuous Conversational Verdant Studio Agent Wizard (`src/components/StudioGuidedWizard.tsx`)
+ * Conversational Verdant Studio Weight-Routing Wizard (`src/components/StudioGuidedWizard.tsx`)
  *
- * Pairs the Creator with the 100% client-side Verdant Studio Agent over Verdant Studio's
- * unified Prism model (`VerdantPrismProject` — persisting conversation history alongside
- * Core Models, Standards, and `.holo` artifacts in IndexedDB):
- * - Every stage is populated, reconciled, and refined through plain-English conversation —
- *   zero manual forms or hardcoded app templates.
- * - For open-ended interactive apps & games (e.g. "This Prism will be the video game 'Minesweeper'"):
- *   asks 1–2 tailored clarifying questions, reconciles all Core Models & applicable standards,
- *   validates generated JavaScript syntax before admitting, and opens the playable app in Preview.
- * - Supports instant Stop/cancellation with stale-run guards so switching Prisms or cancelling
- *   never leaks inference work or mutates the wrong project.
- * - Zero exposure of internal Verdant constructs (no Observer, OTel, vTensor, LexLean).
+ * Implements DEC-009 (Zero LLM-Written JavaScript) & DEC-011 (Plain Human Language):
+ * - Classifies the user's idea across the 7 MediaTypes (Picture, Audio, Written Work, Video,
+ *   Game, Research Program, Tool) and activates ONLY the relevant Studio features.
+ * - Routes structured declarative weights (`route-prism-weights`) — NEVER generates raw JS.
+ * - Supports importing & attaching local media weight files (.gguf / .safetensors) onto
+ *   compatible Picture, Audio, Video, Game, or Written-Work Prisms.
+ * - Works smoothly both with the on-device local model AND instantaneously out of the box.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type FC, type FormEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type FC,
+  type FormEvent,
+} from 'react';
 import {
   Check,
   Cpu,
@@ -25,7 +30,7 @@ import {
   SlidersHorizontal,
   Sparkles,
   Square,
-  Wrench,
+  Upload,
 } from 'lucide-react';
 import {
   dispatchStudioOp,
@@ -44,17 +49,21 @@ import {
   type GuidedStepId,
 } from '../engine/prismInterviewEngine';
 import {
-  assembleCompleteAuthoredPrismOps,
+  assembleProceduralPrismOps,
   buildAgentCoreModelOps,
-  buildDiscoveryAgentPrompt,
-  buildInteractiveAppPrompt,
-  buildRefineInteractiveAppPrompt,
-  classifyIdeaRealizationMode,
-  extractAuthoredAppFromModelOutput,
-  extractCleanIdeaTitle,
+  buildWeightRefinementPrompt,
+  buildWeightRoutingDiscoveryPrompt,
+  classifyArtifactMediaType,
   parseDiscoveryAgentResponse,
   type AgentChatTurn,
 } from '../engine/prismStudioAgent';
+import {
+  compatibleModalitiesForMediaType,
+  createImportedWeightBinding,
+  PRISM_MEDIA_CATALOG,
+  type MediaModelWeightBinding,
+  type PrismMediaType,
+} from '../engine/prismMediaOrgans';
 import type { EngineStatus } from '../engine/workerClient';
 import type { PrismRuntimeError } from './PrismSandboxFrame';
 
@@ -97,8 +106,19 @@ interface StudioGuidedWizardProps {
 
 const STARTER_SUGGESTIONS: readonly string[] = [
   'This Prism will be the video game "Minesweeper"',
-  'Build a Pomodoro focus timer with customizable work/break sessions',
-  'Check if a new expense fits my monthly budget, warn when over, and refuse zero amounts.',
+  'Create an emerald geometric sunburst picture',
+  'Create a calm ambient synth soundscape',
+  'Healthy Habits: protect 5pm to 6pm daily for exercise',
+];
+
+const MEDIA_PILL_ORDER: readonly PrismMediaType[] = [
+  'interactive-game',
+  'picture',
+  'audio',
+  'written-work',
+  'video',
+  'research-program',
+  'tool-organ',
 ];
 
 function isAbortError(err: unknown): boolean {
@@ -123,11 +143,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
   hasLocalModelReady,
   engineStatus,
   engineProgressPercent,
-  engineStatusDetail,
   loadedModelName,
-  onEnableModelStream,
-  runtimeError,
-  onClearRuntimeError,
   onOpenPreview,
   onCheckAndBuild,
   onPublish,
@@ -136,26 +152,28 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
 }) => {
   const [inputText, setInputText] = useState('');
   const [thinking, setThinking] = useState(false);
-  const [agentPhaseLabel, setAgentPhaseLabel] = useState('Reconciling your Prism model…');
+  const [agentPhaseLabel, setAgentPhaseLabel] = useState('Routing Prism weights…');
   const [agentQuickReplies, setAgentQuickReplies] = useState<readonly string[] | null>(null);
-  const [interactiveSessionActive, setInteractiveSessionActive] = useState(
-    () =>
-      Boolean(declaration.view?.authoredView) ||
-      messages.some((m) => m.needsLocalModel || classifyIdeaRealizationMode(m.content).mode === 'interactive-app'),
+  const [selectedMediaType, setSelectedMediaType] = useState<PrismMediaType | null>(
+    () => declaration.view?.proceduralOrgan?.mediaType ?? declaration.concept.mediaType ?? null,
   );
-  const [pendingAgentMessage, setPendingAgentMessage] = useState<string | null>(() => {
-    const last = messages[messages.length - 1];
-    if (last?.role === 'assistant' && last.needsLocalModel) {
-      const prevUser = [...messages].reverse().find((m) => m.role === 'user');
-      return prevUser?.content ?? null;
-    }
-    return null;
-  });
+  const [attachedWeights, setAttachedWeights] = useState<readonly MediaModelWeightBinding[]>(
+    () => declaration.view?.proceduralOrgan?.attachedWeights ?? [],
+  );
 
   const scrollEndRef = useRef<HTMLDivElement | null>(null);
+  const weightFileInputRef = useRef<HTMLInputElement | null>(null);
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
   const runTokenRef = useRef(0);
+
+  useEffect(() => {
+    const declMedia = declaration.view?.proceduralOrgan?.mediaType ?? declaration.concept.mediaType ?? null;
+    if (declMedia) setSelectedMediaType(declMedia);
+    if (declaration.view?.proceduralOrgan?.attachedWeights) {
+      setAttachedWeights(declaration.view.proceduralOrgan.attachedWeights);
+    }
+  }, [declaration.concept.mediaType, declaration.view?.proceduralOrgan]);
 
   const guided = useMemo(
     () => computeGuidedWizardState(declaration, routing, checkReport),
@@ -167,10 +185,9 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
     [declaration, routing, checkReport, activeStep],
   );
 
-  // Scroll smoothly on new messages or step changes (NOT on every streaming char update!)
   useEffect(() => {
     scrollEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, [messages.length, activeStep, thinking, pendingAgentMessage]);
+  }, [messages.length, activeStep, thinking]);
 
   const isModelLoading = engineStatus === 'downloading' || engineStatus === 'loading';
 
@@ -180,186 +197,48 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
     setThinking(false);
   }, [onCancelStudioAgent]);
 
-  const runInteractiveBuildPass = useCallback(
-    async (
-      runToken: number,
-      history: readonly AgentChatTurn[],
-      workingDecl: PrismDeclaration,
-      spec: ReturnType<typeof parseDiscoveryAgentResponse>['spec'] | null,
-      userMessage: string,
-    ): Promise<boolean> => {
-      if (!onRunStudioAgentPrompt) return false;
-      const appTitle = spec?.name || workingDecl.metadata.name || 'your Prism';
-      setAgentPhaseLabel(`Building interactive ${appTitle}…`);
-      const appPrompt = buildInteractiveAppPrompt(history, workingDecl);
-      const rawApp = await onRunStudioAgentPrompt(
-        appPrompt,
-        `Build the complete, playable interactive ${appTitle} application now.`,
-        3072,
-        (chars) => {
-          if (runTokenRef.current === runToken) {
-            setAgentPhaseLabel(`Building interactive ${appTitle}… (${chars.toLocaleString()} chars)`);
-          }
-        },
-      );
-      if (runTokenRef.current !== runToken) return false;
+  const handleAttachWeightFile = useCallback(
+    async (e: ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      e.target.value = '';
+      if (!file) return;
+      const activeMedia: PrismMediaType = selectedMediaType ?? 'picture';
+      const modality = compatibleModalitiesForMediaType(activeMedia)[0] ?? 'text';
+      const binding = createImportedWeightBinding({
+        fileName: file.name,
+        byteLength: file.size,
+        modality,
+      });
+      const nextBindings = [
+        ...attachedWeights.filter((b) => b.id !== binding.id),
+        binding,
+      ];
+      setAttachedWeights(nextBindings);
 
-      let extracted = extractAuthoredAppFromModelOutput(rawApp);
-
-      // Single automatic format/syntax-repair retry before ever mounting a broken preview
-      if (!extracted.ok) {
-        setAgentPhaseLabel(`Checking & repairing ${appTitle} code…`);
-        const retryRaw = await onRunStudioAgentPrompt(
-          appPrompt,
-          `Your previous draft could not be verified (${extracted.reason}). Fix that issue and output ONLY the three complete, valid fenced blocks: \`\`\`html, \`\`\`css, and \`\`\`js for ${appTitle}.`,
-          3072,
-          (chars) => {
-            if (runTokenRef.current === runToken) {
-              setAgentPhaseLabel(`Finishing ${appTitle}… (${chars.toLocaleString()} chars)`);
-            }
-          },
-        );
-        if (runTokenRef.current !== runToken) return false;
-        extracted = extractAuthoredAppFromModelOutput(retryRaw);
-      }
-
-      if (!extracted.ok) {
-        await onAppendMessage({
-          role: 'assistant',
-          content: `I drafted the Core Models for "${appTitle}", but the on-device model didn't produce clean runnable code (${extracted.reason}). Try saying "Build it again" or switching to a larger coding model in the top bar.`,
+      if (declaration.view?.proceduralOrgan) {
+        const primaryReq = declaration.requirements[0]?.id ?? 'REQ-01';
+        await onDispatchOp({
+          op: 'route-prism-weights',
+          mediaType: declaration.view.proceduralOrgan.mediaType,
+          activeOrgans: declaration.view.proceduralOrgan.activeOrgans,
+          weights: declaration.view.proceduralOrgan.weights,
+          attachedWeights: nextBindings,
+          compartmentId: declaration.concept.compartmentId,
+          citation: { kind: 'req', requirementId: primaryReq },
         });
-        setAgentQuickReplies(['Build it again', 'Keep it simpler and build now']);
-        return false;
       }
-
-      const assembled = assembleCompleteAuthoredPrismOps(workingDecl, spec, extracted.view, userMessage);
-      if (assembled.ops.length > 0) {
-        await onDispatchOp({ op: 'batch', ops: assembled.ops });
-      }
-      if (runTokenRef.current !== runToken) return false;
 
       await onAppendMessage({
         role: 'assistant',
-        content: `Your interactive ${appTitle} Prism is live in the Preview pane! All Core Models, safety boundaries, and applicable checks are reconciled. Play with it on the right, ask me to tweak anything in plain English, or click Prove & Seal when ready.`,
-        badges: assembled.badges,
+        content: `Attached local ${modality} model weights "${file.name}" (${(file.size / (1024 * 1024)).toFixed(1)} MB) to this ${PRISM_MEDIA_CATALOG[activeMedia].label} Prism.`,
+        badges: [`Routed ${modality} weights`],
       });
-      setAgentQuickReplies([
-        'Make it look sleeker in dark mode',
-        'Add difficulty or mode options',
-        'Add a reset & score tracker',
-      ]);
-      onSelectStep('ready-to-seal');
-      onOpenPreview();
-      return true;
     },
-    [onAppendMessage, onDispatchOp, onOpenPreview, onRunStudioAgentPrompt, onSelectStep],
-  );
-
-  const runInteractiveRefinement = useCallback(
-    async (instruction: string, errToFix?: PrismRuntimeError | null) => {
-      if (!onRunStudioAgentPrompt || !declaration.view?.authoredView) return;
-      const runToken = ++runTokenRef.current;
-      setThinking(true);
-      setAgentPhaseLabel(
-        errToFix
-          ? `Diagnosing & fixing "${errToFix.message.slice(0, 48)}"…`
-          : `Updating ${declaration.metadata.name}…`,
-      );
-      try {
-        const history: AgentChatTurn[] = [
-          ...messagesRef.current.map((m) => ({
-            role: m.role === 'user' ? ('user' as const) : ('studio' as const),
-            text: m.content,
-          })),
-          { role: 'user', text: instruction },
-        ];
-        const prompt = buildRefineInteractiveAppPrompt(
-          history,
-          declaration,
-          declaration.view.authoredView,
-          instruction,
-          errToFix ?? null,
-        );
-        const raw = await onRunStudioAgentPrompt(
-          prompt,
-          errToFix ? `Fix the runtime error: ${errToFix.message}` : instruction,
-          3072,
-          (chars) => {
-            if (runTokenRef.current === runToken) {
-              setAgentPhaseLabel(
-                errToFix
-                  ? `Applying fix to ${declaration.metadata.name}… (${chars.toLocaleString()} chars)`
-                  : `Updating ${declaration.metadata.name}… (${chars.toLocaleString()} chars)`,
-              );
-            }
-          },
-        );
-        if (runTokenRef.current !== runToken) return;
-
-        let extracted = extractAuthoredAppFromModelOutput(raw);
-        if (!extracted.ok) {
-          setAgentPhaseLabel(`Validating ${declaration.metadata.name} update…`);
-          const retryRaw = await onRunStudioAgentPrompt(
-            prompt,
-            `Your updated code had an issue (${extracted.reason}). Fix it and output ONLY the complete \`\`\`html, \`\`\`css, and \`\`\`js blocks.`,
-            3072,
-          );
-          if (runTokenRef.current !== runToken) return;
-          extracted = extractAuthoredAppFromModelOutput(retryRaw);
-        }
-
-        if (!extracted.ok) {
-          await onAppendMessage({
-            role: 'assistant',
-            content: `I couldn't apply that update cleanly (${extracted.reason}). Could you rephrase what you'd like changed?`,
-          });
-          return;
-        }
-        const assembled = assembleCompleteAuthoredPrismOps(declaration, null, extracted.view, instruction);
-        if (assembled.ops.length > 0) {
-          await onDispatchOp({ op: 'batch', ops: assembled.ops });
-        }
-        if (errToFix) {
-          onClearRuntimeError();
-        }
-        await onAppendMessage({
-          role: 'assistant',
-          content: errToFix
-            ? `Fixed the runtime error and refreshed "${declaration.metadata.name}" in Preview.`
-            : `Updated "${declaration.metadata.name}" and reconciled all checks. Take a look in the Preview pane!`,
-          badges: errToFix ? ['Fixed runtime error', 'Preview refreshed'] : assembled.badges,
-        });
-        onOpenPreview();
-      } catch (err) {
-        if (isAbortError(err) || runTokenRef.current !== runToken) {
-          await onAppendMessage({
-            role: 'assistant',
-            content: 'Stopped updating your Prism. Tell me whenever you want to try again.',
-          });
-          return;
-        }
-        await onAppendMessage({
-          role: 'assistant',
-          content: `Update interrupted: ${err instanceof Error ? err.message : String(err)}`,
-        });
-      } finally {
-        if (runTokenRef.current === runToken) {
-          setThinking(false);
-        }
-      }
-    },
-    [
-      declaration,
-      onAppendMessage,
-      onClearRuntimeError,
-      onDispatchOp,
-      onOpenPreview,
-      onRunStudioAgentPrompt,
-    ],
+    [attachedWeights, declaration, onAppendMessage, onDispatchOp, selectedMediaType],
   );
 
   const submitNaturalMessage = useCallback(
-    async (rawMessage: string, opts?: { readonly skipUserBubble?: boolean }) => {
+    async (rawMessage: string) => {
       const message = rawMessage.trim();
       if (!message || thinking) return;
 
@@ -368,109 +247,121 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
           role: m.role === 'user' ? ('user' as const) : ('studio' as const),
           text: m.content,
         })),
-        ...(opts?.skipUserBubble ? [] : [{ role: 'user' as const, text: message }]),
+        { role: 'user', text: message },
       ];
 
-      if (!opts?.skipUserBubble) {
-        setInputText('');
-        await onAppendMessage({ role: 'user', content: message });
-      }
+      setInputText('');
+      await onAppendMessage({ role: 'user', content: message });
 
-      const modeCheck = classifyIdeaRealizationMode(message);
-      const isInteractiveFlow =
-        interactiveSessionActive ||
-        Boolean(declaration.view?.authoredView) ||
-        ((routing.isUndefined || activeStep === 'anchor-idea') && modeCheck.mode === 'interactive-app');
+      const classified = classifyArtifactMediaType(message);
+      const isProceduralFlow =
+        selectedMediaType !== null ||
+        Boolean(declaration.view?.proceduralOrgan) ||
+        classified.mode === 'procedural-organ';
 
-      // Interactive Prism creation / refinement — powered by the 100% local Verdant Studio Agent
-      if (isInteractiveFlow) {
-        setInteractiveSessionActive(true);
+      if (isProceduralFlow) {
+        const activeMediaType: PrismMediaType =
+          selectedMediaType ??
+          declaration.view?.proceduralOrgan?.mediaType ??
+          declaration.concept.mediaType ??
+          classified.mediaType;
+        setSelectedMediaType(activeMediaType);
 
-        if (!hasLocalModelReady || !onRunStudioAgentPrompt) {
-          const title =
-            declaration.metadata.name && declaration.metadata.name !== 'Untitled Prism'
-              ? declaration.metadata.name
-              : extractCleanIdeaTitle(message);
-          setPendingAgentMessage(message);
+        const runToken = ++runTokenRef.current;
+        const userTurns = nextHistory.filter((t) => t.role === 'user').length;
+        const isRefining = Boolean(declaration.view?.proceduralOrgan);
+
+        let rawModelJson = '';
+        if (hasLocalModelReady && onRunStudioAgentPrompt) {
+          setThinking(true);
+          setAgentPhaseLabel(
+            isRefining
+              ? `Routing updated ${PRISM_MEDIA_CATALOG[activeMediaType].label} weights…`
+              : `Routing ${PRISM_MEDIA_CATALOG[activeMediaType].label} features…`,
+          );
+          try {
+            const prompt = isRefining
+              ? buildWeightRefinementPrompt(nextHistory, declaration, message)
+              : buildWeightRoutingDiscoveryPrompt(nextHistory, declaration, userTurns, activeMediaType);
+            rawModelJson = await onRunStudioAgentPrompt(prompt, message, 768, (chars) => {
+              if (runTokenRef.current === runToken) {
+                setAgentPhaseLabel(`Routing Prism weights… (${chars.toLocaleString()} chars)`);
+              }
+            });
+          } catch (err) {
+            if (isAbortError(err) || runTokenRef.current !== runToken) {
+              setThinking(false);
+              await onAppendMessage({
+                role: 'assistant',
+                content: 'Stopped routing. Send another message whenever you are ready.',
+              });
+              return;
+            }
+            // Fall through cleanly to deterministic weight routing if local inference errored
+            rawModelJson = '';
+          } finally {
+            if (runTokenRef.current === runToken) {
+              setThinking(false);
+            }
+          }
+          if (runTokenRef.current !== runToken) return;
+        }
+
+        const { spec } = parseDiscoveryAgentResponse(
+          rawModelJson,
+          message,
+          declaration,
+          userTurns,
+          activeMediaType,
+        );
+
+        if (spec.readyToBuild || isRefining) {
+          const assembled = assembleProceduralPrismOps(declaration, spec, message);
+          const finalOps =
+            attachedWeights.length > 0
+              ? assembled.ops.map((op) =>
+                  op.op === 'route-prism-weights' ? { ...op, attachedWeights } : op,
+                )
+              : assembled.ops;
+          if (finalOps.length > 0) {
+            await onDispatchOp({ op: 'batch', ops: finalOps });
+          }
           await onAppendMessage({
             role: 'assistant',
-            content: `I'd love to build a real, playable "${title}" Prism with you from scratch — no hardcoded templates. Turn on the on-device Studio Agent below (runs 100% locally in your browser) and I'll pick up right here automatically.`,
-            needsLocalModel: true,
+            content: isRefining
+              ? `Updated your ${PRISM_MEDIA_CATALOG[spec.mediaType].label} Prism "${spec.name}" and refreshed Preview.`
+              : `Your ${PRISM_MEDIA_CATALOG[spec.mediaType].label} Prism "${spec.name}" is synthesized and live in Preview! Ask me in plain English to adjust any settings, rules, or style.`,
+            badges: assembled.badges,
           });
-          return;
-        }
-
-        // Case A: Already built an interactive authored app -> refine it directly!
-        if (declaration.view?.authoredView) {
-          await runInteractiveRefinement(message, null);
-          return;
-        }
-
-        // Case B: Discovery & Build flow with the Verdant Studio Agent
-        const runToken = ++runTokenRef.current;
-        setThinking(true);
-        setAgentPhaseLabel('Understanding your idea & designing Core Models…');
-        try {
-          const userTurns = nextHistory.filter((t) => t.role === 'user').length;
-          const discoveryPrompt = buildDiscoveryAgentPrompt(nextHistory, declaration, userTurns);
-          const rawDiscovery = await onRunStudioAgentPrompt(
-            discoveryPrompt,
-            message,
-            1024,
-            (chars) => {
-              if (runTokenRef.current === runToken) {
-                setAgentPhaseLabel(`Drafting Core Models… (${chars.toLocaleString()} chars)`);
-              }
-            },
-          );
-          if (runTokenRef.current !== runToken) return;
-
-          const { spec } = parseDiscoveryAgentResponse(rawDiscovery, message, declaration, userTurns);
-
-          // Apply Core Model anchor ops right away so the live Blueprint populates immediately
+          setAgentQuickReplies(spec.quickReplies);
+          onSelectStep('ready-to-seal');
+          onOpenPreview();
+        } else {
+          // Anchor Core Models right away so the live Blueprint updates immediately while asking 1–2 quick questions
           const coreOps = buildAgentCoreModelOps(declaration, spec, message);
-          let workingDecl = declaration;
           if (coreOps.length > 0) {
+            let working = declaration;
             for (const op of coreOps) {
-              const r = dispatchStudioOp(workingDecl, op);
-              if (r.ok) workingDecl = r.declaration;
+              const r = dispatchStudioOp(working, op);
+              if (r.ok) working = r.declaration;
             }
             await onDispatchOp({ op: 'batch', ops: coreOps });
           }
-          if (runTokenRef.current !== runToken) return;
-
-          if (spec.readyToBuild) {
-            await runInteractiveBuildPass(runToken, nextHistory, workingDecl, spec, message);
-          } else {
-            await onAppendMessage({
-              role: 'assistant',
-              content: spec.reply,
-              badges: [`Concept: ${spec.name}`, `${spec.inputs.length} core model input(s)`],
-            });
-            setAgentQuickReplies(spec.quickReplies);
-            onSelectStep('confirm-context');
-          }
-        } catch (err) {
-          if (isAbortError(err) || runTokenRef.current !== runToken) {
-            await onAppendMessage({
-              role: 'assistant',
-              content: 'Stopped generating. Send another message whenever you are ready to continue.',
-            });
-            return;
-          }
           await onAppendMessage({
             role: 'assistant',
-            content: `Studio Agent ran into an issue: ${err instanceof Error ? err.message : String(err)}. Try sending your message again.`,
+            content: spec.reply,
+            badges: [
+              PRISM_MEDIA_CATALOG[spec.mediaType].label,
+              `${spec.activeOrgans.length} active feature(s)`,
+            ],
           });
-        } finally {
-          if (runTokenRef.current === runToken) {
-            setThinking(false);
-          }
+          setAgentQuickReplies(spec.quickReplies);
+          onSelectStep('confirm-context');
         }
         return;
       }
 
-      // Structured numeric rule / policy / calculator flow (works instantaneously offline + local-model enhanced)
+      // Structured numeric policy / calculator flow
       let preParsedIntent: ExtractedPrismIntent | undefined;
       if (
         (routing.isUndefined || activeStep === 'anchor-idea') &&
@@ -479,16 +370,14 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
       ) {
         const runToken = ++runTokenRef.current;
         setThinking(true);
-        setAgentPhaseLabel('Extracting your Prism structure…');
+        setAgentPhaseLabel('Extracting your Prism rules…');
         try {
           const deterministic = parseIdeaSentence(message);
           preParsedIntent = await onSynthesizeWithLocalModel(message, deterministic);
         } catch {
           preParsedIntent = parseIdeaSentence(message);
         } finally {
-          if (runTokenRef.current === runToken) {
-            setThinking(false);
-          }
+          if (runTokenRef.current === runToken) setThinking(false);
         }
       }
 
@@ -496,7 +385,6 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
       if (result.ops.length > 0) {
         await onDispatchOp({ op: 'batch', ops: result.ops });
       }
-
       await onAppendMessage({
         role: 'assistant',
         content: result.assistantReply,
@@ -504,15 +392,13 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
       });
       setAgentQuickReplies(null);
       onSelectStep(result.nextStep);
-      if (result.openPreview) {
-        onOpenPreview();
-      }
+      if (result.openPreview) onOpenPreview();
     },
     [
       activeStep,
+      attachedWeights,
       declaration,
       hasLocalModelReady,
-      interactiveSessionActive,
       onAppendMessage,
       onDispatchOp,
       onOpenPreview,
@@ -520,19 +406,10 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
       onSelectStep,
       onSynthesizeWithLocalModel,
       routing.isUndefined,
-      runInteractiveBuildPass,
-      runInteractiveRefinement,
+      selectedMediaType,
       thinking,
     ],
   );
-
-  // Auto-resume queued open-ended request the instant the local on-device model finishes loading!
-  useEffect(() => {
-    if (!hasLocalModelReady || !pendingAgentMessage || thinking) return;
-    const queued = pendingAgentMessage;
-    setPendingAgentMessage(null);
-    void submitNaturalMessage(queued, { skipUserBubble: true });
-  }, [hasLocalModelReady, pendingAgentMessage, submitNaturalMessage, thinking]);
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
@@ -545,10 +422,8 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
     return currentPrompt.quickReplies;
   }, [activeStep, agentQuickReplies, currentPrompt.quickReplies, routing.isUndefined]);
 
-  const showDefaultPromptCard =
-    messages.length === 0 ||
-    (!interactiveSessionActive && !pendingAgentMessage) ||
-    routing.readyToSeal;
+  const activeMediaForUi =
+    selectedMediaType ?? declaration.view?.proceduralOrgan?.mediaType ?? declaration.concept.mediaType ?? null;
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col bg-white dark:bg-[#0E131B]">
@@ -586,19 +461,64 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
           }`}
           title={
             hasLocalModelReady
-              ? `Studio Agent ready (${loadedModelName ?? 'local model'})`
-              : 'Turn on the local model to generate custom interactive Prisms from scratch'
+              ? `Local assistant active (${loadedModelName ?? 'on-device model'})`
+              : 'Instant procedural studio ready (turn on a local model for richer weight routing)'
           }
         >
           <Cpu className="h-2.5 w-2.5" />
           <span>
             {hasLocalModelReady
-              ? 'Agent Ready'
+              ? 'Local AI Ready'
               : isModelLoading
                 ? `Loading ${Math.round(engineProgressPercent)}%`
-                : 'Agent Off'}
+                : 'Instant Studio'}
           </span>
         </span>
+      </div>
+
+      {/* Sparse Artifact Type Selector Rail */}
+      <div className="flex shrink-0 flex-wrap items-center justify-between gap-1.5 border-b border-zinc-100 bg-zinc-50/70 px-3 py-1.5 dark:border-zinc-800/80 dark:bg-[#0B0F14]">
+        <div className="flex flex-wrap items-center gap-1">
+          {MEDIA_PILL_ORDER.map((mt) => {
+            const selected = activeMediaForUi === mt;
+            return (
+              <button
+                key={mt}
+                type="button"
+                onClick={() => setSelectedMediaType(selected ? null : mt)}
+                className={`rounded-full px-2 py-0.5 text-[10px] font-medium transition-colors ${
+                  selected
+                    ? 'bg-emerald-700 text-white'
+                    : 'border border-zinc-200 bg-white text-zinc-600 hover:border-emerald-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300'
+                }`}
+              >
+                {PRISM_MEDIA_CATALOG[mt].label}
+              </button>
+            );
+          })}
+        </div>
+        <div className="flex items-center gap-1">
+          <input
+            ref={weightFileInputRef}
+            type="file"
+            accept=".gguf,.safetensors,.bin"
+            className="hidden"
+            onChange={(e) => void handleAttachWeightFile(e)}
+          />
+          <button
+            type="button"
+            onClick={() => weightFileInputRef.current?.click()}
+            className="inline-flex items-center gap-1 rounded-md border border-zinc-200 bg-white px-2 py-0.5 text-[10px] font-medium text-zinc-700 hover:border-emerald-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
+            title="Import local audio, image, video, or text model weights to enhance this Prism"
+          >
+            <Upload className="h-2.5 w-2.5" />
+            <span>
+              {attachedWeights.length > 0
+                ? `${attachedWeights.length} Model Weight${attachedWeights.length === 1 ? '' : 's'}`
+                : 'Attach Weights'}
+            </span>
+          </button>
+        </div>
       </div>
 
       {/* Persistent Unified Conversational Transcript */}
@@ -629,65 +549,11 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
                   ))}
                 </div>
               )}
-              {entry.needsLocalModel && !hasLocalModelReady && (
-                <div className="mt-2.5 space-y-2 rounded-xl border border-emerald-200 bg-white p-2.5 dark:border-emerald-900/60 dark:bg-[#0B0F14]">
-                  {isModelLoading ? (
-                    <div className="space-y-1.5">
-                      <div className="flex items-center justify-between text-[11px] font-medium text-emerald-800 dark:text-emerald-300">
-                        <span className="inline-flex items-center gap-1.5">
-                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          Loading on-device Studio Agent…
-                        </span>
-                        <span>{Math.round(engineProgressPercent)}%</span>
-                      </div>
-                      <div className="h-1.5 w-full overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800">
-                        <div
-                          className="h-full rounded-full bg-emerald-600 transition-all"
-                          style={{ width: `${Math.max(4, Math.min(100, engineProgressPercent))}%` }}
-                        />
-                      </div>
-                      {engineStatusDetail && (
-                        <p className="truncate text-[10px] text-zinc-500">{engineStatusDetail}</p>
-                      )}
-                    </div>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={onEnableModelStream}
-                      className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-emerald-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-800"
-                    >
-                      <Cpu className="h-3.5 w-3.5" />
-                      Turn On Local Studio Agent &amp; Continue
-                    </button>
-                  )}
-                </div>
-              )}
             </div>
           </div>
         ))}
 
-        {/* Live Runtime Error Self-Healing Card */}
-        {runtimeError && declaration.view?.authoredView && hasLocalModelReady && !thinking && (
-          <div className="rounded-xl border border-amber-200 bg-amber-50/80 p-3 text-xs text-amber-950 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
-            <p className="font-medium">Preview spotted an error: {runtimeError.message}</p>
-            <button
-              type="button"
-              onClick={() =>
-                void runInteractiveRefinement(
-                  `Fix runtime error: ${runtimeError.message}`,
-                  runtimeError,
-                )
-              }
-              className="mt-2 inline-flex items-center gap-1.5 rounded-lg bg-amber-700 px-3 py-1 text-[11px] font-medium text-white hover:bg-amber-800"
-            >
-              <Wrench className="h-3 w-3" />
-              Ask Studio Agent to Fix
-            </button>
-          </div>
-        )}
-
-        {/* Current Active Studio Prompt / Seal Card */}
-        {showDefaultPromptCard && (
+        {(messages.length === 0 || routing.readyToSeal) && (
           <div className="flex flex-col items-start">
             <div className="max-w-[96%] space-y-2.5 rounded-2xl border border-emerald-200/90 bg-emerald-50/45 px-3.5 py-3 text-zinc-800 dark:border-emerald-900/60 dark:bg-emerald-950/20 dark:text-zinc-200">
               <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-700 dark:text-emerald-400">
@@ -696,11 +562,10 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
               </div>
               <p className="leading-relaxed">
                 {messages.length === 0
-                  ? 'What should your Prism be? Describe any app, game, or tool in plain English — like "This Prism will be the video game Minesweeper" — and we will design and build it together.'
+                  ? 'What would you like to create? Pick an artifact type above or describe a game, picture, audio track, novel, video, research program, or personal tool in plain English.'
                   : currentPrompt.promptText}
               </p>
 
-              {/* Primary Prove & Publish CTA when completely reconciled */}
               {routing.readyToSeal && (
                 <div className="flex flex-wrap gap-2 pt-1">
                   <button
@@ -714,7 +579,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
                     ) : (
                       <ShieldCheck className="h-3.5 w-3.5" />
                     )}
-                    Prove &amp; Seal (.holo)
+                    Verify &amp; Seal
                   </button>
                   <button
                     type="button"
@@ -754,7 +619,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
 
       {/* Natural-Language Quick Replies + Persistent Chat Input */}
       <div className="shrink-0 space-y-2 border-t border-zinc-200 bg-zinc-50/70 p-3 dark:border-zinc-800 dark:bg-[#0B0F14]">
-        {quickReplyList.length > 0 && !pendingAgentMessage && (
+        {quickReplyList.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
             {quickReplyList.map((reply) => (
               <button
@@ -782,8 +647,8 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
               }
             }}
             placeholder={
-              declaration.view?.authoredView
-                ? 'Ask to add features, change rules, or restyle your Prism…'
+              declaration.view?.proceduralOrgan
+                ? 'Ask to change difficulty, board size, style, schedule window, or rules…'
                 : currentPrompt.placeholder
             }
             className="min-w-0 flex-1 resize-none rounded-xl border border-zinc-300 bg-white px-3 py-2 text-xs leading-relaxed text-zinc-900 placeholder:text-zinc-400 focus:border-emerald-600 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
@@ -799,7 +664,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
         </form>
 
         <div className="flex items-center justify-between text-[10px] text-zinc-500">
-          <span>Describe any idea or change in plain English</span>
+          <span>Describe any idea or tweak in plain English</span>
           <button
             type="button"
             onClick={onSwitchToAdvanced}

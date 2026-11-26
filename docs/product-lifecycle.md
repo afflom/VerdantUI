@@ -2,8 +2,8 @@
 
 > Generated mechanically by `npm run studio:publish` from `model/features.json` and `model/release-ledger.json`.
 
-- **Active Features:** 6
-- **Proposed / Planned Features:** 2
+- **Active Features:** 7
+- **Proposed / Planned Features:** 1
 - **Recorded Releases:** 2
 
 ## Feature Register
@@ -16,7 +16,7 @@
 | `VUI-FEAT-004` | **active** | `v0.1.0` | `VUI-STUDIO-03` | Browser-Native Verified Prism Compiler & Sandbox Runtime |
 | `VUI-FEAT-005` | **active** | `v0.2.0` | `VUI-LIFECYCLE-01` | Verdant Studio Product & Feature Lifecycle Governance & Automated Releases |
 | `VUI-FEAT-006` | **active** | `v0.2.0` | `VUI-PUBLIC-BENEFIT-01` | Free Public Benefit Service & Zero-Jargon Permanent Ratchets |
-| `VUI-FEAT-007` | **proposed** | `v0.3.0` | `VUI-STUDIO-02` | Procedural MediaType Prism Synthesis & Sparse Studio Sub-Model Activation |
+| `VUI-FEAT-007` | **active** | `v0.3.0` | `VUI-STUDIO-02` | Procedural MediaType Prism Synthesis, Sparse Studio Activation & Multi-Modal Weight Routing |
 | `VUI-FEAT-008` | **proposed** | `v0.4.0` | `VUI-OBSERVER-01` | Unified Possession Model, Non-Leaking Cross-Context Boundary & Active Published Prism Organs |
 
 ## Release Ledger

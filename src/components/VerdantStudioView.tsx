@@ -876,16 +876,20 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                   Interface
                 </p>
                 <p className="mt-1 text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-                  {declaration?.view?.authoredView
-                    ? 'Interactive App (Authored)'
-                    : declaration
-                      ? `prism.design/1 (${declaration.theme.preset})`
-                      : 'HOLOVIEW'}
+                  {declaration?.view?.proceduralOrgan
+                    ? `Procedural ${declaration.view.proceduralOrgan.mediaType}`
+                    : declaration?.view?.authoredView
+                      ? 'Interactive App (Legacy)'
+                      : declaration
+                        ? `prism.design/1 (${declaration.theme.preset})`
+                        : 'HOLOVIEW'}
                 </p>
                 <p className="mt-0.5 text-[11px] text-zinc-500">
-                  {declaration?.view?.authoredView
-                    ? 'Custom interactive view · core invariants proved'
-                    : 'Compiled view · zero rules in page JS'}
+                  {declaration?.view?.proceduralOrgan
+                    ? `${declaration.view.proceduralOrgan.activeOrgans.length} active feature(s) · routed weights · zero generated JS`
+                    : declaration?.view?.authoredView
+                      ? 'Legacy view · core invariants proved'
+                      : 'Compiled view · zero rules in page JS'}
                 </p>
               </div>
             </div>

@@ -29,6 +29,7 @@ import {
 } from 'lucide-react';
 import type { PrismDeclaration, StudioWizardStage } from '../engine/verdantStudioApi';
 import type { StageProgressStatus, VerdantRoutingReport } from '../engine/verdantStandardsRouter';
+import { PRISM_MEDIA_CATALOG } from '../engine/prismMediaOrgans';
 
 interface ModelBlueprintCanvasProps {
   declaration: PrismDeclaration;
@@ -321,11 +322,13 @@ export const ModelBlueprintCanvas: FC<ModelBlueprintCanvasProps> = ({
                     Compiled Interface
                   </p>
                   <p className="mt-0.5 text-[11px] text-zinc-600 dark:text-zinc-300">
-                    {declaration.view?.authoredView
-                      ? `Interactive App · bound to ${declaration.view.elements.length} model signal(s)`
-                      : declaration.view
-                        ? `${declaration.view.viewpoint} · ${declaration.view.elements.length} bound element(s)`
-                        : 'Not synthesized yet (Design)'}
+                    {declaration.view?.proceduralOrgan
+                      ? `${PRISM_MEDIA_CATALOG[declaration.view.proceduralOrgan.mediaType].label} · ${declaration.view.proceduralOrgan.activeOrgans.length} active studio feature(s) · Space: ${declaration.concept.compartmentId ?? 'personal'}`
+                      : declaration.view?.authoredView
+                        ? `Interactive App · bound to ${declaration.view.elements.length} model signal(s)`
+                        : declaration.view
+                          ? `${declaration.view.viewpoint} · ${declaration.view.elements.length} bound element(s)`
+                          : 'Not synthesized yet (Design)'}
                   </p>
                 </div>
               </div>

@@ -16,6 +16,15 @@
  */
 
 import type { JsonSchema2020Object, PrismGrants } from './prismStudio';
+import {
+  deriveActiveStudioOrgans,
+  PRISM_MEDIA_CATALOG,
+  type MediaModelWeightBinding,
+  type PrismMediaType,
+  type ProceduralOrganSpec,
+  type ProceduralOrganWeights,
+  type StudioFeatureOrgan,
+} from './prismMediaOrgans';
 
 export const DECLARATION_SCHEMA = 'verdant-studio/declaration/2' as const;
 export const LEGACY_DECLARATION_SCHEMA_V1 = 'verdant-studio/declaration/1' as const;
@@ -69,6 +78,12 @@ export interface StudioConceptModel {
   readonly jurisdictions: readonly PrismJurisdiction[];
   readonly usesLocalAi: boolean;
   readonly involvesPayments: boolean;
+  /** First-class Verdant Studio artifact MediaType driving sparse sub-model activation (DEC-009). */
+  readonly mediaType?: PrismMediaType | null;
+  /** Sparse subset of Studio sub-model organs activated for this Prism. */
+  readonly activeOrgans?: readonly StudioFeatureOrgan[];
+  /** Owner context compartment (e.g. personal, work, health, research) for zero-leak isolation (DEC-010). */
+  readonly compartmentId?: string;
   readonly stakeholders: readonly StakeholderDecl[];
   readonly opmObjects: readonly OpmObjectDecl[];
   readonly opmProcesses: readonly OpmProcessDecl[];
@@ -302,7 +317,9 @@ export interface StudioViewDecl {
   readonly submitLabel: string;
   readonly disclosure?: string;
   readonly elements: readonly ViewElementDecl[];
-  /** Custom interactive app realization (`prism.app-view/1`) packed into HOLOVIEW when present. */
+  /** Procedural MediaType organ specification driven purely by validated JSON weights (DEC-009, zero LLM JS). */
+  readonly proceduralOrgan?: ProceduralOrganSpec | null;
+  /** Legacy read-only custom interactive app realization (`prism.app-view/1`). */
   readonly authoredView?: AuthoredPrismView | null;
   readonly citation: StudioCitation;
 }
@@ -503,6 +520,20 @@ export type StudioApiOp =
   | {
       readonly op: 'declare-view';
       readonly view: StudioViewDecl;
+    }
+  | {
+      readonly op: 'route-prism-weights';
+      readonly mediaType: PrismMediaType;
+      readonly activeOrgans?: readonly StudioFeatureOrgan[];
+      readonly weights: ProceduralOrganWeights;
+      readonly attachedWeights?: readonly MediaModelWeightBinding[];
+      readonly compartmentId?: string;
+      readonly title?: string;
+      readonly eyebrow?: string;
+      readonly subtitle?: string;
+      readonly disclosure?: string;
+      readonly summary?: string;
+      readonly citation: StudioCitation;
     }
   | {
       readonly op: 'admit-authored-view';
@@ -2259,11 +2290,13 @@ export function dispatchStudioOp(decl: PrismDeclaration, op: StudioApiOp): Studi
       }
       const primaryReq = current.requirements[0].id;
       const existingAuthored = current.view?.authoredView ?? null;
-      const keepAuthored =
-        existingAuthored !== null && (op.viewpoint === undefined || op.viewpoint === 'interactive-app');
+      const existingProcedural = current.view?.proceduralOrgan ?? null;
+      const keepInteractive =
+        (existingProcedural !== null || existingAuthored !== null) &&
+        (op.viewpoint === undefined || op.viewpoint === 'interactive-app');
       const formulaCount = current.features.filter((f) => f.outcome.kind === 'formula').length;
       const hasStateful = current.concept.opmObjects.some((o) => o.role === 'stateful-asset');
-      const viewpoint: PrismViewpoint = keepAuthored
+      const viewpoint: PrismViewpoint = keepInteractive
         ? 'interactive-app'
         : (op.viewpoint ??
           (hasStateful
@@ -2319,7 +2352,8 @@ export function dispatchStudioOp(decl: PrismDeclaration, op: StudioApiOp): Studi
           submitLabel: primaryProc ? primaryProc.slice(0, 28) : 'Evaluate',
           disclosure: current.view?.disclosure,
           elements,
-          authoredView: keepAuthored ? existingAuthored : null,
+          proceduralOrgan: keepInteractive ? existingProcedural : null,
+          authoredView: keepInteractive && !existingProcedural ? existingAuthored : null,
           citation: { kind: 'req', requirementId: primaryReq },
         },
       });
@@ -2770,11 +2804,11 @@ export function dispatchStudioOp(decl: PrismDeclaration, op: StudioApiOp): Studi
           };
         }
       }
-      // Enforce viewpoint <-> authoredView cohesion: structured form viewpoints cannot carry stale authoredView
+      // Enforce viewpoint <-> proceduralOrgan/authoredView cohesion: structured form viewpoints cannot carry stale interactive organ
       const normalizedView: StudioViewDecl =
         op.view.viewpoint === 'interactive-app'
           ? op.view
-          : { ...op.view, authoredView: null };
+          : { ...op.view, proceduralOrgan: null, authoredView: null };
       const next: PrismDeclaration = {
         ...decl,
         view: normalizedView,
@@ -2786,6 +2820,94 @@ export function dispatchStudioOp(decl: PrismDeclaration, op: StudioApiOp): Studi
         ),
       };
       return { ok: true, declaration: next, message: `Declared view "${normalizedView.title}" (${normalizedView.viewpoint}).` };
+    }
+
+    case 'route-prism-weights': {
+      const admittedSet = new Set(decl.admissions.map((a) => a.construct));
+      const citCheck = citationResolves(decl, admittedSet, op.citation);
+      if (!citCheck.ok) {
+        return {
+          ok: false,
+          code: 'admission.unresolved',
+          message: `Procedural weight routing refused: ${citCheck.detail}`,
+          remediation: 'Cite an admitted Requirement or staged Authority.',
+        };
+      }
+      if (op.weights.mediaType !== op.mediaType) {
+        return {
+          ok: false,
+          code: 'organ.mediatype-mismatch',
+          message: `Routed weights mediaType "${op.weights.mediaType}" does not match declared mediaType "${op.mediaType}".`,
+          remediation: 'Route weights matching the active Prism MediaType.',
+        };
+      }
+      const primaryReq =
+        op.citation.kind === 'req'
+          ? op.citation.requirementId
+          : (decl.requirements[0]?.id ?? 'REQ-01');
+      const activeOrgans =
+        op.activeOrgans && op.activeOrgans.length > 0
+          ? [...op.activeOrgans]
+          : [...deriveActiveStudioOrgans(op.mediaType)];
+      const elements: ViewElementDecl[] = (decl.encoding?.fields ?? []).map((f) => ({
+        id: `el_${f.name}`,
+        slot: f.kind === 'choice' ? 'choice-group' : 'field-input',
+        label: f.label,
+        binding: f.name,
+        requirementId: primaryReq,
+      }));
+      elements.push({
+        id: 'el_result',
+        slot: 'result-card',
+        label: decl.concept.opmObjects.find((o) => o.role === 'output')?.name || PRISM_MEDIA_CATALOG[op.mediaType].label,
+        binding: 'outcome',
+        requirementId: primaryReq,
+      });
+
+      const compartmentId = op.compartmentId?.trim() || decl.concept.compartmentId || 'personal';
+      const viewDecl: StudioViewDecl = {
+        viewpoint: 'interactive-app',
+        title: op.title?.trim() || decl.view?.title || decl.metadata.name,
+        eyebrow: op.eyebrow?.trim() || PRISM_MEDIA_CATALOG[op.mediaType].label,
+        subtitle:
+          op.subtitle?.trim() ||
+          decl.view?.subtitle ||
+          decl.concept.purpose ||
+          decl.metadata.description,
+        submitLabel: decl.view?.submitLabel || 'Run',
+        disclosure: op.disclosure !== undefined ? op.disclosure : decl.view?.disclosure,
+        elements,
+        proceduralOrgan: {
+          mediaType: op.mediaType,
+          activeOrgans,
+          weights: op.weights,
+          attachedWeights: op.attachedWeights ?? decl.view?.proceduralOrgan?.attachedWeights,
+          summary: op.summary,
+        },
+        authoredView: null,
+        citation: op.citation,
+      };
+      const next: PrismDeclaration = {
+        ...decl,
+        concept: {
+          ...decl.concept,
+          mediaType: op.mediaType,
+          activeOrgans,
+          compartmentId,
+        },
+        view: viewDecl,
+        admissions: upsertAdmission(decl.admissions, `View.procedural.${op.mediaType}`, op.citation),
+        auditLog: appendAudit(
+          decl,
+          op.op,
+          `Routed ${op.mediaType} weights onto ${activeOrgans.length} active Studio organ(s) in "${compartmentId}" space`,
+        ),
+      };
+      return {
+        ok: true,
+        declaration: next,
+        message: `Routed ${PRISM_MEDIA_CATALOG[op.mediaType].label} weights cleanly (0 LLM JS).`,
+      };
     }
 
     case 'admit-authored-view': {

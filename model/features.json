@@ -69,14 +69,14 @@
     },
     {
       "id": "VUI-FEAT-007",
-      "title": "Procedural MediaType Prism Synthesis & Sparse Studio Sub-Model Activation",
-      "stage": "proposed",
+      "title": "Procedural MediaType Prism Synthesis, Sparse Studio Activation & Multi-Modal Weight Routing",
+      "stage": "active",
       "introducedIn": "0.3.0",
-      "ownerFile": "src/engine/prismStudioAgent.ts",
-      "testFile": "src/engine/prismStudioAgent.test.ts",
+      "ownerFile": "src/engine/prismMediaOrgans.ts",
+      "testFile": "src/engine/prismMediaOrgans.test.ts",
       "invariantId": "VUI-STUDIO-02",
       "citation": { "kind": "req", "decisionId": "DEC-009" },
-      "publicBenefitImpact": "Routes weights onto audited procedural media organs (Picture, Written Work, Video, Game, Research, Tool) with zero LLM-written JavaScript."
+      "publicBenefitImpact": "Routes declarative weights and imported local audio/image/video/text models onto audited procedural media organs with zero LLM-written JavaScript."
     },
     {
       "id": "VUI-FEAT-008",

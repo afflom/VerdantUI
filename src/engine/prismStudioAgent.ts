@@ -1,22 +1,18 @@
 /**
- * Verdant Studio Agent Orchestrator (`src/engine/prismStudioAgent.ts`)
+ * Verdant Studio Procedural Weight-Routing Agent (`src/engine/prismStudioAgent.ts`)
  *
- * Pairs the Creator with VerdantUI's 100% client-side on-device model to design,
- * reconcile, build, and refine ANY Prism from plain-English conversation — without
- * hardcoded templates or fake placeholder forms:
- *
- * 1. Realization Routing (`classifyIdeaRealizationMode`): distinguishes open-ended
- *    interactive apps/games (e.g. Minesweeper, Snake, Kanban, Pomodoro, 2048, Flashcards)
- *    from structured numeric rule/policy forms.
- * 2. Conversational Discovery (`buildDiscoveryAgentPrompt` + `parseDiscoveryAgentResponse`):
- *    anchors the Concept & Core Models via closed `StudioApiOp` calls while asking 1–2
- *    tailored, domain-specific clarifying questions.
- * 3. Full Prism Synthesis (`buildInteractiveAppPrompt` + `extractAuthoredAppFromModelOutput`):
- *    generates a complete, self-contained, playable/usable interactive app (`html`, `css`, `js`)
- *    admitted via `admit-authored-view` and packaged into real binary `prism/holo/6`
- *    `HOLOVIEW` alongside its Lean-proved core invariants (`App.lex.tex`).
- * 4. Iterative Refinement & Self-Healing (`buildRefineInteractiveAppPrompt`):
- *    applies natural-language edits and fixes runtime errors caught by `PrismSandboxFrame`.
+ * Implements DEC-009 (Zero LLM-Written JavaScript):
+ * VerdantUI's on-device LLM NEVER writes JavaScript, HTML, or CSS for Prisms.
+ * Instead, it:
+ *   1. Classifies the user's requested artifact across the 6 first-class `PrismMediaType`s
+ *      (`picture`, `written-work`, `video`, `interactive-game`, `research-program`, `tool-organ`)
+ *      and activates ONLY the sparse subset of Verdant Studio sub-model organs needed.
+ *   2. Guides a short plain-English conversation to anchor the Concept, Space/Privacy boundary,
+ *      and core rules — outputting ONLY structured JSON weights (`route-prism-weights`).
+ *   3. Procedurally synthesizes the entire playable/usable Prism deterministically via
+ *      `prismMediaOrgans.ts` + `prismCompiler.ts`, verifiable by Lean 4.32.2 in the browser.
+ *   4. Applies natural-language refinements (*"make it 16x16 with 40 mines"*, *"protect 5pm-6pm"*)
+ *      purely by routing updated declarative weight patches — instant, deterministic, zero syntax errors.
  */
 
 import {
@@ -24,9 +20,9 @@ import {
   deriveRepairOp,
   dispatchStudioOp,
   evaluateDeclaredModel,
+  fieldsToJsonSchema,
   formatRequestLine,
   sanitizeIdentifier,
-  type AuthoredPrismView,
   type CompareOp,
   type DataClassification,
   type EncodedField,
@@ -39,13 +35,29 @@ import {
   type StudioApiOp,
 } from './verdantStudioApi';
 import {
-  parseContextReply,
-  parseDesignPreferences,
   parseIdeaSentence,
   reconcileAllRemainingFacets,
 } from './prismInterviewEngine';
+import {
+  deriveActiveStudioOrgans,
+  inferGameArchetypeFromText,
+  normalizeOrganWeights,
+  PRISM_MEDIA_CATALOG,
+  type GameArchetype,
+  type PrismMediaType,
+  type ProceduralOrganWeights,
+  type StudioFeatureOrgan,
+} from './prismMediaOrgans';
 
-export type PrismRealizationMode = 'interactive-app' | 'structured-model';
+export type PrismRealizationMode = 'procedural-organ' | 'structured-model';
+
+export interface ArtifactMediaClassification {
+  readonly mediaType: PrismMediaType;
+  readonly activeOrgans: readonly StudioFeatureOrgan[];
+  readonly mode: PrismRealizationMode;
+  readonly gameArchetype?: GameArchetype;
+  readonly reason: string;
+}
 
 export interface AgentChatTurn {
   readonly role: 'user' | 'studio';
@@ -55,6 +67,9 @@ export interface AgentChatTurn {
 export interface AgentModelSpecDraft {
   readonly name: string;
   readonly purpose: string;
+  readonly mediaType: PrismMediaType;
+  readonly activeOrgans: readonly StudioFeatureOrgan[];
+  readonly compartmentId: string;
   readonly domain: PrismDomain;
   readonly audience: PrismAudience;
   readonly dataClassification: DataClassification;
@@ -63,6 +78,7 @@ export interface AgentModelSpecDraft {
   readonly involvesPayments: boolean;
   readonly mode: PrismRealizationMode;
   readonly readyToBuild: boolean;
+  readonly weights: ProceduralOrganWeights;
   readonly stakeholders: readonly {
     readonly name: string;
     readonly role: StakeholderDecl['provRole'];
@@ -93,65 +109,128 @@ export interface DiscoveryParseResult {
   readonly usedFallback: boolean;
 }
 
-export type AuthoredAppExtractionResult =
-  | { readonly ok: true; readonly view: AuthoredPrismView }
-  | { readonly ok: false; readonly reason: string };
-
-const INTERACTIVE_APP_KEYWORDS_RE =
-  /\b(video\s+game|game|minesweeper|tetris|snake|chess|checkers|sudoku|2048|wordle|solitaire|pong|breakout|arkanoid|pac-?man|tic[\s-]?tac[\s-]?toe|connect\s*4|connect\s*four|battleship|hangman|blackjack|poker|memory\s+(?:game|match)|puzzle|arcade|platformer|roguelike|clicker|idle\s+game|maze|flappy|asteroids|space\s+invaders|game\s+of\s+life|conway|kanban|todo|to-?do|task\s+board|pomodoro|stopwatch|countdown|timer|clock|calendar|whiteboard|paint|draw(?:ing)?\s+app|sketchpad|piano|synth(?:esizer)?|drum\s+machine|metronome|flashcards?|quiz\s+(?:app|game)|habit\s+tracker|markdown\s+editor|note(?:s|pad)|code\s+editor|dashboard|visualizer|simulator|playground|spreadsheet|music\s+player|playable)\b/i;
-
+const PICTURE_RE =
+  /\b(picture|image|artwork|poster|illustration|painting|portrait|wallpaper|fractal|mosaic|constellation|sprite|drawing|visual\s+art|svg\s+art)\b/i;
+const AUDIO_RE =
+  /\b(audio|music|song|soundtrack|soundscape|synth(?:esizer)?|melody|beat|rhythm|podcast|jingle|chime|lofi|lo-?fi|ambient\s+sound|sound\s+effects?|wav)\b/i;
+const WRITTEN_WORK_RE =
+  /\b(novel|book|short\s+story|story\s+draft|manuscript|screenplay|essay|memoir|poetry|poem|chapter(?:s)?|written\s+work|fiction|non-?fiction|authoring)\b/i;
+const VIDEO_RE =
+  /\b(video|animation|animated|motion\s+graphic|storyboard|trailer|clip|short\s+film|reel|intro\s+video)\b/i;
+const GAME_RE =
+  /\b(video\s+game|game|minesweeper|mine\s*sweep|tetris|snake|chess|checkers|sudoku|2048|wordle|solitaire|pong|breakout|arkanoid|pac-?man|tic[\s-]?tac[\s-]?toe|connect\s*4|connect\s*four|gomoku|lights?\s*out|memory\s+(?:game|match)|puzzle|arcade|platformer|roguelike|game\s+of\s+life|conway|rule\s*30|cellular\s+automaton|playable)\b/i;
+const RESEARCH_RE =
+  /\b(research\s+program|research\s+project|study\s+plan|hypothesis|hypotheses|literature\s+review|experiment\s+tracker|lab\s+notebook|scientific\s+program)\b/i;
+const TOOL_ORGAN_RE =
+  /\b(healthy\s+habits?|habit\s+(?:tracker|guardian|coach)|schedule\s+guard|focus\s+timer|pomodoro|quiet\s+hours?|protect\s+(?:my\s+)?(?:time|schedule|workout|exercise)|calendar\s+guard|sensory|tool\s+for|workflow\s+helper|daily\s+routine)\b/i;
 const EXPLICIT_NUMERIC_RULE_RE =
-  /\b(budget|expense|bill|tip\s*(?:%|percent)|loan|mortgage|eligibility|credit\s+score|discount|pricing|shipping|tax|salary|calorie|hydration|water\s+intake|bmi|dosage|refuse\s+(?:if|when|zero|under|over)|warn\s+when|approve\s+(?:if|when|scores?))\b/i;
-
+  /\b(budget|expense|bill|tip\s*(?:%|percent)|loan|mortgage|eligibility|credit\s+score|discount|pricing|shipping|tax|salary|calorie|bmi|dosage|refuse\s+(?:if|when|zero|under|over)|warn\s+when|approve\s+(?:if|when|scores?))\b/i;
 const BUILD_NOW_RE =
   /\b(build\s+it|make\s+it|create\s+it|generate\s+it|go\s+ahead|looks?\s+good|sounds?\s+good|yes|yep|yeah|sure|proceed|do\s+it|let'?s\s+(?:go|build|play)|reconcile\s+everything|finish\s+it|recommended)\b/i;
 
 /**
- * Classifies whether the Creator's idea calls for an open-ended interactive app/game
- * synthesized by the Verdant Studio Agent (`interactive-app`) or a deterministic
- * structured numeric policy/calculator (`structured-model`).
+ * Classifies the requested artifact MediaType and derives the sparse set of Verdant Studio
+ * sub-model organs to activate (DEC-009).
  */
-export function classifyIdeaRealizationMode(sentence: string): {
-  readonly mode: PrismRealizationMode;
-  readonly reason: string;
-} {
+export function classifyArtifactMediaType(sentence: string): ArtifactMediaClassification {
   const trimmed = sentence.trim();
   if (!trimmed) {
-    return { mode: 'structured-model', reason: 'Empty input.' };
-  }
-  if (INTERACTIVE_APP_KEYWORDS_RE.test(trimmed)) {
     return {
-      mode: 'interactive-app',
-      reason: 'Describes an interactive game, workspace, or rich visual application.',
+      mediaType: 'tool-organ',
+      activeOrgans: deriveActiveStudioOrgans('tool-organ'),
+      mode: 'structured-model',
+      reason: 'Empty input defaults to structured tool model.',
+    };
+  }
+  if (GAME_RE.test(trimmed)) {
+    const inferred = inferGameArchetypeFromText(trimmed);
+    return {
+      mediaType: 'interactive-game',
+      activeOrgans: deriveActiveStudioOrgans('interactive-game'),
+      mode: 'procedural-organ',
+      gameArchetype: inferred.archetype,
+      reason: `Activates Game Simulation, Rules, and Palette organs (${inferred.archetype}).`,
+    };
+  }
+  if (PICTURE_RE.test(trimmed)) {
+    return {
+      mediaType: 'picture',
+      activeOrgans: deriveActiveStudioOrgans('picture'),
+      mode: 'procedural-organ',
+      reason: 'Activates only Visual Canvas and Palette organs for procedural picture generation.',
+    };
+  }
+  if (AUDIO_RE.test(trimmed)) {
+    return {
+      mediaType: 'audio',
+      activeOrgans: deriveActiveStudioOrgans('audio'),
+      mode: 'procedural-organ',
+      reason: 'Activates only Audio Synth and Palette organs for procedural audio synthesis.',
+    };
+  }
+  if (VIDEO_RE.test(trimmed)) {
+    return {
+      mediaType: 'video',
+      activeOrgans: deriveActiveStudioOrgans('video'),
+      mode: 'procedural-organ',
+      reason: 'Activates Visual Canvas, Motion Timeline, and Palette organs for procedural video synthesis.',
+    };
+  }
+  if (WRITTEN_WORK_RE.test(trimmed)) {
+    return {
+      mediaType: 'written-work',
+      activeOrgans: deriveActiveStudioOrgans('written-work'),
+      mode: 'procedural-organ',
+      reason: 'Activates Narrative Outline and Palette organs for written-work authoring.',
+    };
+  }
+  if (RESEARCH_RE.test(trimmed)) {
+    return {
+      mediaType: 'research-program',
+      activeOrgans: deriveActiveStudioOrgans('research-program'),
+      mode: 'procedural-organ',
+      reason: 'Activates Research Program, Evidence Ledger, Rules, and Privacy Space organs.',
+    };
+  }
+  if (TOOL_ORGAN_RE.test(trimmed)) {
+    return {
+      mediaType: 'tool-organ',
+      activeOrgans: deriveActiveStudioOrgans('tool-organ'),
+      mode: 'procedural-organ',
+      reason: 'Activates Tool, Sensory Stream, Impulse Emitter, and Privacy Space organs.',
     };
   }
   if (EXPLICIT_NUMERIC_RULE_RE.test(trimmed)) {
     return {
+      mediaType: 'tool-organ',
+      activeOrgans: deriveActiveStudioOrgans('tool-organ'),
       mode: 'structured-model',
       reason: 'Describes explicit numeric rules, calculations, or policy thresholds.',
     };
   }
-  const deterministic = parseIdeaSentence(trimmed);
-  const fellBackToDummyValue =
-    deterministic.inputs.length === 1 &&
-    deterministic.inputs[0].name === 'value' &&
-    deterministic.inputs[0].source === 'suggested';
-  if (fellBackToDummyValue) {
-    return {
-      mode: 'interactive-app',
-      reason: 'Open-ended custom Prism idea that requires agent synthesis rather than a generic numeric form.',
-    };
-  }
   return {
-    mode: 'structured-model',
-    reason: 'Structured inputs and rules identified directly.',
+    mediaType: 'tool-organ',
+    activeOrgans: deriveActiveStudioOrgans('tool-organ'),
+    mode: 'procedural-organ',
+    reason: 'General custom Prism routed via procedural Tool organ weights.',
   };
 }
 
-/**
- * Extracts a crisp working title from an open-ended idea sentence (e.g.
- * `This Prism will be the video game 'Minesweeper'` -> `Minesweeper`).
- */
+export function classifyIdeaRealizationMode(sentence: string): {
+  readonly mode: PrismRealizationMode;
+  readonly mediaType: PrismMediaType;
+  readonly activeOrgans: readonly StudioFeatureOrgan[];
+  readonly reason: string;
+} {
+  const c = classifyArtifactMediaType(sentence);
+  return {
+    mode: c.mode,
+    mediaType: c.mediaType,
+    activeOrgans: c.activeOrgans,
+    reason: c.reason,
+  };
+}
+
 export function extractCleanIdeaTitle(sentence: string): string {
   const quoted = sentence.match(/["'“‘]([^"'”’]{2,48})["'”’]/);
   if (quoted && quoted[1].trim().length >= 2) {
@@ -178,507 +257,467 @@ export function extractCleanIdeaTitle(sentence: string): string {
 function formatTranscriptForPrompt(history: readonly AgentChatTurn[]): string {
   if (history.length === 0) return '(start of conversation)';
   return history
-    .slice(-10)
+    .slice(-8)
     .map((t) => `${t.role === 'user' ? 'Creator' : 'Verdant Studio'}: ${t.text}`)
     .join('\n');
 }
 
-function summarizeDeclarationForPrompt(decl: PrismDeclaration): string {
-  const fields = (decl.encoding?.fields ?? []).map((f) => `${f.name} (${f.kind}, ${f.min}..${f.max})`).join(', ');
-  const rules = decl.features.map((f) => `${f.id}: ${f.statement}`).join('; ');
-  const refusals = decl.refusals.map((r) => `${r.id}: ${r.failureText}`).join('; ');
-  return [
-    `Name: ${decl.metadata.name || 'Untitled'}`,
-    `Purpose: ${decl.concept.purpose || '(undefined)'}`,
-    `Domain: ${decl.concept.domain ?? 'general'}, Audience: ${decl.concept.audience ?? 'personal'}, Data: ${decl.concept.dataClassification ?? 'none'}, Regions: ${decl.concept.jurisdictions.join(', ') || 'none'}`,
-    `Core Model Inputs: ${fields || '(none yet)'}`,
-    `Core Model Rules: ${rules || '(none yet)'}`,
-    `Core Model Refusals: ${refusals || '(none yet)'}`,
-    `Has Interactive App View: ${decl.view?.authoredView ? 'yes' : 'no'}`,
-  ].join('\n');
-}
-
 /**
- * Shared byte-identical system prefix across Discovery, Build, and Refinement turns so
- * VerdantUI's content-addressed KV prefix cache (`VramUnifiedStore`) reuses prefilled
- * system tokens across multi-turn Studio Agent sessions with zero redundant prefill.
+ * Shared byte-identical system prefix across Discovery and Refinement turns so VerdantUI's
+ * KV prefix cache reuses prefilled tokens across multi-turn Studio conversations.
+ * Explicitly enforces DEC-009 (ZERO JavaScript/HTML/CSS generation) and DEC-011 (zero jargon).
  */
-export const STUDIO_AGENT_SYSTEM_PREFIX = `You are Verdant Studio, a collaborative 100% on-device Prism architect pairing with a human Creator in plain English.
+export const STUDIO_AGENT_SYSTEM_PREFIX = `You are Verdant Studio, a collaborative 100% on-device Prism designer pairing with a human Creator in plain English.
 Core principles:
-- Build the exact real, complete, interactive Prism the Creator describes — never a stub, placeholder, or hardcoded template.
-- Keep all generated apps 100% self-contained and offline (zero remote URLs, zero CDN links, zero external fetches, zero alert/prompt).
-- Use Verdant theme tokens (--v-bg, --v-surface, --v-surface-alt, --v-border, --v-text, --v-muted, --v-accent, --v-accent-text) so Light and Dark modes look sharp.
-- Sync key state transitions asynchronously with globalThis.prism?.invoke(...) inside try/catch without blocking UI responsiveness.
-- NEVER mention internal engineering terms in user-facing text (never say Observer, OpenTelemetry, vTensor, LexLean, Studio API, or REQ-D6/D9/D11).`;
+- NEVER write JavaScript, HTML, or CSS code blocks. Verdant Studio procedurally synthesizes the Prism purely from structured JSON weights you route.
+- Identify the requested artifact mediaType ("picture", "written-work", "video", "interactive-game", "research-program", or "tool-organ") so only the relevant Studio features activate.
+- Output ONLY one concise JSON object routing weights and asking at most 1-2 brief, plain-English clarifying questions when helpful.
+- NEVER mention internal engineering terms in user-facing text (never say Observer, OpenTelemetry, vTensor, LexLean, Holon, FK-07, Q10, or REQ-*).`;
 
-/**
- * Zero-execution JavaScript syntax validator. Compiles via `new Function(source)` without
- * ever invoking the function, catching truncation and syntax errors before admitting code
- * into a Prism declaration or mounting the sandbox preview.
- */
-export function validateAuthoredJsSyntax(js: string): { readonly ok: true } | { readonly ok: false; readonly error: string } {
-  const trimmed = js.trim();
-  if (!trimmed) {
-    return { ok: false, error: 'JavaScript source is empty.' };
-  }
-  try {
-    // Parse-only check (returned function is immediately discarded and never called)
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval
-    new Function(trimmed);
-    return { ok: true };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return { ok: false, error: `JavaScript syntax error: ${msg}` };
+function weightSchemaHintForMediaType(mediaType: PrismMediaType): string {
+  switch (mediaType) {
+    case 'interactive-game':
+      return `weights schema for interactive-game:
+  - grid-sweep (Minesweeper): { "mediaType":"interactive-game", "archetype":"grid-sweep", "rows":9, "cols":9, "mines":10, "firstClickSafe":true, "floodReveal":true, "chordReveal":true, "showTimer":true, "visualStyle":"modern" }
+  - grid-puzzle: { "mediaType":"interactive-game", "archetype":"grid-puzzle", "variant":"merge-2048|memory-match|lights-out", "rows":4, "cols":4, "targetScore":2048 }
+  - turn-board: { "mediaType":"interactive-game", "archetype":"turn-board", "rows":6, "cols":7, "winLength":4, "gravity":true, "vsCpu":true }
+  - arcade-canvas: { "mediaType":"interactive-game", "archetype":"arcade-canvas", "variant":"snake|breakout|pong", "speed":5, "gridCols":20, "gridRows":16, "wrapWalls":false }
+  - cellular-sim: { "mediaType":"interactive-game", "archetype":"cellular-sim", "variant":"game-of-life|rule-30", "rows":24, "cols":36, "tickMs":140 }`;
+    case 'picture':
+      return `weights schema for picture: { "mediaType":"picture", "generator":"geometric-mosaic|botanical-fractal|wave-field|constellation|pixel-sprite", "symmetry":6, "density":42, "seed":4219, "palette":["#0b1714","#10b981","#f59e0b","#ecfdf5"], "caption":"Title" }`;
+    case 'audio':
+      return `weights schema for audio: { "mediaType":"audio", "style":"ambient-pad|melodic-arpeggio|rhythm-pulse|sound-effects", "bpm":96, "rootMidi":60, "scale":"pentatonic|major|minor|dorian", "durationSec":8, "title":"Title" }`;
+    case 'written-work':
+      return `weights schema for written-work: { "mediaType":"written-work", "genre":"Fiction", "title":"...", "premise":"...", "voice":"...", "targetWordCount":25000, "allowLocalAssist":true, "chapters":[{"title":"...","beat":"...","summary":"...","body":""}] }`;
+    case 'video':
+      return `weights schema for video: { "mediaType":"video", "aspectRatio":"16:9|1:1|9:16", "fps":30, "style":"kinetic-type|abstract-motion|storyboard-scenes", "palette":["#0b0f14","#10b981","#f8fafc"], "scenes":[{"title":"...","subtitle":"...","durationSec":4,"motion":"pan|pulse|orbit|rise","accent":"#10b981"}] }`;
+    case 'research-program':
+      return `weights schema for research-program: { "mediaType":"research-program", "topic":"...", "question":"...", "compartmentId":"research", "tracks":["..."], "hypotheses":[{"id":"H1","statement":"...","status":"open"}], "milestones":[{"title":"...","status":"planned","dueLabel":"Week 1"}] }`;
+    case 'tool-organ':
+      return `weights schema for tool-organ: { "mediaType":"tool-organ", "role":"habit-guardian|schedule-guard|calculator|workflow-helper", "compartmentId":"personal|work|health", "emitsOpaqueConstraints":true, "rulesSummary":"...", "scheduleWindows":[{"label":"...","startMinuteOfDay":1020,"endMinuteOfDay":1080,"daysOfWeek":[0,1,2,3,4,5,6],"protectedWindow":true}], "metrics":[{"label":"...","target":1,"unit":"today"}] }`;
   }
 }
 
-/**
- * Builds the system prompt for a conversational discovery/clarification turn.
- * Asks the local model to anchor the Core Models AND ask 1–2 concise, domain-specific
- * questions tailored to the Creator's exact idea (or mark `readyToBuild: true` once answered).
- */
+export function buildWeightRoutingDiscoveryPrompt(
+  history: readonly AgentChatTurn[],
+  decl: PrismDeclaration,
+  userTurnCount: number,
+  mediaTypeHint?: PrismMediaType,
+): string {
+  const mediaType =
+    mediaTypeHint ??
+    decl.concept.mediaType ??
+    classifyArtifactMediaType(history.map((h) => h.text).join(' ')).mediaType;
+  const activeOrgans = deriveActiveStudioOrgans(mediaType);
+  const existingWeights = decl.view?.proceduralOrgan?.weights
+    ? JSON.stringify(decl.view.proceduralOrgan.weights)
+    : '(none yet)';
+
+  return `${STUDIO_AGENT_SYSTEM_PREFIX}
+
+Active Artifact MediaType: ${mediaType} (${PRISM_MEDIA_CATALOG[mediaType].label})
+Activated Studio Organs (sparse): ${activeOrgans.join(', ')}
+Current Prism: ${decl.metadata.name || 'Untitled'} — ${decl.concept.purpose || '(new)'}
+Current Weights: ${existingWeights}
+
+Conversation so far:
+${formatTranscriptForPrompt(history)}
+
+Turn guidance:
+- On turn 1 (current user turns = ${userTurnCount}), unless the Creator said "build it now" or gave full details, set "readyToBuild": false and ask 1–2 short, concrete questions tailored to ${PRISM_MEDIA_CATALOG[mediaType].activeWizardQuestions.join(' and ')}.
+- On turn 2+ or when ready, set "readyToBuild": true and populate complete "weights".
+- STRICT: Output ONLY one valid JSON object. NEVER output JavaScript, HTML, or CSS.
+
+${weightSchemaHintForMediaType(mediaType)}
+
+JSON shape:
+{
+  "name": "Short title",
+  "purpose": "One-sentence description",
+  "mediaType": "${mediaType}",
+  "compartmentId": "personal|work|health|research",
+  "readyToBuild": true,
+  "weights": { ... },
+  "reply": "Warm plain-English reply (<= 3 sentences)",
+  "quickReplies": ["Option 1", "Option 2", "Build it now"]
+}`;
+}
+
+/** Compatibility alias for callers using the previous discovery function name. */
 export function buildDiscoveryAgentPrompt(
   history: readonly AgentChatTurn[],
   decl: PrismDeclaration,
   userTurnCount: number,
 ): string {
-  const shouldBeReadyHint =
-    userTurnCount >= 2
-      ? 'The Creator has already answered your initial questions. Unless a critical requirement is still ambiguous, set "readyToBuild": true so we immediately build the playable/usable Prism now.'
-      : 'This is the first message. Ask 1–2 short, concrete, friendly questions specifically tailored to THIS exact app/game (e.g., key gameplay/feature options + whether it is personal offline or for kids/public) and set "readyToBuild": false unless the user explicitly asked to build immediately with defaults.';
+  return buildWeightRoutingDiscoveryPrompt(history, decl, userTurnCount);
+}
+
+export function buildWeightRefinementPrompt(
+  history: readonly AgentChatTurn[],
+  decl: PrismDeclaration,
+  instruction: string,
+): string {
+  const mediaType: PrismMediaType =
+    decl.view?.proceduralOrgan?.mediaType ??
+    decl.concept.mediaType ??
+    classifyArtifactMediaType(`${decl.metadata.name} ${instruction}`).mediaType;
+  const currentWeights = decl.view?.proceduralOrgan?.weights ?? normalizeOrganWeights(mediaType, undefined, instruction, decl.metadata.name);
 
   return `${STUDIO_AGENT_SYSTEM_PREFIX}
 
-PHASE: DISCOVERY & CORE MODEL ANCHORING
+Task: Route an updated JSON weight patch to refine the existing "${decl.metadata.name}" (${PRISM_MEDIA_CATALOG[mediaType].label}) Prism based on the Creator's request.
+STRICT: NEVER write JavaScript, HTML, or CSS. Output ONLY one JSON object containing the updated "weights" and a brief "reply".
 
-Current Prism state:
-${summarizeDeclarationForPrompt(decl)}
+Current Weights:
+${JSON.stringify(currentWeights)}
 
-Conversation so far:
+${weightSchemaHintForMediaType(mediaType)}
+
+Recent Conversation:
 ${formatTranscriptForPrompt(history)}
 
-Guidance for this turn:
-${shouldBeReadyHint}
+Creator's Refinement Request: ${instruction}
 
-Output ONLY a single valid JSON object inside a \`\`\`json code fence matching this exact schema:
+Output ONLY:
 {
-  "name": "Short title of the Prism (e.g. Minesweeper)",
-  "purpose": "One clear sentence describing what this Prism does",
-  "domain": "general" | "finance" | "health" | "education" | "games-media" | "enterprise-ops",
-  "audience": "personal" | "team" | "public-adults" | "includes-minors",
-  "dataClassification": "none" | "operational" | "personal" | "sensitive-regulated",
-  "jurisdictions": ["none" | "eu" | "us" | "uk" | "global"],
-  "usesLocalAi": false,
-  "involvesPayments": false,
-  "mode": "interactive-app" | "structured-model",
-  "readyToBuild": true | false,
-  "stakeholders": [{"name": "Player", "role": "consumer", "concern": "Enjoy a responsive offline game"}],
-  "inputs": [
-    {"name": "rows", "label": "Board Rows", "kind": "nat", "min": 4, "max": 30, "defaultValue": 9}
-  ],
-  "refusals": [
-    {"statement": "Refuse zero rows", "field": "rows", "op": "eq", "value": 0, "failureText": "Board rows must be at least 1."}
-  ],
-  "rules": [
-    {"statement": "Default active state", "outcome": "Active", "tone": "brand"}
-  ],
-  "reply": "Short friendly message to the Creator (2–4 sentences max, plain English)",
-  "quickReplies": ["Natural quick reply 1", "Natural quick reply 2", "Build it now with recommended settings"]
+  "name": "${decl.metadata.name}",
+  "purpose": "${decl.concept.purpose || decl.metadata.description}",
+  "mediaType": "${mediaType}",
+  "compartmentId": "${decl.concept.compartmentId || 'personal'}",
+  "readyToBuild": true,
+  "weights": { ...updated weights... },
+  "reply": "One-sentence summary of the weight change",
+  "quickReplies": ["Try another preset", "Adjust visuals"]
+}`;
 }
 
-Rules for the JSON:
-- "inputs" must have 2 to 5 simple non-negative integer ("nat") or boolean ("bool") fields representing verifiable invariants/state for this Prism (for Minesweeper: rows, cols, mines, revealedSafe, hitMine; for Kanban: totalTasks, doneTasks, wipLimit; for Pomodoro: workMinutes, breakMinutes, completedSessions).
-- "refusals" must have 1 to 2 simple boundary checks using op in ["eq","lt","gt","lte","gte"].
-- "rules" must have 1 to 3 simple outcomes, with the LAST rule having NO "field" (acting as the default outcome).
-- Keep "reply" concise, warm, and directly about the Creator's specific idea.`;
-}
-
-function tryExtractJsonObject(raw: string): Record<string, unknown> | null {
-  const candidates: string[] = [];
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenced?.[1]) candidates.push(fenced[1].trim());
-  const firstBrace = raw.indexOf('{');
-  const lastBrace = raw.lastIndexOf('}');
-  if (firstBrace >= 0 && lastBrace > firstBrace) {
-    candidates.push(raw.slice(firstBrace, lastBrace + 1));
-  }
-  for (const cand of candidates) {
-    const cleaned = cand
-      .replace(/,\s*([}\]])/g, '$1')
-      .replace(/[\u201C\u201D]/g, '"')
-      .replace(/[\u2018\u2019]/g, "'");
-    try {
-      const parsed = JSON.parse(cleaned);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        return parsed as Record<string, unknown>;
+function extractFirstJsonObject(raw: string): Record<string, unknown> | null {
+  const cleaned = raw
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/^```(?:json)?\s*/gim, '')
+    .replace(/```\s*$/gim, '')
+    .trim();
+  const start = cleaned.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0;
+  let inStr = false;
+  let escaped = false;
+  for (let i = start; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (inStr) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inStr = false;
+    } else if (ch === '"') {
+      inStr = true;
+    } else if (ch === '{') {
+      depth += 1;
+    } else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          const parsed = JSON.parse(cleaned.slice(start, i + 1));
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            return parsed as Record<string, unknown>;
+          }
+        } catch {
+          return null;
+        }
       }
-    } catch {
-      // Try next candidate
     }
   }
   return null;
 }
 
-const VALID_DOMAINS = new Set<PrismDomain>([
-  'general',
-  'finance',
-  'health',
-  'education',
-  'games-media',
-  'enterprise-ops',
-]);
-const VALID_AUDIENCES = new Set<PrismAudience>(['personal', 'team', 'public-adults', 'includes-minors']);
-const VALID_DATA = new Set<DataClassification>(['none', 'operational', 'personal', 'sensitive-regulated']);
-const VALID_JURISDICTIONS = new Set<PrismJurisdiction>(['none', 'eu', 'us', 'uk', 'global']);
-const VALID_OPS = new Set<CompareOp>(['eq', 'neq', 'lt', 'lte', 'gt', 'gte']);
-const VALID_TONES = new Set<'default' | 'success' | 'warning' | 'destructive' | 'brand'>([
-  'default',
-  'success',
-  'warning',
-  'destructive',
-  'brand',
-]);
-
-function buildFallbackSpec(
-  userMessage: string,
-  decl: PrismDeclaration,
-  userTurnCount: number,
-): AgentModelSpecDraft {
-  const title = decl.metadata.name && decl.metadata.name !== 'Untitled Prism'
-    ? decl.metadata.name
-    : extractCleanIdeaTitle(userMessage);
-  const modeInfo = classifyIdeaRealizationMode(userMessage);
-  const deterministic = parseIdeaSentence(userMessage);
-  const isGame = deterministic.domain.value === 'games-media' || /\bgame|play|minesweeper|puzzle|arcade\b/i.test(userMessage);
-  const readyToBuild = userTurnCount >= 2 || BUILD_NOW_RE.test(userMessage);
-
-  const inputs: EncodedField[] =
-    decl.encoding && decl.encoding.fields.length > 0
-      ? [...decl.encoding.fields]
-      : isGame
-        ? [
-            { name: 'gridSize', label: 'Board Size', kind: 'nat', min: 1, max: 50, defaultValue: 9 },
-            { name: 'score', label: 'Score', kind: 'nat', min: 0, max: 100000, defaultValue: 0 },
-            { name: 'gameOver', label: 'Game Over', kind: 'bool', min: 0, max: 1, defaultValue: 0 },
-          ]
-        : [
-            { name: 'itemCount', label: 'Active Items', kind: 'nat', min: 0, max: 1000, defaultValue: 3 },
-            { name: 'completed', label: 'Completed', kind: 'nat', min: 0, max: 1000, defaultValue: 1 },
-          ];
-
-  return {
-    name: title,
-    purpose: decl.concept.purpose || userMessage.trim(),
-    domain: decl.concept.domain ?? (isGame ? 'games-media' : deterministic.domain.value),
-    audience: decl.concept.audience ?? deterministic.audience.value,
-    dataClassification: decl.concept.dataClassification ?? deterministic.dataClassification.value,
-    jurisdictions:
-      decl.concept.jurisdictions.length > 0
-        ? decl.concept.jurisdictions
-        : deterministic.jurisdictions.value,
-    usesLocalAi: decl.concept.usesLocalAi || deterministic.usesLocalAi.value,
-    involvesPayments: decl.concept.involvesPayments || deterministic.involvesPayments.value,
-    mode: decl.view?.authoredView ? 'interactive-app' : modeInfo.mode,
-    readyToBuild,
-    stakeholders:
-      decl.concept.stakeholders.length > 0
-        ? decl.concept.stakeholders.map((s) => ({ name: s.name, role: s.provRole, concern: s.concern }))
-        : [
-            {
-              name: isGame ? 'Player' : 'Creator',
-              role: 'consumer',
-              concern: `Use ${title} reliably and offline.`,
-            },
-          ],
-    inputs,
-    refusals: [
-      {
-        statement: `Refuse invalid ${inputs[0].label.toLowerCase()} of zero.`,
-        field: inputs[0].name,
-        op: 'eq',
-        value: 0,
-        failureText: `${inputs[0].label} must be greater than zero.`,
-      },
-    ],
-    rules: isGame
-      ? [
+function defaultCoreInputsForMediaType(mediaType: PrismMediaType, weights: ProceduralOrganWeights): {
+  readonly domain: PrismDomain;
+  readonly inputs: readonly EncodedField[];
+  readonly refusals: AgentModelSpecDraft['refusals'];
+  readonly rules: AgentModelSpecDraft['rules'];
+} {
+  if (mediaType === 'interactive-game') {
+    if (weights.mediaType === 'interactive-game' && weights.archetype === 'grid-sweep') {
+      return {
+        domain: 'games-media',
+        inputs: [
+          { name: 'rows', label: 'Board rows', kind: 'nat', min: 5, max: 24, defaultValue: weights.rows, unit: 'rows' },
+          { name: 'cols', label: 'Board columns', kind: 'nat', min: 5, max: 30, defaultValue: weights.cols, unit: 'cols' },
+          { name: 'mines', label: 'Mine count', kind: 'nat', min: 1, max: 200, defaultValue: weights.mines, unit: 'mines' },
+          { name: 'status', label: 'Round state', kind: 'choice', min: 0, max: 2, defaultValue: 0, choices: ['Active', 'Cleared', 'Detonated'] },
+        ],
+        refusals: [
           {
-            statement: 'Report Game Over when the end condition triggers.',
-            field: 'gameOver',
+            statement: 'Refuse boards with zero mines',
+            field: 'mines',
+            op: 'eq',
+            value: 0,
+            failureText: 'Board must place at least one mine.',
+          },
+        ],
+        rules: [
+          {
+            statement: 'Declare victory when all safe cells are cleared',
+            field: 'status',
             op: 'eq',
             value: 1,
-            outcome: 'Game Over',
+            outcome: 'Board Cleared — Victory',
+            tone: 'success',
+          },
+          {
+            statement: 'End round when a mine is revealed',
+            field: 'status',
+            op: 'eq',
+            value: 2,
+            outcome: 'Mine Detonated — Round Over',
             tone: 'destructive',
           },
           {
-            statement: 'Report Active game state during play.',
-            outcome: 'Playing',
+            statement: 'Continue active round',
+            outcome: 'Round In Progress',
             tone: 'brand',
           },
-        ]
-      : [
-          {
-            statement: 'Report active state for valid inputs.',
-            outcome: 'Ready',
-            tone: 'success',
-          },
         ],
-    reply: readyToBuild
-      ? `Got it — building your interactive ${title} Prism now and reconciling all core checks.`
-      : `I've anchored "${title}"! Before I build the interactive Prism for you, what specific features, modes, or visual style would you like, and is it just for personal offline use or also for kids/public users?`,
-    quickReplies: [
-      'Classic style with full interactive controls, personal offline use',
-      'Dark modern theme with score/status tracking, personal offline use',
-      'Build it now with recommended settings',
+      };
+    }
+    return {
+      domain: 'games-media',
+      inputs: [
+        { name: 'score', label: 'Current score', kind: 'nat', min: 0, max: 100000, defaultValue: 0 },
+        { name: 'moves', label: 'Moves taken', kind: 'nat', min: 0, max: 10000, defaultValue: 0 },
+        { name: 'status', label: 'Round state', kind: 'choice', min: 0, max: 2, defaultValue: 0, choices: ['Active', 'Won', 'Over'] },
+      ],
+      refusals: [],
+      rules: [
+        { statement: 'Celebrate win state', field: 'status', op: 'eq', value: 1, outcome: 'Victory', tone: 'success' },
+        { statement: 'Record game over state', field: 'status', op: 'eq', value: 2, outcome: 'Game Over', tone: 'destructive' },
+        { statement: 'Keep playing', outcome: 'Active', tone: 'brand' },
+      ],
+    };
+  }
+
+  if (mediaType === 'picture') {
+    return {
+      domain: 'games-media',
+      inputs: [
+        { name: 'symmetry', label: 'Symmetry order', kind: 'nat', min: 1, max: 16, defaultValue: 6 },
+        { name: 'density', label: 'Element density', kind: 'nat', min: 8, max: 120, defaultValue: 42 },
+      ],
+      refusals: [
+        { statement: 'Refuse zero symmetry', field: 'symmetry', op: 'eq', value: 0, failureText: 'Symmetry must be at least 1.' },
+      ],
+      rules: [{ statement: 'Render balanced procedural composition', outcome: 'Artwork Ready', tone: 'success' }],
+    };
+  }
+
+  if (mediaType === 'audio') {
+    return {
+      domain: 'games-media',
+      inputs: [
+        { name: 'bpm', label: 'Tempo (BPM)', kind: 'nat', min: 45, max: 200, defaultValue: 96, unit: 'bpm' },
+        { name: 'duration', label: 'Clip length (sec)', kind: 'nat', min: 4, max: 30, defaultValue: 8, unit: 's' },
+      ],
+      refusals: [
+        { statement: 'Refuse zero tempo', field: 'bpm', op: 'eq', value: 0, failureText: 'Tempo must be greater than zero.' },
+      ],
+      rules: [{ statement: 'Synthesize audio clip cleanly', outcome: 'Audio Ready', tone: 'success' }],
+    };
+  }
+
+  if (mediaType === 'written-work') {
+    return {
+      domain: 'education',
+      inputs: [
+        { name: 'chapters', label: 'Chapters', kind: 'nat', min: 1, max: 100, defaultValue: 3 },
+        { name: 'words', label: 'Current words', kind: 'nat', min: 0, max: 200000, defaultValue: 0 },
+      ],
+      refusals: [
+        { statement: 'Refuse empty manuscript outline', field: 'chapters', op: 'eq', value: 0, failureText: 'At least one chapter is required.' },
+      ],
+      rules: [{ statement: 'Track manuscript progress', outcome: 'Drafting Active', tone: 'brand' }],
+    };
+  }
+
+  if (mediaType === 'video') {
+    return {
+      domain: 'games-media',
+      inputs: [
+        { name: 'scenes', label: 'Scene count', kind: 'nat', min: 1, max: 20, defaultValue: 3 },
+        { name: 'fps', label: 'Frame rate', kind: 'nat', min: 15, max: 60, defaultValue: 30 },
+      ],
+      refusals: [
+        { statement: 'Refuse empty timeline', field: 'scenes', op: 'eq', value: 0, failureText: 'Video timeline requires at least one scene.' },
+      ],
+      rules: [{ statement: 'Render procedural timeline', outcome: 'Timeline Ready', tone: 'success' }],
+    };
+  }
+
+  if (mediaType === 'research-program') {
+    return {
+      domain: 'education',
+      inputs: [
+        { name: 'hypotheses', label: 'Active hypotheses', kind: 'nat', min: 1, max: 50, defaultValue: 2 },
+        { name: 'verified', label: 'Verified milestones', kind: 'nat', min: 0, max: 50, defaultValue: 0 },
+      ],
+      refusals: [
+        { statement: 'Refuse research program with no hypotheses', field: 'hypotheses', op: 'eq', value: 0, failureText: 'At least one hypothesis is required.' },
+      ],
+      rules: [{ statement: 'Track research milestones', outcome: 'Program Active', tone: 'brand' }],
+    };
+  }
+
+  return {
+    domain: 'health',
+    inputs: [
+      { name: 'checkins', label: 'Daily check-ins', kind: 'nat', min: 0, max: 100, defaultValue: 0 },
+      { name: 'protected_windows', label: 'Protected windows', kind: 'nat', min: 0, max: 16, defaultValue: 1 },
+    ],
+    refusals: [],
+    rules: [
+      { statement: 'Honor protected windows with opaque availability', field: 'protected_windows', op: 'gte', value: 1, outcome: 'Protected & Active', tone: 'success' },
+      { statement: 'Ready for check-in', outcome: 'Active', tone: 'brand' },
     ],
   };
 }
 
-/**
- * Parses and sanitizes the local model's discovery JSON response with resilient fallback.
- */
+function defaultQuickRepliesForMediaType(mediaType: PrismMediaType): readonly string[] {
+  switch (mediaType) {
+    case 'interactive-game':
+      return ['Classic 9×9 (10 mines) + presets — build it', '16×16 Intermediate with 40 mines', 'Build it now with recommended defaults'];
+    case 'picture':
+      return ['Emerald geometric mosaic — build it', 'Botanical fractal in warm gold', 'Build it now'];
+    case 'audio':
+      return ['Calm ambient pentatonic soundscape — build it', '118 BPM lo-fi rhythm pulse', 'Build it now'];
+    case 'written-work':
+      return ['3-chapter sci-fi outline — build it', 'Short story with local drafting assist', 'Build it now'];
+    case 'video':
+      return ['16:9 kinetic title sequence — build it', '1:1 square abstract motion loop', 'Build it now'];
+    case 'research-program':
+      return ['3 hypotheses + weekly milestones — build it', 'Keep in private Research space', 'Build it now'];
+    case 'tool-organ':
+      return ['Protect 5pm–6pm daily (availability only)', 'Personal space with daily check-in', 'Build it now'];
+  }
+}
+
 export function parseDiscoveryAgentResponse(
-  raw: string,
-  userMessage: string,
-  decl: PrismDeclaration,
+  rawModelOutput: string,
+  latestUserMessage: string,
+  currentDecl: PrismDeclaration,
   userTurnCount: number,
+  forcedMediaType?: PrismMediaType,
 ): DiscoveryParseResult {
-  const fallback = buildFallbackSpec(userMessage, decl, userTurnCount);
-  const parsed = tryExtractJsonObject(raw);
-  if (!parsed) {
-    const cleanText = raw
-      .replace(/```[\s\S]*?```/g, '')
-      .trim()
-      .slice(0, 420);
-    return {
-      spec: {
-        ...fallback,
-        reply: cleanText.length >= 16 ? cleanText : fallback.reply,
-      },
-      usedFallback: true,
-    };
-  }
+  const parsed = extractFirstJsonObject(rawModelOutput);
+  const combinedHint = `${currentDecl.metadata.name !== 'Untitled Prism' ? currentDecl.metadata.name : ''} ${currentDecl.concept.purpose} ${latestUserMessage}`.trim();
+  const classified = classifyArtifactMediaType(combinedHint);
+  const allowedMedia: readonly PrismMediaType[] = [
+    'picture',
+    'audio',
+    'written-work',
+    'video',
+    'interactive-game',
+    'research-program',
+    'tool-organ',
+  ];
+  const parsedMedia =
+    parsed && typeof parsed.mediaType === 'string' && allowedMedia.includes(parsed.mediaType as PrismMediaType)
+      ? (parsed.mediaType as PrismMediaType)
+      : null;
+  const mediaType: PrismMediaType =
+    forcedMediaType ??
+    currentDecl.concept.mediaType ??
+    parsedMedia ??
+    classified.mediaType;
+  const activeOrgans = deriveActiveStudioOrgans(mediaType);
 
+  const fallbackTitle =
+    currentDecl.metadata.name && currentDecl.metadata.name !== 'Untitled Prism'
+      ? currentDecl.metadata.name
+      : extractCleanIdeaTitle(latestUserMessage);
   const name =
-    typeof parsed.name === 'string' && parsed.name.trim().length >= 2
+    parsed && typeof parsed.name === 'string' && parsed.name.trim().length >= 2
       ? parsed.name.trim().slice(0, 64)
-      : fallback.name;
+      : fallbackTitle;
   const purpose =
-    typeof parsed.purpose === 'string' && parsed.purpose.trim().length >= 8
-      ? parsed.purpose.trim().slice(0, 280)
-      : fallback.purpose;
-  const domain =
-    typeof parsed.domain === 'string' && VALID_DOMAINS.has(parsed.domain as PrismDomain)
-      ? (parsed.domain as PrismDomain)
-      : fallback.domain;
-  const audience =
-    typeof parsed.audience === 'string' && VALID_AUDIENCES.has(parsed.audience as PrismAudience)
-      ? (parsed.audience as PrismAudience)
-      : fallback.audience;
-  const dataClassification =
-    typeof parsed.dataClassification === 'string' &&
-    VALID_DATA.has(parsed.dataClassification as DataClassification)
-      ? (parsed.dataClassification as DataClassification)
-      : fallback.dataClassification;
+    parsed && typeof parsed.purpose === 'string' && parsed.purpose.trim().length >= 6
+      ? parsed.purpose.trim().slice(0, 220)
+      : currentDecl.concept.purpose || latestUserMessage.trim().slice(0, 220);
 
-  const rawJurs = Array.isArray(parsed.jurisdictions) ? parsed.jurisdictions : [];
-  const validJurs = rawJurs
-    .map((j) => String(j).toLowerCase())
-    .filter((j): j is PrismJurisdiction => VALID_JURISDICTIONS.has(j as PrismJurisdiction));
-  const jurisdictions = validJurs.length > 0 ? validJurs : fallback.jurisdictions;
+  const existingWeights =
+    currentDecl.view?.proceduralOrgan?.mediaType === mediaType
+      ? (currentDecl.view.proceduralOrgan.weights as unknown as Record<string, unknown>)
+      : {};
+  const rawWeightsPatch =
+    parsed && parsed.weights && typeof parsed.weights === 'object' && !Array.isArray(parsed.weights)
+      ? { ...existingWeights, ...(parsed.weights as Record<string, unknown>) }
+      : existingWeights;
 
-  const mode: PrismRealizationMode =
-    parsed.mode === 'interactive-app' || parsed.mode === 'structured-model'
-      ? parsed.mode
-      : fallback.mode;
+  const weights = normalizeOrganWeights(mediaType, rawWeightsPatch, combinedHint, name);
+  const core = defaultCoreInputsForMediaType(mediaType, weights);
+  const compartmentId =
+    (parsed && typeof parsed.compartmentId === 'string' && parsed.compartmentId.trim()) ||
+    currentDecl.concept.compartmentId ||
+    (mediaType === 'research-program'
+      ? 'research'
+      : mediaType === 'tool-organ' && weights.mediaType === 'tool-organ'
+        ? weights.compartmentId
+        : 'personal');
 
+  const userSaidBuild = BUILD_NOW_RE.test(latestUserMessage);
   const readyToBuild =
-    Boolean(parsed.readyToBuild) || userTurnCount >= 2 || BUILD_NOW_RE.test(userMessage);
+    userSaidBuild ||
+    userTurnCount >= 2 ||
+    Boolean(currentDecl.view?.proceduralOrgan) ||
+    Boolean(parsed?.readyToBuild === true && userTurnCount >= 1);
 
-  // Sanitize inputs
-  const inputs: EncodedField[] = [];
-  const seenFields = new Set<string>();
-  if (Array.isArray(parsed.inputs)) {
-    for (const item of parsed.inputs.slice(0, 5)) {
-      if (!item || typeof item !== 'object') continue;
-      const obj = item as Record<string, unknown>;
-      const rawName = typeof obj.name === 'string' ? obj.name : '';
-      const cleanName = sanitizeIdentifier(rawName);
-      if (!cleanName || seenFields.has(cleanName)) continue;
-      seenFields.add(cleanName);
-      const kind = obj.kind === 'bool' ? 'bool' : 'nat';
-      const min = kind === 'bool' ? 0 : Math.max(0, Math.floor(Number(obj.min ?? 0) || 0));
-      const max =
-        kind === 'bool'
-          ? 1
-          : Math.max(min + 1, Math.min(1_000_000, Math.floor(Number(obj.max ?? 1000) || 1000)));
-      const def = Math.max(
-        min,
-        Math.min(max, Math.floor(Number(obj.defaultValue ?? (min === 0 ? 1 : min)) || 0)),
-      );
-      inputs.push({
-        name: cleanName,
-        label:
-          typeof obj.label === 'string' && obj.label.trim()
-            ? obj.label.trim().slice(0, 40)
-            : cleanName,
-        kind,
-        min,
-        max,
-        defaultValue: def,
-      });
-    }
-  }
-  const finalInputs = inputs.length > 0 ? inputs : fallback.inputs;
-  const fieldSet = new Set(finalInputs.map((f) => f.name));
-
-  // Sanitize refusals
-  const refusals: AgentModelSpecDraft['refusals'][number][] = [];
-  if (Array.isArray(parsed.refusals)) {
-    for (const item of parsed.refusals.slice(0, 3)) {
-      if (!item || typeof item !== 'object') continue;
-      const obj = item as Record<string, unknown>;
-      const fName = sanitizeIdentifier(String(obj.field ?? ''));
-      const op = String(obj.op ?? 'eq') as CompareOp;
-      const value = Math.max(0, Math.floor(Number(obj.value ?? 0) || 0));
-      const failureText =
-        typeof obj.failureText === 'string' && obj.failureText.trim()
-          ? obj.failureText.trim().slice(0, 120)
-          : '';
-      if (!fieldSet.has(fName) || !VALID_OPS.has(op) || !failureText) continue;
-      refusals.push({
-        statement:
-          typeof obj.statement === 'string' && obj.statement.trim()
-            ? obj.statement.trim().slice(0, 140)
-            : `Refuse invalid ${fName}.`,
-        field: fName,
-        op,
-        value,
-        failureText,
-      });
-    }
-  }
-
-  // Sanitize rules (always ensure a fallback default rule with no field at the end)
-  const rules: AgentModelSpecDraft['rules'][number][] = [];
-  if (Array.isArray(parsed.rules)) {
-    for (const item of parsed.rules.slice(0, 4)) {
-      if (!item || typeof item !== 'object') continue;
-      const obj = item as Record<string, unknown>;
-      const outcome =
-        typeof obj.outcome === 'string' && obj.outcome.trim()
-          ? obj.outcome.trim().slice(0, 80)
-          : '';
-      if (!outcome) continue;
-      const tone = VALID_TONES.has(obj.tone as 'brand')
-        ? (obj.tone as 'default' | 'success' | 'warning' | 'destructive' | 'brand')
-        : 'brand';
-      const rawField = typeof obj.field === 'string' && obj.field.trim() ? sanitizeIdentifier(obj.field) : undefined;
-      const op = typeof obj.op === 'string' && VALID_OPS.has(obj.op as CompareOp) ? (obj.op as CompareOp) : undefined;
-      if (rawField && fieldSet.has(rawField) && op) {
-        rules.push({
-          statement:
-            typeof obj.statement === 'string' && obj.statement.trim()
-              ? obj.statement.trim().slice(0, 140)
-              : outcome,
-          field: rawField,
-          op,
-          value: Math.max(0, Math.floor(Number(obj.value ?? 0) || 0)),
-          outcome,
-          tone,
-        });
-      } else {
-        rules.push({
-          statement:
-            typeof obj.statement === 'string' && obj.statement.trim()
-              ? obj.statement.trim().slice(0, 140)
-              : outcome,
-          outcome,
-          tone,
-        });
-      }
-    }
-  }
-  if (!rules.some((r) => !r.field)) {
-    rules.push({
-      statement: `Active verified state for ${name}.`,
-      outcome: 'Active',
-      tone: 'brand',
-    });
-  }
-
-  // Sanitize stakeholders
-  const validRoles = new Set<StakeholderDecl['provRole']>(['producer', 'consumer', 'beneficiary', 'regulator']);
-  const stakeholders: AgentModelSpecDraft['stakeholders'][number][] = [];
-  if (Array.isArray(parsed.stakeholders)) {
-    for (const item of parsed.stakeholders.slice(0, 4)) {
-      if (!item || typeof item !== 'object') continue;
-      const obj = item as Record<string, unknown>;
-      const sName = typeof obj.name === 'string' && obj.name.trim() ? obj.name.trim().slice(0, 48) : '';
-      if (!sName) continue;
-      const role = validRoles.has(obj.role as StakeholderDecl['provRole'])
-        ? (obj.role as StakeholderDecl['provRole'])
-        : 'consumer';
-      stakeholders.push({
-        name: sName,
-        role,
-        concern:
-          typeof obj.concern === 'string' && obj.concern.trim()
-            ? obj.concern.trim().slice(0, 160)
-            : `Use ${name} safely and reliably.`,
-      });
-    }
-  }
+  const mediaDesc = PRISM_MEDIA_CATALOG[mediaType];
+  const fallbackReply = readyToBuild
+    ? `Routing ${mediaDesc.label} weights for "${name}" and synthesizing your Prism now.`
+    : `Got it — I've activated Verdant Studio's ${mediaDesc.label} features for "${name}". Before I synthesize it, any preference on ${mediaDesc.activeWizardQuestions.join(' or ')}? (Or say "Build it now" for smart defaults.)`;
 
   const reply =
-    typeof parsed.reply === 'string' && parsed.reply.trim().length >= 8
-      ? parsed.reply.trim().slice(0, 700)
-      : fallback.reply;
+    parsed && typeof parsed.reply === 'string' && parsed.reply.trim().length >= 8
+      ? parsed.reply.trim().slice(0, 420)
+      : fallbackReply;
 
-  const quickReplies = Array.isArray(parsed.quickReplies)
-    ? parsed.quickReplies
-        .map((q) => String(q).trim())
-        .filter((q) => q.length >= 2 && q.length <= 120)
-        .slice(0, 3)
-    : fallback.quickReplies;
+  const quickReplies =
+    parsed && Array.isArray(parsed.quickReplies) && parsed.quickReplies.length > 0
+      ? parsed.quickReplies.map((q) => String(q).trim()).filter(Boolean).slice(0, 4)
+      : defaultQuickRepliesForMediaType(mediaType);
 
   return {
+    usedFallback: parsed === null,
     spec: {
       name,
       purpose,
-      domain,
-      audience,
-      dataClassification,
-      jurisdictions,
-      usesLocalAi: Boolean(parsed.usesLocalAi),
-      involvesPayments: Boolean(parsed.involvesPayments),
-      mode,
+      mediaType,
+      activeOrgans,
+      compartmentId,
+      domain: currentDecl.concept.domain ?? core.domain,
+      audience: currentDecl.concept.audience ?? 'personal',
+      dataClassification: currentDecl.concept.dataClassification ?? 'none',
+      jurisdictions: currentDecl.concept.jurisdictions.length > 0 ? currentDecl.concept.jurisdictions : ['none'],
+      usesLocalAi: mediaType === 'written-work' && weights.mediaType === 'written-work' ? weights.allowLocalAssist : false,
+      involvesPayments: false,
+      mode: 'procedural-organ',
       readyToBuild,
-      stakeholders: stakeholders.length > 0 ? stakeholders : fallback.stakeholders,
-      inputs: finalInputs,
-      refusals: refusals.length > 0 ? refusals : fallback.refusals,
-      rules,
+      weights,
+      stakeholders: [{ name: 'Creator', role: 'consumer', concern: purpose }],
+      inputs: core.inputs,
+      refusals: core.refusals,
+      rules: core.rules,
       reply,
-      quickReplies: quickReplies.length > 0 ? quickReplies : fallback.quickReplies,
+      quickReplies,
     },
-    usedFallback: false,
   };
 }
 
-/**
- * Compiles an `AgentModelSpecDraft` into atomic, validated `StudioApiOp[]` operations
- * that populate Concept (OPM + Stakeholders), System (Encoding + Rules + Refusals +
- * verified Acceptance Vectors), and Security so Lean 4.32.2 proofs always succeed.
- */
 export function buildAgentCoreModelOps(
-  decl: PrismDeclaration,
+  currentDecl: PrismDeclaration,
   spec: AgentModelSpecDraft,
   creatorQuote: string,
-): readonly StudioApiOp[] {
+): StudioApiOp[] {
   const ops: StudioApiOp[] = [];
-  let working = decl;
-
-  const push = (op: StudioApiOp) => {
+  let working = currentDecl;
+  const applyLocal = (op: StudioApiOp) => {
     const res = dispatchStudioOp(working, op);
     if (res.ok) {
       working = res.declaration;
@@ -686,12 +725,8 @@ export function buildAgentCoreModelOps(
     }
   };
 
-  push({
-    op: 'set-metadata',
-    name: spec.name,
-    description: spec.purpose,
-  });
-  push({
+  applyLocal({ op: 'set-metadata', name: spec.name, description: spec.purpose });
+  applyLocal({
     op: 'set-concept-profile',
     purpose: spec.purpose,
     domain: spec.domain,
@@ -702,477 +737,182 @@ export function buildAgentCoreModelOps(
     involvesPayments: spec.involvesPayments,
   });
 
-  // Record verbatim Creator decision if none recorded yet
-  if (working.decisions.length === 0 && creatorQuote.trim()) {
-    push({
+  if (working.decisions.length === 0) {
+    applyLocal({
       op: 'record-decision',
-      id: 'DEC-01',
       stakeholder: 'Creator',
-      quote: creatorQuote.trim(),
+      quote: creatorQuote.slice(0, 280),
       requirementIds: ['REQ-01'],
     });
   }
 
-  // Admit stakeholders
-  const existingStk = new Set(working.concept.stakeholders.map((s) => s.name.toLowerCase()));
-  for (let i = 0; i < spec.stakeholders.length; i++) {
-    const s = spec.stakeholders[i];
-    if (existingStk.has(s.name.toLowerCase())) continue;
-    push({
-      op: 'admit-stakeholder',
-      stakeholder: {
-        id: `STK-${String(working.concept.stakeholders.length + 1).padStart(2, '0')}`,
-        name: s.name,
-        provRole: s.role,
-        concern: s.concern,
-      },
-      autoAdmitRequirement: working.requirements.length === 0,
-    });
+  for (const s of spec.stakeholders) {
+    const already = working.concept.stakeholders.some((ex) => ex.name.toLowerCase() === s.name.toLowerCase());
+    if (!already) {
+      applyLocal({
+        op: 'admit-stakeholder',
+        stakeholder: { name: s.name, provRole: s.role, concern: s.concern },
+        autoAdmitRequirement: working.requirements.length === 0,
+      });
+    }
   }
 
   if (working.requirements.length === 0) {
-    push({
+    applyLocal({
       op: 'admit-requirement',
       requirement: {
         id: 'REQ-01',
         statement: spec.purpose,
-        stakeholder: working.concept.stakeholders[0]?.name || 'Creator',
+        stakeholder: 'Creator',
         origin: 'identity',
-        evidence: 'Creator natural-language specification (DEC-01)',
+        evidence: creatorQuote.slice(0, 200),
       },
     });
   }
-  const primaryReq = working.requirements[0]?.id ?? 'REQ-01';
 
-  // Only populate initial OPM objects/encoding/rules if not already populated (or replace clean undefined start)
+  const primaryReqId = working.requirements[0]?.id ?? 'REQ-01';
+  const reqCitation = { kind: 'req' as const, requirementId: primaryReqId };
+
   if (!working.encoding || working.encoding.fields.length === 0) {
-    const inputObjIds: string[] = [];
-    for (let i = 0; i < spec.inputs.length; i++) {
-      const f = spec.inputs[i];
-      const objId = `OBJ-${String(i + 1).padStart(2, '0')}`;
-      inputObjIds.push(objId);
-      push({
-        op: 'admit-opm-object',
-        object: {
-          id: objId,
-          name: f.label,
-          kind: f.kind,
-          states: f.kind === 'bool' ? ['False', 'True'] : [],
-          role: 'input',
-          min: f.min,
-          max: f.max,
-          defaultValue: f.defaultValue,
-        },
-      });
-    }
-    const outObjId = `OBJ-${String(spec.inputs.length + 1).padStart(2, '0')}`;
-    push({
-      op: 'admit-opm-object',
-      object: {
-        id: outObjId,
-        name: `${spec.name} State`,
-        kind: 'nat',
-        states: spec.rules.map((r) => r.outcome).slice(0, 4),
-        role: 'output',
-      },
-    });
-    push({
-      op: 'admit-opm-process',
-      process: {
-        id: 'PROC-01',
-        name: `Run ${spec.name}`,
-        summary: spec.purpose,
-        consumesObjectIds: inputObjIds,
-        yieldsObjectIds: [outObjId],
-        actorStakeholderIds: working.concept.stakeholders.map((s) => s.id),
-      },
-    });
-    push({
+    applyLocal({
       op: 'propose-encoding',
-      name: `${sanitizeIdentifier(spec.name.replace(/\s+/g, ''))}Input`,
-      fields: spec.inputs,
-      citation: { kind: 'req', requirementId: primaryReq },
+      name: `${sanitizeIdentifier(spec.name)}_input`,
+      schema: fieldsToJsonSchema(spec.inputs),
+      citation: reqCitation,
     });
+  }
 
-    // Admit refusals
-    let nextAppNum = 1;
-    for (const ref of spec.refusals) {
-      const id = `APP-${String(nextAppNum++).padStart(2, '0')}`;
-      push({
+  const fieldNames = new Set((working.encoding?.fields ?? []).map((f) => f.name));
+  if (working.refusals.length === 0) {
+    spec.refusals.forEach((r, idx) => {
+      const f = sanitizeIdentifier(r.field);
+      if (!fieldNames.has(f)) return;
+      applyLocal({
         op: 'admit-refusal',
         refusal: {
-          id,
-          statement: ref.statement,
-          condition: { all: [{ field: ref.field, op: ref.op, value: ref.value }] },
-          failureText: ref.failureText,
-          fieldHint: ref.field,
-          negativeId: id,
-          citation: { kind: 'req', requirementId: primaryReq },
+          id: `REF-${String(idx + 1).padStart(2, '0')}`,
+          negativeId: `NEG-${String(idx + 1).padStart(2, '0')}`,
+          statement: r.statement,
+          condition: { all: [{ field: f, op: r.op, value: r.value }] },
+          failureText: r.failureText,
+          fieldHint: f,
+          citation: reqCitation,
         },
       });
-    }
-
-    // Admit rules
-    for (let i = 0; i < spec.rules.length; i++) {
-      const rule = spec.rules[i];
-      const id = `APP-${String(nextAppNum++).padStart(2, '0')}`;
-      const outcome: RuleOutcome = {
-        kind: 'label',
-        code: i + 1,
-        label: rule.outcome,
-        tone: rule.tone,
-      };
-      push({
-        op: 'admit-feature',
-        feature: {
-          id,
-          level: 'build',
-          statement: rule.statement,
-          condition:
-            rule.field && rule.op
-              ? { all: [{ field: rule.field, op: rule.op, value: rule.value ?? 0 }] }
-              : { all: [] },
-          outcome,
-          priority: rule.field ? i + 1 : 99,
-          citation: { kind: 'req', requirementId: primaryReq },
-        },
-      });
-    }
-
-    // Synthesize guaranteed-passing acceptance vectors (default happy path + every refusal)
-    const defaultInputs: Record<string, number> = {};
-    for (const f of working.encoding?.fields ?? []) {
-      defaultInputs[f.name] = f.defaultValue;
-    }
-    // Ensure default happy-path doesn't trip an `eq 0` refusal
-    for (const ref of working.refusals) {
-      const pred = ref.condition.all[0];
-      if (!pred) continue;
-      if (pred.op === 'eq' && defaultInputs[pred.field] === pred.value) {
-        defaultInputs[pred.field] = pred.value + 1;
-      } else if (pred.op === 'lt' && defaultInputs[pred.field] < pred.value) {
-        defaultInputs[pred.field] = pred.value;
-      } else if (pred.op === 'gt' && defaultInputs[pred.field] > pred.value) {
-        defaultInputs[pred.field] = Math.max(0, pred.value);
-      }
-    }
-    const defaultEval = evaluateDeclaredModel(working, formatRequestLine(working.encoding, defaultInputs));
-    push({
-      op: 'admit-vector',
-      vector: {
-        id: 'vec_default',
-        inputs: defaultInputs,
-        expectedResponse: defaultEval.response,
-        forFeatureId: working.features[working.features.length - 1]?.id ?? 'APP-01',
-        isRefusal: defaultEval.isRefusal,
-      },
     });
-
-    // Ensure every refusal has a verified rejecting vector
-    const chk = checkDeclaration(working);
-    for (const diag of chk.diagnostics) {
-      if (diag.code === 'contract.refusal-unreplayed' || diag.code === 'holo.vectors') {
-        const repair = deriveRepairOp(working, diag.code, diag.message, diag.id);
-        if (repair) push(repair);
-      }
-    }
   }
 
-  push({ op: 'sync-stride-threats' });
+  if (working.features.length === 0) {
+    spec.rules.forEach((rule, idx) => {
+      const f = rule.field ? sanitizeIdentifier(rule.field) : undefined;
+      const cond = f && fieldNames.has(f) && rule.op && rule.value !== undefined
+        ? { all: [{ field: f, op: rule.op, value: rule.value }] }
+        : { all: [] };
+      const outcome: RuleOutcome = { kind: 'label', code: idx + 1, label: rule.outcome, tone: rule.tone };
+      applyLocal({
+        op: 'admit-feature',
+        feature: {
+          id: `F-${String(idx + 1).padStart(2, '0')}`,
+          statement: rule.statement,
+          condition: cond,
+          outcome,
+          priority: (idx + 1) * 10,
+          level: 'build',
+          citation: reqCitation,
+        },
+      });
+    });
+  }
+
   return ops;
 }
 
 /**
- * Builds the dedicated local-LLM prompt to synthesize a complete, playable/usable,
- * 100% self-contained interactive Prism app (`html`, `css`, `js`) matching the
- * Creator's exact conversation and Core Models.
+ * Assembles the complete closed Studio API batch that routes declarative weights onto the
+ * active procedural MediaType organ and reconciles all Core Models, acceptance vectors, and standards.
  */
-export function buildInteractiveAppPrompt(
-  history: readonly AgentChatTurn[],
-  decl: PrismDeclaration,
-): string {
-  const fields = decl.encoding?.fields ?? [];
-  const sampleRequest = fields.map((f) => f.defaultValue).join(' ');
-  const fieldDoc = fields.map((f) => `${f.name} (${f.label})`).join(', ');
-
-  return `${STUDIO_AGENT_SYSTEM_PREFIX}
-
-PHASE: INTERACTIVE APP REALIZATION
-
-Prism specification:
-${summarizeDeclarationForPrompt(decl)}
-
-Full conversation with the Creator:
-${formatTranscriptForPrompt(history)}
-
-REALIZATION DETAILS:
-- For games (Minesweeper, Snake, Tetris, 2048, Chess, Tic-Tac-Toe, Sudoku, etc.), implement EVERY real game mechanic cleanly (playable board/canvas, win & loss detection, counters/score, timer if appropriate, difficulty/mode selector, New Game / Reset button, right-click & mobile toggle support where applicable).
-- For productivity tools (Kanban, Pomodoro, Flashcards, Habit Tracker, Whiteboard, etc.), implement full live interactivity, state management, add/edit/delete/toggle controls, and clear feedback.
-- \`globalThis.prism.invoke(line)\` accepts space-separated non-negative integers for [${fieldDoc}] (e.g. "${sampleRequest}").
-- Write clean, defensive vanilla JavaScript (no external frameworks, no \`import\` statements). Guard every DOM query before attaching listeners.
-
-OUTPUT FORMAT — Output ONLY these three fenced code blocks (no extra explanation before or after):
-
-\`\`\`html
-<!-- Inner body markup only (no <html>, <head>, or <body> tags) -->
-\`\`\`
-
-\`\`\`css
-/* Complete responsive styles using var(--v-*) tokens */
-\`\`\`
-
-\`\`\`js
-// Complete self-contained interactive JavaScript
-\`\`\``;
-}
-
-/**
- * Builds the targeted refinement / self-healing prompt when the Creator requests
- * changes in plain English OR when the live sandbox reports a runtime error.
- */
-export function buildRefineInteractiveAppPrompt(
-  history: readonly AgentChatTurn[],
-  decl: PrismDeclaration,
-  currentView: AuthoredPrismView,
-  instruction: string,
-  runtimeError?: { readonly message: string; readonly line: number | null } | null,
-): string {
-  const goalBlock = runtimeError
-    ? `RUNTIME ERROR TO FIX IMMEDIATELY:\n"${runtimeError.message}"${runtimeError.line ? ` (line ${runtimeError.line})` : ''}\nDiagnose the exact bug in the current code and return the complete fixed HTML, CSS, and JS.`
-    : `CREATOR CHANGE REQUEST:\n"${instruction}"\nApply this change cleanly while keeping all existing functionality working smoothly.`;
-
-  return `${STUDIO_AGENT_SYSTEM_PREFIX}
-
-PHASE: REFINEMENT & SELF-HEALING ("${decl.metadata.name}")
-
-${goalBlock}
-
-Recent conversation:
-${formatTranscriptForPrompt(history.slice(-6))}
-
-Current HTML:
-\`\`\`html
-${currentView.html.slice(0, 8000)}
-\`\`\`
-
-Current CSS:
-\`\`\`css
-${currentView.css.slice(0, 6000)}
-\`\`\`
-
-Current JS:
-\`\`\`js
-${currentView.js.slice(0, 14000)}
-\`\`\`
-
-Return the COMPLETE updated HTML, CSS, and JS in these exact three fenced blocks (never use "...existing code..." ellipses):
-
-\`\`\`html
-...
-\`\`\`
-
-\`\`\`css
-...
-\`\`\`
-
-\`\`\`js
-...
-\`\`\``;
-}
-
-function sanitizeAuthoredHtml(rawHtml: string): string {
-  let html = rawHtml.trim();
-  const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-  if (bodyMatch) html = bodyMatch[1].trim();
-  // Strip any external scripts/stylesheets or inline script tags (JS lives in view/app.js)
-  html = html
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<link[^>]+href=["']https?:\/\/[^"']+["'][^>]*\/?>/gi, '')
-    .replace(/<link[^>]+href=["'](?:\.\/)?(?:prism\.css|styles\.css)["'][^>]*\/?>/gi, '')
-    .trim();
-  return html;
-}
-
-function sanitizeAuthoredJs(rawJs: string): string {
-  return rawJs
-    .replace(/^\s*import\s+[\s\S]*?;\s*$/gm, '')
-    .replace(/^\s*export\s+(?:default\s+)?/gm, '')
-    .trim();
-}
-
-/**
- * Extracts `{ html, css, js }` from local LLM output supporting fenced blocks,
- * single-document HTML with embedded `<style>`/`<script>`, or JSON payloads.
- */
-export function extractAuthoredAppFromModelOutput(raw: string): AuthoredAppExtractionResult {
-  const text = raw.trim();
-  if (!text) {
-    return { ok: false, reason: 'Model returned an empty response.' };
-  }
-
-  let html = '';
-  let css = '';
-  let js = '';
-
-  // 1. Primary path: fenced ```html, ```css, ```js / ```javascript blocks
-  const blockRe = /```([a-zA-Z0-9_-]*)\s*\n([\s\S]*?)```/g;
-  let m: RegExpExecArray | null;
-  while ((m = blockRe.exec(text)) !== null) {
-    const lang = m[1].trim().toLowerCase();
-    const content = m[2].trim();
-    if (!content) continue;
-    if (lang === 'html' || lang === 'htm' || lang === 'markup') {
-      if (content.length > html.length) html = content;
-    } else if (lang === 'css') {
-      if (content.length > css.length) css = content;
-    } else if (lang === 'js' || lang === 'javascript' || lang === 'mjs' || lang === 'ts') {
-      if (content.length > js.length) js = content;
-    }
-  }
-
-  // 2. If single-file HTML contained <style> and/or <script>, extract them cleanly
-  if (html && (!css || !js)) {
-    if (!css) {
-      const styleBlocks = Array.from(html.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)).map((s) =>
-        s[1].trim(),
-      );
-      if (styleBlocks.length > 0) css = styleBlocks.join('\n\n');
-    }
-    if (!js) {
-      const scriptBlocks = Array.from(html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)).map(
-        (s) => s[1].trim(),
-      );
-      if (scriptBlocks.length > 0) js = scriptBlocks.join('\n\n');
-    }
-    html = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
-  }
-
-  // 3. Raw unfenced full HTML document fallback
-  if (!html && /<(?:!doctype\s+html|html|div|main|section|canvas|header)/i.test(text)) {
-    const styleBlocks = Array.from(text.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)).map((s) =>
-      s[1].trim(),
-    );
-    const scriptBlocks = Array.from(text.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)).map(
-      (s) => s[1].trim(),
-    );
-    if (!css && styleBlocks.length > 0) css = styleBlocks.join('\n\n');
-    if (!js && scriptBlocks.length > 0) js = scriptBlocks.join('\n\n');
-    html = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
-  }
-
-  // 4. JSON payload fallback
-  if (!html || !js) {
-    const jsonObj = tryExtractJsonObject(text);
-    if (jsonObj) {
-      if (!html && typeof jsonObj.html === 'string') html = jsonObj.html;
-      if (!css && typeof jsonObj.css === 'string') css = jsonObj.css;
-      if (!js && typeof jsonObj.js === 'string') js = jsonObj.js;
-    }
-  }
-
-  const cleanHtml = sanitizeAuthoredHtml(html);
-  const cleanCss = css.replace(/<\/style>/gi, '').trim();
-  const cleanJs = sanitizeAuthoredJs(js);
-
-  if (!cleanHtml || cleanHtml.length < 12) {
-    return { ok: false, reason: 'Could not extract interactive HTML markup from the studio agent response.' };
-  }
-  if (!cleanJs || cleanJs.length < 20) {
-    return { ok: false, reason: 'Could not extract interactive JavaScript behavior from the studio agent response.' };
-  }
-  const syntaxCheck = validateAuthoredJsSyntax(cleanJs);
-  if (!syntaxCheck.ok) {
-    return { ok: false, reason: syntaxCheck.error };
-  }
-
-  return {
-    ok: true,
-    view: {
-      html: cleanHtml,
-      css: cleanCss,
-      js: cleanJs,
-      authorMode: 'studio-agent',
-    },
-  };
-}
-
-/**
- * Combines Core Model ops + authored interactive view admission + automatic
- * reconciliation of all safety checks and applicable standards into a single atomic batch.
- */
-export function assembleCompleteAuthoredPrismOps(
-  decl: PrismDeclaration,
-  spec: AgentModelSpecDraft | null,
-  authoredView: AuthoredPrismView,
-  userMessage: string,
-): { readonly ops: readonly StudioApiOp[]; readonly badges: readonly string[] } {
+export function assembleProceduralPrismOps(
+  currentDecl: PrismDeclaration,
+  spec: AgentModelSpecDraft,
+  creatorQuote: string,
+): {
+  readonly ops: StudioApiOp[];
+  readonly badges: string[];
+  readonly finalDecl: PrismDeclaration;
+} {
   const ops: StudioApiOp[] = [];
-  const badges: string[] = [];
-  let working = decl;
+  let working = currentDecl;
+  const applyLocal = (op: StudioApiOp) => {
+    const res = dispatchStudioOp(working, op);
+    if (res.ok) {
+      working = res.declaration;
+      ops.push(op);
+    }
+  };
 
-  const pushAll = (list: readonly StudioApiOp[]) => {
-    for (const op of list) {
-      const res = dispatchStudioOp(working, op);
-      if (res.ok) {
-        working = res.declaration;
-        ops.push(op);
+  for (const op of buildAgentCoreModelOps(working, spec, creatorQuote)) {
+    applyLocal(op);
+  }
+
+  const primaryReqId = working.requirements[0]?.id ?? 'REQ-01';
+  applyLocal({
+    op: 'route-prism-weights',
+    mediaType: spec.mediaType,
+    activeOrgans: spec.activeOrgans,
+    weights: spec.weights,
+    compartmentId: spec.compartmentId,
+    title: spec.name,
+    eyebrow: PRISM_MEDIA_CATALOG[spec.mediaType].label,
+    subtitle: spec.purpose,
+    summary: `Procedurally synthesized ${PRISM_MEDIA_CATALOG[spec.mediaType].label} Prism (zero LLM JS)`,
+    citation: { kind: 'req', requirementId: primaryReqId },
+  });
+
+  // Reconcile remaining Core 3 (Security) & applicable standards cleanly
+  const reconciled = reconcileAllRemainingFacets(working);
+  for (const op of reconciled.ops) {
+    if (op.op === 'synthesize-view-from-system' || op.op === 'declare-view') continue;
+    applyLocal(op);
+  }
+
+  // Ensure default acceptance vector + refusal vectors replay cleanly
+  if (working.encoding && working.encoding.fields.length > 0 && working.vectors.length === 0) {
+    const defaults: Record<string, number> = {};
+    for (const f of working.encoding.fields) defaults[f.name] = f.defaultValue;
+    const reqLine = formatRequestLine(working.encoding, defaults);
+    const ev = evaluateDeclaredModel(working, reqLine);
+    applyLocal({
+      op: 'admit-vector',
+      vector: {
+        id: 'vec_default',
+        inputs: defaults,
+        expectedResponse: ev.response,
+        forFeatureId: ev.matchedId || working.features[0]?.id || 'F-01',
+        isRefusal: ev.isRefusal,
+      },
+    });
+  }
+
+  // Run self-healing vector repairs if any check diagnostic remains
+  for (let pass = 0; pass < 3; pass++) {
+    const report = checkDeclaration(working);
+    if (report.ok) break;
+    let repairedAny = false;
+    for (const diag of report.diagnostics) {
+      if (diag.severity !== 'error') continue;
+      const repair = deriveRepairOp(working, diag.code, diag.message);
+      if (repair && repair.op !== 'synthesize-view-from-system' && repair.op !== 'declare-view') {
+        applyLocal(repair);
+        repairedAny = true;
       }
     }
-  };
-
-  if (spec) {
-    pushAll(buildAgentCoreModelOps(working, spec, userMessage));
-    badges.push(`Concept: ${working.metadata.name}`);
+    if (!repairedAny) break;
   }
 
-  // Apply any context or theme preferences mentioned in the latest reply
-  const ctx = parseContextReply(working, userMessage);
-  if (ctx.ops.length > 0) {
-    pushAll(ctx.ops);
-    badges.push(...ctx.changes);
-  }
-  const designPrefs = parseDesignPreferences(userMessage);
-  if (designPrefs.theme) {
-    pushAll([{ op: 'set-theme', theme: { preset: designPrefs.theme } }]);
-    badges.push(`Theme: ${designPrefs.theme}`);
-  }
-
-  // Guarantee at least REQ-01 exists before admitting authored view
-  if (working.requirements.length === 0) {
-    pushAll([
-      {
-        op: 'admit-requirement',
-        requirement: {
-          id: 'REQ-01',
-          statement: working.concept.purpose || `Deliver interactive ${working.metadata.name}.`,
-          stakeholder: working.concept.stakeholders[0]?.name || 'Creator',
-          origin: 'identity',
-          evidence: 'Creator natural-language specification',
-        },
-      },
-    ]);
-  }
-  const primaryReq = working.requirements[0]?.id ?? 'REQ-01';
-
-  // Admit the authored interactive app view
-  pushAll([
-    {
-      op: 'admit-authored-view',
-      authoredView,
-      title: working.metadata.name,
-      subtitle: working.concept.purpose || working.metadata.description,
-      citation: { kind: 'req', requirementId: primaryReq },
-    },
-  ]);
-  badges.push(`Built interactive ${working.metadata.name}`);
-
-  // Reconcile all remaining safety boundaries, vectors, and applicable standards
-  // (synthesize-view-from-system preserves authoredView automatically!)
-  const reconciled = reconcileAllRemainingFacets(working, {
-    viewpoint: 'interactive-app',
-  });
-  pushAll(reconciled.ops);
-  badges.push(...reconciled.badges);
-
-  return { ops, badges: Array.from(new Set(badges)) };
+  const badges = [
+    `${PRISM_MEDIA_CATALOG[spec.mediaType].label}`,
+    `${spec.activeOrgans.length} active feature${spec.activeOrgans.length === 1 ? '' : 's'}`,
+    `Space: ${spec.compartmentId}`,
+  ];
+  return { ops, badges, finalDecl: working };
 }
