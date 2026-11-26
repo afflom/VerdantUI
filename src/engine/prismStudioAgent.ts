@@ -199,6 +199,40 @@ function summarizeDeclarationForPrompt(decl: PrismDeclaration): string {
 }
 
 /**
+ * Shared byte-identical system prefix across Discovery, Build, and Refinement turns so
+ * VerdantUI's content-addressed KV prefix cache (`VramUnifiedStore`) reuses prefilled
+ * system tokens across multi-turn Studio Agent sessions with zero redundant prefill.
+ */
+export const STUDIO_AGENT_SYSTEM_PREFIX = `You are Verdant Studio, a collaborative 100% on-device Prism architect pairing with a human Creator in plain English.
+Core principles:
+- Build the exact real, complete, interactive Prism the Creator describes — never a stub, placeholder, or hardcoded template.
+- Keep all generated apps 100% self-contained and offline (zero remote URLs, zero CDN links, zero external fetches, zero alert/prompt).
+- Use Verdant theme tokens (--v-bg, --v-surface, --v-surface-alt, --v-border, --v-text, --v-muted, --v-accent, --v-accent-text) so Light and Dark modes look sharp.
+- Sync key state transitions asynchronously with globalThis.prism?.invoke(...) inside try/catch without blocking UI responsiveness.
+- NEVER mention internal engineering terms in user-facing text (never say Observer, OpenTelemetry, vTensor, LexLean, Studio API, or REQ-D6/D9/D11).`;
+
+/**
+ * Zero-execution JavaScript syntax validator. Compiles via `new Function(source)` without
+ * ever invoking the function, catching truncation and syntax errors before admitting code
+ * into a Prism declaration or mounting the sandbox preview.
+ */
+export function validateAuthoredJsSyntax(js: string): { readonly ok: true } | { readonly ok: false; readonly error: string } {
+  const trimmed = js.trim();
+  if (!trimmed) {
+    return { ok: false, error: 'JavaScript source is empty.' };
+  }
+  try {
+    // Parse-only check (returned function is immediately discarded and never called)
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    new Function(trimmed);
+    return { ok: true };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: `JavaScript syntax error: ${msg}` };
+  }
+}
+
+/**
  * Builds the system prompt for a conversational discovery/clarification turn.
  * Asks the local model to anchor the Core Models AND ask 1–2 concise, domain-specific
  * questions tailored to the Creator's exact idea (or mark `readyToBuild: true` once answered).
@@ -213,8 +247,9 @@ export function buildDiscoveryAgentPrompt(
       ? 'The Creator has already answered your initial questions. Unless a critical requirement is still ambiguous, set "readyToBuild": true so we immediately build the playable/usable Prism now.'
       : 'This is the first message. Ask 1–2 short, concrete, friendly questions specifically tailored to THIS exact app/game (e.g., key gameplay/feature options + whether it is personal offline or for kids/public) and set "readyToBuild": false unless the user explicitly asked to build immediately with defaults.';
 
-  return `You are Verdant Studio, a collaborative local Prism architect pairing with a human Creator in plain English.
-NEVER mention internal system terms (never say Observer, OpenTelemetry, vTensor, LexLean, Studio API, or REQ-D6/D9/D11).
+  return `${STUDIO_AGENT_SYSTEM_PREFIX}
+
+PHASE: DISCOVERY & CORE MODEL ANCHORING
 
 Current Prism state:
 ${summarizeDeclarationForPrompt(decl)}
@@ -860,7 +895,9 @@ export function buildInteractiveAppPrompt(
   const sampleRequest = fields.map((f) => f.defaultValue).join(' ');
   const fieldDoc = fields.map((f) => `${f.name} (${f.label})`).join(', ');
 
-  return `You are Verdant Studio, building a complete, polished, immediately playable/usable client-side web application inside a sandboxed Prism for the Creator.
+  return `${STUDIO_AGENT_SYSTEM_PREFIX}
+
+PHASE: INTERACTIVE APP REALIZATION
 
 Prism specification:
 ${summarizeDeclarationForPrompt(decl)}
@@ -868,14 +905,11 @@ ${summarizeDeclarationForPrompt(decl)}
 Full conversation with the Creator:
 ${formatTranscriptForPrompt(history)}
 
-CRITICAL REQUIREMENTS:
-1. Build the REAL, COMPLETE, FULLY INTERACTIVE application the Creator described — NEVER a stub, placeholder, or generic numeric form.
-   - If the Creator asked for a game (such as Minesweeper, Snake, Tetris, 2048, Chess, Tic-Tac-Toe, Sudoku, etc.), implement EVERY real game mechanic cleanly (full playable board/canvas, win & loss detection, score/counters, timer if appropriate, difficulty/mode selector, New Game / Reset button, right-click & mobile toggle support where applicable, keyboard support where applicable).
-   - If the Creator asked for a productivity tool (Kanban, Pomodoro, Flashcards, Habit Tracker, Calculator, Whiteboard, etc.), implement full live interactivity, state management, add/edit/delete/toggle controls, and clear feedback.
-2. 100% SELF-CONTAINED & OFFLINE (strict CSP: zero external URLs, zero CDN links, zero external images/fonts, zero fetch calls). Use clean Unicode/emoji/inline SVG if icons are helpful.
-3. THEME-AWARE STYLING: Use CSS variables \`var(--v-bg)\`, \`var(--v-surface)\`, \`var(--v-surface-alt)\`, \`var(--v-border)\`, \`var(--v-text)\`, \`var(--v-muted)\`, \`var(--v-accent)\`, \`var(--v-accent-text)\` so both Light and Dark themes look crisp and legible.
-4. PROVED MODEL BRIDGE: \`globalThis.prism.invoke(line)\` is available asynchronously (takes a space-separated string of non-negative integers for [${fieldDoc}], e.g. "${sampleRequest}"). Call it gracefully inside \`try { await globalThis.prism?.invoke(...); } catch (_) {}\` on major state transitions (like game start / win / loss / submit) to keep the UI synced with the proved model without ever blocking UI responsiveness.
-5. ZERO BUGS: Write clean, defensive vanilla JavaScript (no external frameworks, no \`import\` statements, no \`window.alert\`/\`prompt\`). Guard every DOM query before attaching listeners.
+REALIZATION DETAILS:
+- For games (Minesweeper, Snake, Tetris, 2048, Chess, Tic-Tac-Toe, Sudoku, etc.), implement EVERY real game mechanic cleanly (playable board/canvas, win & loss detection, counters/score, timer if appropriate, difficulty/mode selector, New Game / Reset button, right-click & mobile toggle support where applicable).
+- For productivity tools (Kanban, Pomodoro, Flashcards, Habit Tracker, Whiteboard, etc.), implement full live interactivity, state management, add/edit/delete/toggle controls, and clear feedback.
+- \`globalThis.prism.invoke(line)\` accepts space-separated non-negative integers for [${fieldDoc}] (e.g. "${sampleRequest}").
+- Write clean, defensive vanilla JavaScript (no external frameworks, no \`import\` statements). Guard every DOM query before attaching listeners.
 
 OUTPUT FORMAT — Output ONLY these three fenced code blocks (no extra explanation before or after):
 
@@ -907,7 +941,9 @@ export function buildRefineInteractiveAppPrompt(
     ? `RUNTIME ERROR TO FIX IMMEDIATELY:\n"${runtimeError.message}"${runtimeError.line ? ` (line ${runtimeError.line})` : ''}\nDiagnose the exact bug in the current code and return the complete fixed HTML, CSS, and JS.`
     : `CREATOR CHANGE REQUEST:\n"${instruction}"\nApply this change cleanly while keeping all existing functionality working smoothly.`;
 
-  return `You are Verdant Studio refining an existing live interactive Prism ("${decl.metadata.name}").
+  return `${STUDIO_AGENT_SYSTEM_PREFIX}
+
+PHASE: REFINEMENT & SELF-HEALING ("${decl.metadata.name}")
 
 ${goalBlock}
 
@@ -929,9 +965,7 @@ Current JS:
 ${currentView.js.slice(0, 14000)}
 \`\`\`
 
-REQUIREMENTS:
-- Keep everything 100% self-contained & offline (zero external URLs, zero \`import\` statements, zero \`alert\`/\`prompt\`).
-- Return the COMPLETE updated HTML, CSS, and JS in these exact three fenced blocks (never use "...existing code..." ellipses):
+Return the COMPLETE updated HTML, CSS, and JS in these exact three fenced blocks (never use "...existing code..." ellipses):
 
 \`\`\`html
 ...
@@ -1046,6 +1080,10 @@ export function extractAuthoredAppFromModelOutput(raw: string): AuthoredAppExtra
   if (!cleanJs || cleanJs.length < 20) {
     return { ok: false, reason: 'Could not extract interactive JavaScript behavior from the studio agent response.' };
   }
+  const syntaxCheck = validateAuthoredJsSyntax(cleanJs);
+  if (!syntaxCheck.ok) {
+    return { ok: false, reason: syntaxCheck.error };
+  }
 
   return {
     ok: true,
@@ -1136,5 +1174,5 @@ export function assembleCompleteAuthoredPrismOps(
   pushAll(reconciled.ops);
   badges.push(...reconciled.badges);
 
-  return { ops, badges };
+  return { ops, badges: Array.from(new Set(badges)) };
 }

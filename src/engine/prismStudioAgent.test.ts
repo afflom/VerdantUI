@@ -15,6 +15,7 @@ import { evaluateVerdantRouting } from './verdantStandardsRouter';
 import { compilePrismDeclaration, instantiateAppFoundation } from './prismCompiler';
 import { buildHoloviewSandboxDocument } from './prismSandboxHtml';
 import {
+  STUDIO_AGENT_SYSTEM_PREFIX,
   assembleCompleteAuthoredPrismOps,
   buildAgentCoreModelOps,
   buildDiscoveryAgentPrompt,
@@ -24,7 +25,9 @@ import {
   extractAuthoredAppFromModelOutput,
   extractCleanIdeaTitle,
   parseDiscoveryAgentResponse,
+  validateAuthoredJsSyntax,
 } from './prismStudioAgent';
+import { PrismStore } from './prismStudio';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PRISM_CODE_ROOT = path.resolve(__dirname, '../../node_modules/prism-code');
@@ -373,4 +376,96 @@ startGame();
   assert.ok(dec.decode(viewFiles.get('styles.css')).includes('.ms-board'));
   assert.ok(dec.decode(viewFiles.get('app.js')).includes('startGame'));
   assert.ok(viewFiles.has('prism.js'));
+});
+
+test('Performance & stability: WeakMap memoization, shared KV prefix, zero-exec JS syntax gate, and unified model cohesion', async () => {
+  // 1. Zero-execution JS syntax gate rejects truncated/invalid JS without executing side effects
+  let sideEffectTriggered = false;
+  (globalThis as Record<string, unknown>).__verdantSyntaxGateProbe = () => {
+    sideEffectTriggered = true;
+  };
+  const validCheck = validateAuthoredJsSyntax('globalThis.__verdantSyntaxGateProbe(); const x = 42;');
+  assert.equal(validCheck.ok, true);
+  assert.equal(sideEffectTriggered, false, 'Syntax validator must NEVER execute code');
+  delete (globalThis as Record<string, unknown>).__verdantSyntaxGateProbe;
+
+  const truncated = extractAuthoredAppFromModelOutput(`
+\`\`\`html
+<div id="game">Minesweeper</div>
+\`\`\`
+\`\`\`css
+#game { padding: 12px; }
+\`\`\`
+\`\`\`js
+function revealCell(r, c) {
+  if (r < 0) {
+    return;
+\`\`\`
+`);
+  assert.equal(truncated.ok, false);
+  if (!truncated.ok) {
+    assert.ok(/syntax error/i.test(truncated.reason));
+  }
+
+  // 2. WeakMap memoization returns identical cached instances for immutable declarations and invalidates on mutation
+  const store = new PrismStore();
+  const created = await store.createDeclarative('budget-guard');
+  const decl1 = created.declaration!;
+  const routeA = evaluateVerdantRouting(decl1);
+  const routeB = evaluateVerdantRouting(decl1);
+  assert.strictEqual(routeA, routeB, 'evaluateVerdantRouting must return WeakMap-cached result');
+
+  const compA = compilePrismDeclaration(decl1);
+  const compB = compilePrismDeclaration(decl1);
+  assert.strictEqual(compA, compB, 'compilePrismDeclaration must return WeakMap-cached result');
+
+  // 3. KV-cache prefix sharing across Discovery, Build, and Refinement prompts
+  const dPrompt = buildDiscoveryAgentPrompt([{ role: 'user', text: 'Minesweeper' }], decl1, 1);
+  const bPrompt = buildInteractiveAppPrompt([{ role: 'user', text: 'Minesweeper' }], decl1);
+  const rPrompt = buildRefineInteractiveAppPrompt(
+    [{ role: 'user', text: 'Add timer' }],
+    decl1,
+    { html: '<div id="ms"></div>', css: '', js: 'const a = 1;', authorMode: 'studio-agent' },
+    'Add timer',
+  );
+  assert.ok(dPrompt.startsWith(STUDIO_AGENT_SYSTEM_PREFIX));
+  assert.ok(bPrompt.startsWith(STUDIO_AGENT_SYSTEM_PREFIX));
+  assert.ok(rPrompt.startsWith(STUDIO_AGENT_SYSTEM_PREFIX));
+
+  // 4. Unified viewpoint <-> authoredView invariant: switching to structured viewpoint clears stale authoredView
+  const admitted = await store.applyStudioOp(created.id, {
+    op: 'admit-authored-view',
+    authoredView: {
+      html: '<main id="ms-app">Minesweeper</main>',
+      css: '#ms-app { padding: 8px; }',
+      js: 'document.getElementById("ms-app")?.setAttribute("data-ready", "1");',
+      authorMode: 'studio-agent',
+    },
+    citation: { kind: 'req', requirementId: 'REQ-01' },
+  });
+  assert.equal(admitted.ok, true);
+  if (!admitted.ok) return;
+  assert.equal(admitted.project.declaration!.view?.viewpoint, 'interactive-app');
+  assert.ok(admitted.project.declaration!.view?.authoredView);
+  assert.notStrictEqual(compilePrismDeclaration(admitted.project.declaration!), compA);
+
+  const switched = await store.applyStudioOp(created.id, {
+    op: 'synthesize-view-from-system',
+    viewpoint: 'calculator',
+  });
+  assert.equal(switched.ok, true);
+  if (!switched.ok) return;
+  assert.equal(switched.project.declaration!.view?.viewpoint, 'calculator');
+  assert.equal(switched.project.declaration!.view?.authoredView ?? null, null);
+
+  // 5. Persistent unified conversation history on VerdantPrismProject.messages
+  const updatedProj = await store.appendMessage(created.id, {
+    role: 'assistant',
+    content: 'Built Minesweeper!',
+    badges: ['Concept: Minesweeper', 'Built interactive Minesweeper'],
+    needsLocalModel: false,
+  });
+  assert.ok(updatedProj !== null);
+  assert.equal(updatedProj!.messages.length, 1);
+  assert.deepEqual(updatedProj!.messages[0].badges, ['Concept: Minesweeper', 'Built interactive Minesweeper']);
 });

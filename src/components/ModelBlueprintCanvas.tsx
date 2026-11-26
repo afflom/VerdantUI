@@ -318,12 +318,14 @@ export const ModelBlueprintCanvas: FC<ModelBlueprintCanvasProps> = ({
                 )}
                 <div className="pt-1">
                   <p className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
-                    Compiled View
+                    Compiled Interface
                   </p>
                   <p className="mt-0.5 text-[11px] text-zinc-600 dark:text-zinc-300">
-                    {declaration.view
-                      ? `${declaration.view.viewpoint} · ${declaration.view.elements.length} bound element(s)`
-                      : 'Not synthesized yet (Stage 4)'}
+                    {declaration.view?.authoredView
+                      ? `Interactive App · bound to ${declaration.view.elements.length} model signal(s)`
+                      : declaration.view
+                        ? `${declaration.view.viewpoint} · ${declaration.view.elements.length} bound element(s)`
+                        : 'Not synthesized yet (Design)'}
                   </p>
                 </div>
               </div>

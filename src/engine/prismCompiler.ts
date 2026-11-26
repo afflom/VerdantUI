@@ -1124,13 +1124,27 @@ export function instantiateAppFoundation(
   return out;
 }
 
+const COMPILE_CACHE = new WeakMap<PrismDeclaration, CompiledPrismWorkspace | null>();
+
 /**
  * Full mechanical compilation of a `PrismDeclaration` into canonical Prism files +
  * compiled `prism.design/1` stylesheet/runtime for instant preview & WASM sealing.
  *
+ * Memoized per immutable `PrismDeclaration` reference via WeakMap so repeated reads
+ * across Store snapshots, Studio Preview, and Inspector cost O(1) with zero recomputation.
+ *
  * Returns `null` when the Prism is still undefined / not yet synthesizable (zero fake placeholders).
  */
 export function compilePrismDeclaration(decl: PrismDeclaration): CompiledPrismWorkspace | null {
+  if (COMPILE_CACHE.has(decl)) {
+    return COMPILE_CACHE.get(decl) ?? null;
+  }
+  const result = compilePrismDeclarationUncached(decl);
+  COMPILE_CACHE.set(decl, result);
+  return result;
+}
+
+function compilePrismDeclarationUncached(decl: PrismDeclaration): CompiledPrismWorkspace | null {
   if (!isPrismSynthesizable(decl)) {
     return null;
   }

@@ -2,16 +2,15 @@
  * Continuous Conversational Verdant Studio Agent Wizard (`src/components/StudioGuidedWizard.tsx`)
  *
  * Pairs the Creator with the 100% client-side Verdant Studio Agent over Verdant Studio's
- * formal Core Models & Standards:
+ * unified Prism model (`VerdantPrismProject` — persisting conversation history alongside
+ * Core Models, Standards, and `.holo` artifacts in IndexedDB):
  * - Every stage is populated, reconciled, and refined through plain-English conversation —
  *   zero manual forms or hardcoded app templates.
  * - For open-ended interactive apps & games (e.g. "This Prism will be the video game 'Minesweeper'"):
  *   asks 1–2 tailored clarifying questions, reconciles all Core Models & applicable standards,
- *   and synthesizes the real, playable interactive app (`admit-authored-view`) packed into
- *   a verifiable `prism/holo/6` archive.
- * - When the local on-device model is off and an open-ended app needs agent synthesis,
- *   offers a 1-click "Turn On Local Studio Agent & Continue" action inline and auto-resumes
- *   the moment the model finishes loading.
+ *   validates generated JavaScript syntax before admitting, and opens the playable app in Preview.
+ * - Supports instant Stop/cancellation with stale-run guards so switching Prisms or cancelling
+ *   never leaks inference work or mutates the wrong project.
  * - Zero exposure of internal Verdant constructs (no Observer, OTel, vTensor, LexLean).
  */
 
@@ -25,6 +24,7 @@ import {
   ShieldCheck,
   SlidersHorizontal,
   Sparkles,
+  Square,
   Wrench,
 } from 'lucide-react';
 import {
@@ -34,6 +34,7 @@ import {
   type StudioApiOp,
 } from '../engine/verdantStudioApi';
 import type { VerdantRoutingReport } from '../engine/verdantStandardsRouter';
+import type { StudioChatMessage } from '../engine/prismStudio';
 import {
   buildStudioPromptForStep,
   computeGuidedWizardState,
@@ -61,6 +62,13 @@ interface StudioGuidedWizardProps {
   declaration: PrismDeclaration;
   routing: VerdantRoutingReport;
   checkReport: DeclarationCheckReport;
+  messages: readonly StudioChatMessage[];
+  onAppendMessage: (msg: {
+    readonly role: 'user' | 'assistant';
+    readonly content: string;
+    readonly badges?: readonly string[];
+    readonly needsLocalModel?: boolean;
+  }) => Promise<void>;
   activeStep: GuidedStepId;
   onSelectStep: (step: GuidedStepId) => void;
   onDispatchOp: (op: StudioApiOp, opts?: { readonly pushRevision?: boolean }) => Promise<boolean>;
@@ -71,6 +79,7 @@ interface StudioGuidedWizardProps {
     maxTokens: number,
     onProgress?: (charsGenerated: number) => void,
   ) => Promise<string>;
+  onCancelStudioAgent?: () => void;
   hasLocalModelReady: boolean;
   engineStatus: EngineStatus;
   engineProgressPercent: number;
@@ -86,29 +95,31 @@ interface StudioGuidedWizardProps {
   onSwitchToAdvanced: () => void;
 }
 
-interface WizardChatEntry {
-  readonly id: string;
-  readonly role: 'studio' | 'user';
-  readonly text: string;
-  readonly badges?: readonly string[];
-  readonly needsLocalModel?: boolean;
-}
-
 const STARTER_SUGGESTIONS: readonly string[] = [
   'This Prism will be the video game "Minesweeper"',
   'Build a Pomodoro focus timer with customizable work/break sessions',
   'Check if a new expense fits my monthly budget, warn when over, and refuse zero amounts.',
 ];
 
+function isAbortError(err: unknown): boolean {
+  return (
+    (err instanceof DOMException && err.name === 'AbortError') ||
+    (err instanceof Error && (err.name === 'AbortError' || /aborted|cancelled/i.test(err.message)))
+  );
+}
+
 export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
   declaration,
   routing,
   checkReport,
+  messages,
+  onAppendMessage,
   activeStep,
   onSelectStep,
   onDispatchOp,
   onSynthesizeWithLocalModel,
   onRunStudioAgentPrompt,
+  onCancelStudioAgent,
   hasLocalModelReady,
   engineStatus,
   engineProgressPercent,
@@ -126,15 +137,25 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
   const [inputText, setInputText] = useState('');
   const [thinking, setThinking] = useState(false);
   const [agentPhaseLabel, setAgentPhaseLabel] = useState('Reconciling your Prism model…');
-  const [transcript, setTranscript] = useState<readonly WizardChatEntry[]>([]);
   const [agentQuickReplies, setAgentQuickReplies] = useState<readonly string[] | null>(null);
   const [interactiveSessionActive, setInteractiveSessionActive] = useState(
-    Boolean(declaration.view?.authoredView),
+    () =>
+      Boolean(declaration.view?.authoredView) ||
+      messages.some((m) => m.needsLocalModel || classifyIdeaRealizationMode(m.content).mode === 'interactive-app'),
   );
-  const [pendingAgentMessage, setPendingAgentMessage] = useState<string | null>(null);
+  const [pendingAgentMessage, setPendingAgentMessage] = useState<string | null>(() => {
+    const last = messages[messages.length - 1];
+    if (last?.role === 'assistant' && last.needsLocalModel) {
+      const prevUser = [...messages].reverse().find((m) => m.role === 'user');
+      return prevUser?.content ?? null;
+    }
+    return null;
+  });
+
   const scrollEndRef = useRef<HTMLDivElement | null>(null);
-  const transcriptRef = useRef(transcript);
-  transcriptRef.current = transcript;
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+  const runTokenRef = useRef(0);
 
   const guided = useMemo(
     () => computeGuidedWizardState(declaration, routing, checkReport),
@@ -146,14 +167,22 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
     [declaration, routing, checkReport, activeStep],
   );
 
+  // Scroll smoothly on new messages or step changes (NOT on every streaming char update!)
   useEffect(() => {
     scrollEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, [transcript.length, activeStep, thinking, agentPhaseLabel, pendingAgentMessage]);
+  }, [messages.length, activeStep, thinking, pendingAgentMessage]);
 
   const isModelLoading = engineStatus === 'downloading' || engineStatus === 'loading';
 
+  const handleStopAgent = useCallback(() => {
+    runTokenRef.current += 1;
+    onCancelStudioAgent?.();
+    setThinking(false);
+  }, [onCancelStudioAgent]);
+
   const runInteractiveBuildPass = useCallback(
     async (
+      runToken: number,
       history: readonly AgentChatTurn[],
       workingDecl: PrismDeclaration,
       spec: ReturnType<typeof parseDiscoveryAgentResponse>['spec'] | null,
@@ -168,34 +197,37 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
         `Build the complete, playable interactive ${appTitle} application now.`,
         3072,
         (chars) => {
-          setAgentPhaseLabel(`Building interactive ${appTitle}… (${chars.toLocaleString()} chars)`);
+          if (runTokenRef.current === runToken) {
+            setAgentPhaseLabel(`Building interactive ${appTitle}… (${chars.toLocaleString()} chars)`);
+          }
         },
       );
+      if (runTokenRef.current !== runToken) return false;
+
       let extracted = extractAuthoredAppFromModelOutput(rawApp);
 
-      // Single automatic format-repair retry if first pass missed one of the fenced blocks
+      // Single automatic format/syntax-repair retry before ever mounting a broken preview
       if (!extracted.ok) {
-        setAgentPhaseLabel(`Refining ${appTitle} structure…`);
+        setAgentPhaseLabel(`Checking & repairing ${appTitle} code…`);
         const retryRaw = await onRunStudioAgentPrompt(
           appPrompt,
-          `Your previous draft was incomplete (${extracted.reason}). Output ONLY the three complete fenced blocks: \`\`\`html, \`\`\`css, and \`\`\`js for ${appTitle}.`,
+          `Your previous draft could not be verified (${extracted.reason}). Fix that issue and output ONLY the three complete, valid fenced blocks: \`\`\`html, \`\`\`css, and \`\`\`js for ${appTitle}.`,
           3072,
           (chars) => {
-            setAgentPhaseLabel(`Finishing ${appTitle}… (${chars.toLocaleString()} chars)`);
+            if (runTokenRef.current === runToken) {
+              setAgentPhaseLabel(`Finishing ${appTitle}… (${chars.toLocaleString()} chars)`);
+            }
           },
         );
+        if (runTokenRef.current !== runToken) return false;
         extracted = extractAuthoredAppFromModelOutput(retryRaw);
       }
 
       if (!extracted.ok) {
-        setTranscript((prev) => [
-          ...prev,
-          {
-            id: `s_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
-            role: 'studio',
-            text: `I drafted the Core Models for "${appTitle}", but the on-device model didn't finish the interactive app code (${extracted.reason}). Try saying "Build it again" or switching to a larger coding model in the top bar.`,
-          },
-        ]);
+        await onAppendMessage({
+          role: 'assistant',
+          content: `I drafted the Core Models for "${appTitle}", but the on-device model didn't produce clean runnable code (${extracted.reason}). Try saying "Build it again" or switching to a larger coding model in the top bar.`,
+        });
         setAgentQuickReplies(['Build it again', 'Keep it simpler and build now']);
         return false;
       }
@@ -204,15 +236,13 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
       if (assembled.ops.length > 0) {
         await onDispatchOp({ op: 'batch', ops: assembled.ops });
       }
-      setTranscript((prev) => [
-        ...prev,
-        {
-          id: `s_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
-          role: 'studio',
-          text: `Your interactive ${appTitle} Prism is live in the Preview pane! All Core Models, safety boundaries, and applicable checks are reconciled. Play with it on the right, ask me to tweak anything in plain English, or click Prove & Seal when ready.`,
-          badges: assembled.badges,
-        },
-      ]);
+      if (runTokenRef.current !== runToken) return false;
+
+      await onAppendMessage({
+        role: 'assistant',
+        content: `Your interactive ${appTitle} Prism is live in the Preview pane! All Core Models, safety boundaries, and applicable checks are reconciled. Play with it on the right, ask me to tweak anything in plain English, or click Prove & Seal when ready.`,
+        badges: assembled.badges,
+      });
       setAgentQuickReplies([
         'Make it look sleeker in dark mode',
         'Add difficulty or mode options',
@@ -222,15 +252,13 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
       onOpenPreview();
       return true;
     },
-    [onDispatchOp, onOpenPreview, onRunStudioAgentPrompt, onSelectStep],
+    [onAppendMessage, onDispatchOp, onOpenPreview, onRunStudioAgentPrompt, onSelectStep],
   );
 
   const runInteractiveRefinement = useCallback(
-    async (
-      instruction: string,
-      errToFix?: PrismRuntimeError | null,
-    ) => {
+    async (instruction: string, errToFix?: PrismRuntimeError | null) => {
       if (!onRunStudioAgentPrompt || !declaration.view?.authoredView) return;
+      const runToken = ++runTokenRef.current;
       setThinking(true);
       setAgentPhaseLabel(
         errToFix
@@ -239,7 +267,10 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
       );
       try {
         const history: AgentChatTurn[] = [
-          ...transcriptRef.current.map((e) => ({ role: e.role, text: e.text })),
+          ...messagesRef.current.map((m) => ({
+            role: m.role === 'user' ? ('user' as const) : ('studio' as const),
+            text: m.content,
+          })),
           { role: 'user', text: instruction },
         ];
         const prompt = buildRefineInteractiveAppPrompt(
@@ -254,23 +285,34 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
           errToFix ? `Fix the runtime error: ${errToFix.message}` : instruction,
           3072,
           (chars) => {
-            setAgentPhaseLabel(
-              errToFix
-                ? `Applying fix to ${declaration.metadata.name}… (${chars.toLocaleString()} chars)`
-                : `Updating ${declaration.metadata.name}… (${chars.toLocaleString()} chars)`,
-            );
+            if (runTokenRef.current === runToken) {
+              setAgentPhaseLabel(
+                errToFix
+                  ? `Applying fix to ${declaration.metadata.name}… (${chars.toLocaleString()} chars)`
+                  : `Updating ${declaration.metadata.name}… (${chars.toLocaleString()} chars)`,
+              );
+            }
           },
         );
-        const extracted = extractAuthoredAppFromModelOutput(raw);
+        if (runTokenRef.current !== runToken) return;
+
+        let extracted = extractAuthoredAppFromModelOutput(raw);
         if (!extracted.ok) {
-          setTranscript((prev) => [
-            ...prev,
-            {
-              id: `s_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
-              role: 'studio',
-              text: `I couldn't apply that update cleanly (${extracted.reason}). Could you rephrase what you'd like changed?`,
-            },
-          ]);
+          setAgentPhaseLabel(`Validating ${declaration.metadata.name} update…`);
+          const retryRaw = await onRunStudioAgentPrompt(
+            prompt,
+            `Your updated code had an issue (${extracted.reason}). Fix it and output ONLY the complete \`\`\`html, \`\`\`css, and \`\`\`js blocks.`,
+            3072,
+          );
+          if (runTokenRef.current !== runToken) return;
+          extracted = extractAuthoredAppFromModelOutput(retryRaw);
+        }
+
+        if (!extracted.ok) {
+          await onAppendMessage({
+            role: 'assistant',
+            content: `I couldn't apply that update cleanly (${extracted.reason}). Could you rephrase what you'd like changed?`,
+          });
           return;
         }
         const assembled = assembleCompleteAuthoredPrismOps(declaration, null, extracted.view, instruction);
@@ -280,32 +322,40 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
         if (errToFix) {
           onClearRuntimeError();
         }
-        setTranscript((prev) => [
-          ...prev,
-          {
-            id: `s_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
-            role: 'studio',
-            text: errToFix
-              ? `Fixed the runtime error and refreshed "${declaration.metadata.name}" in Preview.`
-              : `Updated "${declaration.metadata.name}" and reconciled all checks. Take a look in the Preview pane!`,
-            badges: errToFix ? ['Fixed runtime error', 'Preview refreshed'] : assembled.badges,
-          },
-        ]);
+        await onAppendMessage({
+          role: 'assistant',
+          content: errToFix
+            ? `Fixed the runtime error and refreshed "${declaration.metadata.name}" in Preview.`
+            : `Updated "${declaration.metadata.name}" and reconciled all checks. Take a look in the Preview pane!`,
+          badges: errToFix ? ['Fixed runtime error', 'Preview refreshed'] : assembled.badges,
+        });
         onOpenPreview();
       } catch (err) {
-        setTranscript((prev) => [
-          ...prev,
-          {
-            id: `s_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
-            role: 'studio',
-            text: `Update interrupted: ${err instanceof Error ? err.message : String(err)}`,
-          },
-        ]);
+        if (isAbortError(err) || runTokenRef.current !== runToken) {
+          await onAppendMessage({
+            role: 'assistant',
+            content: 'Stopped updating your Prism. Tell me whenever you want to try again.',
+          });
+          return;
+        }
+        await onAppendMessage({
+          role: 'assistant',
+          content: `Update interrupted: ${err instanceof Error ? err.message : String(err)}`,
+        });
       } finally {
-        setThinking(false);
+        if (runTokenRef.current === runToken) {
+          setThinking(false);
+        }
       }
     },
-    [declaration, onClearRuntimeError, onDispatchOp, onOpenPreview, onRunStudioAgentPrompt],
+    [
+      declaration,
+      onAppendMessage,
+      onClearRuntimeError,
+      onDispatchOp,
+      onOpenPreview,
+      onRunStudioAgentPrompt,
+    ],
   );
 
   const submitNaturalMessage = useCallback(
@@ -313,20 +363,17 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
       const message = rawMessage.trim();
       if (!message || thinking) return;
 
-      const currentTranscript = transcriptRef.current;
       const nextHistory: AgentChatTurn[] = [
-        ...currentTranscript.map((e) => ({ role: e.role, text: e.text })),
+        ...messagesRef.current.map((m) => ({
+          role: m.role === 'user' ? ('user' as const) : ('studio' as const),
+          text: m.content,
+        })),
         ...(opts?.skipUserBubble ? [] : [{ role: 'user' as const, text: message }]),
       ];
 
       if (!opts?.skipUserBubble) {
-        const userEntry: WizardChatEntry = {
-          id: `u_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
-          role: 'user',
-          text: message,
-        };
-        setTranscript((prev) => [...prev, userEntry]);
         setInputText('');
+        await onAppendMessage({ role: 'user', content: message });
       }
 
       const modeCheck = classifyIdeaRealizationMode(message);
@@ -345,15 +392,11 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
               ? declaration.metadata.name
               : extractCleanIdeaTitle(message);
           setPendingAgentMessage(message);
-          setTranscript((prev) => [
-            ...prev,
-            {
-              id: `s_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
-              role: 'studio',
-              text: `I'd love to build a real, playable "${title}" Prism with you from scratch — no hardcoded templates. Turn on the on-device Studio Agent below (runs 100% locally in your browser) and I'll pick up right here automatically.`,
-              needsLocalModel: true,
-            },
-          ]);
+          await onAppendMessage({
+            role: 'assistant',
+            content: `I'd love to build a real, playable "${title}" Prism with you from scratch — no hardcoded templates. Turn on the on-device Studio Agent below (runs 100% locally in your browser) and I'll pick up right here automatically.`,
+            needsLocalModel: true,
+          });
           return;
         }
 
@@ -364,6 +407,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
         }
 
         // Case B: Discovery & Build flow with the Verdant Studio Agent
+        const runToken = ++runTokenRef.current;
         setThinking(true);
         setAgentPhaseLabel('Understanding your idea & designing Core Models…');
         try {
@@ -374,9 +418,13 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
             message,
             1024,
             (chars) => {
-              setAgentPhaseLabel(`Drafting Core Models… (${chars.toLocaleString()} chars)`);
+              if (runTokenRef.current === runToken) {
+                setAgentPhaseLabel(`Drafting Core Models… (${chars.toLocaleString()} chars)`);
+              }
             },
           );
+          if (runTokenRef.current !== runToken) return;
+
           const { spec } = parseDiscoveryAgentResponse(rawDiscovery, message, declaration, userTurns);
 
           // Apply Core Model anchor ops right away so the live Blueprint populates immediately
@@ -389,36 +437,35 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
             }
             await onDispatchOp({ op: 'batch', ops: coreOps });
           }
+          if (runTokenRef.current !== runToken) return;
 
           if (spec.readyToBuild) {
-            await runInteractiveBuildPass(nextHistory, workingDecl, spec, message);
+            await runInteractiveBuildPass(runToken, nextHistory, workingDecl, spec, message);
           } else {
-            setTranscript((prev) => [
-              ...prev,
-              {
-                id: `s_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
-                role: 'studio',
-                text: spec.reply,
-                badges: [
-                  `Concept: ${spec.name}`,
-                  `${spec.inputs.length} core model input(s)`,
-                ],
-              },
-            ]);
+            await onAppendMessage({
+              role: 'assistant',
+              content: spec.reply,
+              badges: [`Concept: ${spec.name}`, `${spec.inputs.length} core model input(s)`],
+            });
             setAgentQuickReplies(spec.quickReplies);
             onSelectStep('confirm-context');
           }
         } catch (err) {
-          setTranscript((prev) => [
-            ...prev,
-            {
-              id: `s_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
-              role: 'studio',
-              text: `Studio Agent ran into an issue: ${err instanceof Error ? err.message : String(err)}. Try sending your message again.`,
-            },
-          ]);
+          if (isAbortError(err) || runTokenRef.current !== runToken) {
+            await onAppendMessage({
+              role: 'assistant',
+              content: 'Stopped generating. Send another message whenever you are ready to continue.',
+            });
+            return;
+          }
+          await onAppendMessage({
+            role: 'assistant',
+            content: `Studio Agent ran into an issue: ${err instanceof Error ? err.message : String(err)}. Try sending your message again.`,
+          });
         } finally {
-          setThinking(false);
+          if (runTokenRef.current === runToken) {
+            setThinking(false);
+          }
         }
         return;
       }
@@ -430,6 +477,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
         hasLocalModelReady &&
         onSynthesizeWithLocalModel
       ) {
+        const runToken = ++runTokenRef.current;
         setThinking(true);
         setAgentPhaseLabel('Extracting your Prism structure…');
         try {
@@ -438,7 +486,9 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
         } catch {
           preParsedIntent = parseIdeaSentence(message);
         } finally {
-          setThinking(false);
+          if (runTokenRef.current === runToken) {
+            setThinking(false);
+          }
         }
       }
 
@@ -447,13 +497,11 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
         await onDispatchOp({ op: 'batch', ops: result.ops });
       }
 
-      const studioEntry: WizardChatEntry = {
-        id: `s_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
-        role: 'studio',
-        text: result.assistantReply,
+      await onAppendMessage({
+        role: 'assistant',
+        content: result.assistantReply,
         badges: result.reconciledBadges,
-      };
-      setTranscript((prev) => [...prev, studioEntry]);
+      });
       setAgentQuickReplies(null);
       onSelectStep(result.nextStep);
       if (result.openPreview) {
@@ -465,6 +513,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
       declaration,
       hasLocalModelReady,
       interactiveSessionActive,
+      onAppendMessage,
       onDispatchOp,
       onOpenPreview,
       onRunStudioAgentPrompt,
@@ -497,7 +546,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
   }, [activeStep, agentQuickReplies, currentPrompt.quickReplies, routing.isUndefined]);
 
   const showDefaultPromptCard =
-    transcript.length === 0 ||
+    messages.length === 0 ||
     (!interactiveSessionActive && !pendingAgentMessage) ||
     routing.readyToSeal;
 
@@ -542,13 +591,19 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
           }
         >
           <Cpu className="h-2.5 w-2.5" />
-          <span>{hasLocalModelReady ? 'Agent Ready' : isModelLoading ? `Loading ${Math.round(engineProgressPercent)}%` : 'Agent Off'}</span>
+          <span>
+            {hasLocalModelReady
+              ? 'Agent Ready'
+              : isModelLoading
+                ? `Loading ${Math.round(engineProgressPercent)}%`
+                : 'Agent Off'}
+          </span>
         </span>
       </div>
 
-      {/* Continuous Conversational Transcript */}
+      {/* Persistent Unified Conversational Transcript */}
       <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3.5 text-xs">
-        {transcript.map((entry) => (
+        {messages.map((entry) => (
           <div
             key={entry.id}
             className={`flex flex-col ${entry.role === 'user' ? 'items-end' : 'items-start'}`}
@@ -560,7 +615,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
                   : 'border border-zinc-200 bg-zinc-50 text-zinc-800 dark:border-zinc-800 dark:bg-zinc-900/70 dark:text-zinc-200'
               }`}
             >
-              <p className="whitespace-pre-line">{entry.text}</p>
+              <p className="whitespace-pre-line">{entry.content}</p>
               {entry.badges && entry.badges.length > 0 && (
                 <div className="mt-2 flex flex-wrap gap-1">
                   {entry.badges.map((b, bi) => (
@@ -640,7 +695,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
                 <span>Verdant Studio</span>
               </div>
               <p className="leading-relaxed">
-                {transcript.length === 0
+                {messages.length === 0
                   ? 'What should your Prism be? Describe any app, game, or tool in plain English — like "This Prism will be the video game Minesweeper" — and we will design and build it together.'
                   : currentPrompt.promptText}
               </p>
@@ -677,9 +732,21 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
         )}
 
         {thinking && (
-          <div className="flex items-center gap-2 rounded-xl border border-emerald-200/70 bg-emerald-50/40 px-3 py-2 text-[11px] text-emerald-900 dark:border-emerald-900/50 dark:bg-emerald-950/20 dark:text-emerald-200">
-            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-emerald-600" />
-            <span className="truncate">{agentPhaseLabel}</span>
+          <div className="flex items-center justify-between gap-2 rounded-xl border border-emerald-200/70 bg-emerald-50/40 px-3 py-2 text-[11px] text-emerald-900 dark:border-emerald-900/50 dark:bg-emerald-950/20 dark:text-emerald-200">
+            <div className="flex min-w-0 items-center gap-2">
+              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-emerald-600" />
+              <span className="truncate">{agentPhaseLabel}</span>
+            </div>
+            {onCancelStudioAgent && (
+              <button
+                type="button"
+                onClick={handleStopAgent}
+                className="inline-flex shrink-0 items-center gap-1 rounded-md border border-emerald-300 bg-white px-2 py-0.5 text-[10px] font-medium text-emerald-900 hover:bg-emerald-50 dark:border-emerald-800 dark:bg-zinc-900 dark:text-emerald-200"
+              >
+                <Square className="h-2.5 w-2.5 fill-current" />
+                Stop
+              </button>
+            )}
           </div>
         )}
         <div ref={scrollEndRef} />

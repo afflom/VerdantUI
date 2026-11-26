@@ -142,6 +142,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   const [compiledCopied, setCompiledCopied] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const activeAgentAbortRef = useRef<AbortController | null>(null);
   const declaration = project.declaration ?? null;
   const isDeclarative = project.kind === 'declarative' || declaration !== null;
   const isExternalHolo = project.kind === 'external-holo';
@@ -171,8 +172,10 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     [declaration],
   );
 
-  // Sync local title & reset ephemeral state on project switch
+  // Sync local title, cancel any in-flight Studio Agent stream, & reset ephemeral state on project switch
   useEffect(() => {
+    activeAgentAbortRef.current?.abort();
+    activeAgentAbortRef.current = null;
     setTitleDraft(project.draft.name);
     setRuntimeError(null);
     setBuildBanner(null);
@@ -671,6 +674,31 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     [engineState.model, engineState.promptMode, engineState.sampling, hasLocalModelReady, project.id, workerClient],
   );
 
+  // Abort any in-flight Studio Agent generation on unmount
+  useEffect(() => {
+    return () => {
+      activeAgentAbortRef.current?.abort();
+      activeAgentAbortRef.current = null;
+    };
+  }, []);
+
+  const handleCancelStudioAgent = useCallback(() => {
+    activeAgentAbortRef.current?.abort();
+    activeAgentAbortRef.current = null;
+  }, []);
+
+  const handleAppendStudioMessage = useCallback(
+    async (msg: {
+      readonly role: 'user' | 'assistant';
+      readonly content: string;
+      readonly badges?: readonly string[];
+      readonly needsLocalModel?: boolean;
+    }) => {
+      await store.appendMessage(project.id, msg);
+    },
+    [project.id, store],
+  );
+
   const handleRunStudioAgentPrompt = useCallback(
     async (
       systemPrompt: string,
@@ -681,6 +709,11 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       if (!hasLocalModelReady || !engineState.model) {
         throw new Error('On-device model is not ready yet.');
       }
+      // Cancel any superseded Studio Agent run before starting a new one
+      activeAgentAbortRef.current?.abort();
+      const ac = new AbortController();
+      activeAgentAbortRef.current = ac;
+
       const syntheticUser: ThreadMessage = {
         id: `agent_${Date.now()}`,
         role: 'user',
@@ -696,18 +729,33 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
         systemPrompt,
         { thinkingMode: 'off' },
       );
-      const ac = new AbortController();
       let raw = '';
-      for await (const ev of workerClient.streamGenerate(
-        prompt,
-        ac.signal,
-        { ...engineState.sampling, temperature: 0.25, maxTokens },
-        `studio-agent:${project.id}`,
-      )) {
-        raw = stripReasoningTags(ev.accumulatedText);
+      let lastProgressAt = 0;
+      try {
+        for await (const ev of workerClient.streamGenerate(
+          prompt,
+          ac.signal,
+          { ...engineState.sampling, temperature: 0.25, maxTokens },
+          `studio-agent:${project.id}`,
+        )) {
+          if (ac.signal.aborted) break;
+          raw = stripReasoningTags(ev.accumulatedText);
+          const now = Date.now();
+          if (onProgress && now - lastProgressAt >= 160) {
+            lastProgressAt = now;
+            onProgress(raw.length);
+          }
+        }
+        if (ac.signal.aborted) {
+          throw new DOMException('Studio Agent generation cancelled.', 'AbortError');
+        }
         onProgress?.(raw.length);
+        return raw;
+      } finally {
+        if (activeAgentAbortRef.current === ac) {
+          activeAgentAbortRef.current = null;
+        }
       }
-      return raw;
     },
     [engineState.model, engineState.promptMode, engineState.sampling, hasLocalModelReady, project.id, workerClient],
   );
@@ -1452,11 +1500,14 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                       declaration={declaration}
                       routing={routing}
                       checkReport={checkReport}
+                      messages={project.messages}
+                      onAppendMessage={handleAppendStudioMessage}
                       activeStep={guidedStep}
                       onSelectStep={setGuidedStep}
                       onDispatchOp={handleDispatchOp}
                       onSynthesizeWithLocalModel={handleSynthesizeIdeaWithLocalModel}
                       onRunStudioAgentPrompt={handleRunStudioAgentPrompt}
+                      onCancelStudioAgent={handleCancelStudioAgent}
                       hasLocalModelReady={hasLocalModelReady}
                       engineStatus={engineState.status}
                       engineProgressPercent={engineState.progressPercent}

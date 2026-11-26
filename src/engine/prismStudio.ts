@@ -100,6 +100,8 @@ export interface StudioChatMessage {
   readonly content: string;
   readonly createdAt: number;
   readonly updatedSections?: readonly ('html' | 'css' | 'js' | 'meta')[];
+  readonly badges?: readonly string[];
+  readonly needsLocalModel?: boolean;
 }
 
 export interface VerdantPrismProject {
@@ -1451,6 +1453,8 @@ export class PrismStore {
       content: msg.content,
       createdAt: Date.now(),
       ...(msg.updatedSections ? { updatedSections: msg.updatedSections } : {}),
+      ...(msg.badges && msg.badges.length > 0 ? { badges: msg.badges } : {}),
+      ...(msg.needsLocalModel ? { needsLocalModel: true } : {}),
     };
     const updated: VerdantPrismProject = {
       ...existing,
@@ -1793,7 +1797,7 @@ export class PrismStore {
       grants: { observer: true, storage: false, browser: false, network: false },
       app: {
         html: viewFiles?.['index.html'] ?? '',
-        css: viewFiles?.['prism.css'] ?? '',
+        css: viewFiles?.['prism.css'] ?? viewFiles?.['styles.css'] ?? '',
         js: viewFiles?.['app.js'] ?? '',
       },
     });

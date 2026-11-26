@@ -2267,7 +2267,7 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                 <section className="space-y-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
                   <div className="flex items-center justify-between">
                     <h4 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
-                      ISO 42010 Viewpoint Layout
+                      Interface Realization
                     </h4>
                     <button
                       type="button"
@@ -2277,6 +2277,22 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                       Re-sync Controls
                     </button>
                   </div>
+                  {declaration.view.authoredView && (
+                    <div className="rounded-lg border border-emerald-500/70 bg-emerald-50/70 p-2.5 text-xs dark:border-emerald-700 dark:bg-emerald-950/30">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-semibold text-emerald-900 dark:text-emerald-200">
+                          Interactive App (Studio Agent)
+                        </span>
+                        <span className="font-mono text-[10px] text-emerald-800/80 dark:text-emerald-300/80">
+                          {(declaration.view.authoredView.html.length / 1024).toFixed(1)} KB HTML ·{' '}
+                          {(declaration.view.authoredView.js.length / 1024).toFixed(1)} KB JS
+                        </span>
+                      </div>
+                      <p className="mt-1 text-[10px] text-emerald-800/90 dark:text-emerald-300/90">
+                        Custom interactive view bound to your proved core model. Refine it in plain English in Guided mode, or pick a structured layout below to switch to a form.
+                      </p>
+                    </div>
+                  )}
                   <div className="grid grid-cols-2 gap-1.5">
                     {(
                       [
@@ -2289,9 +2305,9 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                       <button
                         key={vp}
                         type="button"
-                        onClick={() => void handleUpdateViewField({ viewpoint: vp })}
+                        onClick={() => void onDispatchOp({ op: 'synthesize-view-from-system', viewpoint: vp })}
                         className={`rounded-lg border p-2 text-left transition-colors ${
-                          declaration.view?.viewpoint === vp
+                          declaration.view?.viewpoint === vp && !declaration.view.authoredView
                             ? 'border-emerald-600 bg-emerald-50/70 dark:border-emerald-500 dark:bg-emerald-950/30'
                             : 'border-zinc-200 hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-900'
                         }`}

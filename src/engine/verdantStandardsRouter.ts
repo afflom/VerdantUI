@@ -984,7 +984,17 @@ export function isPrismSynthesizable(decl: PrismDeclaration): boolean {
   );
 }
 
+const ROUTING_CACHE = new WeakMap<PrismDeclaration, VerdantRoutingReport>();
+
 export function evaluateVerdantRouting(decl: PrismDeclaration): VerdantRoutingReport {
+  const cached = ROUTING_CACHE.get(decl);
+  if (cached) return cached;
+  const report = computeVerdantRoutingUncached(decl);
+  ROUTING_CACHE.set(decl, report);
+  return report;
+}
+
+function computeVerdantRoutingUncached(decl: PrismDeclaration): VerdantRoutingReport {
   const check = checkDeclaration(decl);
   const trustBoundaries = deriveTrustBoundaries(decl);
   const designChecks = evaluateDesignAccessibility(decl);

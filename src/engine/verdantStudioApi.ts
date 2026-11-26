@@ -2770,13 +2770,22 @@ export function dispatchStudioOp(decl: PrismDeclaration, op: StudioApiOp): Studi
           };
         }
       }
+      // Enforce viewpoint <-> authoredView cohesion: structured form viewpoints cannot carry stale authoredView
+      const normalizedView: StudioViewDecl =
+        op.view.viewpoint === 'interactive-app'
+          ? op.view
+          : { ...op.view, authoredView: null };
       const next: PrismDeclaration = {
         ...decl,
-        view: op.view,
-        admissions: upsertAdmission(decl.admissions, `View.${op.view.viewpoint}`, op.view.citation),
-        auditLog: appendAudit(decl, op.op, `Declared ${op.view.viewpoint} view (${op.view.elements.length} elements)`),
+        view: normalizedView,
+        admissions: upsertAdmission(decl.admissions, `View.${normalizedView.viewpoint}`, normalizedView.citation),
+        auditLog: appendAudit(
+          decl,
+          op.op,
+          `Declared ${normalizedView.viewpoint} view (${normalizedView.elements.length} elements)`,
+        ),
       };
-      return { ok: true, declaration: next, message: `Declared view "${op.view.title}" (${op.view.viewpoint}).` };
+      return { ok: true, declaration: next, message: `Declared view "${normalizedView.title}" (${normalizedView.viewpoint}).` };
     }
 
     case 'admit-authored-view': {
