@@ -26,38 +26,28 @@ import {
   ChevronLeft,
   ChevronRight,
   Copy,
-  Download,
   FileText,
-  Layers,
   Loader2,
   Paperclip,
   Pencil,
   RefreshCw,
   SlidersHorizontal,
-  Sparkles,
   Square,
   Wrench,
   X,
-  Zap,
 } from 'lucide-react';
-import { detectChatTemplate, formatMessagesForLlama } from '../engine/assistantAdapter';
-import { isInternalBootstrapModel } from '../engine/modelCatalog';
+import { formatMessagesForLlama } from '../engine/assistantAdapter';
 import {
-  createVerdantClientTools,
-  findTierForModelId,
-  recommendVerdantTier,
-  resolveTierCatalogModel,
-  VERDANT_HARNESS_MODES,
-  type VerdantHarnessMode,
-  type VerdantRuntimeTierId,
-} from '../engine/verdantHarness';
+  UNIFIED_VERDANT_SUGGESTIONS,
+  UNIFIED_VERDANT_SYSTEM_PROMPT,
+  type CognitiveRouteCertificate,
+} from '../engine/cognitiveObserver';
+import { isInternalBootstrapModel } from '../engine/modelCatalog';
 import type { EngineState } from '../engine/workerClient';
 
 interface ThreadViewProps {
   engineState: EngineState;
   onOpenModels: () => void;
-  onSelectHarnessMode: (mode: VerdantHarnessMode) => void;
-  onLoadManagedTier: (tierId: VerdantRuntimeTierId) => void;
   onCancelDownload: () => void;
   onRetryLoad?: () => void;
   onDismissError?: () => void;
@@ -106,14 +96,6 @@ const SpeculativePrefillDriver: FC<{
   return null;
 };
 
-const METER_CLIENT_TOOL_SCHEMAS = createVerdantClientTools(() => ({
-  model: null,
-  telemetry: {} as never,
-  opfsStorage: { supported: false, usageBytes: 0, quotaBytes: 0, storedModels: [], partialModels: [] },
-  lastTokensPerSec: 0,
-  harnessMode: 'agentic',
-}));
-
 const ComposerContextMeter: FC<{
   engineState: EngineState;
   modelReady: boolean;
@@ -126,10 +108,8 @@ const ComposerContextMeter: FC<{
   const model = engineState.model;
   const maxCtx = model?.maxContextWindow ?? 0;
   const isBootstrapUnbound = isInternalBootstrapModel(model?.id);
-  const modeSpec = VERDANT_HARNESS_MODES[engineState.harnessMode];
-  const systemMessage = engineState.importedHarness?.system ?? modeSpec.system;
+  const systemMessage = engineState.importedHarness?.system ?? UNIFIED_VERDANT_SYSTEM_PROMPT;
   const effectivePromptMode = engineState.importedHarness?.promptMode ?? engineState.promptMode;
-  const activeTools = modeSpec.enableTools ? METER_CLIENT_TOOL_SCHEMAS : undefined;
 
   useEffect(() => {
     if (!modelReady || !model || isBootstrapUnbound || !onCountTokens) {
@@ -162,10 +142,6 @@ const ComposerContextMeter: FC<{
         model,
         effectivePromptMode,
         systemMessage,
-        {
-          thinkingMode: modeSpec.thinkingPolicy,
-          tools: activeTools,
-        },
       );
       void onCountTokens(formatted)
         .then((res) => {
@@ -188,8 +164,6 @@ const ComposerContextMeter: FC<{
     isBootstrapUnbound,
     effectivePromptMode,
     systemMessage,
-    modeSpec.thinkingPolicy,
-    activeTools,
     onCountTokens,
   ]);
 
@@ -476,22 +450,42 @@ const EditComposer: FC = () => (
 );
 
 interface AssistantMessageContextValue {
-  readonly senderLabel: string;
   readonly statusDetail: string;
+  readonly onInspectRoute: () => void;
 }
 
 const AssistantMessageContext = createContext<AssistantMessageContextValue>({
-  senderLabel: 'VerdantUI',
   statusDetail: '',
+  onInspectRoute: () => {},
 });
 
 const AssistantMessage: FC = () => {
-  const { senderLabel, statusDetail } = useContext(AssistantMessageContext);
+  const { statusDetail, onInspectRoute } = useContext(AssistantMessageContext);
+  const prismRoute = useAuiState(
+    (s) =>
+      (
+        s.message.metadata.custom as
+          | { readonly prismRoute?: CognitiveRouteCertificate }
+          | undefined
+      )?.prismRoute,
+  );
   return (
     <MessagePrimitive.Root className="group mx-auto w-full max-w-3xl px-4 py-3 sm:px-6">
       <div className="flex flex-col gap-2">
-        <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
-          <span className="font-semibold text-slate-800 dark:text-slate-200">{senderLabel}</span>
+        <div className="flex items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
+          <span className="font-semibold text-slate-800 dark:text-slate-200">VerdantUI</span>
+          {prismRoute && (
+            <button
+              type="button"
+              onClick={onInspectRoute}
+              title={prismRoute.rationale}
+              className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-mono text-[10px] text-slate-500 hover:bg-slate-100 hover:text-emerald-800 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-emerald-400 transition-colors"
+            >
+              <span>{prismRoute.label}</span>
+              <span aria-hidden="true">·</span>
+              <span>#{prismRoute.digest}</span>
+            </button>
+          )}
         </div>
 
         <div className="rounded-xl border border-slate-200/90 bg-white px-4 py-3.5 text-slate-800 dark:border-slate-800 dark:bg-[#121821] dark:text-slate-100">
@@ -552,24 +546,9 @@ const AssistantMessage: FC = () => {
   );
 };
 
-const HARNESS_MODE_ORDER: readonly VerdantHarnessMode[] = ['fast', 'thinking', 'agentic'];
-
-function renderHarnessModeIcon(mode: VerdantHarnessMode) {
-  switch (mode) {
-    case 'fast':
-      return <Zap className="h-3.5 w-3.5 shrink-0" />;
-    case 'thinking':
-      return <Brain className="h-3.5 w-3.5 shrink-0" />;
-    case 'agentic':
-      return <Wrench className="h-3.5 w-3.5 shrink-0" />;
-  }
-}
-
 export const ThreadView: FC<ThreadViewProps> = ({
   engineState,
   onOpenModels,
-  onSelectHarnessMode,
-  onLoadManagedTier,
   onCancelDownload,
   onRetryLoad,
   onDismissError,
@@ -582,55 +561,27 @@ export const ThreadView: FC<ThreadViewProps> = ({
   const modelReady = engineState.model !== null && !isModelLoading;
   const isBootstrapUnbound = isInternalBootstrapModel(engineState.model?.id);
   const importedHarness = engineState.importedHarness;
-  const activeModeSpec = VERDANT_HARNESS_MODES[engineState.harnessMode];
-  const effectiveSystemMessage = importedHarness?.system ?? activeModeSpec.system;
-  const activeTier = findTierForModelId(engineState.model?.id);
-  const detectedTemplate = detectChatTemplate(engineState.model);
-
-  const recommendedTier = useMemo(
-    () => recommendVerdantTier(engineState.cachedModelIds),
-    [engineState.cachedModelIds],
-  );
-  const recommendedModel = useMemo(
-    () => resolveTierCatalogModel(recommendedTier.id),
-    [recommendedTier.id],
-  );
-  const isRecommendedCached = engineState.cachedModelIds.includes(recommendedTier.modelId);
+  const effectiveSystemMessage = importedHarness?.system ?? UNIFIED_VERDANT_SYSTEM_PROMPT;
 
   const activeSuggestions =
     importedHarness?.suggestions && importedHarness.suggestions.length > 0
       ? importedHarness.suggestions
-      : activeModeSpec.suggestions;
-
-  const senderLabel =
-    !isBootstrapUnbound && (activeTier?.label || engineState.model?.displayName)
-      ? `${activeTier?.label ?? engineState.model?.displayName} · ${activeModeSpec.label}`
-      : `VerdantUI · ${activeModeSpec.label}`;
+      : UNIFIED_VERDANT_SUGGESTIONS;
 
   const assistantContextValue = useMemo<AssistantMessageContextValue>(
     () => ({
-      senderLabel,
       statusDetail: engineState.statusDetail,
+      onInspectRoute: onToggleInspector,
     }),
-    [senderLabel, engineState.statusDetail],
+    [engineState.statusDetail, onToggleInspector],
   );
-
-  const composerPlaceholder = !modelReady
-    ? 'Loading Verdant runtime...'
-    : isBootstrapUnbound
-      ? 'Activate Verdant Runtime above to start chatting...'
-      : engineState.harnessMode === 'thinking'
-        ? 'Ask a complex question (Thinking mode)...'
-        : engineState.harnessMode === 'agentic'
-          ? 'Give an agentic task with local browser tools...'
-          : `Ask ${activeTier?.label ?? engineState.model?.displayName ?? 'VerdantUI'} (Fast mode)...`;
 
   return (
     <AssistantMessageContext.Provider value={assistantContextValue}>
       <ThreadPrimitive.Root className="relative flex h-full flex-col overflow-hidden bg-[#F8F9FA] dark:bg-[#0B0F14]">
       <SpeculativePrefillDriver
         modelId={engineState.model?.id ?? null}
-        modelReady={modelReady}
+        modelReady={modelReady && !isBootstrapUnbound}
         promptMode={importedHarness?.promptMode ?? engineState.promptMode}
         systemMessage={effectiveSystemMessage}
         onSpeculativeDraftChange={onSpeculativeDraftChange}
@@ -647,20 +598,19 @@ export const ThreadView: FC<ThreadViewProps> = ({
                   VerdantUI
                 </h1>
                 <p className="mt-2.5 max-w-2xl text-[15px] leading-relaxed text-slate-600 dark:text-slate-400">
-                  100% client-side local AI workbench powered by Verdant WASM SIMD. Switch cleanly
-                  between <strong className="font-medium text-slate-800 dark:text-slate-200">Fast</strong>,{' '}
-                  <strong className="font-medium text-slate-800 dark:text-slate-200">Thinking</strong>, and{' '}
-                  <strong className="font-medium text-slate-800 dark:text-slate-200">Agentic</strong> modes
-                  with isolated conversation threads.
+                  One unified, 100% client-side AI model powered by Verdant WASM SIMD and a
+                  Prism Cognitive Observer. Every prompt settles automatically across verified
+                  local operators, reasoning depth, and on-demand local weights—zero modes, zero
+                  servers.
                 </p>
 
                 <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500 dark:text-slate-400 tabular-nums">
                   <span>
-                    Runtime:{' '}
+                    Substrate:{' '}
                     <strong className="font-medium text-slate-800 dark:text-slate-200">
                       {isBootstrapUnbound
-                        ? 'Not activated'
-                        : (activeTier?.label ?? engineState.model?.displayName ?? 'Loading...')}
+                        ? 'LOD0 Instant (neural streams on demand)'
+                        : (engineState.model?.displayName ?? 'VerdantUI')}
                     </strong>
                   </span>
                   {!isBootstrapUnbound && engineState.model && (
@@ -679,64 +629,21 @@ export const ThreadView: FC<ThreadViewProps> = ({
                           {engineState.model.maxContextWindow.toLocaleString()} tok
                         </span>
                       </span>
+                    </>
+                  )}
+                  {importedHarness && (
+                    <>
                       <span aria-hidden="true">·</span>
                       <span>
-                        Template: <span className="font-mono">{detectedTemplate}</span>
+                        Override:{' '}
+                        <strong className="font-medium text-slate-800 dark:text-slate-200">
+                          {importedHarness.name}
+                        </strong>
                       </span>
                     </>
                   )}
-                  <span aria-hidden="true">·</span>
-                  <span>
-                    Harness:{' '}
-                    <strong className="font-medium text-slate-800 dark:text-slate-200">
-                      {importedHarness
-                        ? `${activeModeSpec.label} + ${importedHarness.name}`
-                        : activeModeSpec.label}
-                    </strong>
-                  </span>
                 </div>
               </div>
-
-              {isBootstrapUnbound && !isModelLoading && (
-                <div
-                  data-testid="model-selection-banner"
-                  className="mb-6 flex flex-col gap-3 rounded-xl border border-slate-200 bg-white p-4 sm:flex-row sm:items-center sm:justify-between dark:border-slate-800 dark:bg-[#121821]"
-                >
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <Sparkles className="h-4 w-4 text-emerald-700 dark:text-emerald-400" />
-                      <span className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                        Activate {recommendedTier.label}
-                      </span>
-                      <span className="rounded-md bg-emerald-50 px-1.5 py-0.5 font-mono text-[11px] font-medium text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300">
-                        {recommendedModel.shortName} · {recommendedModel.sizeLabel}
-                      </span>
-                    </div>
-                    <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-slate-400">
-                      {recommendedTier.tagline} Cached locally in browser OPFS for instant reload.
-                    </p>
-                  </div>
-                  <div className="flex shrink-0 items-center gap-2">
-                    <button
-                      type="button"
-                      data-testid="activate-recommended-tier"
-                      onClick={() => onLoadManagedTier(recommendedTier.id)}
-                      className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-[#0F5132] px-3.5 text-xs font-medium text-white hover:bg-[#0B3D25] transition-colors whitespace-nowrap"
-                    >
-                      <Download className="h-3.5 w-3.5" />
-                      <span>{isRecommendedCached ? 'Load Runtime' : 'Download & Start'}</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={onOpenModels}
-                      className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
-                    >
-                      <Layers className="h-3.5 w-3.5" />
-                      <span>Choose Tier</span>
-                    </button>
-                  </div>
-                </div>
-              )}
 
               {isModelLoading && (
                 <div
@@ -748,15 +655,13 @@ export const ThreadView: FC<ThreadViewProps> = ({
                     <span className="truncate">{engineState.statusDetail}</span>
                     <div className="flex shrink-0 items-center gap-2">
                       <span className="font-mono tabular-nums">{engineState.progressPercent}%</span>
-                      {isModelLoading && (
-                        <button
-                          type="button"
-                          onClick={onCancelDownload}
-                          className="rounded-md border border-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-                        >
-                          Cancel
-                        </button>
-                      )}
+                      <button
+                        type="button"
+                        onClick={onCancelDownload}
+                        className="rounded-md border border-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                      >
+                        Cancel
+                      </button>
                     </div>
                   </div>
                   <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
@@ -772,30 +677,28 @@ export const ThreadView: FC<ThreadViewProps> = ({
                 </div>
               )}
 
-              {/* Mode-tailored starter suggestions using official Assistant-UI ThreadPrimitive.Suggestion */}
-              {(!isBootstrapUnbound || (importedHarness?.suggestions?.length ?? 0) > 0) &&
-                activeSuggestions.length > 0 && (
-                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                    {activeSuggestions.map((item) => (
-                      <ThreadPrimitive.Suggestion
-                        key={item.prompt}
-                        prompt={item.prompt}
-                        method="replace"
-                        autoSend={modelReady && !isBootstrapUnbound}
-                        className="flex flex-col items-start rounded-xl border border-slate-200 bg-white p-4 text-left hover:border-slate-300 hover:bg-slate-50/70 dark:border-slate-800 dark:bg-[#121821] dark:hover:border-slate-700 dark:hover:bg-[#161E29] transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-700"
-                      >
-                        <span className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                          {item.label ?? item.prompt}
+              {activeSuggestions.length > 0 && (
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  {activeSuggestions.map((item) => (
+                    <ThreadPrimitive.Suggestion
+                      key={item.prompt}
+                      prompt={item.prompt}
+                      method="replace"
+                      autoSend={!isModelLoading}
+                      className="flex flex-col items-start rounded-xl border border-slate-200 bg-white p-4 text-left hover:border-slate-300 hover:bg-slate-50/70 dark:border-slate-800 dark:bg-[#121821] dark:hover:border-slate-700 dark:hover:bg-[#161E29] transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-700"
+                    >
+                      <span className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                        {item.label ?? item.prompt}
+                      </span>
+                      {item.label && (
+                        <span className="mt-1 line-clamp-2 text-xs text-slate-500 dark:text-slate-400">
+                          {item.prompt}
                         </span>
-                        {item.label && (
-                          <span className="mt-1 line-clamp-2 text-xs text-slate-500 dark:text-slate-400">
-                            {item.prompt}
-                          </span>
-                        )}
-                      </ThreadPrimitive.Suggestion>
-                    ))}
-                  </div>
-                )}
+                      )}
+                    </ThreadPrimitive.Suggestion>
+                  ))}
+                </div>
+              )}
             </div>
           </ThreadPrimitive.Empty>
 
@@ -811,6 +714,38 @@ export const ThreadView: FC<ThreadViewProps> = ({
         </div>
 
         <ThreadPrimitive.ViewportFooter className="sticky bottom-0 mx-auto mt-auto w-full max-w-3xl bg-gradient-to-t from-[#F8F9FA] via-[#F8F9FA] to-transparent px-4 pt-6 pb-4 sm:px-6 dark:from-[#0B0F14] dark:via-[#0B0F14]">
+          {isModelLoading && (
+            <div
+              role="status"
+              aria-live="polite"
+              className="mb-3 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-xs shadow-xs dark:border-slate-800 dark:bg-[#121821]"
+            >
+              <div className="flex items-center justify-between gap-3 text-slate-600 dark:text-slate-300">
+                <span className="truncate">{engineState.statusDetail}</span>
+                <div className="flex shrink-0 items-center gap-2">
+                  <span className="font-mono tabular-nums">{engineState.progressPercent}%</span>
+                  <button
+                    type="button"
+                    onClick={onCancelDownload}
+                    className="rounded-md border border-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+              <div className="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
+                <div
+                  className="h-full bg-[#0F5132] transition-transform duration-200 dark:bg-emerald-500"
+                  style={{
+                    width: '100%',
+                    transform: `scaleX(${Math.max(0.05, engineState.progressPercent / 100)})`,
+                    transformOrigin: 'left',
+                  }}
+                />
+              </div>
+            </div>
+          )}
+
           {engineState.errorMessage && (
             <div
               role="alert"
@@ -860,7 +795,7 @@ export const ThreadView: FC<ThreadViewProps> = ({
 
             <ComposerPrimitive.Input
               aria-label="Message prompt"
-              placeholder={composerPlaceholder}
+              placeholder="Ask VerdantUI anything..."
               rows={2}
               autoFocus
               className="max-h-56 w-full resize-none overflow-y-auto bg-transparent px-4 pt-3.5 pb-2 text-[15px] text-slate-900 outline-none placeholder:text-slate-400 dark:text-slate-100 dark:placeholder:text-slate-500"
@@ -875,69 +810,37 @@ export const ThreadView: FC<ThreadViewProps> = ({
                 >
                   <Paperclip className="h-3.5 w-3.5" />
                 </ComposerPrimitive.AddAttachment>
-
-                {/* Cohesive Verdant Harness Mode Switcher: Fast · Thinking · Agentic */}
-                <div
-                  role="radiogroup"
-                  aria-label="Verdant response mode"
-                  data-testid="harness-mode-switcher"
-                  className="inline-flex items-center rounded-lg border border-slate-200 bg-slate-50/90 p-0.5 dark:border-slate-700/80 dark:bg-[#0B0F14]"
-                >
-                  {HARNESS_MODE_ORDER.map((modeId) => {
-                    const spec = VERDANT_HARNESS_MODES[modeId];
-                    const selected = engineState.harnessMode === modeId;
-                    return (
-                      <button
-                        key={modeId}
-                        type="button"
-                        role="radio"
-                        aria-checked={selected}
-                        data-testid={`harness-mode-${modeId}`}
-                        title={spec.description}
-                        onClick={() => onSelectHarnessMode(modeId)}
-                        className={`inline-flex h-6 items-center gap-1 rounded-md px-2 text-[11px] font-medium transition-colors whitespace-nowrap ${
-                          selected
-                            ? 'bg-[#0F5132] text-white shadow-2xs dark:bg-emerald-600'
-                            : 'text-slate-600 hover:text-slate-950 dark:text-slate-400 dark:hover:text-slate-100'
-                        }`}
-                      >
-                        {renderHarnessModeIcon(modeId)}
-                        <span>{spec.shortLabel}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-
-                <span className="hidden sm:inline" aria-hidden="true">
-                  ·
-                </span>
+                <span aria-hidden="true">·</span>
                 <button
                   type="button"
                   onClick={onOpenModels}
-                  className="hidden max-w-[160px] truncate font-medium text-slate-700 hover:text-emerald-800 sm:inline dark:text-slate-300 dark:hover:text-emerald-400 transition-colors"
+                  className="max-w-[200px] truncate font-medium text-slate-700 hover:text-emerald-800 dark:text-slate-300 dark:hover:text-emerald-400 transition-colors"
                 >
                   {isBootstrapUnbound
-                    ? 'Activate Runtime'
-                    : (activeTier?.label ?? engineState.model?.displayName ?? 'Loading...')}
+                    ? 'VerdantUI · Instant'
+                    : (engineState.model?.displayName ?? 'VerdantUI')}
                 </button>
                 <ComposerContextMeter
                   engineState={engineState}
                   modelReady={modelReady}
                   onCountTokens={onCountTokens}
                 />
-                <span className="hidden md:inline" aria-hidden="true">
-                  ·
-                </span>
-                <button
-                  type="button"
-                  onClick={onToggleInspector}
-                  className="hidden shrink-0 items-center gap-1 whitespace-nowrap hover:text-slate-900 md:inline-flex dark:hover:text-slate-200 transition-colors"
-                >
-                  <SlidersHorizontal className="h-3 w-3" />
-                  <span className="font-mono tabular-nums">
-                    temp {engineState.sampling.temperature.toFixed(2)}
-                  </span>
-                </button>
+                {engineState.lastRouteCertificate && (
+                  <>
+                    <span className="hidden sm:inline" aria-hidden="true">
+                      ·
+                    </span>
+                    <button
+                      type="button"
+                      onClick={onToggleInspector}
+                      title={engineState.lastRouteCertificate.rationale}
+                      className="hidden shrink-0 items-center gap-1 whitespace-nowrap font-mono text-[11px] hover:text-emerald-800 sm:inline-flex dark:hover:text-emerald-400 transition-colors"
+                    >
+                      <SlidersHorizontal className="h-3 w-3" />
+                      <span>#{engineState.lastRouteCertificate.digest}</span>
+                    </button>
+                  </>
+                )}
                 {engineState.prefillProgress ? (
                   <>
                     <span className="hidden sm:inline" aria-hidden="true">
@@ -976,7 +879,7 @@ export const ThreadView: FC<ThreadViewProps> = ({
                 </AuiIf>
                 <AuiIf condition={(s) => !s.thread.isRunning}>
                   <ComposerPrimitive.Send
-                    disabled={!modelReady || isBootstrapUnbound}
+                    disabled={isModelLoading}
                     aria-label="Send message"
                     className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-[#0F5132] px-3.5 text-xs font-medium text-white hover:bg-[#0B3D25] disabled:cursor-not-allowed disabled:opacity-45 transition-colors whitespace-nowrap"
                   >

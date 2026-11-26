@@ -59,7 +59,7 @@ owner = "src/engine/vramBootCache.ts"
 evidence = "src/engine/vramBootCache.test.ts"
 
 [[id]]
-code = "VUI-HARNESS-01"
-title = "Cohesive Verdant + Assistant-UI Fast/Thinking/Agentic harness with client-side tools, Qwen3 thinking-mode control, and strict per-thread KV cache isolation"
-owner = "src/engine/verdantHarness.ts"
-evidence = "src/engine/verdantHarness.test.ts"
+code = "VUI-OBSERVER-01"
+title = "Unified VerdantUI Cognitive Observer: 8D Q10 harmonic belief state, Predictive Coding surprise, Active Inference Expected Free Energy + Prism CostSurface cross-classified routing, FK-07 capability lattice, and strict per-thread KV isolation"
+owner = "src/engine/cognitiveObserver.ts"
+evidence = "src/engine/cognitiveObserver.test.ts"

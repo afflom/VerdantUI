@@ -3,7 +3,7 @@ import { CheckCircle2, Play, RotateCcw, ShieldCheck, X, XCircle } from 'lucide-r
 import { formatBytes } from '../engine/modelCatalog';
 import type { SamplingConfig } from '../engine/llamaRuntime';
 import type { PrecisionContractMode } from '../engine/performanceContract';
-import { VERDANT_HARNESS_MODES } from '../engine/verdantHarness';
+import { COGNITIVE_AXIS_LABELS } from '../engine/cognitiveObserver';
 import type { WeightResidencyPolicy } from '../engine/vramWeightPager';
 import type { EngineState, PromptFormatMode } from '../engine/workerClient';
 import { VTENSOR_CONTRACT } from '../engine/vtensorProvider';
@@ -222,6 +222,74 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
                 )}
               </dl>
             </section>
+
+            {engineState.observerSnapshot && (
+              <section data-testid="cognitive-observer-panel">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="font-semibold text-slate-900 dark:text-slate-100">
+                    Cognitive Observer (Prism)
+                  </h3>
+                  {engineState.lastRouteCertificate && (
+                    <span className="font-mono text-[10px] font-semibold text-emerald-800 dark:text-emerald-400">
+                      #{engineState.lastRouteCertificate.digest}
+                    </span>
+                  )}
+                </div>
+                <dl className="mt-2 divide-y divide-slate-100 rounded-lg border border-slate-200 dark:divide-slate-800 dark:border-slate-800">
+                  {engineState.lastRouteCertificate && (
+                    <>
+                      <div className="flex items-center justify-between gap-2 px-3 py-1.5">
+                        <dt className="whitespace-nowrap text-slate-500 dark:text-slate-400">
+                          Settled route
+                        </dt>
+                        <dd className="truncate text-right font-mono text-[11px] text-emerald-800 dark:text-emerald-400">
+                          {engineState.lastRouteCertificate.label}
+                        </dd>
+                      </div>
+                      <div className="flex items-center justify-between gap-2 px-3 py-1.5">
+                        <dt className="whitespace-nowrap text-slate-500 dark:text-slate-400">
+                          Free energy / surprise
+                        </dt>
+                        <dd className="whitespace-nowrap font-mono text-[11px] tabular-nums text-slate-900 dark:text-slate-100">
+                          G={engineState.lastRouteCertificate.freeEnergy} ·{' '}
+                          {Math.round((engineState.observerSnapshot.lastSurpriseQ10 / 1024) * 100)}%
+                          {engineState.lastRouteCertificate.escalatedFromRetry ? ' · retry↑' : ''}
+                        </dd>
+                      </div>
+                      <div className="px-3 py-1.5 text-[11px] leading-relaxed text-slate-600 dark:text-slate-400">
+                        {engineState.lastRouteCertificate.rationale}
+                      </div>
+                    </>
+                  )}
+                  <div className="space-y-1.5 px-3 py-2">
+                    <div className="flex items-center justify-between text-[10px] font-medium text-slate-500 dark:text-slate-400">
+                      <span>8D Harmonic Belief State (Q10)</span>
+                      <span className="font-mono tabular-nums">
+                        turn {engineState.observerSnapshot.turnCount}
+                      </span>
+                    </div>
+                    {COGNITIVE_AXIS_LABELS.map((label, idx) => {
+                      const val = engineState.observerSnapshot!.belief[idx] ?? 0;
+                      const pct = Math.round((val / 1024) * 100);
+                      return (
+                        <div key={label} className="space-y-0.5">
+                          <div className="flex justify-between text-[10px] text-slate-600 dark:text-slate-400">
+                            <span>{label}</span>
+                            <span className="font-mono tabular-nums">{pct}%</span>
+                          </div>
+                          <div className="h-1 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
+                            <div
+                              className="h-full bg-[#0F5132] dark:bg-emerald-500"
+                              style={{ width: `${pct}%` }}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </dl>
+              </section>
+            )}
 
             {contract && (
               <section>
@@ -838,13 +906,12 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
               </div>
               <p className="mt-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
                 <strong className="font-medium text-slate-700 dark:text-slate-300">
-                  {VERDANT_HARNESS_MODES[engineState.harnessMode].label} mode
+                  Unified VerdantUI Model
                 </strong>
                 {' · '}
-                {VERDANT_HARNESS_MODES[engineState.harnessMode].description}
                 {engineState.importedHarness
-                  ? ` Custom override: ${engineState.importedHarness.name}.`
-                  : ''}
+                  ? `Custom override: ${engineState.importedHarness.name}.`
+                  : 'Cognitive Observer dynamically settles verified local actions, reasoning depth, and neural routes per input.'}
               </p>
             </div>
 

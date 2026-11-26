@@ -6,8 +6,13 @@
  */
 
 import type { ThreadMessage } from '@assistant-ui/react';
-import type { Tool } from 'assistant-stream';
 import { formatSpeculativePrefixForLlama } from './assistantAdapter';
+import {
+  UNIFIED_VERDANT_SYSTEM_PROMPT,
+  VerdantCognitiveObserver,
+  type CognitiveObserverSnapshot,
+  type CognitiveRouteCertificate,
+} from './cognitiveObserver';
 import {
   loadSavedHarness,
   saveHarnessToStorage,
@@ -24,18 +29,10 @@ import {
 import {
   INTERNAL_BOOTSTRAP_MODEL,
   MODEL_CATALOG,
+  findCatalogModelById,
   formatBytes,
   type CatalogModel,
 } from './modelCatalog';
-import {
-  VERDANT_HARNESS_MODES,
-  createVerdantClientTools,
-  loadSavedHarnessMode,
-  resolveTierCatalogModel,
-  saveHarnessMode,
-  type VerdantHarnessMode,
-  type VerdantRuntimeTierId,
-} from './verdantHarness';
 import type { PrecisionContractMode } from './performanceContract';
 import type { OpfsQuotaSnapshot } from './vramBackingStore';
 import { trimToStableSpeculativePrefix } from './vramUnifiedStore';
@@ -74,10 +71,12 @@ export interface EngineState {
   readonly prefillProgress: PrefillProgressEvent | null;
   readonly speculativePrefill: SpeculativePrefillState;
   readonly sampling: SamplingConfig;
+  readonly samplingCustomized: boolean;
   readonly promptMode: PromptFormatMode;
   readonly precisionMode: PrecisionContractMode;
   readonly weightResidencyPolicy: WeightResidencyPolicy;
-  readonly harnessMode: VerdantHarnessMode;
+  readonly lastRouteCertificate: CognitiveRouteCertificate | null;
+  readonly observerSnapshot: CognitiveObserverSnapshot | null;
   readonly importedHarness: ImportedHarnessSpec | null;
   readonly cachedModelIds: readonly string[];
   readonly opfsStorage: OpfsQuotaSnapshot;
@@ -245,7 +244,7 @@ export class LlamaVTensorWorkerClient {
   private lastSpeculativePrompt = '';
   private activeSpeculativeThreadId: string | null = null;
   private lastTokenStatePatchMs = 0;
-  private readonly speculativeTools: Record<string, Tool<any, any>>;
+  readonly cognitiveObserver = new VerdantCognitiveObserver();
   private readonly listeners = new Set<Listener>();
   private readonly pending = new Map<
     string,
@@ -274,7 +273,6 @@ export class LlamaVTensorWorkerClient {
   constructor() {
     const saved = loadSavedPrefs();
     const savedHarness = loadSavedHarness();
-    const savedHarnessMode = loadSavedHarnessMode();
     this.state = {
       status: 'idle',
       progressPercent: 0,
@@ -289,24 +287,18 @@ export class LlamaVTensorWorkerClient {
       prefillProgress: null,
       speculativePrefill: { active: false, readyTokens: 0, targetTokens: 0 },
       sampling: saved.sampling,
+      samplingCustomized: false,
       promptMode: saved.promptMode,
       precisionMode: saved.precisionMode,
       weightResidencyPolicy: saved.weightResidencyPolicy,
-      harnessMode: savedHarnessMode,
+      lastRouteCertificate: null,
+      observerSnapshot: null,
       importedHarness: savedHarness,
       cachedModelIds: [],
       opfsStorage: INITIAL_OPFS_STORAGE,
       conformanceReport: null,
       conformanceRunning: false,
     };
-
-    this.speculativeTools = createVerdantClientTools(() => ({
-      model: this.state.model,
-      telemetry: this.state.telemetry,
-      opfsStorage: this.state.opfsStorage,
-      lastTokensPerSec: this.state.lastTokensPerSec,
-      harnessMode: this.state.harnessMode,
-    }));
 
     this.worker = new Worker(new URL('./inference.worker.ts', import.meta.url), {
       type: 'module',
@@ -449,7 +441,7 @@ export class LlamaVTensorWorkerClient {
       this.state.precisionMode,
       this.state.weightResidencyPolicy,
     );
-    this.patchState({ sampling: nextSampling });
+    this.patchState({ sampling: nextSampling, samplingCustomized: true });
   }
 
   updatePromptMode(promptMode: PromptFormatMode): void {
@@ -509,17 +501,10 @@ export class LlamaVTensorWorkerClient {
   }
 
   resetSampling(): void {
-    const spec = VERDANT_HARNESS_MODES[this.state.harnessMode];
-    const nextSampling: SamplingConfig = {
-      ...DEFAULT_SAMPLING_CONFIG,
-      temperature: spec.callSettings.temperature,
-      topP: spec.callSettings.topP,
-      topK: spec.topK,
-      repeatPenalty: spec.repeatPenalty,
-    };
-    savePrefs(nextSampling, 'auto', 'q8-vnni', 'auto');
+    savePrefs(DEFAULT_SAMPLING_CONFIG, 'auto', 'q8-vnni', 'auto');
     this.patchState({
-      sampling: nextSampling,
+      sampling: DEFAULT_SAMPLING_CONFIG,
+      samplingCustomized: false,
       promptMode: 'auto',
       precisionMode: 'q8-vnni',
       weightResidencyPolicy: 'auto',
@@ -655,40 +640,41 @@ export class LlamaVTensorWorkerClient {
     } satisfies WorkerRequest);
   }
 
-  setHarnessMode(mode: VerdantHarnessMode): void {
-    if (this.state.harnessMode === mode) return;
-    saveHarnessMode(mode);
-    const spec = VERDANT_HARNESS_MODES[mode];
-    const imported = this.state.importedHarness;
-    const nextSampling: SamplingConfig = {
-      ...this.state.sampling,
-      temperature: imported?.callSettings?.temperature ?? spec.callSettings.temperature,
-      topP: imported?.callSettings?.topP ?? spec.callSettings.topP,
-      topK: imported?.topK ?? spec.topK,
-      repeatPenalty: imported?.repeatPenalty ?? spec.repeatPenalty,
-    };
-    savePrefs(
-      nextSampling,
-      this.state.promptMode,
-      this.state.precisionMode,
-      this.state.weightResidencyPolicy,
-    );
-    this.clearSpeculativeTimers();
-    this.lastSpeculativePrompt = '';
+  recordCognitiveObservation(
+    certificate: CognitiveRouteCertificate,
+    snapshot: CognitiveObserverSnapshot,
+  ): void {
     this.patchState({
-      harnessMode: mode,
-      sampling: nextSampling,
+      lastRouteCertificate: certificate,
+      observerSnapshot: snapshot,
     });
   }
 
-  async loadManagedTier(tierId: VerdantRuntimeTierId): Promise<LoadedModelSummary> {
-    return this.loadCatalogModel(resolveTierCatalogModel(tierId));
-  }
-
-  private getActiveSpeculativeTools(): Record<string, Tool<any, any>> | undefined {
-    return VERDANT_HARNESS_MODES[this.state.harnessMode].enableTools
-      ? this.speculativeTools
-      : undefined;
+  /**
+   * Seamlessly activates/streams a CostSurface-selected neural route on demand (inline within a turn),
+   * honoring an external AbortSignal if the user clicks Stop.
+   */
+  async ensureUnifiedNeuralRoute(
+    modelId: string,
+    signal?: AbortSignal,
+  ): Promise<LoadedModelSummary> {
+    if (this.state.model && this.state.model.id === modelId) {
+      return this.state.model;
+    }
+    const target = findCatalogModelById(modelId);
+    if (!target) {
+      throw new Error(`Unified neural route "${modelId}" not found in catalog.`);
+    }
+    if (signal?.aborted) {
+      throw new Error('Download cancelled.');
+    }
+    const onAbort = () => this.cancelDownload();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      return await this.loadCatalogModel(target);
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
+    }
   }
 
   /**
@@ -710,10 +696,7 @@ export class LlamaVTensorWorkerClient {
     const model = this.state.model;
     const mode = this.state.importedHarness?.promptMode ?? this.state.promptMode;
     const systemPrompt =
-      systemMessage ??
-      this.state.importedHarness?.system ??
-      VERDANT_HARNESS_MODES[this.state.harnessMode].system;
-    const activeTools = this.getActiveSpeculativeTools();
+      systemMessage ?? this.state.importedHarness?.system ?? UNIFIED_VERDANT_SYSTEM_PROMPT;
     const stableWordDraft = trimToStableSpeculativePrefix(draftText, false);
     const fullDraft = trimToStableSpeculativePrefix(draftText, true);
 
@@ -723,9 +706,11 @@ export class LlamaVTensorWorkerClient {
       model,
       mode,
       systemPrompt,
-      { tools: activeTools },
     );
-    if (wordPrompt && (wordPrompt !== this.lastSpeculativePrompt || threadId !== this.activeSpeculativeThreadId)) {
+    if (
+      wordPrompt &&
+      (wordPrompt !== this.lastSpeculativePrompt || threadId !== this.activeSpeculativeThreadId)
+    ) {
       const delayMs = draftText.trim().length === 0 ? 60 : 160;
       this.speculativeWordTimer = setTimeout(() => {
         this.speculativeWordTimer = null;
@@ -740,9 +725,11 @@ export class LlamaVTensorWorkerClient {
         model,
         mode,
         systemPrompt,
-        { tools: activeTools },
       );
-      if (tailPrompt && (tailPrompt !== this.lastSpeculativePrompt || threadId !== this.activeSpeculativeThreadId)) {
+      if (
+        tailPrompt &&
+        (tailPrompt !== this.lastSpeculativePrompt || threadId !== this.activeSpeculativeThreadId)
+      ) {
         this.speculativeTailTimer = setTimeout(() => {
           this.speculativeTailTimer = null;
           this.dispatchSpeculativePrefill(tailPrompt, threadId);
@@ -798,18 +785,15 @@ export class LlamaVTensorWorkerClient {
         opfsStorage: msg.opfsStorage,
         cachedModelIds: computeCachedIds(msg.opfsStorage),
       });
-      // Warm initial prompt prefix (including active harness system + Agentic <tools>) for local/resident models
+      // Warm initial prompt prefix for the unified VerdantUI model (skip on network demand-paged models)
       if (msg.summary.backingKind !== 'opfs-demand') {
-        const bootSystem =
-          this.state.importedHarness?.system ??
-          VERDANT_HARNESS_MODES[this.state.harnessMode].system;
+        const bootSystem = this.state.importedHarness?.system ?? UNIFIED_VERDANT_SYSTEM_PROMPT;
         const bootPrefix = formatSpeculativePrefixForLlama(
           [],
           '',
           msg.summary,
           this.state.importedHarness?.promptMode ?? this.state.promptMode,
           bootSystem,
-          { tools: this.getActiveSpeculativeTools() },
         );
         if (bootPrefix) {
           this.dispatchSpeculativePrefill(bootPrefix);

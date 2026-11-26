@@ -16,7 +16,6 @@ import {
   X,
 } from 'lucide-react';
 import { isInternalBootstrapModel } from '../engine/modelCatalog';
-import { findTierForModelId, VERDANT_HARNESS_MODES } from '../engine/verdantHarness';
 import type { EngineState } from '../engine/workerClient';
 
 interface ThreadSidebarProps {
@@ -80,8 +79,7 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
   const archivedCount = useAuiState((s) => s.threads.archivedThreadIds.length);
   const isBootstrapUnbound = isInternalBootstrapModel(engineState.model?.id);
   const importedHarness = engineState.importedHarness;
-  const activeTier = findTierForModelId(engineState.model?.id);
-  const activeModeSpec = VERDANT_HARNESS_MODES[engineState.harnessMode];
+  const lastCert = engineState.lastRouteCertificate;
 
   const sidebarContent = (
     <div className="flex h-full w-full flex-col bg-white dark:bg-[#0F141C]">
@@ -143,14 +141,12 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
 
       <div className="border-t border-slate-200 p-3.5 dark:border-slate-800">
         <div className="truncate text-xs font-semibold text-slate-900 dark:text-slate-100">
-          {isBootstrapUnbound
-            ? 'Verdant Runtime'
-            : (activeTier?.label ?? engineState.model?.displayName ?? 'Loading runtime...')}
+          VerdantUI
         </div>
         <div className="mt-0.5 truncate text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
           {isBootstrapUnbound
-            ? 'Activate a local runtime tier'
-            : `${activeModeSpec.label} mode · ${engineState.model?.hparams.primaryQuantization ?? 'F32'} · ${
+            ? 'LOD0 Instant · Neural on demand'
+            : `${engineState.model?.displayName ?? 'Unified Model'} · ${
                 engineState.model
                   ? `${Math.round(engineState.model.maxContextWindow / 1024)}K ctx`
                   : ''
@@ -161,13 +157,17 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
           type="button"
           onClick={() => {
             onCloseMobile();
-            onOpenHarness();
+            onOpenInspector();
           }}
           className="mt-2 flex w-full items-center gap-1.5 truncate text-left text-[11px] text-slate-600 hover:text-emerald-800 dark:text-slate-400 dark:hover:text-emerald-400 transition-colors"
         >
           <FileJson className="h-3.5 w-3.5 shrink-0" />
           <span className="truncate">
-            {importedHarness ? `Override: ${importedHarness.name}` : `Harness: ${activeModeSpec.label}`}
+            {importedHarness
+              ? `Override: ${importedHarness.name}`
+              : lastCert
+                ? `Prism · #${lastCert.digest}`
+                : 'Cognitive Observer · Ready'}
           </span>
         </button>
 
@@ -180,7 +180,7 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
             }}
             className="inline-flex h-8 items-center justify-center rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
           >
-            Runtime
+            Storage
           </button>
           <button
             type="button"

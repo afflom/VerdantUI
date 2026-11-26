@@ -27,9 +27,10 @@ import type { ReadonlyJSONObject } from 'assistant-stream/utils';
 import { applyCallSettingsToSampling } from './harnessConfig';
 import type { LoadedModelSummary } from './llamaRuntime';
 import {
-  VERDANT_HARNESS_MODES,
+  formatDirectOperatorSummary,
+  UNIFIED_VERDANT_SYSTEM_PROMPT,
   type VerdantThinkingPolicy,
-} from './verdantHarness';
+} from './cognitiveObserver';
 import type { LlamaVTensorWorkerClient, PromptFormatMode } from './workerClient';
 
 export type DetectedChatTemplate =
@@ -824,14 +825,32 @@ export function formatSpeculativePrefixForLlama(
   return lines.join('\n');
 }
 
-function resolveThinkingPolicy(
-  harnessMode: keyof typeof VERDANT_HARNESS_MODES,
-  reasoningEffort?: string,
-): VerdantThinkingPolicy {
-  const effort = reasoningEffort?.toLowerCase();
-  if (effort === 'none' || effort === 'off' || effort === 'low') return 'off';
-  if (effort === 'high') return 'on';
-  return VERDANT_HARNESS_MODES[harnessMode].thinkingPolicy;
+function extractLatestUserInput(messages: readonly ThreadMessage[]): {
+  text: string;
+  hasAttachment: boolean;
+} {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== 'user') continue;
+    const text = (m.content as readonly { type?: string; text?: string }[])
+      .filter(
+        (p): p is { type: 'text'; text: string } =>
+          p.type === 'text' && typeof p.text === 'string',
+      )
+      .map((p) => p.text)
+      .join('\n')
+      .trim();
+    const hasAttachment = Array.isArray(m.attachments) && m.attachments.length > 0;
+    return { text, hasAttachment };
+  }
+  return { text: '', hasAttachment: false };
+}
+
+function hasPendingToolResults(msg: ThreadMessage | null | undefined): boolean {
+  if (!msg || msg.role !== 'assistant' || !Array.isArray(msg.content)) return false;
+  return (msg.content as readonly { type?: string; result?: unknown }[]).some(
+    (p) => p.type === 'tool-call' && p.result !== undefined,
+  );
 }
 
 export function createLlamaVTensorAdapter(
@@ -847,38 +866,138 @@ export function createLlamaVTensorAdapter(
       unstable_threadId,
       unstable_getMessage,
     }) {
-      const state = client.getState();
-      if (!state.model) {
-        throw new Error('Model is still loading. Please wait a moment and try again.');
-      }
-
       roundtripSeq += 1;
       const stepIdPrefix = `tc_${Date.now().toString(36)}_${roundtripSeq}`;
-      const harnessSpec = VERDANT_HARNESS_MODES[state.harnessMode];
-      const activeTools = context?.tools && Object.keys(context.tools).length > 0 ? context.tools : undefined;
+      const threadId = unstable_threadId || 'default-thread';
+      const pendingAssistantMessage = unstable_getMessage ? unstable_getMessage() : null;
+      const isToolContinuationStep = hasPendingToolResults(pendingAssistantMessage);
+      const { text: latestUserText, hasAttachment } = extractLatestUserInput(messages);
+
+      const initialState = client.getState();
+      const { certificate, snapshot } = client.cognitiveObserver.selectRoute({
+        threadId,
+        messages,
+        latestUserText,
+        hasAttachment,
+        activeModel: initialState.model,
+        cachedModelIds: initialState.cachedModelIds,
+        isToolContinuationStep,
+        hasImportedHarness: initialState.importedHarness !== null,
+      });
+      client.recordCognitiveObservation(certificate, snapshot);
+
+      const streamStartTime = Date.now();
+
+      // ---------------------------------------------------------------------
+      // Path A: LOD0 Verified Deterministic Settlement (`REQ-SETTLEMENT-LOD0`)
+      // Executes instantaneously (<2ms, 0 bytes downloaded, works on first paint!)
+      // ---------------------------------------------------------------------
+      if (certificate.kind === 'lod0-verified' && certificate.directMatch) {
+        const dm = certificate.directMatch;
+        const toolDef = context?.tools?.[dm.toolName];
+        if (toolDef?.execute) {
+          const toolCallId = `${stepIdPrefix}_lod0`;
+          const argsText = JSON.stringify(dm.args);
+          try {
+            const result = await toolDef.execute(dm.args as never, {
+              toolCallId,
+              abortSignal,
+              human: async () => undefined,
+            } as never);
+            const summaryText = formatDirectOperatorSummary(dm.toolName, result);
+            const updatedSnap = client.cognitiveObserver.recordTurnOutcome(threadId, {
+              factKey: dm.toolName,
+              factSummary: summaryText,
+            });
+            client.recordCognitiveObservation(certificate, updatedSnap);
+            const totalStreamTime = Date.now() - streamStartTime;
+            yield {
+              content: [
+                {
+                  type: 'tool-call' as const,
+                  toolCallId,
+                  toolName: dm.toolName,
+                  args: dm.args as ReadonlyJSONObject,
+                  argsText,
+                  result,
+                },
+                {
+                  type: 'text' as const,
+                  text: summaryText,
+                },
+              ],
+              status: { type: 'complete', reason: 'stop' },
+              metadata: {
+                custom: { prismRoute: certificate },
+                timing: {
+                  streamStartTime,
+                  firstTokenTime: Date.now(),
+                  totalStreamTime,
+                  tokenCount: 0,
+                  tokensPerSecond: 0,
+                  totalChunks: 1,
+                  toolCallCount: 1,
+                },
+              },
+            };
+            return;
+          } catch (err) {
+            const updatedSnap = client.cognitiveObserver.recordTurnOutcome(threadId, {
+              hadToolError: true,
+            });
+            client.recordCognitiveObservation(certificate, updatedSnap);
+            const msg = err instanceof Error ? err.message : String(err);
+            yield {
+              content: [{ type: 'text' as const, text: `Unable to evaluate \`${dm.toolName}\`: ${msg}` }],
+              status: { type: 'complete', reason: 'stop' },
+              metadata: { custom: { prismRoute: certificate } },
+            };
+            return;
+          }
+        }
+      }
+
+      // ---------------------------------------------------------------------
+      // Path B: Seamless Progressive Promotion (`REQ-SETTLEMENT-PROMOTE`)
+      // Automatically activates/streams the CostSurface-selected neural route inline
+      // ---------------------------------------------------------------------
+      if (certificate.kind === 'neural-on-demand' && certificate.modelId) {
+        if (abortSignal.aborted) return;
+        await client.ensureUnifiedNeuralRoute(certificate.modelId, abortSignal);
+        if (abortSignal.aborted) return;
+      }
+
+      const state = client.getState();
+      if (!state.model) {
+        throw new Error('VerdantUI neural route is unavailable. Please check browser storage or network.');
+      }
+
+      // ---------------------------------------------------------------------
+      // Path C: Unified Neural Execution (adaptive depth + conditional tools)
+      // ---------------------------------------------------------------------
+      const allTools =
+        context?.tools && Object.keys(context.tools).length > 0 ? context.tools : undefined;
+      const activeTools = certificate.attachTools ? allTools : undefined;
       const parseToolCalls = Boolean(activeTools);
 
-      // Strictly read system instructions and callSettings from Assistant-UI's ModelContext
-      const systemMessage = context?.system;
-      const baseWithHarness = {
-        ...state.sampling,
-        topK: state.importedHarness?.topK ?? state.sampling.topK ?? harnessSpec.topK,
-        repeatPenalty:
-          state.importedHarness?.repeatPenalty ??
-          state.sampling.repeatPenalty ??
-          harnessSpec.repeatPenalty,
-      };
+      const systemMessage = context?.system ?? UNIFIED_VERDANT_SYSTEM_PROMPT;
+      const baseSampling = state.samplingCustomized
+        ? state.sampling
+        : {
+            ...state.sampling,
+            temperature: certificate.recommendedSampling.temperature,
+            topP: certificate.recommendedSampling.topP,
+            topK: certificate.recommendedSampling.topK,
+            repeatPenalty: certificate.recommendedSampling.repeatPenalty,
+          };
       const effectiveSampling = applyCallSettingsToSampling(
-        baseWithHarness,
-        context?.callSettings,
+        baseSampling,
+        state.importedHarness?.callSettings ??
+          (state.samplingCustomized ? context?.callSettings : undefined),
         state.importedHarness,
       );
       const effectivePromptMode = state.importedHarness?.promptMode ?? state.promptMode;
-      const thinkingPolicy = resolveThinkingPolicy(
-        state.harnessMode,
-        context?.config?.reasoningEffort,
-      );
-      const pendingAssistantMessage = unstable_getMessage ? unstable_getMessage() : null;
+      const thinkingPolicy = certificate.thinkingPolicy;
       const startsInReasoning = shouldPrefillOpenThink(
         state.model,
         effectivePromptMode,
@@ -897,7 +1016,7 @@ export function createLlamaVTensorAdapter(
         },
       );
 
-      // Link an internal controller so Agentic tool calls stop cleanly right after `</tool_call>`
+      // Link an internal controller so tool calls stop cleanly right after `</tool_call>`
       const runController = new AbortController();
       const onExternalAbort = () => runController.abort();
       if (abortSignal.aborted) {
@@ -906,7 +1025,6 @@ export function createLlamaVTensorAdapter(
         abortSignal.addEventListener('abort', onExternalAbort, { once: true });
       }
 
-      const streamStartTime = Date.now();
       let firstTokenTime: number | undefined;
       let totalChunks = 0;
       let latestText = '';
@@ -919,7 +1037,7 @@ export function createLlamaVTensorAdapter(
           prompt,
           runController.signal,
           effectiveSampling,
-          unstable_threadId,
+          threadId,
         )) {
           if (firstTokenTime === undefined) {
             firstTokenTime = Date.now();
@@ -942,6 +1060,7 @@ export function createLlamaVTensorAdapter(
             yield {
               content: parts,
               metadata: {
+                custom: { prismRoute: certificate },
                 timing: {
                   streamStartTime,
                   firstTokenTime,
@@ -955,7 +1074,6 @@ export function createLlamaVTensorAdapter(
           }
 
           if (completedToolCall) {
-            // Stop generation right after `</tool_call>` so the model never fabricates `<tool_response>`
             runController.abort();
             break;
           }
@@ -984,6 +1102,7 @@ export function createLlamaVTensorAdapter(
             ? { type: 'requires-action', reason: 'tool-calls' }
             : { type: 'complete', reason: 'stop' },
           metadata: {
+            custom: { prismRoute: certificate },
             steps: [
               {
                 usage: {
@@ -1013,6 +1132,7 @@ export function createLlamaVTensorAdapter(
           ],
           status: { type: 'complete', reason: 'stop' },
           metadata: {
+            custom: { prismRoute: certificate },
             timing: {
               streamStartTime,
               firstTokenTime,

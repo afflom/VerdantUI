@@ -25,11 +25,9 @@ const VTensorInspector = lazy(() =>
 );
 import type { SamplingConfig } from './engine/llamaRuntime';
 import {
-  buildVerdantModelContext,
+  buildUnifiedVerdantModelContext,
   createVerdantClientTools,
-  type VerdantHarnessMode,
-  type VerdantRuntimeTierId,
-} from './engine/verdantHarness';
+} from './engine/cognitiveObserver';
 import type { ImportedHarnessSpec } from './engine/harnessConfig';
 import type { CatalogModel } from './engine/modelCatalog';
 import { createVTensorThreadListAdapter } from './engine/threadStorage';
@@ -49,17 +47,16 @@ function readInitialDarkMode(): boolean {
 }
 
 /**
- * Registers the active cohesive Verdant Harness (`Fast`, `Thinking`, `Agentic`, plus optional
- * imported harness override) directly into `@assistant-ui/react`'s standard `ModelContext`
- * registry (`aui.modelContext.register`), flowing `system`, `callSettings`, `config`, and
- * client-side `tools` natively into `ChatModelAdapter.run({ context })` and `ToolInvocationTracker`.
+ * Registers the single unified VerdantUI model context (verified client tools, unified system
+ * contract, and optional imported custom harness override) directly into `@assistant-ui/react`'s
+ * standard `ModelContext` registry (`aui.modelContext.register`).
  */
-const VerdantHarnessBridge: FC<{
-  harnessMode: VerdantHarnessMode;
+const VerdantModelContextBridge: FC<{
   importedHarness: ImportedHarnessSpec | null;
   sampling: SamplingConfig;
+  samplingCustomized: boolean;
   workerClient: LlamaVTensorWorkerClient;
-}> = ({ harnessMode, importedHarness, sampling, workerClient }) => {
+}> = ({ importedHarness, sampling, samplingCustomized, workerClient }) => {
   const aui = useAui();
   const clientTools = useMemo(
     () =>
@@ -70,21 +67,30 @@ const VerdantHarnessBridge: FC<{
           telemetry: s.telemetry,
           opfsStorage: s.opfsStorage,
           lastTokensPerSec: s.lastTokensPerSec,
-          harnessMode: s.harnessMode,
         };
       }),
     [workerClient],
   );
 
   useEffect(() => {
-    const context = buildVerdantModelContext(harnessMode, clientTools, importedHarness, {
-      temperature: sampling.temperature,
-      topP: sampling.topP,
-    });
+    const context = buildUnifiedVerdantModelContext(
+      clientTools,
+      importedHarness,
+      samplingCustomized
+        ? { temperature: sampling.temperature, topP: sampling.topP }
+        : undefined,
+    );
     return aui.modelContext.register({
       getModelContext: () => context,
     });
-  }, [aui, harnessMode, clientTools, importedHarness, sampling.temperature, sampling.topP]);
+  }, [
+    aui,
+    clientTools,
+    importedHarness,
+    samplingCustomized,
+    sampling.temperature,
+    sampling.topP,
+  ]);
 
   return null;
 };
@@ -114,7 +120,7 @@ export default function App() {
   const [engineState, setEngineState] = useState<EngineState>(() => workerClient.getState());
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [modelsModalOpen, setModelsModalOpen] = useState(false);
-  const [modelsModalTab, setModelsModalTab] = useState<ModalViewTab>('managed');
+  const [modelsModalTab, setModelsModalTab] = useState<ModalViewTab>('all');
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [darkMode, setDarkMode] = useState<boolean>(readInitialDarkMode);
 
@@ -173,32 +179,18 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [mobileSidebarOpen, inspectorOpen]);
 
-  const openModelsModal = useCallback((tab: ModalViewTab = 'managed') => {
+  const openModelsModal = useCallback((tab: ModalViewTab = 'all') => {
     setModelsModalTab(tab);
     setModelsModalOpen(true);
   }, []);
 
-  const handleOpenManagedModels = useCallback(() => {
-    openModelsModal('managed');
+  const handleOpenStorageModels = useCallback(() => {
+    openModelsModal('all');
   }, [openModelsModal]);
 
   const handleSelectCatalogModel = useCallback(
     async (model: CatalogModel) => {
       await workerClient.loadCatalogModel(model);
-    },
-    [workerClient],
-  );
-
-  const handleSelectManagedTier = useCallback(
-    (tierId: VerdantRuntimeTierId) => {
-      void workerClient.loadManagedTier(tierId).catch(() => {});
-    },
-    [workerClient],
-  );
-
-  const handleSelectHarnessMode = useCallback(
-    (mode: VerdantHarnessMode) => {
-      workerClient.setHarnessMode(mode);
     },
     [workerClient],
   );
@@ -279,10 +271,10 @@ export default function App() {
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
-      <VerdantHarnessBridge
-        harnessMode={engineState.harnessMode}
+      <VerdantModelContextBridge
         importedHarness={engineState.importedHarness}
         sampling={engineState.sampling}
+        samplingCustomized={engineState.samplingCustomized}
         workerClient={workerClient}
       />
       <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#F8F9FA] text-slate-900 dark:bg-[#0B0F14] dark:text-slate-100">
@@ -305,16 +297,16 @@ export default function App() {
           <div className="flex items-center gap-2 shrink-0">
             <button
               type="button"
-              onClick={() => openModelsModal('managed')}
+              onClick={handleOpenStorageModels}
               className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 sm:px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
             >
               <Layers className="h-3.5 w-3.5" />
-              <span>Runtime</span>
+              <span>Storage</span>
             </button>
 
             <button
               type="button"
-              onClick={() => setInspectorOpen((prev) => !prev)}
+              onClick={handleToggleInspector}
               aria-pressed={inspectorOpen}
               className={`inline-flex h-9 items-center gap-1.5 rounded-lg px-2.5 sm:px-3 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
                 inspectorOpen
@@ -343,7 +335,7 @@ export default function App() {
             engineState={engineState}
             mobileOpen={mobileSidebarOpen}
             onCloseMobile={() => setMobileSidebarOpen(false)}
-            onOpenModels={() => openModelsModal('managed')}
+            onOpenModels={handleOpenStorageModels}
             onOpenHarness={() => openModelsModal('harness')}
             onOpenInspector={() => setInspectorOpen(true)}
           />
@@ -351,9 +343,7 @@ export default function App() {
           <main className="min-w-0 flex-1 overflow-hidden">
             <ThreadView
               engineState={engineState}
-              onOpenModels={handleOpenManagedModels}
-              onSelectHarnessMode={handleSelectHarnessMode}
-              onLoadManagedTier={handleSelectManagedTier}
+              onOpenModels={handleOpenStorageModels}
               onCancelDownload={handleCancelDownload}
               onRetryLoad={handleRetryLoad}
               onDismissError={handleDismissError}

@@ -9,7 +9,6 @@ import {
   type FormEvent,
 } from 'react';
 import {
-  Brain,
   Check,
   Code2,
   Download,
@@ -19,10 +18,8 @@ import {
   Layers,
   MessageSquare,
   RotateCw,
-  Sparkles,
   Trash2,
   Upload,
-  Wrench,
   X,
   Zap,
 } from 'lucide-react';
@@ -38,17 +35,12 @@ import {
   type ModelCategory,
 } from '../engine/modelCatalog';
 import {
-  resolveTierCatalogModel,
-  VERDANT_RUNTIME_TIERS,
-  type VerdantRuntimeTier,
-} from '../engine/verdantHarness';
-import {
   observeCatalogScaling,
   type CatalogModelAssessment,
 } from '../engine/verdantObserver';
 import type { EngineState } from '../engine/workerClient';
 
-export type ModalViewTab = 'managed' | ModelCategory | 'custom-ingest' | 'harness';
+export type ModalViewTab = ModelCategory | 'custom-ingest' | 'harness';
 
 interface ModelManagerModalProps {
   open: boolean;
@@ -87,7 +79,7 @@ function formatContextLength(tokens: number): string {
 
 export const ModelManagerModal: FC<ModelManagerModalProps> = ({
   open,
-  initialTab = 'managed',
+  initialTab = 'all',
   onClose,
   engineState,
   onSelectCatalogModel,
@@ -118,9 +110,7 @@ export const ModelManagerModal: FC<ModelManagerModalProps> = ({
   }, [open, initialTab]);
 
   const inspectedCategory: ModelCategory =
-    activeTab === 'managed' || activeTab === 'custom-ingest' || activeTab === 'harness'
-      ? 'all'
-      : activeTab;
+    activeTab === 'custom-ingest' || activeTab === 'harness' ? 'all' : activeTab;
 
   const catalogView = useMemo(
     () =>
@@ -451,11 +441,11 @@ export const ModelManagerModal: FC<ModelManagerModalProps> = ({
               id="model-manager-title"
               className="text-base font-semibold text-slate-900 dark:text-slate-100"
             >
-              Verdant Runtime &amp; Harness
+              Local Storage &amp; Checkpoints
             </h2>
             <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-              Choose a curated client-side runtime tier for Fast, Thinking, and Agentic modes, or
-              load custom GGUF checkpoints.
+              Manage OPFS-cached GGUF substrates, open a local file from disk, or import a custom
+              JSON harness override.
             </p>
           </div>
           <button
@@ -471,48 +461,14 @@ export const ModelManagerModal: FC<ModelManagerModalProps> = ({
 
         {/* Split Body */}
         <div className="flex min-h-0 flex-1 flex-col md:flex-row">
-          {/* Left Rail: Managed Runtime Tiers, Advanced Catalog, Local/URL, Harness, Browser Storage */}
+          {/* Left Rail: Checkpoints, Local/URL, Harness, Browser Storage */}
           <aside className="flex shrink-0 flex-col border-b border-slate-200 bg-[#F8F9FA] md:w-60 md:border-r md:border-b-0 dark:border-slate-800 dark:bg-[#0B0F14]">
             <nav
               aria-label="Model manager sections"
               className="flex gap-1.5 overflow-x-auto p-3 md:flex-1 md:flex-col md:overflow-x-visible md:overflow-y-auto"
             >
               <div className="hidden px-2 pb-1 text-[11px] font-semibold tracking-wide text-slate-500 md:block dark:text-slate-400">
-                Managed Runtime
-              </div>
-
-              <button
-                type="button"
-                data-testid="tab-managed"
-                onClick={() => {
-                  setActiveTab('managed');
-                  setLocalError(null);
-                  setLocalSuccess(null);
-                }}
-                className={`flex shrink-0 items-center justify-between gap-2 rounded-lg border px-3 py-2 text-left text-xs font-semibold transition-colors whitespace-nowrap md:w-full ${
-                  activeTab === 'managed'
-                    ? 'border-emerald-700/40 bg-white text-slate-950 dark:border-emerald-500/40 dark:bg-[#141B26] dark:text-white'
-                    : 'border-transparent text-slate-700 hover:bg-slate-200/60 dark:text-slate-300 dark:hover:bg-slate-800/60'
-                }`}
-              >
-                <span className="inline-flex items-center gap-2">
-                  <Sparkles
-                    className={`h-4 w-4 shrink-0 ${
-                      activeTab === 'managed'
-                        ? 'text-emerald-800 dark:text-emerald-400'
-                        : 'text-slate-500 dark:text-slate-400'
-                    }`}
-                  />
-                  <span>Verdant Tiers</span>
-                </span>
-                <span className="hidden font-mono text-[11px] font-normal text-slate-500 tabular-nums md:inline dark:text-slate-400">
-                  {VERDANT_RUNTIME_TIERS.length}
-                </span>
-              </button>
-
-              <div className="hidden my-2 border-t border-slate-200 md:block dark:border-slate-800" />
-              <div className="hidden px-2 pb-1 text-[11px] font-semibold tracking-wide text-slate-500 md:block dark:text-slate-400">
-                Advanced Checkpoints
+                Substrates
               </div>
 
               {catalogView.categorySummaries.map((summary) => {
@@ -711,137 +667,7 @@ export const ModelManagerModal: FC<ModelManagerModalProps> = ({
               )}
             </div>
 
-            {activeTab === 'managed' ? (
-              <div className="space-y-4">
-                <section className="border-b border-slate-200 pb-4 dark:border-slate-800">
-                  <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                    Verdant Managed Runtime Tiers
-                  </h3>
-                  <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-slate-400">
-                    Each tier pairs a verified open-weight GGUF runtime with VerdantUI&apos;s cohesive{' '}
-                    <strong className="font-medium text-slate-800 dark:text-slate-200">Fast</strong>,{' '}
-                    <strong className="font-medium text-slate-800 dark:text-slate-200">Thinking</strong>, and{' '}
-                    <strong className="font-medium text-slate-800 dark:text-slate-200">Agentic</strong>{' '}
-                    Assistant-UI harness. All inference and tool execution stays 100% in your browser.
-                  </p>
-                </section>
-
-                <div className="grid grid-cols-1 gap-3">
-                  {VERDANT_RUNTIME_TIERS.map((tier: VerdantRuntimeTier) => {
-                    const model = resolveTierCatalogModel(tier.id);
-                    const assessment = catalogView.models.find((m) => m.model.id === model.id);
-                    const isActive = assessment?.readiness === 'active';
-                    const isCached = assessment?.readiness === 'ready-cached';
-                    const isPaused = assessment?.readiness === 'paused-resumable';
-                    const isDemandCache = assessment?.readiness === 'ready-demand-cache';
-                    const hasStoredData = isCached || isPaused;
-
-                    return (
-                      <div
-                        key={tier.id}
-                        data-testid={`managed-tier-${tier.id}`}
-                        className={`flex flex-col gap-3 rounded-xl border p-4 sm:flex-row sm:items-center sm:justify-between ${
-                          isActive
-                            ? 'border-emerald-600/50 bg-emerald-50/40 dark:border-emerald-500/40 dark:bg-emerald-950/20'
-                            : 'border-slate-200 bg-white dark:border-slate-800 dark:bg-[#121821]'
-                        }`}
-                      >
-                        <div className="min-w-0 flex-1">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <span className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                              {tier.label}
-                            </span>
-                            <span className="rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-700 dark:bg-slate-800 dark:text-slate-300">
-                              {tier.badge}
-                            </span>
-                            <span className="font-mono text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-                              {model.shortName} · {model.sizeLabel}
-                            </span>
-                          </div>
-
-                          <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-slate-400">
-                            {tier.tagline}
-                          </p>
-
-                          <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px]">
-                            <span className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-50 px-2 py-0.5 text-slate-700 dark:border-slate-700 dark:bg-[#0B0F14] dark:text-slate-300">
-                              <Zap className="h-3 w-3 text-emerald-700 dark:text-emerald-400" />
-                              <span>Fast</span>
-                            </span>
-                            <span className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-50 px-2 py-0.5 text-slate-700 dark:border-slate-700 dark:bg-[#0B0F14] dark:text-slate-300">
-                              <Brain className="h-3 w-3 text-emerald-700 dark:text-emerald-400" />
-                              <span>
-                                {tier.supportsNativeThinking ? 'Native Thinking' : 'Prompted Thinking'}
-                              </span>
-                            </span>
-                            <span className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-50 px-2 py-0.5 text-slate-700 dark:border-slate-700 dark:bg-[#0B0F14] dark:text-slate-300">
-                              <Wrench className="h-3 w-3 text-emerald-700 dark:text-emerald-400" />
-                              <span>Agentic Tools</span>
-                            </span>
-                            <span className="ml-1 font-mono text-slate-500 dark:text-slate-400 tabular-nums">
-                              {model.quantization} · {formatContextLength(model.geometry.nativeContextTokens)} ctx
-                            </span>
-                          </div>
-                        </div>
-
-                        <div className="flex shrink-0 items-center gap-1.5 sm:pl-3">
-                          {hasStoredData && !isActive && (
-                            <button
-                              type="button"
-                              disabled={isBusy}
-                              onClick={() => void onDeleteCachedModel(model.id)}
-                              aria-label={`Remove ${tier.label} from local storage`}
-                              title="Remove from local storage"
-                              className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-100 hover:text-red-600 disabled:opacity-45 dark:border-slate-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-red-400 transition-colors"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
-                          )}
-
-                          <button
-                            type="button"
-                            disabled={isBusy || isActive}
-                            onClick={() => void handleCatalogSelect(model)}
-                            className={`inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-lg px-3.5 text-xs font-medium transition-colors whitespace-nowrap ${
-                              isActive
-                                ? 'border border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-300'
-                                : 'bg-[#0F5132] text-white hover:bg-[#0B3D25] disabled:opacity-45'
-                            }`}
-                          >
-                            {isActive ? (
-                              <>
-                                <Check className="h-3.5 w-3.5" />
-                                <span>Active</span>
-                              </>
-                            ) : isCached || isDemandCache ? (
-                              <>
-                                <HardDrive className="h-3.5 w-3.5" />
-                                <span>Activate</span>
-                              </>
-                            ) : isPaused ? (
-                              <>
-                                <RotateCw className="h-3.5 w-3.5" />
-                                <span>
-                                  {assessment?.partialPercent !== null &&
-                                  assessment?.partialPercent !== undefined
-                                    ? `Resume (${assessment.partialPercent}%)`
-                                    : 'Resume'}
-                                </span>
-                              </>
-                            ) : (
-                              <>
-                                <Download className="h-3.5 w-3.5" />
-                                <span>Download</span>
-                              </>
-                            )}
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            ) : activeTab === 'custom-ingest' ? (
+            {activeTab === 'custom-ingest' ? (
               <div className="space-y-4">
                 <div>
                   <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
