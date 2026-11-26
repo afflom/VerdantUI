@@ -1,0 +1,91 @@
+# VerdantUI Authoritative Standards & Upstream Register (`verdant-ui/authorities/1`)
+# Modeled on afflom/verdant-studio `model/authorities.toml`.
+# Every `Std` citation in `model/admissions.json` and `model/features.json` resolves here.
+
+schema = "verdant-ui/authorities/1"
+
+[[authority]]
+id = "VERDANT-ENGINE"
+name = "Verdant Engine & vTensor WASM SIMD"
+edition = "v2.22.4"
+source = "https://github.com/afflom/verdant-engine"
+pinFile = "model/engine-pin.json"
+scope = "Exclusive browser WASM SIMD compute substrate, multi-core SharedArrayBuffer pool, and bounded memory governors"
+
+[[authority]]
+id = "VERDANT-STUDIO"
+name = "Verdant Studio Lifecycle Management Model"
+edition = "main@da5083b5ee22"
+source = "https://github.com/afflom/verdant-studio"
+pinFile = "model/studio-pin.json"
+scope = "Closed-API product/feature lifecycle, well-founded Req/Std/Der admission, monotone locks, and automated upstream tracking"
+
+[[authority]]
+id = "PRISM-CODE"
+name = "UOR Foundation prism-code & LexLean 1.2"
+edition = "0.11.5"
+source = "https://www.npmjs.com/package/prism-code"
+scope = "Browser-native LexLean 1.2 compilation, Lean 4.32.2 kernel proofs, prism.design/1 compilation, and prism/holo/6 archives"
+
+[[authority]]
+id = "AFFLOM-ME"
+name = "Owner Possession & Non-Leaking Boundary Reference (afflom/me)"
+edition = "main"
+source = "https://github.com/afflom/me"
+scope = "Owner-centric possession hierarchy, kill switch, regulated detector hashonly/deny boundary, and seen-bytes outbound approval"
+
+[[authority]]
+id = "APACHE-2.0-PUBLIC-BENEFIT"
+name = "Apache-2.0 Free Public Benefit Service Charter"
+edition = "2.0"
+source = "https://www.apache.org/licenses/LICENSE-2.0"
+scope = "Open, free-to-use public benefit AI service with zero paywalls, zero ad/tracking SDKs, and 100% browser-local execution"
+
+[[authority]]
+id = "ISO-25010"
+name = "ISO/IEC 25010 Software Product Quality & Performance Efficiency"
+edition = "2023"
+source = "https://www.iso.org/standard/78176.html"
+scope = "Frame budget KPI (<= 16,666 us), zero turn-completion storage stalls, bounded memory, and multi-core throughput scaling"
+
+[[authority]]
+id = "ISO-42010"
+name = "ISO/IEC/IEEE 42010 Architecture Description"
+edition = "2022"
+source = "https://www.iso.org/standard/74393.html"
+scope = "Stakeholder-traceable viewpoints and deterministic separation of model authority from rendered view"
+
+[[authority]]
+id = "OWASP-ASVS-5.0.0"
+name = "OWASP Application Security Verification Standard"
+edition = "5.0.0"
+source = "https://owasp.org/www-project-application-security-verification-standard/"
+scope = "Strict CSP sandboxing, zero raw cross-context leakage, FK-07 denial-wins grants, and integrity-verified local persistence"
+
+[[authority]]
+id = "WCAG-2.2-AA"
+name = "W3C Web Content Accessibility Guidelines"
+edition = "2.2 Level AA"
+source = "https://www.w3.org/TR/WCAG22/"
+scope = "Accessible public-benefit interface with plain-language copy and zero internal engineering jargon"
+
+[[authority]]
+id = "W3C-PROV-O"
+name = "W3C Provenance Ontology"
+edition = "REC-20130430"
+source = "https://www.w3.org/TR/prov-o/"
+scope = "Stakeholder producer/consumer provenance and content-addressed artifact lineage"
+
+[[authority]]
+id = "JSON-SCHEMA-2020-12"
+name = "JSON Schema Draft 2020-12"
+edition = "2020-12"
+source = "https://json-schema.org/draft/2020-12/schema"
+scope = "Typed declarative weight schemas and Prism tool stream contracts"
+
+[[authority]]
+id = "DORA-METRICS"
+name = "DORA Software Delivery & Operational Performance Standards"
+edition = "2024"
+source = "https://dora.dev/"
+scope = "Fast automated CI/CD (~60s GitHub Pages publish), automated upstream upgrade PRs, and deterministic semantic releases"

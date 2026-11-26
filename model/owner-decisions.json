@@ -36,6 +36,36 @@
       "at": "2026-11-25",
       "requirements": ["REQ-STUDIO-HARNESS"],
       "quote": "Verdant Studio will also be an agent harness in VerdantUI, so that Verdant Apps can be created, published, and managed in VerdantUI. We'll work on the Verdant Studio harness after we refine the VerdantUI implementation."
+    },
+    {
+      "id": "DEC-007",
+      "at": "2026-11-26",
+      "requirements": ["REQ-FREE-PUBLIC-BENEFIT"],
+      "quote": "VerdantUI must be a best-in-class AI service that will provide a Free Public Benefit Service. The implementation of Verdant UI must be maintained to the highest standards including performance standards."
+    },
+    {
+      "id": "DEC-008",
+      "at": "2026-11-26",
+      "requirements": ["REQ-STUDIO-LIFECYCLE", "REQ-AUTO-RELEASE"],
+      "quote": "We must implement VerdantUI using Verdant Studio, so that we can maintain a healthy product lifecycle including the lifecycle of VerdantUI features, so that we can automate releases and upgrades and other aspects of software publishing."
+    },
+    {
+      "id": "DEC-009",
+      "at": "2026-11-26",
+      "requirements": ["REQ-PROCEDURAL-PRISM-WEIGHTS", "REQ-SPARSE-MEDIA-ACTIVATION"],
+      "quote": "The entire Verdant Prism must be procedurally synthesized from the Verdant Studio, so that VerdantUI is only used to route weights onto the Verdant Prism."
+    },
+    {
+      "id": "DEC-010",
+      "at": "2026-11-26",
+      "requirements": ["REQ-POSSESSION-MODEL", "REQ-NON-LEAKING-BOUNDARY"],
+      "quote": "We need to establish the user model within the VerdantUI unified model, so that the User can possess its parts of VerdantUI... The Observer also possesses the User in the same way... VerdantUI will route to external sources and must not leak any weights between contexts when it is sending information."
+    },
+    {
+      "id": "DEC-011",
+      "at": "2026-11-26",
+      "requirements": ["REQ-ZERO-USER-JARGON"],
+      "quote": "We do not expose verdant constructs such as the Observer or other technical jargon to the user of VerdantUI."
     }
   ]
 }

@@ -1,0 +1,95 @@
+# Automated Semantic Release & Software Publishing (`.github/workflows/release.yml`)
+# Modeled on Verdant Studio's deterministic release lifecycle (DEC-008):
+# Runs after `pages.yml` succeeds on `main` (or via manual dispatch). When newly active
+# features or upstream pin upgrades exist beyond `model/release-ledger.json`, computes the
+# next SemVer tag, publishes release notes + provenance, and creates a GitHub Release.
+
+name: release
+
+on:
+  workflow_run:
+    workflows: [pages]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump mode (auto | patch | minor | major)'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: cut semantic release when model ledger advances
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: main
+
+      - name: Install Node 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        shell: bash
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Plan semantic release from model/ registers
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUMP="${{ inputs.bump || 'auto' }}"
+          OUT=$(npm run studio:release -- "--bump=${BUMP}" --notes-out /tmp/release-notes.md)
+          echo "$OUT"
+          if echo "$OUT" | grep -q "studio-release: READY"; then
+            NEXT=$(echo "$OUT" | sed -n 's/.*-> v\([0-9][0-9.]*\).*/\1/p')
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "version=$NEXT" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply release ledger, tag, and publish GitHub Release
+        if: steps.plan.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v${{ steps.plan.outputs.version }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists; skipping duplicate release."
+            exit 0
+          fi
+          BUMP="${{ inputs.bump || 'auto' }}"
+          npm run studio:release -- "--bump=${BUMP}" --write --notes-out /tmp/release-notes.md
+          npm run ratchet
+          npm run studio:check
+          git config user.name "verdant-studio-bot"
+          git config user.email "verdant-studio-bot@users.noreply.github.com"
+          git add package.json model/release-ledger.json CONFORMANCE.md CHANGELOG.md docs/
+          git commit -m "chore(release): publish ${TAG} [skip ci]"
+          git tag -a "$TAG" -m "VerdantUI ${TAG}"
+          git push origin main "$TAG"
+          gh release create "$TAG" --title "VerdantUI ${TAG}" --notes-file /tmp/release-notes.md

@@ -357,10 +357,10 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
           <FileJson className="h-3.5 w-3.5 shrink-0" />
           <span className="truncate">
             {importedHarness
-              ? `Override: ${importedHarness.name}`
+              ? `Profile: ${importedHarness.name}`
               : lastCert
-                ? `Prism · #${lastCert.digest}`
-                : 'Cognitive Observer · Ready'}
+                ? `Verified · #${lastCert.digest}`
+                : 'On-Device AI · Ready'}
           </span>
         </button>
 

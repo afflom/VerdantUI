@@ -16,6 +16,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gzipSync } from 'node:zlib';
 
 function fail(message: string): never {
   console.error(`verify-pages: REFUSED — ${message}`);
@@ -111,6 +112,27 @@ export function verifyPagesBundle(distArg = 'dist', cwd = process.cwd()): void {
     fail(
       `Expected both inference.worker and vtensorCompute.worker bundles in dist/assets (found: ${jsFiles.join(', ')})`,
     );
+  }
+
+  // Enforce ISO-25010 bundle performance budgets from model/performance-budgets.json
+  const budgetsPath = join(resolve(cwd), 'model/performance-budgets.json');
+  if (existsSync(budgetsPath)) {
+    const budgetsFile = JSON.parse(readFileSync(budgetsPath, 'utf8')) as {
+      budgets?: { totalDistJsKiBMax?: number; mainIndexChunkGzipKiBMax?: number };
+    };
+    const totalKiB = totalJsBytes / 1024;
+    const maxTotalKiB = budgetsFile.budgets?.totalDistJsKiBMax ?? 3600;
+    if (totalKiB > maxTotalKiB) {
+      fail(`Total JS bundle (${totalKiB.toFixed(1)} KiB) exceeds performance budget (${maxTotalKiB} KiB)`);
+    }
+    const mainIndex = jsFiles.find((f) => /^index-[^.]+\.js$/.test(f));
+    const maxMainGzipKiB = budgetsFile.budgets?.mainIndexChunkGzipKiBMax ?? 160;
+    if (mainIndex) {
+      const gzKiB = gzipSync(readFileSync(join(assetsDir, mainIndex))).byteLength / 1024;
+      if (gzKiB > maxMainGzipKiB) {
+        fail(`Main index chunk gzip (${gzKiB.toFixed(1)} KiB) exceeds performance budget (${maxMainGzipKiB} KiB)`);
+      }
+    }
   }
 
   console.log(

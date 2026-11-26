@@ -24,6 +24,8 @@ export interface RatchetViolation {
     | 'engine-pin-parity'
     | 'owner-decisions'
     | 'ids-register'
+    | 'public-benefit-charter'
+    | 'user-facing-jargon'
     | 'policy-config';
   readonly path: string;
   readonly line?: number;
@@ -81,6 +83,39 @@ const FORBIDDEN_PROCESSOR_API_PATTERNS: readonly { readonly label: string; reado
   { label: 'ONNX Runtime', regex: /\bonnxruntime\b/i },
   { label: 'TensorFlow.js', regex: /@tensorflow\/tfjs/ },
 ];
+
+const FORBIDDEN_PUBLIC_BENEFIT_DEPS = new Set<string>([
+  '@sentry/browser',
+  '@sentry/react',
+  'posthog-js',
+  'mixpanel-browser',
+  '@amplitude/analytics-browser',
+  'amplitude-js',
+  '@segment/analytics-next',
+  'stripe',
+  '@stripe/stripe-js',
+  '@auth0/auth0-react',
+  '@clerk/clerk-react',
+  'react-ga4',
+]);
+
+const FORBIDDEN_TRACKING_URLS_RE =
+  /https?:\/\/(?:www\.)?(?:googletagmanager\.com|google-analytics\.com|cdn\.segment\.com|app\.posthog\.com|api\.mixpanel\.com)/i;
+
+/**
+ * Primary user-facing UI surfaces audited for zero internal Verdant construct leakage (DEC-011 / VUI-UX-JARGON-01).
+ * Technical diagnostics live exclusively in the opt-in developer inspector drawer, never primary user surfaces.
+ */
+const USER_FACING_UI_FILES: readonly string[] = [
+  'src/components/StudioGuidedWizard.tsx',
+  'src/components/ModelBlueprintCanvas.tsx',
+  'src/components/ThreadSidebar.tsx',
+  'src/components/ThreadView.tsx',
+  'src/App.tsx',
+];
+
+const USER_FACING_JARGON_JSX_RE =
+  /(?:>[^<{}]*\b(Observer|OpenTelemetry|vTensor|LexLean|Holon|FK-07|REQ-D\d+)\b[^<{}]*<|(?:title|placeholder|aria-label)=["'][^"']*\b(Observer|OpenTelemetry|vTensor|LexLean|Holon|FK-07|REQ-D\d+)\b[^"']*["'])/;
 
 const REQUIRED_DISABLED_GGML_PROVIDERS = [
   'GGML_CPU',
@@ -177,6 +212,13 @@ export function evaluateVerdantRatchet(snapshot: RatchetSnapshot): RatchetReport
             category: 'server-dependency',
             path: 'package.json',
             detail: `Forbidden server/external-API package "${name}" in ${section}`,
+          });
+        }
+        if (FORBIDDEN_PUBLIC_BENEFIT_DEPS.has(name)) {
+          violations.push({
+            category: 'public-benefit-charter',
+            path: 'package.json',
+            detail: `Forbidden tracking/analytics/paywall package "${name}" in ${section} violates Free Public Benefit Charter (DEC-007)`,
           });
         }
       }
@@ -396,6 +438,43 @@ export function evaluateVerdantRatchet(snapshot: RatchetSnapshot): RatchetReport
     });
   }
 
+  // 10. Free Public Benefit Service Charter (zero tracking/analytics URLs in HTML or src/)
+  if (FORBIDDEN_TRACKING_URLS_RE.test(snapshot.indexHtmlRaw)) {
+    violations.push({
+      category: 'public-benefit-charter',
+      path: 'index.html',
+      line: findLineNumber(snapshot.indexHtmlRaw, FORBIDDEN_TRACKING_URLS_RE),
+      detail: 'Forbidden third-party tracking/analytics URL in index.html violates Free Public Benefit Charter (DEC-007)',
+    });
+  }
+  for (const relPath of srcPaths) {
+    const content = snapshot.srcFiles[relPath];
+    if (FORBIDDEN_TRACKING_URLS_RE.test(content)) {
+      violations.push({
+        category: 'public-benefit-charter',
+        path: relPath,
+        line: findLineNumber(content, FORBIDDEN_TRACKING_URLS_RE),
+        detail: 'Forbidden third-party tracking/analytics URL in src/ violates Free Public Benefit Charter (DEC-007)',
+      });
+    }
+  }
+
+  // 11. Zero internal Verdant construct jargon in primary user-facing JSX surfaces (DEC-011 / VUI-UX-JARGON-01)
+  for (const uiPath of USER_FACING_UI_FILES) {
+    const content = snapshot.srcFiles[uiPath];
+    if (!content) continue;
+    const match = content.match(USER_FACING_JARGON_JSX_RE);
+    if (match) {
+      const term = match[1] || match[2] || 'internal term';
+      violations.push({
+        category: 'user-facing-jargon',
+        path: uiPath,
+        line: findLineNumber(content, USER_FACING_JARGON_JSX_RE),
+        detail: `User-facing JSX exposes internal Verdant construct "${term}" — violates DEC-011 / VUI-UX-JARGON-01`,
+      });
+    }
+  }
+
   return {
     ok: violations.length === 0,
     schema,
@@ -501,6 +580,26 @@ export function verifyPlantedDefects(cleanSnapshot: RatchetSnapshot): {
       mutate: (s) => ({
         ...s,
         idsTomlRaw: `${s.idsTomlRaw}\n[[id]]\ncode = "VUI-CLIENT-01"\ntitle = "duplicate"\n`,
+      }),
+    },
+    {
+      name: 'planted-analytics-tracker-dep',
+      expectedCategory: 'public-benefit-charter',
+      mutate: (s) => {
+        const pkg = JSON.parse(s.packageJsonRaw) as { dependencies: Record<string, string> };
+        pkg.dependencies['posthog-js'] = '^1.0.0';
+        return { ...s, packageJsonRaw: JSON.stringify(pkg) };
+      },
+    },
+    {
+      name: 'planted-user-facing-observer-jargon',
+      expectedCategory: 'user-facing-jargon',
+      mutate: (s) => ({
+        ...s,
+        srcFiles: {
+          ...s.srcFiles,
+          'src/components/StudioGuidedWizard.tsx': `${s.srcFiles['src/components/StudioGuidedWizard.tsx'] ?? ''}\nexport const _bad = () => <span>Observer Stream Active</span>;`,
+        },
       }),
     },
   ];

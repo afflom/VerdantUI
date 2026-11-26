@@ -1,0 +1,93 @@
+{
+  "schema": "verdant-ui/features/1",
+  "features": [
+    {
+      "id": "VUI-FEAT-001",
+      "title": "Exclusive Multi-Threaded Verdant vTensor WASM SIMD Inference",
+      "stage": "active",
+      "introducedIn": "0.1.0",
+      "ownerFile": "src/engine/vtensorProvider.ts",
+      "testFile": "src/engine/vtensorProvider.test.ts",
+      "invariantId": "VUI-ENGINE-01",
+      "citation": { "kind": "req", "decisionId": "DEC-002" },
+      "publicBenefitImpact": "Runs private local AI at full multi-core CPU speed in any modern browser without GPUs, servers, or accounts."
+    },
+    {
+      "id": "VUI-FEAT-002",
+      "title": "OPFS Virtual-DIMM Weight Paging & UKV3 Integrity-Verified Non-Blocking KV Persistence",
+      "stage": "active",
+      "introducedIn": "0.1.0",
+      "ownerFile": "src/engine/vramUnifiedStore.ts",
+      "testFile": "src/engine/engineStability.test.ts",
+      "invariantId": "VUI-OPFS-01",
+      "citation": { "kind": "req", "decisionId": "DEC-005" },
+      "publicBenefitImpact": "Eliminates end-of-turn storage stalls and protects cached conversations from corruption across browser reloads."
+    },
+    {
+      "id": "VUI-FEAT-003",
+      "title": "Lossless Cognitive Context Governor & Prefix-Stable Multi-Turn Continuity",
+      "stage": "active",
+      "introducedIn": "0.1.0",
+      "ownerFile": "src/engine/cognitiveContext.ts",
+      "testFile": "src/engine/cognitiveContext.test.ts",
+      "invariantId": "VUI-OBSERVER-01",
+      "citation": { "kind": "req", "decisionId": "DEC-005" },
+      "publicBenefitImpact": "Prevents model quality degradation over long conversations while keeping verbatim episodic memory recall lossless."
+    },
+    {
+      "id": "VUI-FEAT-004",
+      "title": "Browser-Native Verified Prism Compiler & Sandbox Runtime",
+      "stage": "active",
+      "introducedIn": "0.1.0",
+      "ownerFile": "src/engine/prismCompiler.ts",
+      "testFile": "src/engine/prismCompiler.test.ts",
+      "invariantId": "VUI-STUDIO-03",
+      "citation": { "kind": "req", "decisionId": "DEC-006" },
+      "publicBenefitImpact": "Compiles, formally proves, and executes portable offline Prisms directly inside the browser."
+    },
+    {
+      "id": "VUI-FEAT-005",
+      "title": "Verdant Studio Product & Feature Lifecycle Governance & Automated Releases",
+      "stage": "active",
+      "introducedIn": "0.2.0",
+      "ownerFile": "scripts/studio-lifecycle.ts",
+      "testFile": "src/engine/studioLifecycle.test.ts",
+      "invariantId": "VUI-LIFECYCLE-01",
+      "citation": { "kind": "req", "decisionId": "DEC-008" },
+      "publicBenefitImpact": "Maintains VerdantUI as a durable, standards-verified Free Public Benefit Service with automated upstream upgrades and semantic releases."
+    },
+    {
+      "id": "VUI-FEAT-006",
+      "title": "Free Public Benefit Service & Zero-Jargon Permanent Ratchets",
+      "stage": "active",
+      "introducedIn": "0.2.0",
+      "ownerFile": "scripts/ratchet-gate.ts",
+      "testFile": "src/engine/studioLifecycle.test.ts",
+      "invariantId": "VUI-PUBLIC-BENEFIT-01",
+      "citation": { "kind": "req", "decisionId": "DEC-007" },
+      "publicBenefitImpact": "Mechanically guarantees zero paywalls, zero tracking/analytics, zero server backends, and plain human UI language."
+    },
+    {
+      "id": "VUI-FEAT-007",
+      "title": "Procedural MediaType Prism Synthesis & Sparse Studio Sub-Model Activation",
+      "stage": "proposed",
+      "introducedIn": "0.3.0",
+      "ownerFile": "src/engine/prismStudioAgent.ts",
+      "testFile": "src/engine/prismStudioAgent.test.ts",
+      "invariantId": "VUI-STUDIO-02",
+      "citation": { "kind": "req", "decisionId": "DEC-009" },
+      "publicBenefitImpact": "Routes weights onto audited procedural media organs (Picture, Written Work, Video, Game, Research, Tool) with zero LLM-written JavaScript."
+    },
+    {
+      "id": "VUI-FEAT-008",
+      "title": "Unified Possession Model, Non-Leaking Cross-Context Boundary & Active Published Prism Organs",
+      "stage": "proposed",
+      "introducedIn": "0.4.0",
+      "ownerFile": "src/engine/cognitiveObserver.ts",
+      "testFile": "src/engine/cognitiveObserver.test.ts",
+      "invariantId": "VUI-OBSERVER-01",
+      "citation": { "kind": "req", "decisionId": "DEC-010" },
+      "publicBenefitImpact": "Protects user privacy across Personal/Work/Health contexts via zero-detail opaque constraint projection while letting Published Prisms act as unified cognitive organs."
+    }
+  ]
+}

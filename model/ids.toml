@@ -1,6 +1,6 @@
 # VerdantUI Architectural & Performance Invariant Register (Verdant Studio model/ids.toml parity)
-# Every registered ID maps a non-negotiable client-side, engine, or performance invariant to its
-# primary implementation file and verification test. Audited by `npm run ratchet`.
+# Every registered ID maps a non-negotiable client-side, engine, lifecycle, security, or performance
+# invariant to its primary implementation file and verification test. Audited by `npm run ratchet` & `npm run studio:check`.
 
 schema = "verdant-ui/ids/1"
 
@@ -18,13 +18,13 @@ evidence = "model/engine-pin.json"
 
 [[id]]
 code = "VUI-MT-01"
-title = "Multi-threaded SharedArrayBuffer WASM SIMD pool with COOP/COEP isolation and saturation-safe worker sizing"
+title = "Multi-threaded SharedArrayBuffer WASM SIMD pool with COOP/COEP isolation, watchdog failover, and saturation-safe worker sizing"
 owner = "src/engine/vtensorThreadPool.ts"
 evidence = "public/coi-serviceworker.js"
 
 [[id]]
 code = "VUI-OPFS-01"
-title = "Lock-free read-only OPFS model reads, pagehide teardown, BroadcastChannel lease handover, and zero handle leaks"
+title = "Lock-free read-only OPFS model reads, UKV3 integrity-checked non-blocking KV persistence, pagehide teardown, and BroadcastChannel lease handover"
 owner = "src/engine/vramBackingStore.ts"
 evidence = "src/engine/vramBackingStore.test.ts"
 
@@ -48,7 +48,7 @@ evidence = "src/engine/vramBackingStore.ts"
 
 [[id]]
 code = "VUI-PAGES-01"
-title = "Subpath-safe GitHub Pages static bundle with commit-pinned fast CD workflow"
+title = "Subpath-safe GitHub Pages static bundle with commit-pinned fast CD workflow and enforced performance budgets"
 owner = "scripts/assemble-pages.ts"
 evidence = ".github/workflows/pages.yml"
 
@@ -60,13 +60,13 @@ evidence = "src/engine/vramBootCache.test.ts"
 
 [[id]]
 code = "VUI-OBSERVER-01"
-title = "Unified VerdantUI Cognitive Observer: 8D Q10 harmonic belief state, Predictive Coding surprise, Active Inference Expected Free Energy + Prism CostSurface cross-classified routing, FK-07 capability lattice, and strict per-thread KV isolation"
+title = "Unified VerdantUI Cognitive Observer: 8D Q10 harmonic belief state, Predictive Coding surprise, Active Inference Expected Free Energy + Prism CostSurface routing, FK-07 capability lattice, and lossless episodic continuity"
 owner = "src/engine/cognitiveObserver.ts"
 evidence = "src/engine/cognitiveObserver.test.ts"
 
 [[id]]
 code = "VUI-STUDIO-01"
-title = "Verdant Studio & OpenTelemetry Observer Stream Bus: W3C Trace Context sensory/output routing, canonical SHA-256 .holo packaging, JSON Schema 2020-12 Prism tool contracts, IndexedDB store, and FK-07 sandboxed Prism app execution"
+title = "Verdant Studio & Prism (.holo) Runtime: canonical SHA-256 packaging, JSON Schema 2020-12 Prism tool contracts, IndexedDB store, and FK-07 sandboxed Prism app execution"
 owner = "src/engine/prismStudio.ts"
 evidence = "src/engine/prismStudio.test.ts"
 
@@ -81,3 +81,21 @@ code = "VUI-STUDIO-03"
 title = "Mechanical Prism Compiler & Browser-Native prism/holo/6 WASM Verification: deterministic LexLean 1.2 + prism.design/1 compilation, OPFS BLAKE3 toolchain caching, Lean 4.32.2 WASM kernel proofs, and portable Core-Wasm guest execution"
 owner = "src/engine/prismCompiler.ts"
 evidence = "src/engine/prismCompiler.test.ts"
+
+[[id]]
+code = "VUI-LIFECYCLE-01"
+title = "Verdant Studio Product & Feature Lifecycle Governance: authoritative model/ registers, closed studio:* CLI, automated upstream engine/studio tracking, and deterministic semantic releases"
+owner = "scripts/studio-lifecycle.ts"
+evidence = "src/engine/studioLifecycle.test.ts"
+
+[[id]]
+code = "VUI-PUBLIC-BENEFIT-01"
+title = "Free Public Benefit Service Charter: Apache-2.0 open service with zero tracking/analytics SDKs, zero paywalls, zero server telemetry, and enforced ISO-25010 performance budgets"
+owner = "scripts/ratchet-gate.ts"
+evidence = "model/performance-budgets.json"
+
+[[id]]
+code = "VUI-UX-JARGON-01"
+title = "Plain-Language User Surface Invariant: zero exposure of internal Verdant constructs (Observer, OpenTelemetry, vTensor, LexLean, Holon, FK-07, Q10, REQ-D*) in user-facing UI surfaces"
+owner = "scripts/ratchet-gate.ts"
+evidence = "model/verdant-ratchet.toml"

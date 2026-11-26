@@ -806,10 +806,9 @@ export const ThreadView: FC<ThreadViewProps> = ({
                   VerdantUI
                 </h1>
                 <p className="mt-2.5 max-w-2xl text-[15px] leading-relaxed text-slate-600 dark:text-slate-400">
-                  One unified, 100% client-side AI model powered by Verdant WASM SIMD and a
-                  Prism Cognitive Observer. Every prompt settles automatically across verified
-                  local operators, reasoning depth, and on-demand local weights—zero modes, zero
-                  servers.
+                  A free, private, 100% on-device AI workspace running directly in your browser.
+                  Every prompt adapts automatically across built-in tools, deeper reasoning, and
+                  your own Prisms — zero accounts, zero tracking, zero servers.
                 </p>
 
                 <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500 dark:text-slate-400 tabular-nums">
@@ -817,7 +816,7 @@ export const ThreadView: FC<ThreadViewProps> = ({
                     Model Stream:{' '}
                     <strong className="font-medium text-slate-800 dark:text-slate-200">
                       {!engineState.modelStreamEnabled && isBootstrapUnbound
-                        ? 'Off (LOD0 instant actions active)'
+                        ? 'Off (instant built-in tools active)'
                         : isModelLoading
                           ? `${engineState.statusDetail} (${engineState.progressPercent}%)`
                           : isBootstrapUnbound

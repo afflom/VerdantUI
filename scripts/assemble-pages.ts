@@ -33,6 +33,14 @@ export function assemblePagesSite(distArg = 'dist', cwd = process.cwd()): void {
     registers: ReadonlyArray<{ idPrefix: string; path: string; sha256: string }>;
   };
 
+  const studioPinPath = join(cwd, 'model/studio-pin.json');
+  const studioPin = existsSync(studioPinPath)
+    ? (JSON.parse(readFileSync(studioPinPath, 'utf8')) as {
+        repository: string;
+        commit: string;
+      })
+    : null;
+
   const ghRepo = process.env.GITHUB_REPOSITORY || 'afflom/VerdantUI';
   const [owner, repo] = ghRepo.split('/');
   const repoUrl = `https://github.com/${ghRepo}`;
@@ -49,6 +57,21 @@ export function assemblePagesSite(distArg = 'dist', cwd = process.cwd()): void {
     repository: repoUrl,
     live: liveUrl,
     commit: commitSha,
+    publicBenefit: {
+      freePublicBenefitService: true,
+      license: 'Apache-2.0',
+      zeroTracking: true,
+      zeroPaywalls: true,
+      zeroServers: true,
+    },
+    ...(studioPin
+      ? {
+          studioPin: {
+            repository: studioPin.repository,
+            commit: studioPin.commit,
+          },
+        }
+      : {}),
     enginePin: {
       repository: enginePin.repository,
       tag: enginePin.tag,

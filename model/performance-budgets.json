@@ -1,0 +1,14 @@
+{
+  "schema": "verdant-ui/performance-budgets/1",
+  "authority": "ISO-25010",
+  "budgets": {
+    "turnCompletionOpfsStallMsMax": 0,
+    "frameYieldBudgetUsMax": 16666,
+    "totalDistJsKiBMax": 3600,
+    "mainIndexChunkGzipKiBMax": 160,
+    "studioCheckLatencyMsMax": 1000,
+    "requireMultiCoreParityBench": true,
+    "requireCoopCoepIsolation": true,
+    "requireZeroAllocationHotViews": true
+  }
+}

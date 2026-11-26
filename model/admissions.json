@@ -1,0 +1,39 @@
+{
+  "schema": "verdant-ui/admissions/1",
+  "lockedIds": [
+    "VUI-CLIENT-01",
+    "VUI-ENGINE-01",
+    "VUI-MT-01",
+    "VUI-OPFS-01",
+    "VUI-MOE-01",
+    "VUI-SIMD-01",
+    "VUI-PREFETCH-01",
+    "VUI-PAGES-01",
+    "VUI-DEDUP-01",
+    "VUI-OBSERVER-01",
+    "VUI-STUDIO-01",
+    "VUI-STUDIO-02",
+    "VUI-STUDIO-03",
+    "VUI-LIFECYCLE-01",
+    "VUI-PUBLIC-BENEFIT-01",
+    "VUI-UX-JARGON-01"
+  ],
+  "admissions": [
+    { "construct": "VUI-CLIENT-01", "citation": { "kind": "req", "decisionId": "DEC-001" } },
+    { "construct": "VUI-ENGINE-01", "citation": { "kind": "req", "decisionId": "DEC-002" } },
+    { "construct": "VUI-MT-01", "citation": { "kind": "req", "decisionId": "DEC-005" } },
+    { "construct": "VUI-OPFS-01", "citation": { "kind": "std", "authorityId": "ISO-25010" } },
+    { "construct": "VUI-MOE-01", "citation": { "kind": "std", "authorityId": "VERDANT-ENGINE" } },
+    { "construct": "VUI-SIMD-01", "citation": { "kind": "std", "authorityId": "VERDANT-ENGINE" } },
+    { "construct": "VUI-PREFETCH-01", "citation": { "kind": "std", "authorityId": "ISO-25010" } },
+    { "construct": "VUI-PAGES-01", "citation": { "kind": "req", "decisionId": "DEC-003" } },
+    { "construct": "VUI-DEDUP-01", "citation": { "kind": "der", "rule": "extrapolated", "inputs": ["VUI-OPFS-01", "VUI-ENGINE-01"], "checkId": "VUI-DEDUP-01" } },
+    { "construct": "VUI-OBSERVER-01", "citation": { "kind": "std", "authorityId": "VERDANT-ENGINE" } },
+    { "construct": "VUI-STUDIO-01", "citation": { "kind": "req", "decisionId": "DEC-006" } },
+    { "construct": "VUI-STUDIO-02", "citation": { "kind": "std", "authorityId": "VERDANT-STUDIO" } },
+    { "construct": "VUI-STUDIO-03", "citation": { "kind": "std", "authorityId": "PRISM-CODE" } },
+    { "construct": "VUI-LIFECYCLE-01", "citation": { "kind": "req", "decisionId": "DEC-008" } },
+    { "construct": "VUI-PUBLIC-BENEFIT-01", "citation": { "kind": "req", "decisionId": "DEC-007" } },
+    { "construct": "VUI-UX-JARGON-01", "citation": { "kind": "req", "decisionId": "DEC-011" } }
+  ]
+}
