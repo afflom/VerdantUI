@@ -36,6 +36,8 @@ export function verifyPagesBundle(distArg = 'dist', cwd = process.cwd()): void {
     'app.json',
     'manifest.webmanifest',
     'models/stories260K.gguf',
+    'prism-toolchain/evaluator.wasm',
+    'prism-toolchain/template-foundation.json',
   ];
   for (const rel of requiredFiles) {
     const full = join(distDir, rel);

@@ -69,3 +69,15 @@ code = "VUI-STUDIO-01"
 title = "Verdant Studio & OpenTelemetry Observer Stream Bus: W3C Trace Context sensory/output routing, canonical SHA-256 .holo packaging, JSON Schema 2020-12 Prism tool contracts, IndexedDB store, and FK-07 sandboxed Prism app execution"
 owner = "src/engine/prismStudio.ts"
 evidence = "src/engine/prismStudio.test.ts"
+
+[[id]]
+code = "VUI-STUDIO-02"
+title = "Declarative Verdant Studio API (afflom/verdant-studio parity): closed API operations with mandatory Req/Std/Der citations, monotone register admission, ISO 42010 traceable views, derived agenda, and self-healing repair loop"
+owner = "src/engine/verdantStudioApi.ts"
+evidence = "src/engine/verdantStudioApi.test.ts"
+
+[[id]]
+code = "VUI-STUDIO-03"
+title = "Mechanical Prism Compiler & Browser-Native prism/holo/6 WASM Verification: deterministic LexLean 1.2 + prism.design/1 compilation, OPFS BLAKE3 toolchain caching, Lean 4.32.2 WASM kernel proofs, and portable Core-Wasm guest execution"
+owner = "src/engine/prismCompiler.ts"
+evidence = "src/engine/prismCompiler.test.ts"

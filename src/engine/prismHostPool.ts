@@ -13,8 +13,10 @@ import type { ThreadMessage } from '@assistant-ui/react';
 import { formatMessagesForLlama, stripReasoningTags } from './assistantAdapter';
 import type { ContainerGrantMatrix } from './cognitiveObserver';
 import type { ObserverStreamBus, OtelTraceContext } from './observerStreamBus';
+import type { PrismBuildWorkerClient } from './prismBuildClient';
 import { buildPrismSandboxDocument } from './prismSandboxHtml';
 import type { PrismStore, VerdantPrismSnapshot } from './prismStudio';
+import { evaluateDeclaredModel, formatRequestLine, type PrismDeclaration } from './verdantStudioApi';
 import { isInternalBootstrapModel } from './modelCatalog';
 import type { LlamaVTensorWorkerClient } from './workerClient';
 
@@ -106,6 +108,7 @@ export class PrismHostPool implements PrismBridgeRuntime {
   private dispatchSeq = 1;
   private evictTimer: ReturnType<typeof setInterval> | null = null;
   private callbacks: PrismHostCallbacks = {};
+  private buildClient: PrismBuildWorkerClient | null = null;
 
   constructor(
     private readonly bus: ObserverStreamBus,
@@ -113,11 +116,17 @@ export class PrismHostPool implements PrismBridgeRuntime {
     private readonly grantsMatrix: ContainerGrantMatrix,
     private readonly workerClient: LlamaVTensorWorkerClient | null,
     callbacks?: PrismHostCallbacks,
+    buildClient?: PrismBuildWorkerClient | null,
   ) {
     if (callbacks) this.callbacks = callbacks;
+    if (buildClient) this.buildClient = buildClient;
     if (typeof window !== 'undefined') {
       this.evictTimer = setInterval(() => this.evictIdle(), 15_000);
     }
+  }
+
+  setBuildClient(client: PrismBuildWorkerClient | null): void {
+    this.buildClient = client;
   }
 
   setCallbacks(callbacks: PrismHostCallbacks): void {
@@ -522,6 +531,85 @@ export class PrismHostPool implements PrismBridgeRuntime {
         signal: opts?.signal,
         parentContext,
         callChain,
+      });
+      return { result, prismName: snapshot.name, digest: snapshot.digest };
+    }
+
+    // Fast path for real binary `prism/holo/6` archives and declarative Prisms:
+    // invoke the verified WASM guest or declared model directly in <1ms without mounting a DOM iframe!
+    const formatPayloadForModel = (raw: unknown, decl?: PrismDeclaration): string => {
+      if (typeof raw === 'string') return raw.trim();
+      if (raw && typeof raw === 'object') {
+        const obj = raw as Record<string, unknown>;
+        if (typeof obj.request === 'string') return obj.request.trim();
+        if (typeof obj.message === 'string' && (!decl?.encoding || Object.keys(obj).length === 1)) {
+          return obj.message.trim();
+        }
+        if (decl?.encoding) {
+          const numericInputs: Record<string, number> = {};
+          let matchedField = false;
+          for (const field of decl.encoding.fields) {
+            if (obj[field.name] !== undefined) {
+              matchedField = true;
+              const v = obj[field.name];
+              if (typeof v === 'number') numericInputs[field.name] = v;
+              else if (typeof v === 'boolean') numericInputs[field.name] = v ? 1 : 0;
+              else if (typeof v === 'string' && field.kind === 'choice' && field.choices) {
+                const idx = field.choices.findIndex((c) => c.toLowerCase() === v.toLowerCase());
+                numericInputs[field.name] = idx >= 0 ? idx : Number.parseInt(v, 10) || 0;
+              } else {
+                numericInputs[field.name] = Number.parseInt(String(v), 10) || 0;
+              }
+            } else {
+              numericInputs[field.name] = field.defaultValue;
+            }
+          }
+          if (matchedField) return formatRequestLine(decl.encoding, numericInputs);
+        }
+      }
+      return String(raw ?? '').trim();
+    };
+
+    if (project.publishedHolo && this.buildClient) {
+      const holo = project.publishedHolo;
+      const line = formatPayloadForModel(payload, project.declaration);
+      const { result } = await this.bus.dispatchToEndpoint(prismId, payload, {
+        signal: opts?.signal,
+        parentContext,
+        callChain,
+        fallbackHandler: {
+          endpointId: prismId,
+          endpointKind: 'prism',
+          dispatch: async (_input, traceContext) => {
+            const answer = await this.buildClient!.runHoloGuest({
+              prismId,
+              address: holo.address,
+              holoBytes: holo.bytes,
+              request: line,
+              parentContext: traceContext,
+            });
+            return { answer, request: line, address: holo.address, verified: holo.proved };
+          },
+        },
+      });
+      return { result, prismName: snapshot.name, digest: holo.address };
+    }
+
+    if (project.declaration) {
+      const decl = project.declaration;
+      const line = formatPayloadForModel(payload, decl);
+      const { result } = await this.bus.dispatchToEndpoint(prismId, payload, {
+        signal: opts?.signal,
+        parentContext,
+        callChain,
+        fallbackHandler: {
+          endpointId: prismId,
+          endpointKind: 'prism',
+          dispatch: async () => {
+            const evaluated = evaluateDeclaredModel(decl, line);
+            return { answer: evaluated.response, request: line, refused: evaluated.isRefusal };
+          },
+        },
       });
       return { result, prismName: snapshot.name, digest: snapshot.digest };
     }

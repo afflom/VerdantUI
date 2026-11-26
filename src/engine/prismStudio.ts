@@ -9,12 +9,48 @@
  * - Single async IndexedDB store (`verdant-ui-studio-v1`) with Node in-memory fallback
  */
 
+import {
+  createDeclarativeStarter,
+  dispatchStudioOp,
+  fieldsToJsonSchema,
+  type DeclarativeStarterId,
+  type PrismDeclaration,
+  type StudioApiOp,
+} from './verdantStudioApi';
+import { compilePrismDeclaration } from './prismCompiler';
+import type { WorkerVerifyPayload } from './prismBuildClient';
+
 export const HOLO_ARCHIVE_SCHEMA = 'verdant-ui/holo/1' as const;
 const MAX_REVISIONS = 20;
 const IDB_NAME = 'verdant-ui-studio-v1';
 const IDB_VERSION = 1;
 const STORE_PROJECTS = 'projects';
 const STORE_PRISM_KV = 'prism_kv';
+
+export type PrismProjectKind = 'declarative' | 'external-holo' | 'legacy-v1';
+
+export interface SealedHoloRecord {
+  readonly bytes: Uint8Array;
+  readonly address: string;
+  readonly schema: string;
+  readonly semanticId: string | null;
+  readonly proved: boolean;
+  readonly theorems: readonly {
+    readonly theorem: string;
+    readonly status: string;
+    readonly axioms?: readonly string[];
+  }[];
+  readonly vectorsPassed: number;
+  readonly vectorsTotal: number;
+  readonly carries: {
+    readonly snapshot: boolean;
+    readonly sources: boolean;
+    readonly proof: boolean;
+  };
+  readonly viewFiles?: Readonly<Record<string, string>> | null;
+  readonly viewEntry?: string | null;
+  readonly sealedAt: number;
+}
 
 export interface JsonSchema2020Object {
   readonly type: 'object';
@@ -67,11 +103,19 @@ export interface StudioChatMessage {
 
 export interface VerdantPrismProject {
   readonly id: string;
+  readonly kind?: PrismProjectKind;
   readonly draft: VerdantPrismSnapshot;
   readonly published: VerdantPrismSnapshot | null;
   readonly publishedAt: number | null;
   readonly revisions: readonly VerdantPrismSnapshot[];
   readonly messages: readonly StudioChatMessage[];
+  /** Declarative registers (authoritative single source for declarative Prisms). */
+  readonly declaration?: PrismDeclaration;
+  readonly declarationRevisions?: readonly PrismDeclaration[];
+  /** Latest real binary `prism/holo/6` archive sealed from the current draft. */
+  readonly sealedDraft?: SealedHoloRecord | null;
+  /** Immutable published binary `prism/holo/6` archive (also used for imported external `.holo`). */
+  readonly publishedHolo?: SealedHoloRecord | null;
   readonly createdAt: number;
   readonly updatedAt: number;
 }
@@ -1553,5 +1597,274 @@ export class PrismStore {
     } catch {
       // Keep memory fallback
     }
+  }
+
+  // ============================================================================
+  // Declarative Verdant Studio & Real Binary `prism/holo/6` Operations
+  // ============================================================================
+
+  async createDeclarative(
+    starterId: DeclarativeStarterId = 'blank',
+    customName?: string,
+  ): Promise<VerdantPrismProject> {
+    let decl = createDeclarativeStarter(starterId);
+    if (customName?.trim()) {
+      const renamed = dispatchStudioOp(decl, { op: 'set-metadata', name: customName.trim() });
+      if (renamed.ok) decl = renamed.declaration;
+    }
+    const now = Date.now();
+    const id = `prism_${now.toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const draft = snapshotFromDeclaration(decl);
+    const project: VerdantPrismProject = {
+      id,
+      kind: 'declarative',
+      draft,
+      published: null,
+      publishedAt: null,
+      revisions: [],
+      messages: [],
+      declaration: decl,
+      declarationRevisions: [],
+      sealedDraft: null,
+      publishedHolo: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.projects.set(id, project);
+    this.notify();
+    await this.persistProject(project);
+    return project;
+  }
+
+  async applyStudioOp(
+    id: string,
+    op: StudioApiOp,
+    opts?: { readonly pushRevision?: boolean },
+  ): Promise<
+    | { readonly ok: true; readonly project: VerdantPrismProject; readonly message: string }
+    | { readonly ok: false; readonly code: string; readonly message: string; readonly remediation: string }
+  > {
+    const existing = this.projects.get(id);
+    if (!existing || !existing.declaration) {
+      return {
+        ok: false,
+        code: 'project.not-declarative',
+        message: 'This project does not hold a declarative Prism model.',
+        remediation: 'Create a new declarative Prism in Verdant Studio.',
+      };
+    }
+    const res = dispatchStudioOp(existing.declaration, op);
+    if (!res.ok) {
+      return {
+        ok: false,
+        code: res.code,
+        message: res.message,
+        remediation: res.remediation,
+      };
+    }
+    const nextDraft = snapshotFromDeclaration(res.declaration);
+    const pushRev = opts?.pushRevision !== false;
+    const declarationRevisions = pushRev
+      ? [...(existing.declarationRevisions ?? []), existing.declaration].slice(-MAX_REVISIONS)
+      : (existing.declarationRevisions ?? []);
+
+    // Invalidate sealedDraft whenever declaration mutates (except lock-registers / resolve-error)
+    const keepSealed = op.op === 'lock-registers' || op.op === 'resolve-error';
+    const updated: VerdantPrismProject = {
+      ...existing,
+      kind: 'declarative',
+      draft: nextDraft,
+      declaration: res.declaration,
+      declarationRevisions,
+      sealedDraft: keepSealed ? existing.sealedDraft : null,
+      updatedAt: Date.now(),
+    };
+    this.projects.set(id, updated);
+    this.notify();
+    await this.persistProject(updated);
+    return { ok: true, project: updated, message: res.message };
+  }
+
+  async undoDeclaration(id: string): Promise<VerdantPrismProject | null> {
+    const existing = this.projects.get(id);
+    const revs = existing?.declarationRevisions ?? [];
+    if (!existing || revs.length === 0) return null;
+    const prevDecl = revs[revs.length - 1];
+    const updated: VerdantPrismProject = {
+      ...existing,
+      draft: snapshotFromDeclaration(prevDecl),
+      declaration: prevDecl,
+      declarationRevisions: revs.slice(0, -1),
+      sealedDraft: null,
+      updatedAt: Date.now(),
+    };
+    this.projects.set(id, updated);
+    this.notify();
+    await this.persistProject(updated);
+    return updated;
+  }
+
+  async saveSealedDraft(id: string, sealed: SealedHoloRecord): Promise<VerdantPrismProject | null> {
+    const existing = this.projects.get(id);
+    if (!existing) return null;
+    const updated: VerdantPrismProject = {
+      ...existing,
+      sealedDraft: sealed,
+      updatedAt: Date.now(),
+    };
+    this.projects.set(id, updated);
+    this.notify();
+    await this.persistProject(updated);
+    return updated;
+  }
+
+  async publishSealedHolo(id: string, sealed?: SealedHoloRecord): Promise<VerdantPrismProject | null> {
+    const existing = this.projects.get(id);
+    if (!existing) return null;
+    const holoToPublish = sealed ?? existing.sealedDraft ?? existing.publishedHolo ?? null;
+    let decl = existing.declaration;
+    if (decl) {
+      const locked = dispatchStudioOp(decl, { op: 'lock-registers' });
+      if (locked.ok) decl = locked.declaration;
+    }
+    const frozenDraft = decl ? snapshotFromDeclaration(decl) : buildSnapshot(existing.draft);
+    const now = Date.now();
+    const updated: VerdantPrismProject = {
+      ...existing,
+      draft: frozenDraft,
+      published: frozenDraft,
+      publishedAt: now,
+      declaration: decl,
+      sealedDraft: holoToPublish,
+      publishedHolo: holoToPublish,
+      updatedAt: now,
+    };
+    this.projects.set(id, updated);
+    this.notify();
+    await this.persistProject(updated);
+    return updated;
+  }
+
+  async importBinaryHolo(
+    bytes: Uint8Array,
+    verified: WorkerVerifyPayload,
+    publishImmediately = true,
+  ): Promise<VerdantPrismProject> {
+    const now = Date.now();
+    const id = `prism_${now.toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const viewFiles = verified.viewFiles ?? null;
+    const sealed: SealedHoloRecord = {
+      bytes,
+      address: verified.address,
+      schema: verified.schema,
+      semanticId: verified.semanticId,
+      proved: verified.carries.proof && verified.ok,
+      theorems: [],
+      vectorsPassed: verified.vectorsPassed,
+      vectorsTotal: verified.vectorsTotal,
+      carries: verified.carries,
+      viewFiles,
+      viewEntry: verified.viewEntry ?? 'index.html',
+      sealedAt: now,
+    };
+    const snap = buildSnapshot({
+      name: verified.name || 'Imported Prism',
+      summary: `Verified ${verified.schema} archive (${verified.vectorsPassed}/${verified.vectorsTotal} vectors passed).`,
+      streams: {
+        inputs: {
+          type: 'object',
+          properties: {
+            request: { type: 'string', description: 'Line of text sent to the proved Prism WASM guest.' },
+          },
+          required: ['request'],
+        },
+        outputs: ['prism.ready', 'prism.output'],
+      },
+      grants: { observer: true, storage: false, browser: false, network: false },
+      app: {
+        html: viewFiles?.['index.html'] ?? '',
+        css: viewFiles?.['prism.css'] ?? '',
+        js: viewFiles?.['app.js'] ?? '',
+      },
+    });
+    const project: VerdantPrismProject = {
+      id,
+      kind: 'external-holo',
+      draft: snap,
+      published: publishImmediately ? snap : null,
+      publishedAt: publishImmediately ? now : null,
+      revisions: [],
+      messages: [],
+      sealedDraft: sealed,
+      publishedHolo: publishImmediately ? sealed : null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.projects.set(id, project);
+    this.notify();
+    await this.persistProject(project);
+    return project;
+  }
+}
+
+export function snapshotFromDeclaration(decl: PrismDeclaration): VerdantPrismSnapshot {
+  const compiled = compilePrismDeclaration(decl);
+  const inputs: JsonSchema2020Object = decl.encoding
+    ? fieldsToJsonSchema(decl.encoding.fields)
+    : DEFAULT_STREAM_CONTRACT.inputs;
+  return buildSnapshot({
+    name: decl.metadata.name,
+    summary: decl.metadata.description,
+    streams: {
+      inputs,
+      outputs: ['prism.ready', 'prism.output'],
+    },
+    grants: decl.capabilities,
+    app: {
+      html: compiled.appFiles['view/index.html'] ?? '',
+      css: compiled.compiledCss,
+      js: compiled.appFiles['view/app.js'] ?? '',
+    },
+  });
+}
+
+/**
+ * Optional NL -> Declarative Studio API Operations proposer prompt.
+ * NEVER asks the model to write raw HTML, CSS, or JavaScript — only closed StudioApiOp JSON!
+ */
+export function buildStudioApiProposerPrompt(decl: PrismDeclaration): string {
+  const fieldsSummary = (decl.encoding?.fields ?? [])
+    .map((f) => `${f.name} (${f.kind}, ${f.min}..${f.max}${f.choices ? `, choices=${JSON.stringify(f.choices)}` : ''})`)
+    .join('; ');
+  return [
+    'You are the Verdant Studio declarative API translator.',
+    'NEVER output HTML, CSS, JavaScript, or LexLean code.',
+    'Output ONLY a valid JSON array of StudioApiOp objects inside a single ```json code fence.',
+    `Current Prism: "${decl.metadata.name}" | Requirements: ${decl.requirements.map((r) => r.id).join(', ')}`,
+    `Current Fields: ${fieldsSummary || 'none'}`,
+    `Current Features: ${decl.features.map((f) => f.id).join(', ') || 'none'} | Refusals: ${decl.refusals.map((r) => r.id).join(', ') || 'none'}`,
+    'Allowed op kinds: "admit-requirement", "propose-encoding", "admit-feature", "admit-refusal", "admit-vector", "set-theme".',
+    'Every feature/refusal must cite an existing requirement via {"kind":"req","requirementId":"REQ-01"}.',
+  ].join('\n');
+}
+
+export function extractStudioApiOpsFromModelOutput(rawText: string): readonly StudioApiOp[] | null {
+  const fenced = rawText.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = (fenced ? fenced[1] : rawText).trim();
+  const start = candidate.indexOf('[');
+  const end = candidate.lastIndexOf(']');
+  if (start < 0 || end <= start) return null;
+  try {
+    const parsed = JSON.parse(candidate.slice(start, end + 1));
+    if (!Array.isArray(parsed) || parsed.length === 0) return null;
+    const validOps = parsed.filter(
+      (item): item is StudioApiOp =>
+        item !== null &&
+        typeof item === 'object' &&
+        typeof (item as { op?: unknown }).op === 'string',
+    );
+    return validOps.length > 0 ? validOps : null;
+  } catch {
+    return null;
   }
 }

@@ -13,7 +13,7 @@
 import { useEffect, useMemo, useRef, type FC } from 'react';
 import type { ObserverStreamBus, OtelTraceContext } from '../engine/observerStreamBus';
 import type { PrismBridgeRuntime } from '../engine/prismHostPool';
-import { buildPrismSandboxDocument } from '../engine/prismSandboxHtml';
+import { buildHoloviewSandboxDocument, buildPrismSandboxDocument } from '../engine/prismSandboxHtml';
 import { sha256HexSync, type VerdantPrismSnapshot } from '../engine/prismStudio';
 
 export interface PrismRuntimeError {
@@ -23,9 +23,19 @@ export interface PrismRuntimeError {
   readonly timestampMs: number;
 }
 
+export interface HoloviewMountConfig {
+  readonly indexHtml: string;
+  readonly prismCss: string;
+  readonly prismUiJs: string;
+  readonly appJs: string;
+  readonly onInvoke: (requestLine: string, traceContext?: OtelTraceContext) => Promise<string>;
+}
+
 interface PrismSandboxFrameProps {
   prismId: string;
   snapshot: VerdantPrismSnapshot;
+  /** When set, mounts a compiled `prism/holo/6` HOLOVIEW with `globalThis.prism.invoke`. */
+  holoview?: HoloviewMountConfig | null;
   darkMode: boolean;
   bus: ObserverStreamBus;
   bridgeRuntime: PrismBridgeRuntime;
@@ -41,6 +51,7 @@ interface PrismSandboxFrameProps {
 export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
   prismId,
   snapshot,
+  holoview = null,
   darkMode,
   bus,
   bridgeRuntime,
@@ -57,8 +68,12 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
   const digestRef = useRef(snapshot.digest);
   digestRef.current = snapshot.digest;
 
-  const latestCssRef = useRef(snapshot.app.css);
-  latestCssRef.current = snapshot.app.css;
+  const holoviewRef = useRef(holoview);
+  holoviewRef.current = holoview;
+
+  const activeCss = holoview ? holoview.prismCss : snapshot.app.css;
+  const latestCssRef = useRef(activeCss);
+  latestCssRef.current = activeCss;
 
   const latestDarkRef = useRef(darkMode);
   latestDarkRef.current = darkMode;
@@ -69,10 +84,13 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
   const onReadyRef = useRef(onReady);
   onReadyRef.current = onReady;
 
-  // Structural key excludes CSS so CSS edits hot-swap without reloading iframe state!
+  // Structural key excludes CSS so CSS/theme edits hot-swap without reloading iframe state!
   const structuralKey = useMemo(
-    () => sha256HexSync(`${snapshot.app.html}\0${snapshot.app.js}`).slice(0, 12),
-    [snapshot.app.html, snapshot.app.js],
+    () =>
+      holoview
+        ? sha256HexSync(`holoview\0${holoview.indexHtml}\0${holoview.appJs}\0${holoview.prismUiJs}`).slice(0, 12)
+        : sha256HexSync(`${snapshot.app.html}\0${snapshot.app.js}`).slice(0, 12),
+    [holoview?.indexHtml, holoview?.appJs, holoview?.prismUiJs, holoview !== null, snapshot.app.html, snapshot.app.js],
   );
 
   const channelId = useMemo(
@@ -84,6 +102,18 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
   const initialDarkRef = useRef(darkMode);
   const srcDoc = useMemo(() => {
     initialDarkRef.current = darkMode;
+    if (holoview) {
+      return buildHoloviewSandboxDocument({
+        prismId,
+        channelId,
+        digest: snapshot.digest,
+        indexHtml: holoview.indexHtml,
+        prismCss: holoview.prismCss,
+        prismUiJs: holoview.prismUiJs,
+        appJs: holoview.appJs,
+        darkMode: initialDarkRef.current,
+      });
+    }
     return buildPrismSandboxDocument({
       prismId,
       channelId,
@@ -98,10 +128,10 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
     const win = iframeRef.current?.contentWindow;
     if (!win) return;
     win.postMessage(
-      { __verdant: true, channelId, type: 'hot-css', payload: { css: snapshot.app.css } },
+      { __verdant: true, channelId, type: 'hot-css', payload: { css: activeCss } },
       '*',
     );
-  }, [snapshot.app.css, channelId]);
+  }, [activeCss, channelId]);
 
   // Sync light/dark theme live without reloading the sandbox iframe
   useEffect(() => {
@@ -197,6 +227,39 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
           },
         });
         onRuntimeErrorRef.current?.(errInfo);
+        return;
+      }
+
+      if (msg.type === 'prism-invoke' && msg.payload?.reqId) {
+        const hv = holoviewRef.current;
+        const reqId = String(msg.payload.reqId);
+        const requestLine = String(msg.payload.request ?? '');
+        const reply = (ok: boolean, value?: string, error?: string) => {
+          iframeRef.current?.contentWindow?.postMessage(
+            { __verdant: true, channelId, type: 'prism-invoke-result', payload: { reqId, ok, value, error } },
+            '*',
+          );
+        };
+        if (!hv) {
+          reply(false, undefined, 'No Prism model handler is attached.');
+          return;
+        }
+        try {
+          const answer = await hv.onInvoke(requestLine);
+          bus.emit({
+            name: 'prism.model.invoke',
+            endpointKind: 'prism',
+            endpointId: prismId,
+            attributes: {
+              'verdant.request.bytes': requestLine.length,
+              'verdant.response.bytes': answer.length,
+            },
+            body: { request: requestLine, answer },
+          });
+          reply(true, answer);
+        } catch (err) {
+          reply(false, undefined, err instanceof Error ? err.message : String(err));
+        }
         return;
       }
 
@@ -326,6 +389,20 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
           signal?: AbortSignal,
           callChain?: readonly string[],
         ) => {
+          // For HOLOVIEW / declarative Prisms, invoke the proved model directly with causal trace context!
+          const hv = holoviewRef.current;
+          if (hv) {
+            const line =
+              typeof input === 'string'
+                ? input
+                : input && typeof input === 'object' && typeof (input as { request?: unknown }).request === 'string'
+                  ? String((input as { request: string }).request)
+                  : input && typeof input === 'object' && typeof (input as { message?: unknown }).message === 'string'
+                    ? String((input as { message: string }).message)
+                    : JSON.stringify(input ?? '');
+            const answer = await hv.onInvoke(line, traceContext);
+            return { answer, request: line };
+          }
           if (!isReady) {
             await readyPromise;
           }

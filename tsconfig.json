@@ -19,6 +19,9 @@
     "paths": {
       "@/*": [
         "./*"
+      ],
+      "@prism-code-internal/*": [
+        "./node_modules/prism-code/src/*"
       ]
     },
     "allowImportingTsExtensions": true,

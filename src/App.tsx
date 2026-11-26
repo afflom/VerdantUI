@@ -30,6 +30,7 @@ import {
 import type { ImportedHarnessSpec } from './engine/harnessConfig';
 import { isInternalBootstrapModel } from './engine/modelCatalog';
 import { ObserverStreamBus } from './engine/observerStreamBus';
+import { PrismBuildWorkerClient } from './engine/prismBuildClient';
 import { PrismHostPool } from './engine/prismHostPool';
 import {
   PrismStore,
@@ -124,6 +125,7 @@ type ActiveWorkspaceView =
 export default function App() {
   const workerClient = useMemo(() => new LlamaVTensorWorkerClient(), []);
   const observerBus = useMemo(() => new ObserverStreamBus(), []);
+  const prismBuildClient = useMemo(() => new PrismBuildWorkerClient(observerBus), [observerBus]);
   const prismStore = useMemo(() => new PrismStore(), []);
   const prismPool = useMemo(
     () =>
@@ -132,8 +134,10 @@ export default function App() {
         prismStore,
         workerClient.cognitiveObserver.grants,
         workerClient,
+        undefined,
+        prismBuildClient,
       ),
-    [observerBus, prismStore, workerClient],
+    [observerBus, prismStore, workerClient, prismBuildClient],
   );
   const modelAdapter = useMemo(
     () =>
@@ -204,8 +208,9 @@ export default function App() {
       unsubStore();
       unsubBus();
       prismPool.dispose();
+      prismBuildClient.dispose();
     };
-  }, [prismStore, observerBus, workerClient, prismPool]);
+  }, [prismStore, observerBus, workerClient, prismPool, prismBuildClient]);
 
   useEffect(() => {
     const unsubscribe = workerClient.subscribe(setEngineState);
@@ -313,7 +318,7 @@ export default function App() {
   }, [workerClient]);
 
   const handleCreatePrism = useCallback(() => {
-    void prismStore.create('blank').then((created) => {
+    void prismStore.createDeclarative('budget-guard').then((created) => {
       setActiveView({ kind: 'prism', prismId: created.id, mode: 'studio' });
     });
   }, [prismStore]);
@@ -484,6 +489,7 @@ export default function App() {
                   store={prismStore}
                   bus={observerBus}
                   bridgeRuntime={prismPool}
+                  buildClient={prismBuildClient}
                   workerClient={workerClient}
                   engineState={engineState}
                   darkMode={darkMode}

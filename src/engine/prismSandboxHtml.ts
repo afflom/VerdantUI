@@ -295,3 +295,127 @@ ${safeJs}
 </body>
 </html>`;
 }
+
+/**
+ * Composes a strictly sandboxed HTML document for a real `prism/holo/6` `HOLOVIEW`
+ * (`prism.design/1` `index.html`, `prism.css`, `prism-ui.js`, `app.js`), replacing the
+ * network-bound `prism.js` fetch shim with a zero-origin `postMessage` bridge exposing
+ * `globalThis.prism.invoke(line)` backed by the verified WASM guest or instant draft evaluator.
+ */
+export function buildHoloviewSandboxDocument(opts: {
+  readonly prismId: string;
+  readonly channelId: string;
+  readonly digest: string;
+  readonly indexHtml: string;
+  readonly prismCss: string;
+  readonly prismUiJs: string;
+  readonly appJs: string;
+  readonly darkMode: boolean;
+}): string {
+  const safeChannelId = JSON.stringify(opts.channelId);
+  const safeDigest = JSON.stringify(opts.digest);
+  const safeCss = escapeClosingTag(opts.prismCss || '', 'style');
+  const safeUiJs = escapeClosingTag(opts.prismUiJs || '', 'script');
+  const safeAppJs = escapeClosingTag(opts.appJs || '', 'script');
+
+  const prismBridgeScript = `
+(function () {
+  const CHANNEL_ID = ${safeChannelId};
+  const DIGEST = ${safeDigest};
+  const pending = new Map();
+  let seq = 1;
+
+  function post(type, payload) {
+    window.parent.postMessage({ __verdant: true, channelId: CHANNEL_ID, type, payload }, '*');
+  }
+
+  function applyTheme(dark) {
+    document.documentElement.classList.toggle('dark', !!dark);
+    document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+  }
+
+  window.addEventListener('error', (ev) => {
+    post('runtime-error', {
+      message: ev.message || 'Uncaught runtime error',
+      line: ev.lineno || null,
+      col: ev.colno || null,
+    });
+  });
+
+  window.addEventListener('unhandledrejection', (ev) => {
+    const r = ev.reason;
+    post('runtime-error', {
+      message: (r && r.message) ? String(r.message) : String(r || 'Unhandled rejection'),
+      line: null,
+      col: null,
+    });
+  });
+
+  window.addEventListener('message', (ev) => {
+    const msg = ev.data;
+    if (!msg || !msg.__verdant || msg.channelId !== CHANNEL_ID) return;
+    if (msg.type === 'theme' && msg.payload) {
+      applyTheme(!!msg.payload.dark);
+    } else if (msg.type === 'hot-css' && msg.payload && typeof msg.payload.css === 'string') {
+      const styleEl = document.getElementById('verdant-user-css');
+      if (styleEl) styleEl.textContent = msg.payload.css;
+    } else if (msg.type === 'prism-invoke-result' && msg.payload) {
+      const w = pending.get(msg.payload.reqId);
+      if (!w) return;
+      pending.delete(msg.payload.reqId);
+      if (msg.payload.ok) w.resolve(String(msg.payload.value ?? ''));
+      else w.reject(new Error(String(msg.payload.error || 'Model invocation failed')));
+    }
+  });
+
+  const invoke = (request) => new Promise((resolve, reject) => {
+    const reqId = 'inv_' + (seq++);
+    pending.set(reqId, { resolve, reject });
+    post('prism-invoke', { reqId, request: String(request ?? '') });
+  });
+
+  globalThis.prism = Object.freeze({
+    invoke,
+    requestMaximum: 4096,
+    responseMaximum: 8192,
+  });
+
+  window.addEventListener('DOMContentLoaded', () => {
+    post('ready', { digest: DIGEST });
+  }, { once: true });
+})();
+`;
+
+  // Extract body inner HTML if full HTML doc was provided, stripping external prism asset tags
+  const bodyMatch = opts.indexHtml.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+  const rawBody = bodyMatch ? bodyMatch[1] : opts.indexHtml;
+  const cleanedBody = rawBody
+    .replace(/<script[^>]+src=["'](?:\.\/)?(?:prism\.js|prism-ui\.js|app\.js)["'][^>]*><\/script>/gi, '')
+    .replace(/<link[^>]+href=["'](?:\.\/)?prism\.css["'][^>]*\/?>/gi, '');
+
+  const htmlAttr = opts.darkMode ? ' class="dark" data-theme="dark"' : ' data-theme="light"';
+
+  return `<!doctype html>
+<html lang="en"${htmlAttr}>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta http-equiv="Content-Security-Policy" content="${VERDANT_SANDBOX_CSP}" />
+<style id="verdant-user-css">${safeCss}</style>
+<script>${prismBridgeScript}</script>
+<script>${safeUiJs}</script>
+</head>
+<body>
+${cleanedBody}
+<script>
+(function () {
+  try {
+${safeAppJs}
+  } catch (err) {
+    window.dispatchEvent(new ErrorEvent('error', { message: err && err.message ? err.message : String(err) }));
+  }
+})();
+</script>
+</body>
+</html>`;
+}
