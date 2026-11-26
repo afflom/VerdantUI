@@ -140,6 +140,9 @@ export default function App() {
       createLlamaVTensorAdapter(workerClient, {
         bus: observerBus,
         getPublishedPrisms: () => prismStore.listPublishedSummaries(),
+        onOpenPrism: (prismId) => {
+          setActiveView({ kind: 'prism', prismId, mode: 'app' });
+        },
       }),
     [workerClient, observerBus, prismStore],
   );
@@ -329,13 +332,14 @@ export default function App() {
 
   const handleDeletePrism = useCallback(
     (prismId: string) => {
+      prismPool.evictPrism(prismId);
       void prismStore.delete(prismId).then(() => {
         setActiveView((prev) =>
           prev.kind === 'prism' && prev.prismId === prismId ? { kind: 'thread' } : prev,
         );
       });
     },
-    [prismStore],
+    [prismStore, prismPool],
   );
 
   const handleEnableModelStream = useCallback(() => {

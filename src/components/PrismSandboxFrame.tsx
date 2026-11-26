@@ -54,6 +54,15 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
   const grantsRef = useRef(snapshot.grants);
   grantsRef.current = snapshot.grants;
 
+  const digestRef = useRef(snapshot.digest);
+  digestRef.current = snapshot.digest;
+
+  const latestCssRef = useRef(snapshot.app.css);
+  latestCssRef.current = snapshot.app.css;
+
+  const latestDarkRef = useRef(darkMode);
+  latestDarkRef.current = darkMode;
+
   const onRuntimeErrorRef = useRef(onRuntimeError);
   onRuntimeErrorRef.current = onRuntimeError;
 
@@ -110,7 +119,20 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
       string,
       { resolve: (v: unknown) => void; reject: (e: Error) => void }
     >();
+    const frameAbort = new AbortController();
     let dispSeq = 1;
+    let isReady = false;
+    let resolveReady!: () => void;
+    let rejectReady!: (err: Error) => void;
+    const readyPromise = new Promise<void>((res, rej) => {
+      resolveReady = res;
+      rejectReady = rej;
+    });
+    const readyTimer = setTimeout(() => {
+      if (!isReady) {
+        rejectReady(new Error(`Prism frame "${prismId}" did not become ready in time.`));
+      }
+    }, 3_000);
 
     const onMessage = async (ev: MessageEvent) => {
       const iframeWin = iframeRef.current?.contentWindow;
@@ -119,11 +141,23 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
       if (!msg || !msg.__verdant || msg.channelId !== channelId) return;
 
       if (msg.type === 'ready') {
+        isReady = true;
+        clearTimeout(readyTimer);
+        resolveReady();
+        // Re-sync latest theme & hot CSS in case either changed before DOMContentLoaded
+        iframeWin.postMessage(
+          { __verdant: true, channelId, type: 'theme', payload: { dark: latestDarkRef.current } },
+          '*',
+        );
+        iframeWin.postMessage(
+          { __verdant: true, channelId, type: 'hot-css', payload: { css: latestCssRef.current } },
+          '*',
+        );
         bus.emit({
           name: 'prism.ready',
           endpointKind: 'prism',
           endpointId: prismId,
-          attributes: { 'verdant.prism.digest': snapshot.digest },
+          attributes: { 'verdant.prism.digest': digestRef.current },
         });
         onReadyRef.current?.();
         return;
@@ -197,6 +231,7 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
             const text = await bridgeRuntime.ask({
               prismId,
               prompt: String(args?.prompt ?? ''),
+              signal: frameAbort.signal,
               onToken: (partial) => {
                 iframeRef.current?.contentWindow?.postMessage(
                   { __verdant: true, channelId, type: 'rpc-token', payload: { reqId, text: partial } },
@@ -255,6 +290,7 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
                   '*',
                 );
               },
+              frameAbort.signal,
             );
             reply(true, res);
           } else {
@@ -274,14 +310,35 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
         endpointId: prismId,
         endpointKind: 'prism',
         priority: 10, // Mounted live frame takes priority over warm background pool
-        dispatch: (input: unknown, traceContext: OtelTraceContext) => {
+        dispatch: async (input: unknown, traceContext: OtelTraceContext, signal?: AbortSignal) => {
+          if (!isReady) {
+            await readyPromise;
+          }
           const win = iframeRef.current?.contentWindow;
           if (!win) {
-            return Promise.reject(new Error('Prism frame is not mounted.'));
+            throw new Error('Prism frame is not mounted.');
           }
           const reqId = `live_${dispSeq++}`;
           return new Promise((resolve, reject) => {
-            pendingDispatches.set(reqId, { resolve, reject });
+            const onAbort = () => {
+              pendingDispatches.delete(reqId);
+              reject(new Error(`Dispatch to "${prismId}" aborted.`));
+            };
+            if (signal?.aborted) {
+              onAbort();
+              return;
+            }
+            signal?.addEventListener('abort', onAbort, { once: true });
+            pendingDispatches.set(reqId, {
+              resolve: (v) => {
+                signal?.removeEventListener('abort', onAbort);
+                resolve(v);
+              },
+              reject: (e) => {
+                signal?.removeEventListener('abort', onAbort);
+                reject(e);
+              },
+            });
             win.postMessage(
               {
                 __verdant: true,
@@ -297,6 +354,11 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
     }
 
     return () => {
+      clearTimeout(readyTimer);
+      frameAbort.abort();
+      if (!isReady) {
+        rejectReady(new Error('Prism frame unmounted before ready.'));
+      }
       window.removeEventListener('message', onMessage);
       unregisterEndpoint?.();
       for (const waiter of pendingDispatches.values()) {
@@ -304,7 +366,7 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
       }
       pendingDispatches.clear();
     };
-  }, [prismId, channelId, snapshot.digest, bus, bridgeRuntime, registerAsEndpoint]);
+  }, [prismId, channelId, bus, bridgeRuntime, registerAsEndpoint]);
 
   return (
     <iframe

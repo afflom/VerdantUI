@@ -1046,7 +1046,8 @@ export function extractPrismPatchFromModelOutput(
   rawText: string,
   currentDraft: VerdantPrismSnapshot,
 ): ExtractedPrismPatch | null {
-  const blockRegex = /```([a-zA-Z0-9_-]*)\s*\n([\s\S]*?)```/g;
+  const normalizedText = rawText.replace(/\r\n/g, '\n');
+  const blockRegex = /```([a-zA-Z0-9_-]*)[ \t]*\n([\s\S]*?)```/g;
   let nextHtml = currentDraft.app.html;
   let nextCss = currentDraft.app.css;
   let nextJs = currentDraft.app.js;
@@ -1055,14 +1056,29 @@ export function extractPrismPatchFromModelOutput(
   let nextStreams = currentDraft.streams;
 
   const updated = new Set<'html' | 'css' | 'js' | 'meta'>();
+  const blocks: Array<{ lang: string; body: string }> = [];
+  let lastIndex = 0;
   let match: RegExpExecArray | null;
 
-  while ((match = blockRegex.exec(rawText)) !== null) {
-    const lang = match[1].trim().toLowerCase();
-    const body = match[2].trim();
+  while ((match = blockRegex.exec(normalizedText)) !== null) {
+    blocks.push({ lang: match[1].trim().toLowerCase(), body: match[2].trim() });
+    lastIndex = blockRegex.lastIndex;
+  }
+
+  // Salvage an unclosed trailing code fence if generation hit maxTokens mid-block
+  const tail = normalizedText.slice(lastIndex);
+  const unclosedMatch = tail.match(/```(html|htm|css|js|javascript)[ \t]*\n([\s\S]+)$/i);
+  if (unclosedMatch && unclosedMatch[2].trim().length >= 16) {
+    blocks.push({
+      lang: unclosedMatch[1].trim().toLowerCase(),
+      body: unclosedMatch[2].trim(),
+    });
+  }
+
+  for (const { lang, body } of blocks) {
     if (!body) continue;
 
-    if (lang === 'html') {
+    if (lang === 'html' || lang === 'htm') {
       // If model returned a full <!doctype html> doc, cleanly split style/script/body
       const hasFullDoc = /<body[\s>]/i.test(body) || /<style[\s>]/i.test(body) || /<script[\s>]/i.test(body);
       if (hasFullDoc) {
@@ -1198,7 +1214,7 @@ export class PrismStore {
       const tx = db.transaction(STORE_PROJECTS, 'readonly');
       const all = await idbReq<VerdantPrismProject[]>(tx.objectStore(STORE_PROJECTS).getAll());
       for (const proj of all) {
-        if (proj && typeof proj.id === 'string' && proj.draft) {
+        if (proj && typeof proj.id === 'string' && proj.draft && !this.projects.has(proj.id)) {
           this.projects.set(proj.id, proj);
         }
       }
@@ -1239,11 +1255,23 @@ export class PrismStore {
   }
 
   private async removeProjectFromDb(id: string): Promise<void> {
+    // Also clean up scoped per-Prism KV keys so deleted Prisms leave zero orphaned storage
+    const prefix = `${id}:`;
+    for (const k of [...this.memoryKv.keys()]) {
+      if (k.startsWith(prefix)) this.memoryKv.delete(k);
+    }
     const db = await this.getDb();
     if (!db) return;
     try {
-      const tx = db.transaction(STORE_PROJECTS, 'readwrite');
+      const tx = db.transaction([STORE_PROJECTS, STORE_PRISM_KV], 'readwrite');
       await idbReq(tx.objectStore(STORE_PROJECTS).delete(id));
+      const kvStore = tx.objectStore(STORE_PRISM_KV);
+      const allKeys = await idbReq<IDBValidKey[]>(kvStore.getAllKeys());
+      for (const key of allKeys) {
+        if (typeof key === 'string' && key.startsWith(prefix)) {
+          kvStore.delete(key);
+        }
+      }
     } catch {
       // Non-fatal persistence error
     }

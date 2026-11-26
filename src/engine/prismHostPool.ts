@@ -61,7 +61,7 @@ export interface PrismBridgeRuntime {
     targetNameOrId: string,
     payload: unknown,
     parentContext?: OtelTraceContext,
-    depth?: number,
+    callChain?: readonly string[],
   ): Promise<unknown>;
   openPrism(
     callerPrismId: string,
@@ -75,6 +75,7 @@ export interface PrismBridgeRuntime {
     init?: { readonly method?: string; readonly headers?: Record<string, string>; readonly body?: string },
     parentContext?: OtelTraceContext,
     onChunk?: (accumulatedText: string) => void,
+    signal?: AbortSignal,
   ): Promise<{ readonly status: number; readonly ok: boolean; readonly text: string }>;
 }
 
@@ -84,6 +85,10 @@ interface PooledPrismInstance {
   readonly channelId: string;
   readonly iframe: HTMLIFrameElement;
   readonly readyPromise: Promise<void>;
+  readonly pendingDispatches: Map<
+    string,
+    { resolve: (v: unknown) => void; reject: (e: Error) => void }
+  >;
   lastUsedAt: number;
   cleanup: () => void;
 }
@@ -91,15 +96,12 @@ interface PooledPrismInstance {
 const MAX_POOLED_PRISMS = 2;
 const IDLE_EVICT_MS = 60_000;
 const READY_TIMEOUT_MS = 3_000;
+const FETCH_TIMEOUT_MS = 20_000;
 const MAX_PRISM_CALL_DEPTH = 4;
 
 export class PrismHostPool implements PrismBridgeRuntime {
   private askTail: Promise<unknown> = Promise.resolve();
   private readonly pool = new Map<string, PooledPrismInstance>();
-  private readonly pendingDispatches = new Map<
-    string,
-    { resolve: (v: unknown) => void; reject: (e: Error) => void }
-  >();
   private dispatchSeq = 1;
   private evictTimer: ReturnType<typeof setInterval> | null = null;
   private callbacks: PrismHostCallbacks = {};
@@ -121,6 +123,13 @@ export class PrismHostPool implements PrismBridgeRuntime {
     this.callbacks = callbacks;
   }
 
+  evictPrism(prismId: string): void {
+    const inst = this.pool.get(prismId);
+    if (!inst) return;
+    inst.cleanup();
+    this.pool.delete(prismId);
+  }
+
   dispose(): void {
     if (this.evictTimer !== null) {
       clearInterval(this.evictTimer);
@@ -137,6 +146,9 @@ export class PrismHostPool implements PrismBridgeRuntime {
    */
   ask(req: PrismAskRequest): Promise<string> {
     const run = async (): Promise<string> => {
+      if (req.signal?.aborted) {
+        throw new Error('Prism AI request cancelled.');
+      }
       const span = this.bus.startSpan(`prism.ask:${req.prismId}`, {
         endpointKind: 'prism',
         endpointId: req.prismId,
@@ -353,12 +365,13 @@ export class PrismHostPool implements PrismBridgeRuntime {
     targetNameOrId: string,
     payload: unknown,
     parentContext?: OtelTraceContext,
-    depth = 0,
+    callChain: readonly string[] = [],
   ): Promise<unknown> {
     if (!grants.observer) {
       throw new Error(`Observer grant is Off for Prism "${callerPrismId}".`);
     }
-    if (depth >= MAX_PRISM_CALL_DEPTH) {
+    const chain = callChain.includes(callerPrismId) ? callChain : [...callChain, callerPrismId];
+    if (chain.length >= MAX_PRISM_CALL_DEPTH) {
       throw new Error(`Prism-to-Prism call depth exceeded limit (${MAX_PRISM_CALL_DEPTH}).`);
     }
     const targetId = this.resolveTargetPrismId(targetNameOrId);
@@ -367,6 +380,9 @@ export class PrismHostPool implements PrismBridgeRuntime {
     }
     if (targetId === callerPrismId) {
       throw new Error('Self-recursive Prism call refused.');
+    }
+    if (chain.includes(targetId)) {
+      throw new Error(`Cyclic Prism-to-Prism call refused (${[...chain, targetId].join(' -> ')}).`);
     }
     const { result } = await this.dispatchPublishedPrism(targetId, payload, {
       parentContext,
@@ -397,6 +413,7 @@ export class PrismHostPool implements PrismBridgeRuntime {
     init?: { readonly method?: string; readonly headers?: Record<string, string>; readonly body?: string },
     parentContext?: OtelTraceContext,
     onChunk?: (accumulatedText: string) => void,
+    signal?: AbortSignal,
   ): Promise<{ readonly status: number; readonly ok: boolean; readonly text: string }> {
     const span = this.bus.startSpan(`prism.fetch:${prismId}`, {
       endpointKind: 'network',
@@ -426,11 +443,20 @@ export class PrismHostPool implements PrismBridgeRuntime {
       throw new Error(msg);
     }
 
+    const fetchCtrl = new AbortController();
+    const timeoutId = setTimeout(() => fetchCtrl.abort(), FETCH_TIMEOUT_MS);
+    const onOuterAbort = () => fetchCtrl.abort();
+    if (signal) {
+      if (signal.aborted) fetchCtrl.abort();
+      else signal.addEventListener('abort', onOuterAbort, { once: true });
+    }
+
     try {
       const res = await fetch(parsedUrl.toString(), {
         method: init?.method ?? 'GET',
         headers: init?.headers,
         body: init?.body,
+        signal: fetchCtrl.signal,
       });
       let text = '';
       if (onChunk && res.body && typeof res.body.getReader === 'function') {
@@ -450,9 +476,17 @@ export class PrismHostPool implements PrismBridgeRuntime {
       span.end(res.ok ? 'ok' : 'error');
       return { status: res.status, ok: res.ok, text: text.slice(0, 128_000) };
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg =
+        fetchCtrl.signal.aborted && !signal?.aborted
+          ? `Fetch timed out after ${FETCH_TIMEOUT_MS}ms (${url}).`
+          : err instanceof Error
+            ? err.message
+            : String(err);
       span.end('error', msg);
-      throw err;
+      throw new Error(msg);
+    } finally {
+      clearTimeout(timeoutId);
+      signal?.removeEventListener('abort', onOuterAbort);
     }
   }
 
@@ -502,7 +536,13 @@ export class PrismHostPool implements PrismBridgeRuntime {
     }
 
     const instance = this.getOrMountPooledInstance(prismId, snapshot);
-    await instance.readyPromise;
+    try {
+      await instance.readyPromise;
+    } catch (err) {
+      // Evict zombie instance immediately so future calls can mount cleanly
+      this.evictPrism(prismId);
+      throw err;
+    }
     instance.lastUsedAt = Date.now();
 
     const { result } = await this.bus.dispatchToEndpoint(prismId, payload, {
@@ -511,8 +551,8 @@ export class PrismHostPool implements PrismBridgeRuntime {
       fallbackHandler: {
         endpointId: prismId,
         endpointKind: 'prism',
-        dispatch: (input, traceContext) =>
-          this.sendDispatchToIframe(instance, input, traceContext),
+        dispatch: (input, traceContext, signal) =>
+          this.sendDispatchToIframe(instance, input, traceContext, signal),
       },
     });
     return { result, prismName: snapshot.name, digest: snapshot.digest };
@@ -559,6 +599,12 @@ export class PrismHostPool implements PrismBridgeRuntime {
     iframe.style.pointerEvents = 'none';
     iframe.style.left = '-9999px';
 
+    const pendingDispatches = new Map<
+      string,
+      { resolve: (v: unknown) => void; reject: (e: Error) => void }
+    >();
+    const instanceAbort = new AbortController();
+
     let resolveReady!: () => void;
     let rejectReady!: (err: Error) => void;
     const readyPromise = new Promise<void>((res, rej) => {
@@ -600,8 +646,8 @@ export class PrismHostPool implements PrismBridgeRuntime {
         return;
       }
       if (msg.type === 'dispatch-response' && msg.payload?.reqId) {
-        const waiter = this.pendingDispatches.get(msg.payload.reqId);
-        this.pendingDispatches.delete(msg.payload.reqId);
+        const waiter = pendingDispatches.get(msg.payload.reqId);
+        pendingDispatches.delete(msg.payload.reqId);
         if (!waiter) return;
         if (msg.payload.ok) waiter.resolve(msg.payload.value);
         else waiter.reject(new Error(String(msg.payload.error ?? 'Prism handler failed')));
@@ -629,6 +675,7 @@ export class PrismHostPool implements PrismBridgeRuntime {
             const text = await this.ask({
               prismId,
               prompt: String(args?.prompt ?? ''),
+              signal: instanceAbort.signal,
               onToken: (partial) => {
                 iframe.contentWindow?.postMessage(
                   { __verdant: true, channelId, type: 'rpc-token', payload: { reqId, text: partial } },
@@ -687,6 +734,7 @@ export class PrismHostPool implements PrismBridgeRuntime {
                   '*',
                 );
               },
+              instanceAbort.signal,
             );
             reply(true, res);
           } else {
@@ -713,10 +761,16 @@ export class PrismHostPool implements PrismBridgeRuntime {
       channelId,
       iframe,
       readyPromise,
+      pendingDispatches,
       lastUsedAt: Date.now(),
       cleanup: () => {
         clearTimeout(readyTimer);
+        instanceAbort.abort();
         window.removeEventListener('message', onMessage);
+        for (const waiter of pendingDispatches.values()) {
+          waiter.reject(new Error(`Background Prism "${snapshot.name}" evicted.`));
+        }
+        pendingDispatches.clear();
         iframe.remove();
       },
     };
@@ -728,10 +782,29 @@ export class PrismHostPool implements PrismBridgeRuntime {
     instance: PooledPrismInstance,
     input: unknown,
     traceContext: OtelTraceContext,
+    signal?: AbortSignal,
   ): Promise<unknown> {
     const reqId = `disp_${this.dispatchSeq++}`;
     return new Promise((resolve, reject) => {
-      this.pendingDispatches.set(reqId, { resolve, reject });
+      const onAbort = () => {
+        instance.pendingDispatches.delete(reqId);
+        reject(new Error(`Dispatch to "${instance.prismId}" aborted.`));
+      };
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      signal?.addEventListener('abort', onAbort, { once: true });
+      instance.pendingDispatches.set(reqId, {
+        resolve: (v) => {
+          signal?.removeEventListener('abort', onAbort);
+          resolve(v);
+        },
+        reject: (e) => {
+          signal?.removeEventListener('abort', onAbort);
+          reject(e);
+        },
+      });
       instance.iframe.contentWindow?.postMessage(
         {
           __verdant: true,

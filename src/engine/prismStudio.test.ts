@@ -299,3 +299,49 @@ test('Published Prisms register JSON Schema 2020-12 tools and route predictably 
 
   pool.dispose();
 });
+
+test('Reliability hardening: unclosed code-fence salvage, KV cleanup on delete, indirect cycle guard, and aborted ask bailout', async () => {
+  // 1. Salvage truncated/unclosed trailing code fence + CRLF line endings
+  const base = createStarterSnapshot('blank');
+  const truncatedModelOutput =
+    'Sure, adding dark card styling:\r\n```css\r\n.empty-card { border-radius: 18px; padding: 32px; }';
+  const salvaged = extractPrismPatchFromModelOutput(truncatedModelOutput, base);
+  assert.ok(salvaged);
+  assert.deepEqual(salvaged!.updatedSections, ['css']);
+  assert.ok(salvaged!.snapshot.app.css.includes('border-radius: 18px'));
+
+  // 2. Deleting a Prism purges its scoped KV entries with zero leaks
+  const store = new PrismStore();
+  const bus = new ObserverStreamBus();
+  const grants = new ContainerGrantMatrix();
+  const pool = new PrismHostPool(bus, store, grants, null);
+
+  const a = await store.create('kanban', 'Board A');
+  const b = await store.create('budget', 'Budget B');
+  await store.publish(a.id);
+  await store.publish(b.id);
+  await store.setKv(a.id, 'tasks', ['t1']);
+  await store.setKv(b.id, 'expenses', [10]);
+
+  await store.delete(a.id);
+  assert.equal(await store.getKv(a.id, 'tasks'), null);
+  assert.deepEqual(await store.getKv(b.id, 'expenses'), [10]);
+
+  // 3. Indirect cycle detection (B -> C -> B) via callChain
+  const c = await store.create('focus', 'Timer C');
+  await store.publish(c.id);
+  await assert.rejects(
+    () => pool.callPrism(c.id, c.draft.grants, 'Budget B', {}, undefined, [b.id, c.id]),
+    /Cyclic Prism-to-Prism call refused/,
+  );
+
+  // 4. Aborted verdant.ask() bails immediately without invoking worker
+  const aborted = new AbortController();
+  aborted.abort();
+  await assert.rejects(
+    () => pool.ask({ prismId: c.id, prompt: 'hello', signal: aborted.signal }),
+    /cancelled/i,
+  );
+
+  pool.dispose();
+});

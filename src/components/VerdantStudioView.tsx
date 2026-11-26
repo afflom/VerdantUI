@@ -110,7 +110,12 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     JSON.stringify(project.draft.streams.inputs, null, 2),
   );
   const [schemaError, setSchemaError] = useState<string | null>(null);
+  const [summaryDraft, setSummaryDraft] = useState(project.draft.summary);
+  const [sourceDraft, setSourceDraft] = useState(project.draft.app[sourceTab]);
   const sourceSnapshotPushedRef = useRef(false);
+  const summaryDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sourceDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const publishBadgeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
@@ -126,6 +131,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
 
   useEffect(() => {
     setTitleDraft(project.draft.name);
+    setSummaryDraft(project.draft.summary);
     setSchemaDraft(JSON.stringify(project.draft.streams.inputs, null, 2));
     setSchemaError(null);
     setTestResultText(null);
@@ -133,7 +139,11 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     setImportError(null);
     sourceSnapshotPushedRef.current = false;
     setRecentEvents(bus.getRecentEvents({ endpointId: project.id }).slice(-12));
-  }, [project.id, project.draft.name, project.draft.streams.inputs, bus]);
+  }, [project.id, project.draft.name, project.draft.summary, project.draft.streams.inputs, bus]);
+
+  useEffect(() => {
+    setSourceDraft(project.draft.app[sourceTab]);
+  }, [project.id, project.draft.digest, sourceTab, project.draft.app]);
 
   useEffect(() => {
     const unsub = bus.subscribe(
@@ -152,8 +162,48 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   useEffect(() => {
     return () => {
       abortRef.current?.abort();
+      if (summaryDebounceRef.current) clearTimeout(summaryDebounceRef.current);
+      if (sourceDebounceRef.current) clearTimeout(sourceDebounceRef.current);
+      if (publishBadgeTimerRef.current) clearTimeout(publishBadgeTimerRef.current);
     };
   }, []);
+
+  const flushSummaryDraft = useCallback(
+    async (val: string) => {
+      if (summaryDebounceRef.current) {
+        clearTimeout(summaryDebounceRef.current);
+        summaryDebounceRef.current = null;
+      }
+      if (val === project.draft.summary) return;
+      await store.updateDraft(
+        project.id,
+        (prev) => ({ ...prev, summary: val }),
+        { pushRevision: false },
+      );
+    },
+    [project.id, project.draft.summary, store],
+  );
+
+  const flushSourceDraft = useCallback(
+    async (tab: SourceFileTab, val: string) => {
+      if (sourceDebounceRef.current) {
+        clearTimeout(sourceDebounceRef.current);
+        sourceDebounceRef.current = null;
+      }
+      if (val === project.draft.app[tab]) return;
+      const shouldPushRevision = !sourceSnapshotPushedRef.current;
+      sourceSnapshotPushedRef.current = true;
+      await store.updateDraft(
+        project.id,
+        (prev) => ({
+          ...prev,
+          app: { ...prev.app, [tab]: val },
+        }),
+        { pushRevision: shouldPushRevision },
+      );
+    },
+    [project.id, project.draft.app, store],
+  );
 
   const handleCommitTitle = useCallback(async () => {
     setEditingTitle(false);
@@ -166,19 +216,34 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   }, [titleDraft, project.id, project.draft.name, store]);
 
   const handlePublish = useCallback(async () => {
+    await flushSummaryDraft(summaryDraft);
+    await flushSourceDraft(sourceTab, sourceDraft);
     await store.publish(project.id);
+    const updated = store.get(project.id);
     bus.emit({
       name: 'prism.published',
       endpointKind: 'studio',
       endpointId: project.id,
       attributes: {
-        'verdant.prism.name': project.draft.name,
-        'verdant.prism.digest': project.draft.digest,
+        'verdant.prism.name': updated?.draft.name ?? project.draft.name,
+        'verdant.prism.digest': updated?.draft.digest ?? project.draft.digest,
       },
     });
     setJustPublished(true);
-    setTimeout(() => setJustPublished(false), 1800);
-  }, [store, bus, project.id, project.draft.name, project.draft.digest]);
+    if (publishBadgeTimerRef.current) clearTimeout(publishBadgeTimerRef.current);
+    publishBadgeTimerRef.current = setTimeout(() => setJustPublished(false), 1800);
+  }, [
+    flushSummaryDraft,
+    summaryDraft,
+    flushSourceDraft,
+    sourceTab,
+    sourceDraft,
+    store,
+    bus,
+    project.id,
+    project.draft.name,
+    project.draft.digest,
+  ]);
 
   const handleUndo = useCallback(async () => {
     setRuntimeError(null);
@@ -292,6 +357,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
         );
 
         let accumulated = '';
+        let lastUiFlushAt = 0;
         for await (const ev of workerClient.streamGenerate(
           fullPrompt,
           ctrl.signal,
@@ -299,8 +365,13 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
           `studio:${project.id}`,
         )) {
           accumulated = ev.accumulatedText;
-          setStreamingReply(accumulated);
+          const now = Date.now();
+          if (now - lastUiFlushAt >= 100) {
+            lastUiFlushAt = now;
+            setStreamingReply(accumulated);
+          }
         }
+        setStreamingReply(accumulated);
 
         const cleanedOutput = stripReasoningTags(accumulated);
         const latestProj = store.get(project.id) ?? project;
@@ -546,14 +617,15 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                   </span>
                   <input
                     type="text"
-                    value={project.draft.summary}
+                    value={summaryDraft}
+                    onBlur={() => void flushSummaryDraft(summaryDraft)}
                     onChange={(e) => {
                       const val = e.target.value;
-                      void store.updateDraft(
-                        project.id,
-                        (prev) => ({ ...prev, summary: val }),
-                        { pushRevision: false },
-                      );
+                      setSummaryDraft(val);
+                      if (summaryDebounceRef.current) clearTimeout(summaryDebounceRef.current);
+                      summaryDebounceRef.current = setTimeout(() => {
+                        void flushSummaryDraft(val);
+                      }, 180);
                     }}
                     className="mt-1 w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-900 dark:border-slate-700 dark:bg-[#0F141C] dark:text-slate-100"
                   />
@@ -709,7 +781,9 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                       key={f}
                       type="button"
                       onClick={() => {
+                        void flushSourceDraft(sourceTab, sourceDraft);
                         setSourceTab(f);
+                        setSourceDraft(project.draft.app[f]);
                         sourceSnapshotPushedRef.current = false;
                       }}
                       className={`inline-flex items-center gap-1 rounded px-2 py-0.5 font-mono text-[11px] uppercase ${
@@ -728,23 +802,19 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                 </span>
               </div>
               <textarea
-                value={project.draft.app[sourceTab]}
+                value={sourceDraft}
                 onBlur={() => {
+                  void flushSourceDraft(sourceTab, sourceDraft);
                   sourceSnapshotPushedRef.current = false;
                 }}
                 onChange={(e) => {
                   const nextVal = e.target.value;
-                  const shouldPushRevision = !sourceSnapshotPushedRef.current;
-                  sourceSnapshotPushedRef.current = true;
+                  setSourceDraft(nextVal);
                   setRuntimeError(null);
-                  void store.updateDraft(
-                    project.id,
-                    (prev) => ({
-                      ...prev,
-                      app: { ...prev.app, [sourceTab]: nextVal },
-                    }),
-                    { pushRevision: shouldPushRevision },
-                  );
+                  if (sourceDebounceRef.current) clearTimeout(sourceDebounceRef.current);
+                  sourceDebounceRef.current = setTimeout(() => {
+                    void flushSourceDraft(sourceTab, nextVal);
+                  }, 180);
                 }}
                 rows={7}
                 spellCheck={false}

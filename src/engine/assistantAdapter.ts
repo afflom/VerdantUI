@@ -858,6 +858,7 @@ function hasPendingToolResults(msg: ThreadMessage | null | undefined): boolean {
 export interface StudioAdapterBridge {
   readonly bus: ObserverStreamBus;
   getPublishedPrisms(): readonly PublishedPrismSummary[];
+  onOpenPrism?: (prismId: string) => void;
 }
 
 export function createLlamaVTensorAdapter(
@@ -928,6 +929,9 @@ export function createLlamaVTensorAdapter(
               abortSignal,
               human: async () => undefined,
             } as never);
+            if (dm.prismId && /^\/open\s+/i.test(latestUserText.trim())) {
+              studioBridge?.onOpenPrism?.(dm.prismId);
+            }
             const summaryText = formatDirectOperatorSummary(dm.toolName, result);
             const updatedSnap = client.cognitiveObserver.recordTurnOutcome(threadId, {
               factKey: dm.toolName,
