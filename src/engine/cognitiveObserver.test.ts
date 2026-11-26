@@ -14,6 +14,7 @@ import {
 } from './assistantAdapter';
 import {
   ContainerGrantMatrix,
+  UNIFIED_VERDANT_SUGGESTIONS,
   UNIFIED_VERDANT_SYSTEM_PROMPT,
   VerdantCognitiveObserver,
   buildUnifiedVerdantModelContext,
@@ -402,4 +403,31 @@ test('evaluateMathExpression, all 5 client tools, and unified ModelContext run d
   });
   assert.equal(coldMath.certificate.kind, 'lod0-verified');
   assert.equal(coldObserver.grants.isAllowed('network-weights'), false);
+
+  // Space-isolated workspace_notes: Personal notes never appear in Work space
+  let activeSpace: 'personal' | 'work' = 'personal';
+  const scopedTools = createVerdantClientTools(
+    () => ({
+      model: QWEN3_4B_SUMMARY,
+      telemetry: { activeProvider: 'vTensor', verdantVersion: '2.22.4', kernelAcceleration: 'wasm-simd' } as never,
+      opfsStorage: { supported: true, usageBytes: 0, quotaBytes: 0, storedModels: [], partialModels: [] } as never,
+      lastTokensPerSec: 20,
+    }),
+    undefined,
+    undefined,
+    () => activeSpace,
+  );
+  await scopedTools.workspace_notes.execute!({ action: 'write', title: 'PrivateJournal', content: 'Evening run' }, {} as never);
+  activeSpace = 'work';
+  const workList = await scopedTools.workspace_notes.execute!({ action: 'list' }, {} as never);
+  assert.equal(workList.notes.some((n: { title: string }) => n.title === 'PrivateJournal'), false);
+  const workRead = await scopedTools.workspace_notes.execute!({ action: 'read', title: 'PrivateJournal' }, {} as never);
+  assert.equal(workRead.found, false);
+  activeSpace = 'personal';
+  await scopedTools.workspace_notes.execute!({ action: 'delete', title: 'PrivateJournal' }, {} as never);
+
+  // Welcome suggestions remain 100% plain human language (zero internal jargon)
+  for (const s of UNIFIED_VERDANT_SUGGESTIONS) {
+    assert.equal(/\b(LOD0|OPFS|WASM|SIMD|vTensor|Verdant engine|SharedArrayBuffer)\b/i.test(`${s.label ?? ''} ${s.prompt}`), false);
+  }
 });

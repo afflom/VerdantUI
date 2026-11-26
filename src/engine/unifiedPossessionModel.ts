@@ -575,6 +575,50 @@ export class ObserverPossessionStore {
     this.bindPrismToCompartment(organ.prismId, organ.compartmentId, [organ.name]);
   }
 
+  /**
+   * Removes unpublished or deleted Prisms from the unified possession model, pruning both
+   * their active organ weights and any schedule constraints emitted by those Prisms.
+   */
+  pruneRemovedPrisms(activePublishedIds: ReadonlySet<string>): void {
+    for (const prismId of Array.from(this.publishedOrgans.keys())) {
+      if (!activePublishedIds.has(prismId)) {
+        this.publishedOrgans.delete(prismId);
+      }
+    }
+    const nextCompartments: Record<string, ContextCompartment> = {};
+    let changed = false;
+    for (const [cid, comp] of Object.entries(this.user.compartments)) {
+      const nextAttached = comp.attachedPrismIds.filter(
+        (id) => activePublishedIds.has(id) || !id.startsWith('prism-'),
+      );
+      const nextConstraints = comp.scheduleConstraints.filter(
+        (c) => !c.sourcePrismId || activePublishedIds.has(c.sourcePrismId),
+      );
+      if (
+        nextAttached.length !== comp.attachedPrismIds.length ||
+        nextConstraints.length !== comp.scheduleConstraints.length
+      ) {
+        changed = true;
+        nextCompartments[cid] = {
+          ...comp,
+          attachedPrismIds: nextAttached,
+          scheduleConstraints: nextConstraints,
+        };
+      } else {
+        nextCompartments[cid] = comp;
+      }
+    }
+    if (changed) {
+      this.user = {
+        ...this.user,
+        ownedPrismIds: this.user.ownedPrismIds.filter(
+          (id) => activePublishedIds.has(id) || !id.startsWith('prism-'),
+        ),
+        compartments: nextCompartments,
+      };
+    }
+  }
+
   listPublishedOrgans(compartmentId?: ContextCompartmentId): readonly PublishedPrismOrgan[] {
     const all = Array.from(this.publishedOrgans.values());
     if (!compartmentId) return all;

@@ -1164,8 +1164,8 @@ export function createLlamaVTensorAdapter(
         systemTokensEstimate: estimateTextTokens(systemMessage) + (activeTools ? 380 : 0),
       });
 
-      const sensoryBlock = client.consumePendingSensoryBlock();
-      const combinedTailRecall = [projected.foveatedRecallBlock, sensoryBlock]
+      const sensory = client.consumePendingSensory();
+      const combinedTailRecall = [projected.foveatedRecallBlock, sensory.textBlock]
         .filter((s): s is string => Boolean(s && s.trim()))
         .join('\n\n') || null;
 
@@ -1206,6 +1206,7 @@ export function createLlamaVTensorAdapter(
           runController.signal,
           effectiveSampling,
           threadId,
+          sensory.visualKappa,
         )) {
           if (firstTokenTime === undefined) {
             firstTokenTime = Date.now();

@@ -72,6 +72,7 @@ export type WorkerRequest =
       prompt: string;
       sampling: SamplingConfig;
       threadId?: string;
+      visualKappa?: string;
     }
   | {
       type: 'cancel';
@@ -1125,6 +1126,17 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         let lastTelemetryPost = 0;
         runtime.beginGenerationSlice();
         let lastStepMs = performance.now();
+        const cachedVisual = req.visualKappa
+          ? multimodalCoordinator.getCachedVisual(req.visualKappa)
+          : undefined;
+        const modelEmbDim = runtime.getModelSummary()?.hparams.embeddingLength ?? 0;
+        const prefixEmbeddings =
+          cachedVisual &&
+          cachedVisual.embeddings.length > 0 &&
+          cachedVisual.embeddingDim === modelEmbDim
+            ? cachedVisual.embeddings
+            : undefined;
+
         for await (const tokenEvent of runtime.generate(
           req.prompt,
           req.sampling,
@@ -1150,6 +1162,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
             }
           },
           req.threadId,
+          prefixEmbeddings,
         )) {
           count += 1;
           const nowMs = performance.now();

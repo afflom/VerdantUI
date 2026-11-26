@@ -1219,6 +1219,7 @@ export class LlamaVTensorWorkerClient {
     signal?: AbortSignal,
     samplingOverride?: SamplingConfig,
     threadId?: string,
+    visualKappa?: string,
   ): AsyncGenerator<TokenStreamEvent, void, unknown> {
     if (!this.state.model) {
       throw new Error('Wait for the model to finish loading before sending a message.');
@@ -1290,6 +1291,7 @@ export class LlamaVTensorWorkerClient {
       prompt,
       sampling: samplingOverride ?? this.state.sampling,
       threadId,
+      visualKappa,
     };
     this.worker.postMessage(req);
 
@@ -1389,12 +1391,13 @@ export class LlamaVTensorWorkerClient {
 
   /**
    * Consumes any pending speculative visual/audio sensory observations for the active turn
-   * so they attach cleanly at the tail without mutating prior cached KV turns.
+   * so they attach cleanly at the tail (and inject cached SigLIP embeddings via `visualKappa`
+   * when dimension-matched) without mutating prior cached KV turns.
    */
-  consumePendingSensoryBlock(): string | null {
+  consumePendingSensory(): { readonly textBlock: string | null; readonly visualKappa?: string } {
     const img = this.state.pendingImageContext;
     const aud = this.state.pendingAudioContext;
-    if (!img && !aud) return null;
+    if (!img && !aud) return { textBlock: null };
     const lines: string[] = [];
     if (img) lines.push(`[Visual Perception] ${img.summary}`);
     if (aud) {
@@ -1405,7 +1408,11 @@ export class LlamaVTensorWorkerClient {
       );
     }
     this.patchState({ pendingImageContext: null, pendingAudioContext: null });
-    return lines.join('\n');
+    return { textBlock: lines.join('\n'), visualKappa: img?.kappa };
+  }
+
+  consumePendingSensoryBlock(): string | null {
+    return this.consumePendingSensory().textBlock;
   }
 
   dispose(): void {

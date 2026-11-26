@@ -123,7 +123,7 @@ test('LlamaVTensorRuntime.prefillEmbeddingSequence produces BIT-EXACT logits mat
   }
 });
 
-test('SiglipVisionEncoder encodes real RGBA frames & video clips into projected embeddings that inject straight into LlamaVTensorRuntime', () => {
+test('SiglipVisionEncoder encodes real RGBA frames & video clips into projected embeddings that inject straight into LlamaVTensorRuntime', async () => {
   // Compact SigLIP-compatible projector matching stories260K embedding dim (64)
   const D = 16;
   const imgSize = 8;
@@ -194,13 +194,26 @@ test('SiglipVisionEncoder encodes real RGBA frames & video clips into projected 
   ]);
   assert.equal(vidTokens.length, 2);
 
-  // Inject real visual tokens straight into real LlamaVTensorRuntime KV cache!
+  // Inject real visual tokens straight into real LlamaVTensorRuntime KV cache AND run full generate()!
   const modelPath = path.resolve(process.cwd(), 'public/models/stories260K.gguf');
   const rt = new LlamaVTensorRuntime();
   rt.loadFromBuffer('stories260k', 'Stories 260K', 'local', new Uint8Array(fs.readFileSync(modelPath)));
   const injected = rt.prefillEmbeddingSequence(vidTokens, 0, true);
   assert.equal(injected.nextPos, 2);
   assert.ok(injected.logits && injected.logits.every((v) => Number.isFinite(v)));
+
+  let generatedWithVision = '';
+  for await (const ev of rt.generate(
+    'Once upon a time',
+    { temperature: 0, topP: 1, topK: 1, repeatPenalty: 1.0, maxTokens: 6, seed: 1 },
+    undefined,
+    undefined,
+    'vision-thread',
+    vidTokens,
+  )) {
+    generatedWithVision = ev.accumulatedText;
+  }
+  assert.ok(generatedWithVision.length > 0);
 });
 
 test('Audio frontend Log-Mel spectrogram distinguishes frequencies and WhisperAudioEngine runs real encoder-decoder pass', () => {

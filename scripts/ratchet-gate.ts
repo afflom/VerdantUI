@@ -461,7 +461,7 @@ export function evaluateVerdantRatchet(snapshot: RatchetSnapshot): RatchetReport
     }
   }
 
-  // 11. Universal zero internal jargon across ALL user-facing TSX surfaces (DEC-011 / DEC-012 / VUI-UX-JARGON-01)
+  // 11. Universal zero internal jargon across ALL user-facing TSX surfaces + welcome suggestions (DEC-011 / DEC-012 / VUI-UX-JARGON-01)
   for (const uiPath of srcPaths) {
     if (uiPath !== 'src/App.tsx' && !uiPath.startsWith('src/components/')) continue;
     if (!uiPath.endsWith('.tsx') || DEBUG_ONLY_UI_FILES.has(uiPath)) continue;
@@ -475,6 +475,21 @@ export function evaluateVerdantRatchet(snapshot: RatchetSnapshot): RatchetReport
         path: uiPath,
         line: findLineNumber(content, USER_FACING_JARGON_JSX_RE),
         detail: `User-facing JSX exposes technical jargon "${term}" — violates DEC-011 / VUI-UX-JARGON-01`,
+      });
+    }
+  }
+  const obsSrc = snapshot.srcFiles['src/engine/cognitiveObserver.ts'] ?? '';
+  const suggMatch = obsSrc.match(/export const UNIFIED_VERDANT_SUGGESTIONS[\s\S]*?\];/);
+  if (suggMatch) {
+    const jargonInSugg = suggMatch[0].match(
+      /\b(Verdant Engine|vTensor|WASM|OPFS|GGUF|LOD0|SIMD|SharedArrayBuffer|Model Stream|Holon|LexLean|Observer)\b/i,
+    );
+    if (jargonInSugg) {
+      violations.push({
+        category: 'user-facing-jargon',
+        path: 'src/engine/cognitiveObserver.ts',
+        line: findLineNumber(obsSrc, /export const UNIFIED_VERDANT_SUGGESTIONS/),
+        detail: `User-facing welcome suggestion exposes technical jargon "${jargonInSugg[1]}" — violates DEC-011 / VUI-UX-JARGON-01`,
       });
     }
   }

@@ -102,6 +102,7 @@ const VerdantModelContextBridge: FC<{
           recallTurns: (q) =>
             workerClient.cognitiveContext.recallTurns(workerClient.getActiveThreadId(), q),
         },
+        () => workerClient.cognitiveObserver.possession.getActiveCompartmentId(),
       ),
     [workerClient, publishedPrisms, prismPool],
   );
@@ -208,13 +209,21 @@ export default function App() {
     [prismStore, prisms],
   );
 
-  // Sync owned Prisms, active space, and global pause switch into unified possession model
-  const opaqueConstraintsNotice = useMemo(() => {
+  // Sync owned Prisms, active space, and global pause switch into unified possession model,
+  // and filter visible Published Prisms strictly to the active Space (zero cross-space name/detail leaks!)
+  const { opaqueConstraintsNotice, visiblePublishedPrisms } = useMemo(() => {
     workerClient.cognitiveObserver.possession.setActiveCompartment(activeSpace);
     workerClient.cognitiveObserver.possession.setHalted(sharingPaused);
     workerClient.cognitiveObserver.syncPublishedPrisms(prisms);
-    return workerClient.cognitiveObserver.getOpaqueConstraintsPromptForSpace(activeSpace);
-  }, [workerClient, activeSpace, sharingPaused, prisms]);
+    return {
+      opaqueConstraintsNotice:
+        workerClient.cognitiveObserver.getOpaqueConstraintsPromptForSpace(activeSpace),
+      visiblePublishedPrisms: workerClient.cognitiveObserver.getVisiblePublishedPrismsForSpace(
+        publishedPrisms,
+        activeSpace,
+      ),
+    };
+  }, [workerClient, activeSpace, sharingPaused, prisms, publishedPrisms]);
 
   useEffect(() => {
     let toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -455,7 +464,7 @@ export default function App() {
         sampling={engineState.sampling}
         samplingCustomized={engineState.samplingCustomized}
         workerClient={workerClient}
-        publishedPrisms={publishedPrisms}
+        publishedPrisms={visiblePublishedPrisms}
         prismPool={prismPool}
         opaqueConstraintsNotice={opaqueConstraintsNotice}
       />
@@ -641,7 +650,7 @@ export default function App() {
                 onToggleInspector={handleToggleInspector}
                 onOpenPrism={handleOpenPrismApp}
                 onEditPrism={handleEditPrismStudio}
-                publishedPrisms={publishedPrisms}
+                publishedPrisms={visiblePublishedPrisms}
                 onSpeculativeDraftChange={handleSpeculativeDraftChange}
                 onCountTokens={handleCountTokens}
                 onPerceiveImage={handlePerceiveImage}

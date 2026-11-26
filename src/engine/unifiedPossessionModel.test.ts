@@ -285,3 +285,50 @@ test('buildHoloviewSandboxDocument exposes window.verdant alongside prism.invoke
 
   pool.dispose();
 });
+
+test('Unified model enforces Space-scoped Published Prism visibility, organ pruning, thread ownership, and Space-isolated notes', async () => {
+  const observer = new VerdantCognitiveObserver();
+  const store = new PrismStore();
+  const personalProj = await store.createDeclarative('undefined');
+  await store.applyStudioOp(personalProj.id, { op: 'set-metadata', name: 'Healthy Habits' });
+  await store.applyStudioOp(personalProj.id, { op: 'set-concept-profile', compartmentId: 'personal' });
+  await store.publish(personalProj.id);
+
+  const workProj = await store.createDeclarative('undefined');
+  await store.applyStudioOp(workProj.id, { op: 'set-metadata', name: 'Sprint Tracker' });
+  await store.applyStudioOp(workProj.id, { op: 'set-concept-profile', compartmentId: 'work' });
+  await store.publish(workProj.id);
+
+  observer.syncPublishedPrisms(store.list());
+  const allPublished = store.listPublishedSummaries();
+
+  // In Work space, Personal Healthy Habits is NOT exposed as a tool / mention
+  const workVisible = observer.getVisiblePublishedPrismsForSpace(allPublished, 'work');
+  assert.equal(workVisible.some((p) => p.name === 'Sprint Tracker'), true);
+  assert.equal(workVisible.some((p) => p.name === 'Healthy Habits'), false);
+
+  // In Personal space, Healthy Habits IS visible and Sprint Tracker is isolated to Work
+  const personalVisible = observer.getVisiblePublishedPrismsForSpace(allPublished, 'personal');
+  assert.equal(personalVisible.some((p) => p.name === 'Healthy Habits'), true);
+  assert.equal(personalVisible.some((p) => p.name === 'Sprint Tracker'), false);
+
+  // Unpublishing removes the organ cleanly from possession
+  await store.unpublish(personalProj.id);
+  observer.syncPublishedPrisms(store.list());
+  assert.equal(observer.possession.listPublishedOrgans('personal').length, 0);
+
+  // selectRoute binds active thread ownership to active Space (`Observer ⊇ User ⊇ Thread`)
+  observer.possession.setActiveCompartment('work');
+  observer.selectRoute({
+    threadId: 'thread-work-42',
+    messages: [],
+    latestUserText: 'Calculate 7 * 8',
+    hasAttachment: false,
+    activeModel: null,
+    cachedModelIds: [],
+    isToolContinuationStep: false,
+    hasImportedHarness: false,
+  });
+  assert.ok(observer.possession.getUser().ownedThreadIds.includes('thread-work-42'));
+  assert.ok(observer.possession.getUser().compartments.work.ownedThreadIds.includes('thread-work-42'));
+});

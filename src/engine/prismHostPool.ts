@@ -185,8 +185,8 @@ export class PrismHostPool implements PrismBridgeRuntime {
 
         if (!hasRealModel) {
           const notice = state.modelStreamEnabled
-            ? `Model Stream is initializing (${state.progressPercent}%). Try again once ready.`
-            : 'Model Stream is currently Off. Toggle Model Stream on in the top bar to enable local AI inside Prisms.';
+            ? `Local AI is getting ready (${state.progressPercent}%). Try again in a moment.`
+            : 'Local AI is currently off. Turn Local AI on in the top bar to enable on-device AI inside apps.';
           span.addEvent('prism.ask.deferred', { reason: notice }, undefined, 'ok');
           span.end('ok');
           throw new Error(notice);

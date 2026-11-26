@@ -328,6 +328,10 @@ export class MultimodalCoherenceCoordinator {
     return { entry, cacheHit: false };
   }
 
+  getCachedVisual(kappa: string): CachedVisualEncoding | undefined {
+    return this.visualCache.get(kappa);
+  }
+
   getTelemetry(): MultimodalCoherenceTelemetry {
     return {
       activeModalities: Array.from(this.residentSlots.keys()),

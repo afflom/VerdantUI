@@ -5673,6 +5673,7 @@ export class LlamaVTensorRuntime {
     signal?: AbortSignal,
     onPrefillProgress?: (progress: PrefillProgressEvent) => void,
     threadId?: string,
+    prefixEmbeddings?: readonly Float32Array[],
   ): AsyncGenerator<TokenStreamEvent, void, unknown> {
     if (!this.tokenizer || !this.hparams || !this.kvPager) {
       throw new Error('No GGUF model loaded in llama.cpp + vTensor runtime.');
@@ -5687,11 +5688,26 @@ export class LlamaVTensorRuntime {
       this.activeThreadId = threadId;
     }
 
+    // Native coherent multimodal embedding injection: when dimension-matched visual embeddings
+    // (e.g. SigLIP mmproj) are provided, prefill them directly into Layer 0 ahead of text tokens!
+    const validPrefixEmbeddings =
+      prefixEmbeddings &&
+      prefixEmbeddings.length > 0 &&
+      prefixEmbeddings.every((e) => e.length === this.hparams!.embeddingLength)
+        ? prefixEmbeddings
+        : null;
+    let posOffset = 0;
+    if (validPrefixEmbeddings) {
+      this.resetKvCache();
+      const injected = this.prefillEmbeddingSequence(validPrefixEmbeddings, 0, false);
+      posOffset = injected.nextPos;
+    }
+
     const promptTokens = this.tokenizer.encode(prompt, this.tokenizer.addBosToken);
     // Allow users to input up to 100% of the selected model's native context window with zero artificial reservation.
     // On extreme overflow, preserve the leading system/anchor prefix alongside the recent tail so instructions
     // are never amputated and the pinned KV prefix remains reusable!
-    const maxPrompt = Math.max(1, this.maxContextWindow);
+    const maxPrompt = Math.max(1, this.maxContextWindow - posOffset);
     const promptTruncatedTokens = Math.max(0, promptTokens.length - maxPrompt);
     let truncatedPrompt: number[];
     if (promptTokens.length > maxPrompt) {
@@ -5713,7 +5729,10 @@ export class LlamaVTensorRuntime {
     }
 
     // Bit-exact live KV-cache prefix reuse + Unified Virtual Store Q8 block restore
-    const aligned = this.alignAndRestorePrefix(truncatedPrompt, truncatedPrompt.length - 1);
+    const aligned =
+      posOffset > 0
+        ? { commonPrefix: 0, reusedLive: 0, restoredUnified: 0 }
+        : this.alignAndRestorePrefix(truncatedPrompt, truncatedPrompt.length - 1);
     const commonPrefix = aligned.commonPrefix;
     // Pin leading system/anchor KV pages above lossy Cold-Q4 demotion as multi-turn prefix stabilizes
     const anchorPages = Math.max(
@@ -5774,16 +5793,18 @@ export class LlamaVTensorRuntime {
             await this.evalPrefillChunkLayerMajorAsync(
               truncatedPrompt,
               i,
-              i,
+              i + posOffset,
               chunkBatches,
               signal,
               (detail) => emitStageDetail(i - commonPrefix, detail),
             );
           } else {
-            this.evalPrefillChunkLayerMajor(truncatedPrompt, i, i, chunkBatches);
+            this.evalPrefillChunkLayerMajor(truncatedPrompt, i, i + posOffset, chunkBatches);
           }
-          for (let k = 0; k < chunkTokens; k++) {
-            this.cachedTokens.push(truncatedPrompt[i + k]);
+          if (posOffset === 0) {
+            for (let k = 0; k < chunkTokens; k++) {
+              this.cachedTokens.push(truncatedPrompt[i + k]);
+            }
           }
           i += chunkTokens;
 
@@ -5806,15 +5827,17 @@ export class LlamaVTensorRuntime {
             await this.evalPrefillBatch4Async(
               truncatedPrompt,
               i,
-              i,
+              i + posOffset,
               signal,
               (detail) => emitStageDetail(i - commonPrefix, detail),
             );
           } else {
-            this.evalPrefillBatch4(truncatedPrompt, i, i);
+            this.evalPrefillBatch4(truncatedPrompt, i, i + posOffset);
           }
-          for (let k = 0; k < PREFILL_BATCH_SIZE; k++) {
-            this.cachedTokens.push(truncatedPrompt[i + k]);
+          if (posOffset === 0) {
+            for (let k = 0; k < PREFILL_BATCH_SIZE; k++) {
+              this.cachedTokens.push(truncatedPrompt[i + k]);
+            }
           }
           i += PREFILL_BATCH_SIZE;
 
@@ -5832,15 +5855,17 @@ export class LlamaVTensorRuntime {
         if (useAsyncDemand) {
           logits = await this.evalTokenAsync(
             truncatedPrompt[i],
-            i,
+            i + posOffset,
             isLastPrefill,
             signal,
             (detail) => emitStageDetail(i - commonPrefix, detail),
           );
         } else {
-          logits = this.evalToken(truncatedPrompt[i], i, isLastPrefill, isLastPrefill);
+          logits = this.evalToken(truncatedPrompt[i], i + posOffset, isLastPrefill, isLastPrefill);
         }
-        this.cachedTokens.push(truncatedPrompt[i]);
+        if (posOffset === 0) {
+          this.cachedTokens.push(truncatedPrompt[i]);
+        }
         i += 1;
 
         emitStageDetail(i - commonPrefix);
@@ -5864,13 +5889,15 @@ export class LlamaVTensorRuntime {
       }
 
       // Commit completed prompt prefix pages into Unified Virtual Store immediately after prefill
-      this.commitFullPagesToUnifiedStore(this.cachedTokens);
+      if (posOffset === 0) {
+        this.commitFullPagesToUnifiedStore(this.cachedTokens);
+      }
 
       const prefillElapsedSec = Math.max(0.001, (performance.now() - prefillStart) / 1000);
       const observedPrefillTokSec = Number((Math.max(1, tokensToEval) / prefillElapsedSec).toFixed(1));
 
       const decodeStart = performance.now();
-      let pos = truncatedPrompt.length;
+      let pos = posOffset + truncatedPrompt.length;
       let accumulated = '';
       const requestedMaxGen =
         config.fullContextOutput || config.maxTokens <= 0
@@ -5961,7 +5988,9 @@ export class LlamaVTensorRuntime {
           } else {
             logits = this.evalToken(nextToken, pos, step === 0, true);
           }
-          this.cachedTokens.push(nextToken);
+          if (posOffset === 0) {
+            this.cachedTokens.push(nextToken);
+          }
           pos += 1;
         }
       }
@@ -5973,8 +6002,12 @@ export class LlamaVTensorRuntime {
     } finally {
       // Roll back any partially-written KV slots past `cachedTokens.length` (e.g. mid-chunk abort)
       // before committing completed 16-token KV pages into the Unified Store.
-      this.kvPager?.truncateTo(this.cachedTokens.length);
-      this.commitFullPagesToUnifiedStore(this.cachedTokens);
+      if (posOffset === 0) {
+        this.kvPager?.truncateTo(this.cachedTokens.length);
+        this.commitFullPagesToUnifiedStore(this.cachedTokens);
+      } else {
+        this.resetKvCache();
+      }
     }
   }
 }

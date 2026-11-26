@@ -953,10 +953,17 @@ export class VerdantCognitiveObserver {
   readonly possession = new ObserverPossessionStore('personal');
 
   /**
-   * Registers all Published Prisms as active Observer cognitive weight organs and syncs any
-   * opaque schedule constraints declared by Tool Organs (e.g. Healthy Habits in Personal space).
+   * Registers all Published Prisms as active Observer cognitive weight organs, prunes any
+   * unpublished/deleted Prisms cleanly, and syncs opaque schedule constraints declared by
+   * Tool Organs (e.g. Healthy Habits in Personal space).
    */
   syncPublishedPrisms(projects: readonly VerdantPrismProject[]): void {
+    const activeIds = new Set<string>();
+    for (const proj of projects) {
+      if (proj.published) activeIds.add(proj.id);
+    }
+    this.possession.pruneRemovedPrisms(activeIds);
+
     for (const proj of projects) {
       if (!proj.published) continue;
       const decl = proj.declaration;
@@ -986,20 +993,37 @@ export class VerdantCognitiveObserver {
 
       if (proc?.weights.mediaType === 'tool-organ' && proc.weights.scheduleWindows.length > 0) {
         const toolWeights = proc.weights;
-        toolWeights.scheduleWindows.forEach((win, idx) => {
-          this.possession.upsertScheduleConstraint(compartmentId, {
-            id: `${proj.id}:win:${idx}`,
-            privateLabel: win.label,
-            sourcePrismId: proj.id,
-            startMinuteOfDay: win.startMinuteOfDay,
-            endMinuteOfDay: win.endMinuteOfDay,
-            daysOfWeek: win.daysOfWeek,
-            weightQ10: 960,
-            shareOpaqueAvailability: toolWeights.emitsOpaqueConstraints && win.protectedWindow,
-          });
-        });
+        const nextConstraints = toolWeights.scheduleWindows.map((win, idx) => ({
+          id: `${proj.id}:win:${idx}`,
+          privateLabel: win.label,
+          sourcePrismId: proj.id,
+          startMinuteOfDay: win.startMinuteOfDay,
+          endMinuteOfDay: win.endMinuteOfDay,
+          daysOfWeek: win.daysOfWeek,
+          weightQ10: 960,
+          shareOpaqueAvailability: toolWeights.emitsOpaqueConstraints && win.protectedWindow,
+        }));
+        this.possession.replacePrismScheduleConstraints(compartmentId, proj.id, nextConstraints);
       }
     }
+  }
+
+  /**
+   * Filters Published Prisms to ONLY those owned by the active Space (or explicitly `'public'`),
+   * ensuring private Personal/Health Prism names and summaries never leak into Work tools or chat.
+   */
+  getVisiblePublishedPrismsForSpace(
+    allPublished: readonly PublishedPrismSummary[],
+    spaceId?: ContextCompartmentId,
+  ): readonly PublishedPrismSummary[] {
+    const active = spaceId ?? this.possession.getActiveCompartmentId();
+    const organs = this.possession.listPublishedOrgans();
+    if (organs.length === 0) return allPublished;
+    const spaceById = new Map(organs.map((o) => [o.prismId, o.compartmentId] as const));
+    return allPublished.filter((p) => {
+      const ownerSpace = spaceById.get(p.id);
+      return !ownerSpace || ownerSpace === active || ownerSpace === 'public';
+    });
   }
 
   /**
@@ -1073,8 +1097,25 @@ export class VerdantCognitiveObserver {
     certificate: CognitiveRouteCertificate;
     snapshot: CognitiveObserverSnapshot;
   } {
+    const activeSpace = this.possession.getActiveCompartmentId();
+    this.possession.bindThreadToCompartment(ctx.threadId || 'default-thread', activeSpace);
     const mem = this.getOrCreateThread(ctx.threadId);
     const obs = observeInputSensoryState(ctx.messages, ctx.latestUserText, ctx.hasAttachment);
+
+    // Couple active Space's Published Prism cognitive weights (`PublishedPrismOrgan.cognitiveWeightsQ10`)
+    // into the unified model's prior belief (1/8 exact Q10 blend) strictly within the owning Space!
+    const spaceOrgans = this.possession.listPublishedOrgans(activeSpace);
+    let effectivePrior = mem.belief;
+    if (spaceOrgans.length > 0) {
+      const blended: number[] = new Array(COGNITIVE_DIM);
+      for (let i = 0; i < COGNITIVE_DIM; i++) {
+        let sum = 0;
+        for (const o of spaceOrgans) sum += o.cognitiveWeightsQ10[i];
+        const meanOrganQ10 = Math.round(sum / spaceOrgans.length);
+        blended[i] = clampQ10((mem.belief[i] * 7 + meanOrganQ10) >> 3);
+      }
+      effectivePrior = blended as unknown as CognitiveVector;
+    }
 
     // Metacognitive retry detection: same prompt digest re-submitted without a tool continuation
     // means the user clicked Regenerate — treat as prediction error and escalate deductive depth!
@@ -1101,8 +1142,8 @@ export class VerdantCognitiveObserver {
         ]
       : obs.vector;
 
-    const surpriseQ10 = computePredictionSurpriseQ10(mem.belief, escalatedObs);
-    const nextBelief = harmonicIntegrateBelief(mem.belief, escalatedObs, surpriseQ10);
+    const surpriseQ10 = computePredictionSurpriseQ10(effectivePrior, escalatedObs);
+    const nextBelief = harmonicIntegrateBelief(effectivePrior, escalatedObs, surpriseQ10);
 
     mem.belief = nextBelief;
     mem.lastSurpriseQ10 = surpriseQ10;
@@ -1404,27 +1445,27 @@ export class VerdantCognitiveObserver {
 // ============================================================================
 
 export const UNIFIED_VERDANT_SYSTEM_PROMPT = [
-  'You are VerdantUI, a unified local AI assistant running 100% privately in the user\'s browser on the Verdant WASM SIMD engine.',
+  'You are VerdantUI, a unified private AI assistant running 100% locally in the user\'s browser.',
   'Be accurate, clear, and concise. When working through complex problems inside <think>...</think>, verify edge cases before giving a crisp final answer.',
   'When <tools> are provided and a local tool helps answer accurately or take an action, call it with exact JSON inside <tool_call>...</tool_call> and stop immediately after </tool_call> to await <tool_response>. Never fabricate tool results.',
 ].join('\n');
 
 export const UNIFIED_VERDANT_SUGGESTIONS: readonly HarnessSuggestionSpec[] = [
   {
-    label: 'Exact verified math (Instant LOD0)',
+    label: 'Quick exact math',
     prompt: 'Calculate (144 * 37) + sqrt(625)',
   },
   {
-    label: 'Inspect live Verdant engine',
-    prompt: 'Inspect my local Verdant runtime and OPFS storage',
+    label: 'Plan my afternoon',
+    prompt: 'Help me schedule a focused 45-minute project review without conflicting with my busy times.',
   },
   {
-    label: 'Deep algorithmic reasoning',
-    prompt: 'Compare lock-free ring buffers vs Atomics.wait barriers for a SharedArrayBuffer WASM thread pool.',
+    label: 'Brainstorm a project',
+    prompt: 'Give me 4 creative ideas for a relaxing puzzle game I can build in Studio.',
   },
   {
-    label: 'Clear technical summary',
-    prompt: 'Explain how WebAssembly SIMD speeds up quantized LLM inference in 4 concise bullet points.',
+    label: 'Summarize clearly',
+    prompt: 'Explain the key benefits of keeping personal AI completely on-device in 4 short bullet points.',
   },
 ];
 
@@ -1510,6 +1551,7 @@ export function createVerdantClientTools(
   getSnapshot: () => RuntimeToolSnapshot,
   publishedPrismBridge?: PublishedPrismToolBridge,
   episodicRecallBridge?: EpisodicRecallToolBridge,
+  getActiveSpace?: () => ContextCompartmentId,
 ): Record<string, Tool<any, any>> {
   const tools: Record<string, Tool<any, any>> = {
     calculate: {
@@ -1623,22 +1665,27 @@ export function createVerdantClientTools(
       },
       execute: async (args: { action?: string; title?: string; content?: string }) => {
         const action = String(args?.action ?? 'list').toLowerCase();
+        const space = getActiveSpace ? getActiveSpace() : 'personal';
+        const prefix = `space:${space}:`;
         const notes = readWorkspaceNotes();
         if (action === 'list') {
-          const list = Object.values(notes).map((n) => ({
-            title: n.title,
-            updatedAt: n.updatedAt,
-            chars: n.content.length,
-          }));
+          const list = Object.entries(notes)
+            .filter(([k]) => (getActiveSpace ? k.startsWith(prefix) : k.startsWith(prefix) || !k.startsWith('space:')))
+            .map(([, n]) => ({
+              title: n.title,
+              updatedAt: n.updatedAt,
+              chars: n.content.length,
+            }));
           return { action: 'list', count: list.length, notes: list };
         }
         const title = String(args?.title ?? '').trim();
         if (!title) {
           throw new Error('Note title is required for read/write/delete.');
         }
-        const key = title.toLowerCase();
+        const key = `${prefix}${title.toLowerCase()}`;
+        const legacyKey = title.toLowerCase();
         if (action === 'read') {
-          const found = notes[key];
+          const found = notes[key] ?? (!getActiveSpace ? notes[legacyKey] : undefined);
           if (!found) return { action: 'read', found: false, title };
           return { action: 'read', found: true, note: found };
         }
@@ -1654,8 +1701,9 @@ export function createVerdantClientTools(
           return { action: 'write', saved: true, note };
         }
         if (action === 'delete') {
-          const existed = Object.hasOwn(notes, key);
+          const existed = Object.hasOwn(notes, key) || (!getActiveSpace && Object.hasOwn(notes, legacyKey));
           delete notes[key];
+          if (!getActiveSpace) delete notes[legacyKey];
           writeWorkspaceNotes(notes);
           return { action: 'delete', deleted: existed, title };
         }
