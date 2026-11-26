@@ -32,6 +32,25 @@
         "VUI-FEAT-006"
       ],
       "summary": "Verdant Studio Product & Feature Lifecycle Governance & Automated Releases; Free Public Benefit Service & Zero-Jargon Permanent Ratchets"
+    },
+    {
+      "version": "0.3.0",
+      "tag": "v0.3.0",
+      "releasedAt": "2026-11-26T19:50:01.150Z",
+      "commit": "c3a3129659c1411b8a5d30a44a05fa1b27403ac4",
+      "engineTag": "v2.22.4",
+      "studioCommit": "da5083b5ee22e2d9942acee0e03a5b1a0a22e091",
+      "activeFeatureIds": [
+        "VUI-FEAT-001",
+        "VUI-FEAT-002",
+        "VUI-FEAT-003",
+        "VUI-FEAT-004",
+        "VUI-FEAT-005",
+        "VUI-FEAT-006",
+        "VUI-FEAT-007",
+        "VUI-FEAT-008"
+      ],
+      "summary": "Procedural MediaType Prism Synthesis, Sparse Studio Activation & Multi-Modal Weight Routing; Unified Possession Model, Non-Leaking Cross-Context Boundary & Active Published Prism Organs"
     }
   ]
 }
