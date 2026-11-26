@@ -164,18 +164,22 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     setProposedOps(null);
     setTestAnswer(null);
     setAppPrismModalOpen(false);
+    setPreviewPaneMode('preview');
     setRecentEvents(bus.getRecentEvents({ endpointId: project.id }).slice(-12));
   }, [project.id, project.draft.name, bus]);
 
-  // Close App-mode Prism modal cleanly on Escape
+  // Escape closes Prism inspector back to Preview (Studio mode) or App (App mode)
   useEffect(() => {
-    if (!appPrismModalOpen) return;
+    if (!appPrismModalOpen && previewPaneMode !== 'prism') return;
     const onKey = (ev: KeyboardEvent) => {
-      if (ev.key === 'Escape') setAppPrismModalOpen(false);
+      if (ev.key === 'Escape') {
+        if (appPrismModalOpen) setAppPrismModalOpen(false);
+        if (previewPaneMode === 'prism') setPreviewPaneMode('preview');
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [appPrismModalOpen]);
+  }, [appPrismModalOpen, previewPaneMode]);
 
   // Subscribe to OTel events for this Prism
   useEffect(() => {
@@ -603,33 +607,45 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     ? (project.declarationRevisions?.length ?? 0) > 0
     : project.revisions.length > 0;
 
-  const renderPrismInspector = () => (
-    <div className="flex h-full min-h-0 flex-col bg-white dark:bg-[#0B0F14]">
-      <div className="flex shrink-0 items-center gap-1 border-b border-zinc-200 px-4 py-2 dark:border-zinc-800">
-        {(
-          [
-            ['overview', 'Overview', ShieldCheck],
-            ['package', 'Package (.holo)', FileCheck2],
-            ...(compiled ? [['compiled', 'Compiled Files', Code2] as const] : []),
-          ] as readonly [PrismPanelTab, string, typeof ShieldCheck][]
-        ).map(([id, label, Icon]) => (
+  const renderPrismInspector = (onClose?: () => void, closeLabel = 'Back to Preview') => (
+    <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-white dark:bg-[#0B0F14]">
+      <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-zinc-200 px-4 py-2 dark:border-zinc-800">
+        <div className="flex flex-wrap items-center gap-1">
+          {(
+            [
+              ['overview', 'Overview', ShieldCheck],
+              ['package', 'Package (.holo)', FileCheck2],
+              ...(compiled ? [['compiled', 'Compiled Files', Code2] as const] : []),
+            ] as readonly [PrismPanelTab, string, typeof ShieldCheck][]
+          ).map(([id, label, Icon]) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => setPanelTab(id)}
+              className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+                panelTab === id
+                  ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
+                  : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              <Icon className="h-3.5 w-3.5" />
+              {label}
+            </button>
+          ))}
+        </div>
+        {onClose && (
           <button
-            key={id}
             type="button"
-            onClick={() => setPanelTab(id)}
-            className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
-              panelTab === id
-                ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
-                : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
-            }`}
+            onClick={onClose}
+            className="inline-flex shrink-0 items-center gap-1 rounded-md border border-zinc-200 px-2.5 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800"
           >
-            <Icon className="h-3.5 w-3.5" />
-            {label}
+            <Eye className="h-3.5 w-3.5" />
+            <span>{closeLabel}</span>
           </button>
-        ))}
+        )}
       </div>
 
-      <div className="flex-1 overflow-y-auto p-4 text-xs">
+      <div className="min-h-0 min-w-0 flex-1 overflow-y-auto p-4 text-xs">
         {panelTab === 'overview' && (
           <div className="space-y-4">
             {/* Honest Claim Verification Cards */}
@@ -902,7 +918,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
         )}
 
         {panelTab === 'compiled' && compiled && (
-          <div className="flex h-full min-h-[360px] flex-col gap-2">
+          <div className="flex h-full min-h-0 min-w-0 flex-col gap-2">
             <div className="flex flex-wrap items-center justify-between gap-1">
               <div className="flex flex-wrap gap-1">
                 {Object.keys(compiled.files).map((filePath) => (
@@ -933,7 +949,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                 {compiledCopied ? 'Copied' : 'Copy'}
               </button>
             </div>
-            <pre className="flex-1 overflow-auto rounded-lg border border-zinc-200 bg-zinc-50 p-3 font-mono text-[11px] leading-relaxed text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-200">
+            <pre className="min-h-[260px] w-full max-w-full flex-1 overflow-auto rounded-lg border border-zinc-200 bg-zinc-50 p-3 font-mono text-[11px] leading-relaxed text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-200">
               {compiled.files[selectedCompiledFile] ?? ''}
             </pre>
           </div>
@@ -1073,11 +1089,16 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
           {mode === 'app' && (
             <button
               type="button"
-              onClick={() => setAppPrismModalOpen(true)}
-              className="inline-flex h-7 items-center gap-1 rounded-md border border-zinc-200 px-2.5 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800"
+              aria-pressed={appPrismModalOpen}
+              onClick={() => setAppPrismModalOpen((v) => !v)}
+              className={`inline-flex h-7 items-center gap-1 rounded-md border px-2.5 text-xs font-medium transition-colors ${
+                appPrismModalOpen
+                  ? 'border-emerald-600 bg-emerald-50 text-emerald-900 dark:border-emerald-500 dark:bg-emerald-950/60 dark:text-emerald-200'
+                  : 'border-zinc-200 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800'
+              }`}
             >
               <Layers className="h-3.5 w-3.5" />
-              Prism
+              {appPrismModalOpen ? 'Back to App' : 'Prism'}
             </button>
           )}
 
@@ -1085,7 +1106,10 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
             <div className="inline-flex rounded-lg border border-zinc-200 bg-zinc-100 p-0.5 text-[11px] dark:border-zinc-700 dark:bg-zinc-900">
               <button
                 type="button"
-                onClick={() => onChangeMode('studio')}
+                onClick={() => {
+                  setAppPrismModalOpen(false);
+                  onChangeMode('studio');
+                }}
                 className={`rounded-md px-2 py-0.5 font-medium transition-colors ${
                   mode === 'studio'
                     ? 'bg-white text-zinc-900 shadow-xs dark:bg-zinc-800 dark:text-zinc-100'
@@ -1097,7 +1121,10 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
               <button
                 type="button"
                 disabled={!isPublished}
-                onClick={() => onChangeMode('app')}
+                onClick={() => {
+                  setAppPrismModalOpen(false);
+                  onChangeMode('app');
+                }}
                 className={`rounded-md px-2 py-0.5 font-medium transition-colors disabled:opacity-40 ${
                   mode === 'app'
                     ? 'bg-white text-zinc-900 shadow-xs dark:bg-zinc-800 dark:text-zinc-100'
@@ -1146,64 +1173,61 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
 
       {/* Main Content Stage */}
       {mode === 'app' ? (
-        <div className="relative min-h-0 flex-1">
-          <PrismSandboxFrame
-            prismId={project.id}
-            snapshot={activeSnapshot}
-            holoview={holoviewConfig}
-            darkMode={effectivePreviewDark}
-            bus={bus}
-            bridgeRuntime={bridgeRuntime}
-            reloadNonce={reloadNonce}
-            onRuntimeError={setRuntimeError}
-            className="h-full w-full border-0"
-          />
+        <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
+          <div className={`h-full w-full ${appPrismModalOpen ? 'invisible pointer-events-none' : ''}`}>
+            <PrismSandboxFrame
+              prismId={project.id}
+              snapshot={activeSnapshot}
+              holoview={holoviewConfig}
+              darkMode={effectivePreviewDark}
+              bus={bus}
+              bridgeRuntime={bridgeRuntime}
+              reloadNonce={reloadNonce}
+              onRuntimeError={setRuntimeError}
+              className="h-full w-full border-0"
+            />
+          </div>
           {appPrismModalOpen && (
-            <div
-              className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 backdrop-blur-xs"
-              onClick={() => setAppPrismModalOpen(false)}
-            >
-              <div
-                className="flex h-[80vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-800 dark:bg-[#0B0F14]"
-                onClick={(e) => e.stopPropagation()}
-              >
-                <div className="flex items-center justify-between border-b border-zinc-200 px-4 py-2.5 dark:border-zinc-800">
-                  <div className="flex items-center gap-2">
-                    <Layers className="h-4 w-4 text-emerald-600" />
-                    <span className="text-sm font-semibold">{project.draft.name} · Prism Package</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {!isExternalHolo && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setAppPrismModalOpen(false);
-                          onChangeMode('studio');
-                        }}
-                        className="inline-flex items-center gap-1 rounded-md border border-zinc-200 px-2.5 py-1 text-xs font-medium hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
-                      >
-                        <ExternalLink className="h-3 w-3" />
-                        Open in Studio
-                      </button>
-                    )}
+            <div className="absolute inset-0 z-20 flex flex-col overflow-hidden bg-white dark:bg-[#0B0F14]">
+              <div className="flex shrink-0 items-center justify-between border-b border-zinc-200 px-4 py-2 dark:border-zinc-800">
+                <div className="flex items-center gap-2">
+                  <Layers className="h-4 w-4 text-emerald-600" />
+                  <span className="text-sm font-semibold">{project.draft.name} · Prism Package</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  {!isExternalHolo && (
                     <button
                       type="button"
-                      onClick={() => setAppPrismModalOpen(false)}
-                      className="rounded p-1 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                      onClick={() => {
+                        setAppPrismModalOpen(false);
+                        onChangeMode('studio');
+                      }}
+                      className="inline-flex items-center gap-1 rounded-md border border-zinc-200 px-2.5 py-1 text-xs font-medium hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
                     >
-                      <X className="h-4 w-4" />
+                      <ExternalLink className="h-3 w-3" />
+                      Open in Studio
                     </button>
-                  </div>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setAppPrismModalOpen(false)}
+                    className="inline-flex items-center gap-1 rounded-md bg-zinc-900 px-2.5 py-1 text-xs font-medium text-white hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                    Close
+                  </button>
                 </div>
-                <div className="min-h-0 flex-1">{renderPrismInspector()}</div>
+              </div>
+              <div className="min-h-0 min-w-0 flex-1 overflow-hidden">
+                {renderPrismInspector(() => setAppPrismModalOpen(false), 'Back to App')}
               </div>
             </div>
           )}
         </div>
       ) : (
-        <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden lg:flex-row">
           {/* Left Pane: Declarative Studio API Builder */}
-          <div className="flex h-1/2 min-h-0 w-full flex-col border-b border-zinc-200 lg:h-full lg:w-[440px] lg:shrink-0 lg:border-r lg:border-b-0 dark:border-zinc-800">
+          <div className="flex h-1/2 min-h-0 min-w-0 w-full flex-col overflow-hidden border-b border-zinc-200 lg:h-full lg:w-[440px] lg:shrink-0 lg:border-r lg:border-b-0 dark:border-zinc-800">
             {isDeclarative && declaration && checkReport ? (
               <StudioDeclarativeBuilder
                 key={project.id}
@@ -1252,11 +1276,12 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
           </div>
 
           {/* Right Pane: Live Compiled Preview with `Preview | Prism` Toggle */}
-          <div className="flex min-h-0 flex-1 flex-col">
-            <div className="flex shrink-0 items-center justify-between gap-2 border-b border-zinc-200 bg-white px-3 py-1.5 dark:border-zinc-800 dark:bg-[#0E131B]">
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+            <div className="relative z-20 flex shrink-0 items-center justify-between gap-2 border-b border-zinc-200 bg-white px-3 py-1.5 dark:border-zinc-800 dark:bg-[#0E131B]">
               <div className="inline-flex rounded-lg border border-zinc-200 bg-zinc-100 p-0.5 text-xs dark:border-zinc-700 dark:bg-zinc-900">
                 <button
                   type="button"
+                  aria-pressed={previewPaneMode === 'preview'}
                   onClick={() => setPreviewPaneMode('preview')}
                   className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 font-medium transition-colors ${
                     previewPaneMode === 'preview'
@@ -1269,7 +1294,8 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                 </button>
                 <button
                   type="button"
-                  onClick={() => setPreviewPaneMode('prism')}
+                  aria-pressed={previewPaneMode === 'prism'}
+                  onClick={() => setPreviewPaneMode((m) => (m === 'prism' ? 'preview' : 'prism'))}
                   className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 font-medium transition-colors ${
                     previewPaneMode === 'prism'
                       ? 'bg-white text-zinc-900 shadow-xs dark:bg-zinc-800 dark:text-zinc-100'
@@ -1371,7 +1397,9 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
               </div>
 
               {previewPaneMode === 'prism' && (
-                <div className="absolute inset-0 z-10">{renderPrismInspector()}</div>
+                <div className="absolute inset-0 z-10 overflow-hidden">
+                  {renderPrismInspector(() => setPreviewPaneMode('preview'), 'Back to Preview')}
+                </div>
               )}
             </div>
 
