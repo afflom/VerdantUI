@@ -61,3 +61,8 @@
 
 - **Requirements:** `REQ-ZERO-USER-TUNABLES`, `REQ-COHERENT-MULTIMODAL-SENSES`
 - **Decision:** "Take all jargon and bloat out of VerdantUI. Do not introduce a bunch of tunables to the user. Users are not going to be uploading their own weights or models. Coherent multi-modal models enabled by verdant-engine improve the performance of VerdantUI."
+
+## DEC-013 (2026-11-26)
+
+- **Requirements:** `REQ-AUTO-MEDIATYPE-INFERENCE`, `REQ-PRISM-BACKED-TOOL-CALLS`
+- **Decision:** "Instead of exposing more clutter in the UI/UX such as the mediatype selection buttons, the model will select these for the user based on the user's natural language input. When a model attempts a tool-call, the tool called will be a prism. If no prism exists to meet the model's requirement, the model can create a prism, so that it can use its Prism to perform the task of its tool-call."

@@ -301,6 +301,7 @@ const VerdantToolCallPart: ToolCallMessagePartComponent = ({
     typeof result === 'object' &&
     (result as Record<string, unknown>).__prismInvocation === true
       ? (result as {
+          autoCreated?: boolean;
           prismId: string;
           prismName: string;
           digest: string;
@@ -338,6 +339,11 @@ const VerdantToolCallPart: ToolCallMessagePartComponent = ({
             )}
             <Sparkles className="h-3.5 w-3.5 shrink-0 text-emerald-700 dark:text-emerald-400" />
             <span className="truncate">{prismPayload.prismName}</span>
+            {prismPayload.autoCreated && (
+              <span className="rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-800 dark:bg-emerald-900/60 dark:text-emerald-200">
+                Created
+              </span>
+            )}
             <span className="font-mono text-[10px] font-normal text-emerald-800/75 dark:text-emerald-400/75">
               #{shortPrismDigest(prismPayload.digest)}
             </span>

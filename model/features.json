@@ -99,6 +99,17 @@
       "invariantId": "VUI-ENGINE-01",
       "citation": { "kind": "req", "decisionId": "DEC-012" },
       "publicBenefitImpact": "Unifies real on-device vision (SigLIP), speech (Whisper), 1-step image creation, and multi-track stereo modal audio on one shared verdant-engine substrate with zero user tunables or technical jargon."
+    },
+    {
+      "id": "VUI-FEAT-010",
+      "title": "Autonomous Prism-Backed Chat Tool-Calls & Natural-Language MediaType Selection",
+      "stage": "active",
+      "introducedIn": "0.5.0",
+      "ownerFile": "src/engine/prismToolResolver.ts",
+      "testFile": "src/engine/prismToolResolver.test.ts",
+      "invariantId": "VUI-STUDIO-02",
+      "citation": { "kind": "req", "decisionId": "DEC-013" },
+      "publicBenefitImpact": "Eliminates mediatype button clutter by inferring creation types automatically from natural language and resolves every model tool-call in chat through a Space-isolated Prism, autonomously synthesizing missing Prisms on demand."
     }
   ]
 }

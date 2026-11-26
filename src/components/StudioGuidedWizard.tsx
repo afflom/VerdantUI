@@ -90,16 +90,6 @@ const STARTER_SUGGESTIONS: readonly string[] = [
   'Healthy Habits: protect 5pm to 6pm daily for exercise',
 ];
 
-const MEDIA_PILL_ORDER: readonly PrismMediaType[] = [
-  'interactive-game',
-  'picture',
-  'audio',
-  'written-work',
-  'video',
-  'research-program',
-  'tool-organ',
-];
-
 function isAbortError(err: unknown): boolean {
   return (
     (err instanceof DOMException && err.name === 'AbortError') ||
@@ -130,19 +120,11 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
   const [thinking, setThinking] = useState(false);
   const [phaseLabel, setPhaseLabel] = useState('Designing…');
   const [agentQuickReplies, setAgentQuickReplies] = useState<readonly string[] | null>(null);
-  const [selectedMediaType, setSelectedMediaType] = useState<PrismMediaType | null>(
-    () => declaration.view?.proceduralOrgan?.mediaType ?? declaration.concept.mediaType ?? null,
-  );
 
   const scrollEndRef = useRef<HTMLDivElement | null>(null);
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
   const runTokenRef = useRef(0);
-
-  useEffect(() => {
-    const declMedia = declaration.view?.proceduralOrgan?.mediaType ?? declaration.concept.mediaType ?? null;
-    if (declMedia) setSelectedMediaType(declMedia);
-  }, [declaration.concept.mediaType, declaration.view?.proceduralOrgan]);
 
   const currentPrompt = useMemo(
     () => buildStudioPromptForStep(declaration, routing, checkReport, activeStep),
@@ -221,17 +203,15 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
 
       const classified = classifyArtifactMediaType(message);
       const isProceduralFlow =
-        selectedMediaType !== null ||
         Boolean(declaration.view?.proceduralOrgan) ||
+        Boolean(declaration.concept.mediaType) ||
         classified.mode === 'procedural-organ';
 
       if (isProceduralFlow) {
         const activeMediaType: PrismMediaType =
-          selectedMediaType ??
           declaration.view?.proceduralOrgan?.mediaType ??
           declaration.concept.mediaType ??
           classified.mediaType;
-        setSelectedMediaType(activeMediaType);
 
         const runToken = ++runTokenRef.current;
         const userTurns = nextHistory.filter((t) => t.role === 'user').length;
@@ -352,7 +332,6 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
       onSelectStep,
       onSynthesizeWithLocalModel,
       routing.isUndefined,
-      selectedMediaType,
       thinking,
     ],
   );
@@ -369,40 +348,12 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
   }, [activeStep, agentQuickReplies, currentPrompt.quickReplies, routing.isUndefined]);
 
   const activeMediaForUi =
-    selectedMediaType ?? declaration.view?.proceduralOrgan?.mediaType ?? declaration.concept.mediaType ?? null;
+    declaration.view?.proceduralOrgan?.mediaType ?? declaration.concept.mediaType ?? null;
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col bg-white dark:bg-[#0E131B]">
-      {/* Creation Type Rail */}
-      <div className="flex shrink-0 flex-wrap items-center justify-between gap-1.5 border-b border-zinc-100 bg-zinc-50/70 px-3 py-2 dark:border-zinc-800/80 dark:bg-[#0B0F14]">
-        <div className="flex flex-wrap items-center gap-1">
-          {MEDIA_PILL_ORDER.map((mt) => {
-            const selected = activeMediaForUi === mt;
-            return (
-              <button
-                key={mt}
-                type="button"
-                onClick={() => setSelectedMediaType(selected ? null : mt)}
-                className={`rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors ${
-                  selected
-                    ? 'bg-emerald-700 text-white'
-                    : 'border border-zinc-200 bg-white text-zinc-600 hover:border-emerald-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300'
-                }`}
-              >
-                {PRISM_MEDIA_CATALOG[mt].label}
-              </button>
-            );
-          })}
-        </div>
-        {isLoadingAi && (
-          <span className="text-[10px] font-medium text-zinc-500 tabular-nums">
-            Preparing AI {Math.round(engineProgressPercent)}%
-          </span>
-        )}
-      </div>
-
-      {/* Space & Privacy Bar */}
-      {(activeMediaForUi !== null || declaration.concept.compartmentId) && (
+      {/* Space & Privacy Bar (shown cleanly without media-type button clutter; model infers type automatically) */}
+      {(activeMediaForUi !== null || declaration.concept.compartmentId || isLoadingAi) && (
         <div className="flex shrink-0 flex-wrap items-center justify-between gap-1.5 border-b border-zinc-100 bg-white px-3 py-1.5 text-[11px] dark:border-zinc-800/80 dark:bg-[#0E131B]">
           <div className="flex items-center gap-1">
             <span className="font-medium text-zinc-500 dark:text-zinc-400">Space:</span>
@@ -425,27 +376,34 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
               );
             })}
           </div>
-          {declaration.view?.proceduralOrgan?.weights.mediaType === 'tool-organ' && (
-            <button
-              type="button"
-              role="switch"
-              aria-checked={declaration.view.proceduralOrgan.weights.emitsOpaqueConstraints}
-              onClick={() => void handleToggleOpaqueSharing()}
-              className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors ${
-                declaration.view.proceduralOrgan.weights.emitsOpaqueConstraints
-                  ? 'border-emerald-500/50 bg-emerald-50 text-emerald-800 dark:border-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300'
-                  : 'border-zinc-200 bg-zinc-50 text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400'
-              }`}
-              title="Share busy time blocks across spaces without revealing any private details"
-            >
-              <Shield className="h-2.5 w-2.5" />
-              <span>
-                {declaration.view.proceduralOrgan.weights.emitsOpaqueConstraints
-                  ? 'Share busy times only (never details)'
-                  : 'Private to this space only'}
+          <div className="flex items-center gap-1.5">
+            {isLoadingAi && (
+              <span className="text-[10px] font-medium text-zinc-500 tabular-nums">
+                Preparing AI {Math.round(engineProgressPercent)}%
               </span>
-            </button>
-          )}
+            )}
+            {declaration.view?.proceduralOrgan?.weights.mediaType === 'tool-organ' && (
+              <button
+                type="button"
+                role="switch"
+                aria-checked={declaration.view.proceduralOrgan.weights.emitsOpaqueConstraints}
+                onClick={() => void handleToggleOpaqueSharing()}
+                className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors ${
+                  declaration.view.proceduralOrgan.weights.emitsOpaqueConstraints
+                    ? 'border-emerald-500/50 bg-emerald-50 text-emerald-800 dark:border-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300'
+                    : 'border-zinc-200 bg-zinc-50 text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400'
+                }`}
+                title="Share busy time blocks across spaces without revealing any private details"
+              >
+                <Shield className="h-2.5 w-2.5" />
+                <span>
+                  {declaration.view.proceduralOrgan.weights.emitsOpaqueConstraints
+                    ? 'Share busy times only (never details)'
+                    : 'Private to this space only'}
+                </span>
+              </button>
+            )}
+          </div>
         </div>
       )}
 

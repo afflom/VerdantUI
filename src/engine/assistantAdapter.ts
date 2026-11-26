@@ -928,6 +928,23 @@ export interface StudioAdapterBridge {
   readonly bus: ObserverStreamBus;
   getPublishedPrisms(): readonly PublishedPrismSummary[];
   onOpenPrism?: (prismId: string) => void;
+  /**
+   * Resolves any model `<tool_call>` not satisfied by an already-registered tool:
+   * reuses an existing Space-visible Published Prism or autonomously creates, publishes,
+   * and executes a new procedural Prism in the active Space (`DEC-013`).
+   */
+  resolveOrCreatePrismForToolCall?: (
+    toolName: string,
+    args: Record<string, unknown>,
+    meta: { readonly latestUserText: string; readonly signal?: AbortSignal },
+  ) => Promise<{
+    readonly __prismInvocation: true;
+    readonly autoCreated: boolean;
+    readonly prismId: string;
+    readonly prismName: string;
+    readonly digest: string;
+    readonly output: unknown;
+  }>;
 }
 
 export function createLlamaVTensorAdapter(
@@ -1129,7 +1146,9 @@ export function createLlamaVTensorAdapter(
       const allTools =
         context?.tools && Object.keys(context.tools).length > 0 ? context.tools : undefined;
       const activeTools = certificate.attachTools ? allTools : undefined;
-      const parseToolCalls = Boolean(activeTools);
+      // Always parse `<tool_call>...</tool_call>` if the model emits one so spontaneous tool calls
+      // NEVER leak raw XML to the user and instead resolve cleanly through Prisms (`DEC-013`).
+      const parseToolCalls = true;
 
       const systemMessage = context?.system ?? UNIFIED_VERDANT_SYSTEM_PROMPT;
       const baseSampling = state.samplingCustomized
@@ -1255,14 +1274,72 @@ export function createLlamaVTensorAdapter(
         return;
       }
 
-      const finalParts = parseAssistantStreamParts(latestText, true, {
+      const rawFinalParts = parseAssistantStreamParts(latestText, true, {
         startsInReasoning,
         parseToolCalls,
         idPrefix: stepIdPrefix,
       });
+
+      // Autonomous Prism Tool-Call Resolution (`DEC-013`):
+      // Any `<tool_call>` whose `toolName` is not already registered in `context.tools`
+      // is resolved through a Published Prism — automatically synthesizing & publishing a new
+      // procedural Prism in the active Space if none exists yet!
+      const registeredTools = context?.tools ?? {};
+      const finalParts: ParsedAssistantContentPart[] = [];
+      let hasUnresolvedToolCalls = false;
+      const autoCreatedPrisms: string[] = [];
+
+      for (const part of rawFinalParts) {
+        if (part.type !== 'tool-call') {
+          finalParts.push(part);
+          continue;
+        }
+        const registered = registeredTools[part.toolName];
+        if (registered?.execute) {
+          hasUnresolvedToolCalls = true;
+          finalParts.push(part);
+          continue;
+        }
+        if (studioBridge?.resolveOrCreatePrismForToolCall) {
+          try {
+            const prismResult = await studioBridge.resolveOrCreatePrismForToolCall(
+              part.toolName,
+              (part.args && typeof part.args === 'object' ? part.args : {}) as Record<string, unknown>,
+              { latestUserText, signal: abortSignal },
+            );
+            if (prismResult.autoCreated) {
+              autoCreatedPrisms.push(prismResult.prismName);
+            }
+            finalParts.push({
+              ...part,
+              result: prismResult,
+            });
+          } catch (err) {
+            finalParts.push({
+              ...part,
+              isError: true,
+              result: err instanceof Error ? err.message : String(err),
+            });
+          }
+        } else {
+          hasUnresolvedToolCalls = true;
+          finalParts.push(part);
+        }
+      }
+
+      if (
+        autoCreatedPrisms.length > 0 &&
+        !finalParts.some((p) => p.type === 'text' && p.text.trim().length > 0)
+      ) {
+        finalParts.push({
+          type: 'text',
+          text: `Created and ran **${autoCreatedPrisms.join(', ')}** to handle this request. Open it above to interact or customize it in Studio.`,
+        });
+      }
+
       const totalStreamTime = Date.now() - streamStartTime;
       const toolCallsEmitted = finalParts.filter((p) => p.type === 'tool-call');
-      const hasToolCalls = toolCallsEmitted.length > 0;
+      const hasToolCalls = hasUnresolvedToolCalls;
       if (hasToolCalls && studioBridge && turnSpan) {
         // Keep active W3C trace context available while Assistant-UI's ToolInvocationTracker runs tools
         studioBridge.bus.setActiveTraceContext(turnSpan.context);

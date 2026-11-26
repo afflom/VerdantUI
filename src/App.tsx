@@ -37,6 +37,7 @@ import { isInternalBootstrapModel } from './engine/modelCatalog';
 import { ObserverStreamBus } from './engine/observerStreamBus';
 import { PrismBuildWorkerClient } from './engine/prismBuildClient';
 import { PrismHostPool } from './engine/prismHostPool';
+import { resolveOrCreatePrismForToolCall } from './engine/prismToolResolver';
 import {
   PrismStore,
   type PublishedPrismSummary,
@@ -161,12 +162,26 @@ export default function App() {
     () =>
       createLlamaVTensorAdapter(workerClient, {
         bus: observerBus,
-        getPublishedPrisms: () => prismStore.listPublishedSummaries(),
+        getPublishedPrisms: () =>
+          workerClient.cognitiveObserver.getVisiblePublishedPrismsForSpace(
+            prismStore.listPublishedSummaries(),
+          ),
         onOpenPrism: (prismId) => {
           setActiveView({ kind: 'prism', prismId, mode: 'app' });
         },
+        resolveOrCreatePrismForToolCall: (toolName, args, meta) =>
+          resolveOrCreatePrismForToolCall({
+            toolName,
+            args,
+            latestUserText: meta.latestUserText,
+            activeSpace: workerClient.cognitiveObserver.possession.getActiveCompartmentId(),
+            store: prismStore,
+            pool: prismPool,
+            observer: workerClient.cognitiveObserver,
+            signal: meta.signal,
+          }),
       }),
-    [workerClient, observerBus, prismStore],
+    [workerClient, observerBus, prismStore, prismPool],
   );
   const attachmentAdapter = useMemo(() => new SimpleTextAttachmentAdapter(), []);
   const threadListAdapter = useMemo(() => createVTensorThreadListAdapter(), []);
