@@ -47,7 +47,6 @@ import type { EngineState } from '../engine/workerClient';
 
 interface ThreadViewProps {
   engineState: EngineState;
-  onOpenModels: () => void;
   onCancelDownload: () => void;
   onRetryLoad?: () => void;
   onDismissError?: () => void;
@@ -548,7 +547,6 @@ const AssistantMessage: FC = () => {
 
 export const ThreadView: FC<ThreadViewProps> = ({
   engineState,
-  onOpenModels,
   onCancelDownload,
   onRetryLoad,
   onDismissError,
@@ -817,12 +815,10 @@ export const ThreadView: FC<ThreadViewProps> = ({
                 <span aria-hidden="true">·</span>
                 <button
                   type="button"
-                  onClick={onOpenModels}
+                  onClick={onToggleInspector}
                   className="max-w-[200px] truncate font-medium text-slate-700 hover:text-emerald-800 dark:text-slate-300 dark:hover:text-emerald-400 transition-colors"
                 >
-                  {isBootstrapUnbound
-                    ? 'VerdantUI · Instant'
-                    : (engineState.model?.displayName ?? 'VerdantUI')}
+                  VerdantUI
                 </button>
                 <ComposerContextMeter
                   engineState={engineState}

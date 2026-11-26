@@ -972,7 +972,7 @@ export function createLlamaVTensorAdapter(
             content: [
               {
                 type: 'text' as const,
-                text: 'Model Stream is currently **Off**. Toggle **Model Stream** on in the top bar to stream and cache VerdantUI\'s local neural weights, or open a local `.gguf` file in **Storage**.\n\n*(Verified local actions like exact math, runtime inspection, and JSON validation work immediately even while Model Stream is off.)*',
+                text: 'Model Stream is currently **Off**. Toggle **Model Stream** on in the top bar to stream and cache VerdantUI\'s local neural weights.\n\n*(Verified local actions like exact math, runtime inspection, and JSON validation work immediately even while Model Stream is off.)*',
               },
             ],
             status: { type: 'complete', reason: 'stop' },

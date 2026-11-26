@@ -12,8 +12,8 @@ interface VTensorInspectorProps {
   open: boolean;
   onClose: () => void;
   engineState: EngineState;
-  onOpenHarness: () => void;
   onClearHarness: () => void;
+  onClearCache?: () => Promise<void>;
   onUpdateSampling: (patch: Partial<SamplingConfig>) => void;
   onUpdatePromptMode: (mode: PromptFormatMode) => void;
   onUpdatePrecisionMode: (mode: PrecisionContractMode) => void;
@@ -28,8 +28,8 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
   open,
   onClose,
   engineState,
-  onOpenHarness,
   onClearHarness,
+  onClearCache,
   onUpdateSampling,
   onUpdatePromptMode,
   onUpdatePrecisionMode,
@@ -38,6 +38,7 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
   onRunConformance,
 }) => {
   const [tab, setTab] = useState<InspectorTab>('sampling');
+  const [clearingCache, setClearingCache] = useState(false);
 
   if (!open) return null;
 
@@ -736,6 +737,59 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
               </section>
             )}
 
+            {engineState.opfsStorage.supported && (
+              <section>
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="font-semibold text-slate-900 dark:text-slate-100">
+                    Local Weight Cache (OPFS)
+                  </h3>
+                  {onClearCache &&
+                    (engineState.opfsStorage.storedModels.length > 0 ||
+                      (engineState.opfsStorage.partialModels?.length ?? 0) > 0) && (
+                      <button
+                        type="button"
+                        disabled={clearingCache}
+                        onClick={() => {
+                          setClearingCache(true);
+                          void onClearCache().finally(() => setClearingCache(false));
+                        }}
+                        className="inline-flex h-7 items-center rounded-md border border-slate-200 bg-white px-2.5 text-[11px] font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
+                      >
+                        {clearingCache ? 'Clearing…' : 'Clear Cache'}
+                      </button>
+                    )}
+                </div>
+                <dl className="mt-2 divide-y divide-slate-100 rounded-lg border border-slate-200 dark:divide-slate-800 dark:border-slate-800">
+                  <div className="flex justify-between px-3 py-1.5">
+                    <dt className="text-slate-500 dark:text-slate-400">Cached Weights</dt>
+                    <dd className="font-mono tabular-nums text-slate-900 dark:text-slate-100">
+                      {engineState.opfsStorage.storedModels.length > 0
+                        ? formatBytes(
+                            engineState.opfsStorage.storedModels.reduce(
+                              (sum, m) => sum + m.byteLength,
+                              0,
+                            ),
+                          )
+                        : 'Empty'}
+                    </dd>
+                  </div>
+                  {(engineState.opfsStorage.partialModels?.length ?? 0) > 0 && (
+                    <div className="flex justify-between px-3 py-1.5">
+                      <dt className="text-slate-500 dark:text-slate-400">Resumable Stream</dt>
+                      <dd className="font-mono tabular-nums text-slate-900 dark:text-slate-100">
+                        {formatBytes(
+                          (engineState.opfsStorage.partialModels ?? []).reduce(
+                            (sum, p) => sum + p.receivedBytes,
+                            0,
+                          ),
+                        )}
+                      </dd>
+                    </div>
+                  )}
+                </dl>
+              </section>
+            )}
+
             <section>
               <div className="flex items-center justify-between gap-2">
                 <h3 className="font-semibold text-slate-900 dark:text-slate-100">
@@ -883,26 +937,17 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
             <div className="rounded-lg border border-slate-200 p-3 dark:border-slate-800">
               <div className="flex items-center justify-between gap-2">
                 <span className="font-semibold text-slate-900 dark:text-slate-100">
-                  Harness Context
+                  Unified Model
                 </span>
-                <div className="flex items-center gap-1.5">
+                {engineState.importedHarness && (
                   <button
                     type="button"
-                    onClick={onOpenHarness}
-                    className="rounded-md px-2 py-0.5 text-[11px] font-medium text-emerald-800 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/50"
+                    onClick={onClearHarness}
+                    className="rounded-md px-2 py-0.5 text-[11px] font-medium text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100"
                   >
-                    {engineState.importedHarness ? 'Inspect' : 'Import'}
+                    Unload
                   </button>
-                  {engineState.importedHarness && (
-                    <button
-                      type="button"
-                      onClick={onClearHarness}
-                      className="rounded-md px-2 py-0.5 text-[11px] font-medium text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100"
-                    >
-                      Unload
-                    </button>
-                  )}
-                </div>
+                )}
               </div>
               <p className="mt-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
                 <strong className="font-medium text-slate-700 dark:text-slate-300">

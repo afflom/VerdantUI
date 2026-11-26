@@ -22,8 +22,6 @@ interface ThreadSidebarProps {
   engineState: EngineState;
   mobileOpen: boolean;
   onCloseMobile: () => void;
-  onOpenModels: () => void;
-  onOpenHarness: () => void;
   onOpenInspector: () => void;
 }
 
@@ -71,8 +69,6 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
   engineState,
   mobileOpen,
   onCloseMobile,
-  onOpenModels,
-  onOpenHarness,
   onOpenInspector,
 }) => {
   const [showArchived, setShowArchived] = useState(false);
@@ -145,8 +141,10 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
         </div>
         <div className="mt-0.5 truncate text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
           {isBootstrapUnbound
-            ? 'LOD0 Instant · Neural on demand'
-            : `${engineState.model?.displayName ?? 'Unified Model'} · ${
+            ? engineState.modelStreamEnabled
+              ? `Streaming · ${engineState.progressPercent}%`
+              : 'Model Stream off · LOD0 ready'
+            : `Unified model ready · ${
                 engineState.model
                   ? `${Math.round(engineState.model.maxContextWindow / 1024)}K ctx`
                   : ''
@@ -171,24 +169,14 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
           </span>
         </button>
 
-        <div className="mt-3 grid grid-cols-2 gap-2">
-          <button
-            type="button"
-            onClick={() => {
-              onCloseMobile();
-              onOpenModels();
-            }}
-            className="inline-flex h-8 items-center justify-center rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
-          >
-            Storage
-          </button>
+        <div className="mt-3">
           <button
             type="button"
             onClick={() => {
               onCloseMobile();
               onOpenInspector();
             }}
-            className="inline-flex h-8 items-center justify-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
+            className="inline-flex h-8 w-full items-center justify-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
           >
             <SlidersHorizontal className="h-3.5 w-3.5" />
             <span>Settings</span>

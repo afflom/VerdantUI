@@ -11,15 +11,11 @@ import {
   useLocalRuntime,
   useRemoteThreadListRuntime,
 } from '@assistant-ui/react';
-import { Layers, Menu, Moon, SlidersHorizontal, Sun } from 'lucide-react';
-import type { ModalViewTab } from './components/ModelManagerModal';
+import { Menu, Moon, SlidersHorizontal, Sun } from 'lucide-react';
 import { ThreadSidebar } from './components/ThreadSidebar';
 import { ThreadView } from './components/ThreadView';
 import { createLlamaVTensorAdapter } from './engine/assistantAdapter';
 
-const ModelManagerModal = lazy(() =>
-  import('./components/ModelManagerModal').then((m) => ({ default: m.ModelManagerModal })),
-);
 const VTensorInspector = lazy(() =>
   import('./components/VTensorInspector').then((m) => ({ default: m.VTensorInspector })),
 );
@@ -30,7 +26,6 @@ import {
 } from './engine/cognitiveObserver';
 import type { ImportedHarnessSpec } from './engine/harnessConfig';
 import { isInternalBootstrapModel } from './engine/modelCatalog';
-import type { CatalogModel } from './engine/modelCatalog';
 import { createVTensorThreadListAdapter } from './engine/threadStorage';
 import { LlamaVTensorWorkerClient, type EngineState } from './engine/workerClient';
 
@@ -120,8 +115,6 @@ export default function App() {
 
   const [engineState, setEngineState] = useState<EngineState>(() => workerClient.getState());
   const [inspectorOpen, setInspectorOpen] = useState(false);
-  const [modelsModalOpen, setModelsModalOpen] = useState(false);
-  const [modelsModalTab, setModelsModalTab] = useState<ModalViewTab>('all');
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [darkMode, setDarkMode] = useState<boolean>(readInitialDarkMode);
 
@@ -180,44 +173,6 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [mobileSidebarOpen, inspectorOpen]);
 
-  const openModelsModal = useCallback((tab: ModalViewTab = 'all') => {
-    setModelsModalTab(tab);
-    setModelsModalOpen(true);
-  }, []);
-
-  const handleOpenStorageModels = useCallback(() => {
-    openModelsModal('all');
-  }, [openModelsModal]);
-
-  const handleSelectCatalogModel = useCallback(
-    async (model: CatalogModel) => {
-      await workerClient.loadCatalogModel(model);
-    },
-    [workerClient],
-  );
-
-  const handleUploadLocalFile = useCallback(
-    async (file: File) => {
-      await workerClient.loadFromFile(file);
-    },
-    [workerClient],
-  );
-
-  const handleLoadCustomUrl = useCallback(
-    async (url: string) => {
-      const fileName = url.split('/').pop()?.replace(/\.gguf$/i, '') || 'Custom GGUF';
-      await workerClient.loadFromUrl(`custom-${Date.now()}`, fileName, url, false);
-    },
-    [workerClient],
-  );
-
-  const handleImportHarness = useCallback(
-    (harness: ImportedHarnessSpec) => {
-      workerClient.setImportedHarness(harness);
-    },
-    [workerClient],
-  );
-
   const handleClearHarness = useCallback(() => {
     workerClient.setImportedHarness(null);
   }, [workerClient]);
@@ -257,13 +212,6 @@ export default function App() {
 
   const handleCountTokens = useCallback(
     (prompt: string) => workerClient.countTokens(prompt),
-    [workerClient],
-  );
-
-  const handleDeleteCachedModel = useCallback(
-    async (modelId: string) => {
-      await workerClient.deleteCachedModel(modelId);
-    },
     [workerClient],
   );
 
@@ -356,15 +304,6 @@ export default function App() {
 
             <button
               type="button"
-              onClick={handleOpenStorageModels}
-              className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 sm:px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
-            >
-              <Layers className="h-3.5 w-3.5" />
-              <span>Storage</span>
-            </button>
-
-            <button
-              type="button"
               onClick={handleToggleInspector}
               aria-pressed={inspectorOpen}
               className={`inline-flex h-9 items-center gap-1.5 rounded-lg px-2.5 sm:px-3 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
@@ -394,15 +333,12 @@ export default function App() {
             engineState={engineState}
             mobileOpen={mobileSidebarOpen}
             onCloseMobile={() => setMobileSidebarOpen(false)}
-            onOpenModels={handleOpenStorageModels}
-            onOpenHarness={() => openModelsModal('harness')}
             onOpenInspector={() => setInspectorOpen(true)}
           />
 
           <main className="min-w-0 flex-1 overflow-hidden">
             <ThreadView
               engineState={engineState}
-              onOpenModels={handleOpenStorageModels}
               onCancelDownload={handleCancelDownload}
               onRetryLoad={handleRetryLoad}
               onDismissError={handleDismissError}
@@ -418,8 +354,8 @@ export default function App() {
                 open={inspectorOpen}
                 onClose={() => setInspectorOpen(false)}
                 engineState={engineState}
-                onOpenHarness={() => openModelsModal('harness')}
                 onClearHarness={handleClearHarness}
+                onClearCache={handleClearCache}
                 onUpdateSampling={(patch) => workerClient.updateSampling(patch)}
                 onUpdatePromptMode={(mode) => workerClient.updatePromptMode(mode)}
                 onUpdatePrecisionMode={(mode) => void workerClient.updatePrecisionMode(mode)}
@@ -432,25 +368,6 @@ export default function App() {
             </Suspense>
           )}
         </div>
-
-        {modelsModalOpen && (
-          <Suspense fallback={null}>
-            <ModelManagerModal
-              open={modelsModalOpen}
-              initialTab={modelsModalTab}
-              onClose={() => setModelsModalOpen(false)}
-              engineState={engineState}
-              onSelectCatalogModel={handleSelectCatalogModel}
-              onUploadLocalFile={handleUploadLocalFile}
-              onLoadCustomUrl={handleLoadCustomUrl}
-              onImportHarness={handleImportHarness}
-              onClearHarness={handleClearHarness}
-              onCancelDownload={handleCancelDownload}
-              onDeleteCachedModel={handleDeleteCachedModel}
-              onClearCache={handleClearCache}
-            />
-          </Suspense>
-        )}
       </div>
     </AssistantRuntimeProvider>
   );
