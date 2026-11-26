@@ -4,7 +4,7 @@
 
 - **Active Features:** 11
 - **Proposed / Planned Features:** 0
-- **Recorded Releases:** 5
+- **Recorded Releases:** 6
 
 ## Feature Register
 
@@ -31,3 +31,4 @@
 | `v0.3.0` | `v2.22.4` | `da5083b5ee` | 8 | Procedural MediaType Prism Synthesis, Sparse Studio Activation & Multi-Modal Weight Routing; Unified Possession Model, Non-Leaking Cross-Context Boundary & Active Published Prism Organs |
 | `v0.4.0` | `v2.22.4` | `da5083b5ee` | 9 | Coherent Multimodal Perception, 1-Step Image Synthesis, Modal Audio & Closed-Loop Vision Critique |
 | `v0.5.0` | `v2.22.4` | `da5083b5ee` | 10 | Autonomous Prism-Backed Chat Tool-Calls & Natural-Language MediaType Selection |
+| `v0.6.0` | `v2.22.4` | `da5083b5ee` | 11 | Unified Expert Basis, Global MediaType Galleries, Spaces-as-Prisms & Feature-Complete Media Synthesis |
