@@ -551,6 +551,25 @@ export class ObserverPossessionStore {
     };
   }
 
+  replacePrismScheduleConstraints(
+    compartmentId: ContextCompartmentId,
+    prismId: string,
+    constraints: readonly CompartmentScheduleConstraint[],
+  ): void {
+    const comp = this.ensureCompartment(compartmentId);
+    const kept = comp.scheduleConstraints.filter((c) => c.sourcePrismId !== prismId);
+    this.user = {
+      ...this.user,
+      compartments: {
+        ...this.user.compartments,
+        [compartmentId]: {
+          ...comp,
+          scheduleConstraints: [...kept, ...constraints],
+        },
+      },
+    };
+  }
+
   registerPublishedPrismOrgan(organ: PublishedPrismOrgan): void {
     this.publishedOrgans.set(organ.prismId, organ);
     this.bindPrismToCompartment(organ.prismId, organ.compartmentId, [organ.name]);

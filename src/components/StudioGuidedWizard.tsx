@@ -26,11 +26,13 @@ import {
   Globe,
   Loader2,
   Send,
+  Shield,
   ShieldCheck,
   SlidersHorizontal,
   Sparkles,
   Square,
   Upload,
+  X,
 } from 'lucide-react';
 import {
   dispatchStudioOp,
@@ -60,10 +62,12 @@ import {
 import {
   compatibleModalitiesForMediaType,
   createImportedWeightBinding,
+  MULTIMODAL_WEIGHT_PRESETS,
   PRISM_MEDIA_CATALOG,
   type MediaModelWeightBinding,
   type PrismMediaType,
 } from '../engine/prismMediaOrgans';
+import { DEFAULT_USER_SPACES, type ContextCompartmentId } from '../engine/unifiedPossessionModel';
 import type { EngineStatus } from '../engine/workerClient';
 import type { PrismRuntimeError } from './PrismSandboxFrame';
 
@@ -160,6 +164,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
   const [attachedWeights, setAttachedWeights] = useState<readonly MediaModelWeightBinding[]>(
     () => declaration.view?.proceduralOrgan?.attachedWeights ?? [],
   );
+  const [weightsPanelOpen, setWeightsPanelOpen] = useState(false);
 
   const scrollEndRef = useRef<HTMLDivElement | null>(null);
   const weightFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -197,24 +202,9 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
     setThinking(false);
   }, [onCancelStudioAgent]);
 
-  const handleAttachWeightFile = useCallback(
-    async (e: ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      e.target.value = '';
-      if (!file) return;
-      const activeMedia: PrismMediaType = selectedMediaType ?? 'picture';
-      const modality = compatibleModalitiesForMediaType(activeMedia)[0] ?? 'text';
-      const binding = createImportedWeightBinding({
-        fileName: file.name,
-        byteLength: file.size,
-        modality,
-      });
-      const nextBindings = [
-        ...attachedWeights.filter((b) => b.id !== binding.id),
-        binding,
-      ];
+  const dispatchWeightBindings = useCallback(
+    async (nextBindings: readonly MediaModelWeightBinding[]) => {
       setAttachedWeights(nextBindings);
-
       if (declaration.view?.proceduralOrgan) {
         const primaryReq = declaration.requirements[0]?.id ?? 'REQ-01';
         await onDispatchOp({
@@ -227,15 +217,94 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
           citation: { kind: 'req', requirementId: primaryReq },
         });
       }
+    },
+    [declaration, onDispatchOp],
+  );
+
+  const handleAttachWeightFile = useCallback(
+    async (e: ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      e.target.value = '';
+      if (!file) return;
+      const activeMedia: PrismMediaType = selectedMediaType ?? 'picture';
+      const modality = compatibleModalitiesForMediaType(activeMedia)[0] ?? 'text';
+      // Read only the leading 64 KiB header slice so multi-GB checkpoints inspect in <5ms
+      const headerSlice = new Uint8Array(await file.slice(0, 65536).arrayBuffer());
+      const binding = createImportedWeightBinding({
+        fileName: file.name,
+        byteLength: file.size,
+        modality,
+        headerBytes: headerSlice,
+      });
+      const nextBindings = [
+        ...attachedWeights.filter((b) => b.id !== binding.id),
+        binding,
+      ];
+      await dispatchWeightBindings(nextBindings);
 
       await onAppendMessage({
         role: 'assistant',
-        content: `Attached local ${modality} model weights "${file.name}" (${(file.size / (1024 * 1024)).toFixed(1)} MB) to this ${PRISM_MEDIA_CATALOG[activeMedia].label} Prism.`,
+        content: `Attached local ${modality} model weights "${file.name}" (${binding.headerSummary ?? `${(file.size / (1024 * 1024)).toFixed(1)} MB`}) and routed its signature onto this ${PRISM_MEDIA_CATALOG[activeMedia].label} Prism.`,
         badges: [`Routed ${modality} weights`],
       });
     },
-    [attachedWeights, declaration, onAppendMessage, onDispatchOp, selectedMediaType],
+    [attachedWeights, dispatchWeightBindings, onAppendMessage, selectedMediaType],
   );
+
+  const handleTogglePresetWeight = useCallback(
+    async (preset: MediaModelWeightBinding) => {
+      const exists = attachedWeights.some((b) => b.id === preset.id);
+      const nextBindings = exists
+        ? attachedWeights.filter((b) => b.id !== preset.id)
+        : [...attachedWeights, preset];
+      await dispatchWeightBindings(nextBindings);
+    },
+    [attachedWeights, dispatchWeightBindings],
+  );
+
+  const handleChangePrismSpace = useCallback(
+    async (nextSpace: ContextCompartmentId) => {
+      if (declaration.view?.proceduralOrgan) {
+        const primaryReq = declaration.requirements[0]?.id ?? 'REQ-01';
+        const curW = declaration.view.proceduralOrgan.weights;
+        const nextWeights =
+          curW.mediaType === 'tool-organ' || curW.mediaType === 'research-program'
+            ? { ...curW, compartmentId: nextSpace }
+            : curW;
+        await onDispatchOp({
+          op: 'route-prism-weights',
+          mediaType: declaration.view.proceduralOrgan.mediaType,
+          activeOrgans: declaration.view.proceduralOrgan.activeOrgans,
+          weights: nextWeights,
+          attachedWeights: declaration.view.proceduralOrgan.attachedWeights,
+          compartmentId: nextSpace,
+          citation: { kind: 'req', requirementId: primaryReq },
+        });
+      } else {
+        await onDispatchOp({
+          op: 'set-concept-profile',
+          compartmentId: nextSpace,
+        });
+      }
+    },
+    [declaration, onDispatchOp],
+  );
+
+  const handleToggleOpaqueSharing = useCallback(async () => {
+    const organ = declaration.view?.proceduralOrgan;
+    if (!organ || organ.weights.mediaType !== 'tool-organ') return;
+    const primaryReq = declaration.requirements[0]?.id ?? 'REQ-01';
+    const nextShare = !organ.weights.emitsOpaqueConstraints;
+    await onDispatchOp({
+      op: 'route-prism-weights',
+      mediaType: organ.mediaType,
+      activeOrgans: organ.activeOrgans,
+      weights: { ...organ.weights, emitsOpaqueConstraints: nextShare },
+      attachedWeights: organ.attachedWeights,
+      compartmentId: declaration.concept.compartmentId,
+      citation: { kind: 'req', requirementId: primaryReq },
+    });
+  }, [declaration, onDispatchOp]);
 
   const submitNaturalMessage = useCallback(
     async (rawMessage: string) => {
@@ -507,9 +576,14 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
           />
           <button
             type="button"
-            onClick={() => weightFileInputRef.current?.click()}
-            className="inline-flex items-center gap-1 rounded-md border border-zinc-200 bg-white px-2 py-0.5 text-[10px] font-medium text-zinc-700 hover:border-emerald-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
-            title="Import local audio, image, video, or text model weights to enhance this Prism"
+            aria-expanded={weightsPanelOpen}
+            onClick={() => setWeightsPanelOpen((v) => !v)}
+            className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[10px] font-medium transition-colors ${
+              weightsPanelOpen || attachedWeights.length > 0
+                ? 'border-emerald-600/50 bg-emerald-50 text-emerald-900 dark:border-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-200'
+                : 'border-zinc-200 bg-white text-zinc-700 hover:border-emerald-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300'
+            }`}
+            title="Import local audio, image, or video weights or pick a compatible model preset"
           >
             <Upload className="h-2.5 w-2.5" />
             <span>
@@ -520,6 +594,127 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Per-Prism Space & Privacy Shield Controls (plain language) */}
+      {(activeMediaForUi !== null || declaration.concept.compartmentId) && (
+        <div className="flex shrink-0 flex-wrap items-center justify-between gap-1.5 border-b border-zinc-100 bg-white px-3 py-1.5 text-[10px] dark:border-zinc-800/80 dark:bg-[#0E131B]">
+          <div className="flex items-center gap-1">
+            <span className="font-medium text-zinc-500 dark:text-zinc-400">Space:</span>
+            {DEFAULT_USER_SPACES.map((sp) => {
+              const currentSpace = declaration.concept.compartmentId ?? 'personal';
+              const isSelected = currentSpace === sp.id;
+              return (
+                <button
+                  key={sp.id}
+                  type="button"
+                  onClick={() => void handleChangePrismSpace(sp.id)}
+                  className={`rounded px-1.5 py-0.5 font-medium transition-colors ${
+                    isSelected
+                      ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
+                      : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+                  }`}
+                >
+                  {sp.label}
+                </button>
+              );
+            })}
+          </div>
+          {declaration.view?.proceduralOrgan?.weights.mediaType === 'tool-organ' && (
+            <button
+              type="button"
+              role="switch"
+              aria-checked={declaration.view.proceduralOrgan.weights.emitsOpaqueConstraints}
+              onClick={() => void handleToggleOpaqueSharing()}
+              className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-medium transition-colors ${
+                declaration.view.proceduralOrgan.weights.emitsOpaqueConstraints
+                  ? 'border-emerald-500/50 bg-emerald-50 text-emerald-800 dark:border-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300'
+                  : 'border-zinc-200 bg-zinc-50 text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400'
+              }`}
+              title="Share busy time blocks across spaces without revealing any private details"
+            >
+              <Shield className="h-2.5 w-2.5" />
+              <span>
+                {declaration.view.proceduralOrgan.weights.emitsOpaqueConstraints
+                  ? 'Share availability only (never details)'
+                  : 'Private to this space only'}
+              </span>
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Multi-Modal Model Weights Drawer */}
+      {weightsPanelOpen && (
+        <div className="shrink-0 space-y-2 border-b border-zinc-200 bg-zinc-50 px-3 py-2 text-[11px] dark:border-zinc-800 dark:bg-[#0B0F14]">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-semibold text-zinc-800 dark:text-zinc-200">
+              Route Audio, Image &amp; Video Model Weights
+            </span>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => weightFileInputRef.current?.click()}
+                className="inline-flex items-center gap-1 rounded-md bg-emerald-700 px-2 py-0.5 text-[10px] font-medium text-white hover:bg-emerald-800"
+              >
+                <Upload className="h-2.5 w-2.5" />
+                Import Local File
+              </button>
+              <button
+                type="button"
+                onClick={() => setWeightsPanelOpen(false)}
+                className="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-800"
+                aria-label="Close weights drawer"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {MULTIMODAL_WEIGHT_PRESETS.filter((p) => {
+              if (!activeMediaForUi) return true;
+              return compatibleModalitiesForMediaType(activeMediaForUi).includes(p.modality);
+            }).map((preset) => {
+              const active = attachedWeights.some((b) => b.id === preset.id);
+              return (
+                <button
+                  key={preset.id}
+                  type="button"
+                  onClick={() => void handleTogglePresetWeight(preset)}
+                  className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[10px] font-medium transition-colors ${
+                    active
+                      ? 'border-emerald-600 bg-emerald-50 text-emerald-900 dark:border-emerald-600 dark:bg-emerald-950/60 dark:text-emerald-200'
+                      : 'border-zinc-200 bg-white text-zinc-700 hover:border-emerald-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300'
+                  }`}
+                >
+                  {active && <Check className="h-2.5 w-2.5 text-emerald-600" />}
+                  <span>{preset.label}</span>
+                </button>
+              );
+            })}
+          </div>
+          {attachedWeights.length > 0 && (
+            <div className="flex flex-wrap gap-1 pt-0.5">
+              {attachedWeights.map((b) => (
+                <span
+                  key={b.id}
+                  className="inline-flex items-center gap-1 rounded-full bg-emerald-100/80 px-2 py-0.5 text-[10px] text-emerald-900 dark:bg-emerald-950/70 dark:text-emerald-200"
+                >
+                  <span>{b.label}</span>
+                  {b.headerSummary && <span className="opacity-75">· {b.headerSummary}</span>}
+                  <button
+                    type="button"
+                    onClick={() => void dispatchWeightBindings(attachedWeights.filter((x) => x.id !== b.id))}
+                    className="rounded-full p-0.5 hover:bg-black/10"
+                    aria-label={`Remove ${b.label}`}
+                  >
+                    <X className="h-2.5 w-2.5" />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Persistent Unified Conversational Transcript */}
       <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3.5 text-xs">

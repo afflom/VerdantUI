@@ -8,6 +8,11 @@ import {
   verifyZeroCrossContextLeak,
 } from './unifiedPossessionModel';
 import { VerdantCognitiveObserver } from './cognitiveObserver';
+import { buildHoloviewSandboxDocument } from './prismSandboxHtml';
+import { PrismHostPool } from './prismHostPool';
+import { ObserverStreamBus } from './observerStreamBus';
+import { PrismStore } from './prismStudio';
+import type { LlamaVTensorWorkerClient } from './workerClient';
 
 test('ObserverPossessionStore establishes Observer ⊇ User ⊇ {Threads, Prisms, Compartments} hierarchy', () => {
   const store = new ObserverPossessionStore('personal');
@@ -221,4 +226,62 @@ test('Published Prisms act as Observer organs: sensory ingestion (with PHI hasho
     emittedAt: Date.now(),
   });
   assert.equal(blockedImp.verdict, 'deny');
+});
+
+test('buildHoloviewSandboxDocument exposes window.verdant alongside prism.invoke and PrismHostPool mediates emits & space-isolated KV', async () => {
+  const html = buildHoloviewSandboxDocument({
+    prismId: 'prism-habits',
+    channelId: 'ch_test',
+    digest: 'abc123',
+    indexHtml: '<div id="organ-root"></div>',
+    prismCss: '',
+    prismUiJs: '',
+    appJs: '',
+    darkMode: true,
+  });
+  assert.ok(html.includes('globalThis.prism = Object.freeze'));
+  assert.ok(html.includes('window.verdant = Object.freeze'));
+  assert.ok(html.includes("post('emit'"));
+
+  const bus = new ObserverStreamBus();
+  const store = new PrismStore();
+  const observer = new VerdantCognitiveObserver();
+  const proj = await store.createDeclarative('undefined');
+  await store.applyStudioOp(proj.id, {
+    op: 'set-concept-profile',
+    compartmentId: 'personal',
+  });
+
+  const fakeWorker = { cognitiveObserver: observer } as unknown as LlamaVTensorWorkerClient;
+  const pool = new PrismHostPool(bus, store, observer.grants, fakeWorker);
+  const grants = { observer: true, storage: true, browser: true, network: false };
+
+  // 1. Live `constraint` emit populates zero-detail opaque window for `work`
+  const emitRes = pool.handlePrismEmit(proj.id, grants, 'constraint', {
+    opaqueOnly: true,
+    windows: [{ startMinuteOfDay: 1020, endMinuteOfDay: 1080, daysOfWeek: [0, 1, 2, 3, 4, 5, 6] }],
+  });
+  assert.equal(emitRes.accepted, true);
+  assert.equal(observer.possession.getProjectedConstraintsFor('work').length, 1);
+
+  // 2. Toggling window off (empty windows array) prunes the constraint cleanly
+  pool.handlePrismEmit(proj.id, grants, 'constraint', { opaqueOnly: true, windows: [] });
+  assert.equal(observer.possession.getProjectedConstraintsFor('work').length, 0);
+
+  // 3. Kill switch halts constraint & impulse emits immediately
+  observer.possession.setHalted(true);
+  const haltedEmit = pool.handlePrismEmit(proj.id, grants, 'constraint', {
+    opaqueOnly: true,
+    windows: [{ startMinuteOfDay: 1020, endMinuteOfDay: 1080 }],
+  });
+  assert.equal(haltedEmit.accepted, false);
+  observer.possession.setHalted(false);
+
+  // 4. Compartment-isolated KV storage: `personal` vs `work` never bleed
+  await pool.setKv(proj.id, grants, 'notes', 'personal-only-note');
+  assert.equal(await pool.getKv(proj.id, grants, 'notes'), 'personal-only-note');
+  await store.applyStudioOp(proj.id, { op: 'set-concept-profile', compartmentId: 'work' });
+  assert.equal(await pool.getKv(proj.id, grants, 'notes'), null);
+
+  pool.dispose();
 });

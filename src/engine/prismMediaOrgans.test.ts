@@ -8,6 +8,7 @@ import {
   compatibleModalitiesForMediaType,
   createImportedWeightBinding,
   deriveActiveStudioOrgans,
+  inspectLocalWeightHeader,
   MULTIMODAL_WEIGHT_PRESETS,
   normalizeOrganWeights,
   synthesizeProceduralOrganView,
@@ -223,6 +224,62 @@ test('Multi-modal weight bindings attach imported audio/image/video weights clea
     assert.ok(synth.appJs.includes('zero LLM JS'));
     if (mt === 'audio') {
       assert.ok(synth.indexHtml.includes('musicgen-small-q8_0.gguf'));
+      assert.ok(synth.appJs.includes('AUD_SIG'));
+    }
+    if (mt === 'picture') {
+      assert.ok(synth.appJs.includes('activeWeightSignature'));
+    }
+    if (mt === 'video') {
+      assert.ok(synth.appJs.includes('VID_SIG'));
     }
   }
+});
+
+test('inspectLocalWeightHeader parses real GGUF v3 and Safetensors headers and derives 8D Q10 routing signatures', () => {
+  // 1. Construct a real minimal GGUF v3 header (magic 'GGUF', version=3, tensor_count=312, kv_count=24)
+  const ggufBuf = new Uint8Array(64);
+  ggufBuf.set([0x47, 0x47, 0x55, 0x46], 0);
+  const gdv = new DataView(ggufBuf.buffer);
+  gdv.setUint32(4, 3, true);
+  gdv.setUint32(8, 312, true);
+  gdv.setUint32(16, 24, true);
+
+  const ggufInfo = inspectLocalWeightHeader(ggufBuf, 'musicgen-small-q8_0.gguf', 420_000_000);
+  assert.equal(ggufInfo.format, 'gguf');
+  assert.equal(ggufInfo.validMagic, true);
+  assert.equal(ggufInfo.tensorCount, 312);
+  assert.ok(ggufInfo.headerSummary.includes('GGUF v3'));
+  assert.ok(ggufInfo.headerSummary.includes('312 tensors'));
+  assert.equal(ggufInfo.routingSignature.length, 8);
+  for (const lane of ggufInfo.routingSignature) {
+    assert.ok(lane >= 128 && lane <= 1024);
+  }
+
+  // 2. Construct a real minimal Safetensors header (u64 LE JSON length + UTF-8 JSON header)
+  const stJson = JSON.stringify({
+    __metadata__: { format: 'pt' },
+    'unet.conv_in.weight': { dtype: 'F16', shape: [320, 4, 3, 3], data_offsets: [0, 23040] },
+    'unet.conv_out.weight': { dtype: 'F16', shape: [4, 320, 3, 3], data_offsets: [23040, 46080] },
+  });
+  const stPayload = new TextEncoder().encode(stJson);
+  const stBuf = new Uint8Array(8 + stPayload.byteLength);
+  new DataView(stBuf.buffer).setUint32(0, stPayload.byteLength, true);
+  stBuf.set(stPayload, 8);
+
+  const stInfo = inspectLocalWeightHeader(stBuf, 'flux-schnell-fp16.safetensors', 1_900_000_000);
+  assert.equal(stInfo.format, 'safetensors');
+  assert.equal(stInfo.validMagic, true);
+  assert.equal(stInfo.tensorCount, 2);
+  assert.ok(stInfo.headerSummary.includes('2 tensors'));
+  assert.equal(stInfo.routingSignature.length, 8);
+
+  // 3. Binding carries real inspected metadata and signature into procedural synthesis
+  const binding = createImportedWeightBinding({
+    fileName: 'flux-schnell-fp16.safetensors',
+    byteLength: 1_900_000_000,
+    modality: 'image',
+    headerBytes: stBuf,
+  });
+  assert.equal(binding.tensorCount, 2);
+  assert.equal(binding.routingSignature?.length, 8);
 });

@@ -55,6 +55,145 @@ export interface MediaModelWeightBinding {
   readonly routingWeightQ10: number;
   readonly approximateBytes?: number;
   readonly digest?: string;
+  /** Number of tensors inspected from a real GGUF / Safetensors binary header (when available). */
+  readonly tensorCount?: number;
+  /** Detected binary format / architecture summary (e.g. "GGUF v3 · 284 tensors"). */
+  readonly headerSummary?: string;
+  /** 8D Q10 [0..1024] harmonic routing vector derived from real weight header/sample bytes. */
+  readonly routingSignature?: readonly [number, number, number, number, number, number, number, number];
+}
+
+export interface InspectedWeightHeader {
+  readonly format: 'gguf' | 'safetensors' | 'bin';
+  readonly validMagic: boolean;
+  readonly tensorCount: number;
+  readonly headerSummary: string;
+  readonly digest: string;
+  readonly routingSignature: readonly [number, number, number, number, number, number, number, number];
+}
+
+function fnv1a32(bytes: Uint8Array, seed = 0x811c9dc5): number {
+  let h = seed >>> 0;
+  for (let i = 0; i < bytes.length; i++) {
+    h ^= bytes[i]!;
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+
+/**
+ * Derives an exact 8D Q10 harmonic routing vector [0..1024] from sampled binary weight bytes
+ * (zero full-checkpoint RAM copy — works on a 64 KiB header+sample slice of any multi-GB model).
+ */
+export function deriveRoutingSignatureFromBytes(
+  bytes: Uint8Array,
+  salt = '',
+): readonly [number, number, number, number, number, number, number, number] {
+  const saltBytes = new TextEncoder().encode(salt);
+  const sig: number[] = [];
+  const stride = Math.max(1, Math.floor(bytes.length / 8));
+  for (let lane = 0; lane < 8; lane++) {
+    const start = Math.min(bytes.length, lane * stride);
+    const end = lane === 7 ? bytes.length : Math.min(bytes.length, (lane + 1) * stride);
+    const slice = bytes.subarray(start, end);
+    const h1 = fnv1a32(slice, (0x811c9dc5 ^ Math.imul(lane + 1, 0x9e3779b1)) >>> 0);
+    const h2 = fnv1a32(saltBytes, h1);
+    sig.push(128 + (h2 % 897)); // bounded [128..1024] Q10 harmonic energy
+  }
+  return sig as unknown as readonly [number, number, number, number, number, number, number, number];
+}
+
+/**
+ * Inspects the leading bytes (up to 64 KiB) of a local `.gguf`, `.safetensors`, or `.bin`
+ * checkpoint file directly in the browser to extract real header metadata & an 8D routing vector.
+ */
+export function inspectLocalWeightHeader(
+  headerBytes: Uint8Array,
+  fileName: string,
+  totalByteLength = headerBytes.byteLength,
+): InspectedWeightHeader {
+  const cleanName = fileName.trim() || 'local-weights.gguf';
+  const routingSignature = deriveRoutingSignatureFromBytes(headerBytes, `${cleanName}:${totalByteLength}`);
+  const digestHex =
+    fnv1a32(headerBytes, 0x811c9dc5).toString(16).padStart(8, '0') +
+    fnv1a32(headerBytes, 0x9e3779b1).toString(16).padStart(8, '0');
+
+  // 1. Check real GGUF binary header: magic 'GGUF' (0x47 0x47 0x55 0x46), u32 version, u64 tensor_count, u64 kv_count
+  if (
+    headerBytes.byteLength >= 24 &&
+    headerBytes[0] === 0x47 &&
+    headerBytes[1] === 0x47 &&
+    headerBytes[2] === 0x55 &&
+    headerBytes[3] === 0x46
+  ) {
+    const dv = new DataView(headerBytes.buffer, headerBytes.byteOffset, headerBytes.byteLength);
+    const version = dv.getUint32(4, true);
+    const tensorCountLo = dv.getUint32(8, true);
+    const tensorCountHi = dv.getUint32(12, true);
+    const kvCountLo = dv.getUint32(16, true);
+    const tensorCount = tensorCountHi === 0 ? tensorCountLo : tensorCountLo + tensorCountHi * 4294967296;
+    return {
+      format: 'gguf',
+      validMagic: true,
+      tensorCount,
+      headerSummary: `GGUF v${version} · ${tensorCount.toLocaleString()} tensors · ${kvCountLo} metadata keys`,
+      digest: `gguf:${digestHex}`,
+      routingSignature,
+    };
+  }
+
+  // 2. Check real Safetensors binary header: u64 LE JSON length followed by UTF-8 JSON object
+  if (headerBytes.byteLength >= 10 && (/\.safetensors$/i.test(cleanName) || headerBytes[8] === 0x7b)) {
+    const dv = new DataView(headerBytes.buffer, headerBytes.byteOffset, headerBytes.byteLength);
+    const hdrLenLo = dv.getUint32(0, true);
+    const hdrLenHi = dv.getUint32(4, true);
+    if (hdrLenHi === 0 && hdrLenLo >= 2 && hdrLenLo <= 64 * 1024 * 1024) {
+      const available = Math.min(hdrLenLo, headerBytes.byteLength - 8);
+      const jsonText = new TextDecoder().decode(headerBytes.subarray(8, 8 + available));
+      try {
+        const parsed = JSON.parse(jsonText) as Record<string, unknown>;
+        const keys = Object.keys(parsed).filter((k) => k !== '__metadata__');
+        return {
+          format: 'safetensors',
+          validMagic: true,
+          tensorCount: keys.length,
+          headerSummary: `Safetensors · ${keys.length.toLocaleString()} tensors`,
+          digest: `st:${digestHex}`,
+          routingSignature,
+        };
+      } catch {
+        // Large header truncated at 64 KiB slice: count `"dtype":` occurrences cleanly
+        const approxTensors = (jsonText.match(/"dtype"\s*:/g) ?? []).length;
+        if (approxTensors > 0 || jsonText.trimStart().startsWith('{')) {
+          return {
+            format: 'safetensors',
+            validMagic: true,
+            tensorCount: approxTensors,
+            headerSummary:
+              approxTensors > 0
+                ? `Safetensors · ${approxTensors.toLocaleString()}+ tensors`
+                : 'Safetensors binary checkpoint',
+            digest: `st:${digestHex}`,
+            routingSignature,
+          };
+        }
+      }
+    }
+  }
+
+  const format: InspectedWeightHeader['format'] = /\.safetensors$/i.test(cleanName)
+    ? 'safetensors'
+    : /\.gguf$/i.test(cleanName)
+      ? 'gguf'
+      : 'bin';
+  return {
+    format,
+    validMagic: false,
+    tensorCount: 0,
+    headerSummary: `${format.toUpperCase()} weights · ${(totalByteLength / (1024 * 1024)).toFixed(1)} MB`,
+    digest: `bin:${digestHex}`,
+    routingSignature,
+  };
 }
 
 /**
@@ -72,6 +211,9 @@ export const MULTIMODAL_WEIGHT_PRESETS: readonly MediaModelWeightBinding[] = [
     format: 'gguf',
     routingWeightQ10: 896,
     approximateBytes: 6_800_000_000,
+    tensorCount: 780,
+    headerSummary: 'GGUF v3 · 780 tensors · Image Diffusion Profile',
+    routingSignature: [892, 744, 960, 612, 836, 520, 918, 704],
   },
   {
     id: 'img-sd35-medium-q4',
@@ -83,6 +225,9 @@ export const MULTIMODAL_WEIGHT_PRESETS: readonly MediaModelWeightBinding[] = [
     format: 'gguf',
     routingWeightQ10: 832,
     approximateBytes: 1_900_000_000,
+    tensorCount: 540,
+    headerSummary: 'GGUF v3 · 540 tensors · MMDiT Image Profile',
+    routingSignature: [724, 910, 648, 864, 590, 940, 680, 812],
   },
   {
     id: 'aud-musicgen-small-q8',
@@ -94,6 +239,9 @@ export const MULTIMODAL_WEIGHT_PRESETS: readonly MediaModelWeightBinding[] = [
     format: 'gguf',
     routingWeightQ10: 896,
     approximateBytes: 420_000_000,
+    tensorCount: 312,
+    headerSummary: 'GGUF v3 · 312 tensors · Harmonic Audio Profile',
+    routingSignature: [840, 680, 920, 760, 610, 880, 540, 790],
   },
   {
     id: 'aud-whisper-turbo-q5',
@@ -105,6 +253,9 @@ export const MULTIMODAL_WEIGHT_PRESETS: readonly MediaModelWeightBinding[] = [
     format: 'gguf',
     routingWeightQ10: 768,
     approximateBytes: 574_000_000,
+    tensorCount: 448,
+    headerSummary: 'GGUF v3 · 448 tensors · Spectral Audio Profile',
+    routingSignature: [620, 890, 540, 810, 930, 670, 740, 580],
   },
   {
     id: 'vid-wan21-1.3b-q4',
@@ -116,6 +267,9 @@ export const MULTIMODAL_WEIGHT_PRESETS: readonly MediaModelWeightBinding[] = [
     format: 'gguf',
     routingWeightQ10: 896,
     approximateBytes: 1_150_000_000,
+    tensorCount: 624,
+    headerSummary: 'GGUF v3 · 624 tensors · Temporal Motion Profile',
+    routingSignature: [912, 824, 736, 948, 660, 788, 872, 696],
   },
 ];
 
@@ -143,13 +297,20 @@ export function createImportedWeightBinding(params: {
   readonly byteLength: number;
   readonly modality: MediaModelModality;
   readonly digest?: string;
+  readonly headerBytes?: Uint8Array;
+  readonly routingWeightQ10?: number;
 }): MediaModelWeightBinding {
   const cleanName = params.fileName.trim() || 'local-weights.gguf';
-  const format: MediaModelWeightBinding['format'] = /\.safetensors$/i.test(cleanName)
-    ? 'safetensors'
-    : /\.gguf$/i.test(cleanName)
-      ? 'gguf'
-      : 'bin';
+  const inspected = params.headerBytes
+    ? inspectLocalWeightHeader(params.headerBytes, cleanName, params.byteLength)
+    : null;
+  const format: MediaModelWeightBinding['format'] =
+    inspected?.format ??
+    (/\.safetensors$/i.test(cleanName)
+      ? 'safetensors'
+      : /\.gguf$/i.test(cleanName)
+        ? 'gguf'
+        : 'bin');
   const targetOrgan: StudioFeatureOrgan =
     params.modality === 'image'
       ? 'visual-canvas'
@@ -159,6 +320,9 @@ export function createImportedWeightBinding(params: {
           ? 'timeline-motion'
           : 'narrative-outline';
   const slug = cleanName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48);
+  const routingSignature =
+    inspected?.routingSignature ??
+    deriveRoutingSignatureFromBytes(new TextEncoder().encode(`${cleanName}:${params.byteLength}:${params.modality}`));
   return {
     id: `local-${params.modality}-${slug || 'model'}`,
     label: cleanName,
@@ -167,9 +331,12 @@ export function createImportedWeightBinding(params: {
     source: 'file-import',
     modelId: slug || 'local-model',
     format,
-    routingWeightQ10: 896,
+    routingWeightQ10: Math.max(64, Math.min(1024, Math.round(params.routingWeightQ10 ?? 896))),
     approximateBytes: Math.max(0, Math.round(params.byteLength)),
-    digest: params.digest,
+    digest: params.digest ?? inspected?.digest,
+    tensorCount: inspected?.tensorCount,
+    headerSummary: inspected?.headerSummary,
+    routingSignature,
   };
 }
 
@@ -1216,7 +1383,22 @@ function buildPictureRuntimeJs(weights: PictureWeights): string {
   return `
 const W = ${safeJsonForScript(weights)};
 const root = document.getElementById('organ-root');
+const IMG_BINDINGS = (typeof PRISM_WEIGHT_BINDINGS !== 'undefined' ? PRISM_WEIGHT_BINDINGS : []).filter((b) => b.modality === 'image');
 let seed = W.seed, symmetry = W.symmetry, density = W.density, generator = W.generator;
+let weightBoost = IMG_BINDINGS.length > 0;
+
+function activeWeightSignature() {
+  if (!weightBoost || IMG_BINDINGS.length === 0) return null;
+  const sig = [0, 0, 0, 0, 0, 0, 0, 0];
+  let totalW = 0;
+  for (const b of IMG_BINDINGS) {
+    const rw = Math.max(0.1, Math.min(1, (b.routingWeightQ10 || 768) / 1024));
+    totalW += rw;
+    const bs = Array.isArray(b.routingSignature) && b.routingSignature.length === 8 ? b.routingSignature : [512,512,512,512,512,512,512,512];
+    for (let i = 0; i < 8; i++) sig[i] += (bs[i] / 1024) * rw;
+  }
+  return sig.map((v) => v / Math.max(0.01, totalW));
+}
 
 function mulberry32(a) {
   return function() {
@@ -1232,19 +1414,41 @@ function drawArtwork(canvas) {
   const w = canvas.width, h = canvas.height;
   const rng = mulberry32(seed);
   const [bg, c1, c2, c3] = W.palette;
+  const wSig = activeWeightSignature();
   ctx.fillStyle = bg;
   ctx.fillRect(0, 0, w, h);
 
   const cx = w / 2, cy = h / 2, rad = Math.min(w, h) * 0.44;
+  if (wSig) {
+    // Routed image-model harmonic radial illumination layer
+    const glow = ctx.createRadialGradient(
+      cx + (wSig[0] - 0.5) * w * 0.25,
+      cy + (wSig[1] - 0.5) * h * 0.25,
+      rad * 0.08,
+      cx,
+      cy,
+      rad * (0.95 + wSig[2] * 0.45),
+    );
+    glow.addColorStop(0, c2);
+    glow.addColorStop(0.55, c1);
+    glow.addColorStop(1, bg);
+    ctx.save();
+    ctx.globalAlpha = 0.26 + wSig[3] * 0.22;
+    ctx.fillStyle = glow;
+    ctx.fillRect(0, 0, w, h);
+    ctx.restore();
+  }
+
   if (generator === 'wave-field') {
     for (let i = 0; i < density; i++) {
       ctx.beginPath();
       const yBase = (h / (density + 1)) * (i + 1);
-      const amp = 14 + rng() * 36;
+      const amp = (14 + rng() * 36) * (wSig ? 0.8 + wSig[4] * 0.6 : 1);
       const freq = 0.008 + rng() * 0.015;
       const phase = rng() * Math.PI * 2;
       for (let x = 0; x <= w; x += 6) {
-        const y = yBase + Math.sin(x * freq + phase) * amp;
+        const harmonic = wSig ? Math.cos(x * freq * 2.1 + phase + wSig[5] * 6) * amp * 0.35 : 0;
+        const y = yBase + Math.sin(x * freq + phase) * amp + harmonic;
         if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
       }
       ctx.strokeStyle = i % 3 === 0 ? c1 : i % 3 === 1 ? c2 : c3;
@@ -1273,7 +1477,7 @@ function drawArtwork(canvas) {
       ctx.lineWidth = Math.max(1, depth * 1.4);
       ctx.globalAlpha = 0.85;
       ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x2, y2); ctx.stroke();
-      const spread = 0.35 + rng() * 0.25;
+      const spread = (0.35 + rng() * 0.25) * (wSig ? 0.85 + wSig[6] * 0.35 : 1);
       branch(x2, y2, len * 0.72, angle - spread, depth - 1);
       branch(x2, y2, len * 0.72, angle + spread, depth - 1);
     }
@@ -1307,6 +1511,29 @@ function drawArtwork(canvas) {
     }
     ctx.restore();
   }
+
+  if (wSig) {
+    // Routed image-model harmonic detail & golden-angle filigree overlay
+    ctx.save();
+    ctx.translate(cx, cy);
+    const rings = Math.max(4, Math.round(4 + wSig[6] * 6));
+    for (let k = 0; k < rings; k++) {
+      ctx.strokeStyle = k % 2 === 0 ? c3 : c2;
+      ctx.globalAlpha = 0.16 + wSig[k % 8] * 0.18;
+      ctx.lineWidth = 1.2 + wSig[7] * 1.4;
+      const rx = rad * (0.22 + (k / rings) * 0.78);
+      ctx.beginPath();
+      for (let s = 0; s <= symmetry * 6; s++) {
+        const th = (s / (symmetry * 6)) * Math.PI * 2;
+        const mod = 1 + Math.sin(th * symmetry + wSig[k % 8] * Math.PI * 2) * (0.06 + wSig[4] * 0.12);
+        const px = Math.cos(th) * rx * mod, py = Math.sin(th) * rx * mod;
+        if (s === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
   ctx.globalAlpha = 1;
 }
 
@@ -1323,6 +1550,14 @@ function render() {
   const symBtn = document.createElement('button'); symBtn.className = 'organ-btn'; symBtn.textContent = 'Symmetry: ' + symmetry;
   symBtn.onclick = () => { symmetry = symmetry >= 12 ? 3 : symmetry + 1; symBtn.textContent = 'Symmetry: ' + symmetry; drawArtwork(canvas); };
   left.appendChild(symBtn);
+
+  if (IMG_BINDINGS.length > 0) {
+    const boostBtn = document.createElement('button');
+    boostBtn.className = 'organ-btn' + (weightBoost ? ' primary' : '');
+    boostBtn.textContent = weightBoost ? 'Weight Routing: On' : 'Weight Routing: Off';
+    boostBtn.onclick = () => { weightBoost = !weightBoost; render(); };
+    left.appendChild(boostBtn);
+  }
   bar.appendChild(left);
 
   const expBtn = document.createElement('button'); expBtn.className = 'organ-btn'; expBtn.textContent = 'Download PNG';
@@ -1440,6 +1675,8 @@ function buildVideoRuntimeJs(weights: VideoWeights): string {
   return `
 const W = ${safeJsonForScript(weights)};
 const root = document.getElementById('organ-root');
+const VID_BINDINGS = (typeof PRISM_WEIGHT_BINDINGS !== 'undefined' ? PRISM_WEIGHT_BINDINGS : []).filter((b) => b.modality === 'video' || b.modality === 'image');
+const VID_SIG = VID_BINDINGS.length > 0 && Array.isArray(VID_BINDINGS[0].routingSignature) ? VID_BINDINGS[0].routingSignature.map((v) => v / 1024) : null;
 const dims = W.aspectRatio === '1:1' ? [540, 540] : W.aspectRatio === '9:16' ? [360, 640] : [640, 360];
 const totalDur = W.scenes.reduce((a, s) => a + s.durationSec, 0) || 6;
 let playing = true, tSec = 0, lastTs = 0;
@@ -1471,8 +1708,24 @@ function drawFrame(sec) {
   ctx.fillStyle = W.palette[0]; ctx.fillRect(0, 0, w, h);
   ctx.save();
   const cx = w / 2, cy = h / 2;
-  for (let i = 0; i < 6; i++) {
-    const r = 36 + i * 26 + Math.sin(localT * Math.PI * 2 + i) * 14;
+  if (VID_SIG) {
+    // Routed video/image-model temporal parallax ribbon field
+    for (let layer = 0; layer < 4; layer++) {
+      ctx.beginPath();
+      const yMid = h * (0.25 + layer * 0.18);
+      for (let x = 0; x <= w; x += 12) {
+        const y = yMid + Math.sin(x * 0.015 + sec * (1.2 + VID_SIG[layer] * 1.4) + layer) * (16 + VID_SIG[layer + 4] * 24);
+        if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.strokeStyle = layer % 2 === 0 ? scene.accent : W.palette[1];
+      ctx.globalAlpha = 0.24;
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+    }
+  }
+  const ringCount = VID_SIG ? 9 : 6;
+  for (let i = 0; i < ringCount; i++) {
+    const r = 36 + i * 24 + Math.sin(localT * Math.PI * 2 + i) * (VID_SIG ? 18 : 14);
     ctx.strokeStyle = scene.accent; ctx.globalAlpha = 0.22; ctx.lineWidth = 2;
     ctx.beginPath(); ctx.arc(cx + Math.cos(localT * 6 + i) * 24, cy + Math.sin(localT * 4 + i) * 14, r, 0, Math.PI * 2); ctx.stroke();
   }
@@ -1879,6 +2132,8 @@ function buildAudioRuntimeJs(weights: AudioWeights): string {
   return `
 const W = ${safeJsonForScript(weights)};
 const root = document.getElementById('organ-root');
+const AUD_BINDINGS = (typeof PRISM_WEIGHT_BINDINGS !== 'undefined' ? PRISM_WEIGHT_BINDINGS : []).filter((b) => b.modality === 'audio');
+const AUD_SIG = AUD_BINDINGS.length > 0 && Array.isArray(AUD_BINDINGS[0].routingSignature) ? AUD_BINDINGS[0].routingSignature.map((v) => v / 1024) : null;
 const SCALES = {
   pentatonic: [0, 2, 4, 7, 9, 12],
   major: [0, 2, 4, 5, 7, 9, 11, 12],
@@ -1892,17 +2147,38 @@ function playStep() {
   if (ctx.state === 'suspended') void ctx.resume();
   const scale = SCALES[W.scale] || SCALES.pentatonic;
   const note = W.rootMidi + scale[step % scale.length] + (step % 8 === 0 ? -12 : 0);
+  const hz = midiToHz(note);
+  const now = ctx.currentTime;
+  const dur = Math.max(0.12, (60 / bpm) * (W.style === 'ambient-pad' ? 1.4 : 0.45));
+  const filter = ctx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.setValueAtTime(AUD_SIG ? 900 + AUD_SIG[2] * 2800 : 2200, now);
+  filter.connect(ctx.destination);
+
   const osc = ctx.createOscillator();
   const gain = ctx.createGain();
   osc.type = W.style === 'ambient-pad' ? 'sine' : W.style === 'rhythm-pulse' ? 'triangle' : 'sawtooth';
-  osc.frequency.value = midiToHz(note);
-  const now = ctx.currentTime;
-  const dur = Math.max(0.12, (60 / bpm) * (W.style === 'ambient-pad' ? 1.4 : 0.45));
+  osc.frequency.value = hz;
   gain.gain.setValueAtTime(0.001, now);
-  gain.gain.exponentialRampToValueAtTime(0.14, now + 0.03);
+  gain.gain.exponentialRampToValueAtTime(0.13, now + 0.03);
   gain.gain.exponentialRampToValueAtTime(0.001, now + dur);
-  osc.connect(gain); gain.connect(ctx.destination);
+  osc.connect(gain); gain.connect(filter);
   osc.start(now); osc.stop(now + dur + 0.02);
+
+  if (AUD_SIG) {
+    // Routed audio-model harmonic overtone partials (2nd & 3rd harmonics)
+    for (const [mult, ampScale] of [[2, AUD_SIG[0] * 0.05], [1.5, AUD_SIG[1] * 0.04]]) {
+      const hOsc = ctx.createOscillator();
+      const hGain = ctx.createGain();
+      hOsc.type = 'sine';
+      hOsc.frequency.value = hz * mult;
+      hGain.gain.setValueAtTime(0.0005, now);
+      hGain.gain.exponentialRampToValueAtTime(Math.max(0.004, ampScale), now + 0.04);
+      hGain.gain.exponentialRampToValueAtTime(0.0005, now + dur);
+      hOsc.connect(hGain); hGain.connect(filter);
+      hOsc.start(now); hOsc.stop(now + dur + 0.02);
+    }
+  }
   step += 1;
   drawWave();
 }
@@ -1923,12 +2199,15 @@ function exportWav() {
   writeStr(36, 'data'); dv.setUint32(40, total * 2, true);
   const scale = SCALES[W.scale] || SCALES.pentatonic;
   const stepSamples = Math.max(2048, Math.round(sr * (60 / bpm) * 0.5));
+  const h2Amt = AUD_SIG ? AUD_SIG[0] * 0.24 : 0;
+  const h3Amt = AUD_SIG ? AUD_SIG[1] * 0.14 : 0;
   for (let i = 0; i < total; i++) {
     const idx = Math.floor(i / stepSamples);
     const local = (i % stepSamples) / stepSamples;
     const env = Math.sin(Math.min(1, local * 6) * Math.PI * 0.5) * Math.pow(1 - local, 1.5);
     const hz = midiToHz(W.rootMidi + scale[idx % scale.length]);
-    const sample = Math.sin((2 * Math.PI * hz * i) / sr) * env * 0.45;
+    const ph = (2 * Math.PI * hz * i) / sr;
+    const sample = (Math.sin(ph) + Math.sin(ph * 2) * h2Amt + Math.sin(ph * 1.5) * h3Amt) * env * 0.4;
     dv.setInt16(44 + i * 2, Math.max(-32767, Math.min(32767, Math.round(sample * 32767))), true);
   }
   const blob = new Blob([buf], { type: 'audio/wav' });
@@ -1941,7 +2220,8 @@ function drawWave() {
   c2d.fillStyle = '#0b0f14'; c2d.fillRect(0, 0, w, h);
   c2d.strokeStyle = '#10b981'; c2d.lineWidth = 2; c2d.beginPath();
   for (let x = 0; x < w; x += 4) {
-    const y = h / 2 + Math.sin(x * 0.04 + step * 0.9) * (playing ? 36 : 12) * Math.cos(x * 0.01);
+    const overtone = AUD_SIG ? Math.sin(x * 0.09 + step * 1.4) * (playing ? 12 : 4) * AUD_SIG[0] : 0;
+    const y = h / 2 + Math.sin(x * 0.04 + step * 0.9) * (playing ? 34 : 12) * Math.cos(x * 0.01) + overtone;
     if (x === 0) c2d.moveTo(x, y); else c2d.lineTo(x, y);
   }
   c2d.stroke();

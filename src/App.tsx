@@ -344,10 +344,17 @@ export default function App() {
   }, [workerClient]);
 
   const handleCreatePrism = useCallback(() => {
-    void prismStore.createDeclarative('undefined').then((created) => {
+    void prismStore.createDeclarative('undefined').then(async (created) => {
+      if (activeSpace && activeSpace !== 'personal') {
+        await prismStore.applyStudioOp(
+          created.id,
+          { op: 'set-concept-profile', compartmentId: activeSpace },
+          { pushRevision: false },
+        );
+      }
       setActiveView({ kind: 'prism', prismId: created.id, mode: 'studio' });
     });
-  }, [prismStore]);
+  }, [prismStore, activeSpace]);
 
   const handleImportHoloFile = useCallback(
     async (file: File) => {

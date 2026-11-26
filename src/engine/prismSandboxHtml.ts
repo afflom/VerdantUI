@@ -312,6 +312,7 @@ export function buildHoloviewSandboxDocument(opts: {
   readonly appJs: string;
   readonly darkMode: boolean;
 }): string {
+  const safePrismId = JSON.stringify(opts.prismId);
   const safeChannelId = JSON.stringify(opts.channelId);
   const safeDigest = JSON.stringify(opts.digest);
   const safeCss = escapeClosingTag(opts.prismCss || '', 'style');
@@ -321,12 +322,33 @@ export function buildHoloviewSandboxDocument(opts: {
   const prismBridgeScript = `
 (function () {
   const CHANNEL_ID = ${safeChannelId};
+  const PRISM_ID = ${safePrismId};
   const DIGEST = ${safeDigest};
-  const pending = new Map();
+  const pendingInvoke = new Map();
+  const pendingRpc = new Map();
+  const tokenCallbacks = new Map();
+  const inputHandlers = new Set();
+  let activeTraceContext = null;
+  let activeCallChain = [];
   let seq = 1;
 
   function post(type, payload) {
-    window.parent.postMessage({ __verdant: true, channelId: CHANNEL_ID, type, payload }, '*');
+    window.parent.postMessage({ __verdant: true, channelId: CHANNEL_ID, prismId: PRISM_ID, type, payload }, '*');
+  }
+
+  function callHost(method, args, onToken) {
+    const reqId = 'rpc_' + (seq++);
+    if (typeof onToken === 'function') tokenCallbacks.set(reqId, onToken);
+    return new Promise((resolve, reject) => {
+      pendingRpc.set(reqId, { resolve, reject });
+      post('rpc', {
+        reqId,
+        method,
+        args,
+        traceContext: activeTraceContext,
+        callChain: activeCallChain,
+      });
+    });
   }
 
   function applyTheme(dark) {
@@ -351,7 +373,7 @@ export function buildHoloviewSandboxDocument(opts: {
     });
   });
 
-  window.addEventListener('message', (ev) => {
+  window.addEventListener('message', async (ev) => {
     const msg = ev.data;
     if (!msg || !msg.__verdant || msg.channelId !== CHANNEL_ID) return;
     if (msg.type === 'theme' && msg.payload) {
@@ -360,17 +382,46 @@ export function buildHoloviewSandboxDocument(opts: {
       const styleEl = document.getElementById('verdant-user-css');
       if (styleEl) styleEl.textContent = msg.payload.css;
     } else if (msg.type === 'prism-invoke-result' && msg.payload) {
-      const w = pending.get(msg.payload.reqId);
+      const w = pendingInvoke.get(msg.payload.reqId);
       if (!w) return;
-      pending.delete(msg.payload.reqId);
+      pendingInvoke.delete(msg.payload.reqId);
       if (msg.payload.ok) w.resolve(String(msg.payload.value ?? ''));
       else w.reject(new Error(String(msg.payload.error || 'Model invocation failed')));
+    } else if (msg.type === 'rpc-token' && msg.payload && msg.payload.reqId) {
+      const cb = tokenCallbacks.get(msg.payload.reqId);
+      if (cb) { try { cb(msg.payload.text); } catch (_) {} }
+    } else if (msg.type === 'rpc-result' && msg.payload && msg.payload.reqId) {
+      const entry = pendingRpc.get(msg.payload.reqId);
+      pendingRpc.delete(msg.payload.reqId);
+      tokenCallbacks.delete(msg.payload.reqId);
+      if (!entry) return;
+      if (msg.payload.ok) entry.resolve(msg.payload.value);
+      else entry.reject(new Error(msg.payload.error || 'Verdant bridge request failed'));
+    } else if (msg.type === 'dispatch-input' && msg.payload) {
+      const { reqId, input, traceContext, callChain } = msg.payload;
+      const prevTrace = activeTraceContext;
+      const prevChain = activeCallChain;
+      activeTraceContext = traceContext || null;
+      activeCallChain = Array.isArray(callChain) ? callChain.slice() : [];
+      try {
+        let lastResult = { ok: true, prismId: PRISM_ID, received: input };
+        for (const handler of inputHandlers) {
+          const r = await handler(input, traceContext);
+          if (r !== undefined) lastResult = r;
+        }
+        post('dispatch-response', { reqId, ok: true, value: lastResult });
+      } catch (err) {
+        post('dispatch-response', { reqId, ok: false, error: err && err.message ? err.message : String(err) });
+      } finally {
+        activeTraceContext = prevTrace;
+        activeCallChain = prevChain;
+      }
     }
   });
 
   const invoke = (request) => new Promise((resolve, reject) => {
     const reqId = 'inv_' + (seq++);
-    pending.set(reqId, { resolve, reject });
+    pendingInvoke.set(reqId, { resolve, reject });
     post('prism-invoke', { reqId, request: String(request ?? '') });
   });
 
@@ -378,6 +429,59 @@ export function buildHoloviewSandboxDocument(opts: {
     invoke,
     requestMaximum: 4096,
     responseMaximum: 8192,
+  });
+
+  window.verdant = Object.freeze({
+    prismId: PRISM_ID,
+    digest: DIGEST,
+    emit(name, body, attributes) {
+      post('emit', {
+        name: String(name || 'prism.event'),
+        body,
+        attributes,
+        traceContext: activeTraceContext,
+      });
+    },
+    onInput(handler) {
+      if (typeof handler !== 'function') return () => {};
+      inputHandlers.add(handler);
+      return () => { inputHandlers.delete(handler); };
+    },
+    ask(prompt, opts) {
+      return callHost('ask', { prompt: String(prompt || '') }, opts && opts.onToken);
+    },
+    storage: Object.freeze({
+      get(key) { return callHost('storage.get', { key: String(key || '') }); },
+      set(key, value) { return callHost('storage.set', { key: String(key || ''), value }); },
+    }),
+    browser: Object.freeze({
+      copyText(text) { return callHost('browser.copyText', { text: String(text || '') }); },
+      downloadFile(filename, content, mimeType) {
+        return callHost('browser.downloadFile', {
+          filename: String(filename || 'export.txt'),
+          content: String(content || ''),
+          mimeType: String(mimeType || 'text/plain'),
+        });
+      },
+      notify(title, body) {
+        return callHost('browser.notify', { title: String(title || ''), body: String(body || '') });
+      },
+    }),
+    downloadFile(filename, content, mimeType) {
+      return callHost('browser.downloadFile', {
+        filename: String(filename || 'export.txt'),
+        content: String(content || ''),
+        mimeType: String(mimeType || 'text/plain'),
+      });
+    },
+    ui: Object.freeze({
+      getState() { return callHost('ui.getState', {}); },
+      callPrism(target, payload) { return callHost('ui.callPrism', { target: String(target || ''), payload }); },
+      openPrism(target) { return callHost('ui.openPrism', { target: String(target || '') }); },
+    }),
+    fetch(url, init, opts) {
+      return callHost('fetch', { url: String(url || ''), init: init || {} }, opts && opts.onChunk);
+    },
   });
 
   window.addEventListener('DOMContentLoaded', () => {

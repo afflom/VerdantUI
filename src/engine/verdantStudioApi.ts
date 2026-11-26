@@ -401,6 +401,7 @@ export type StudioApiOp =
       readonly jurisdictions?: readonly PrismJurisdiction[];
       readonly usesLocalAi?: boolean;
       readonly involvesPayments?: boolean;
+      readonly compartmentId?: string;
     }
   | {
       readonly op: 'admit-stakeholder';
@@ -1873,6 +1874,8 @@ export function dispatchStudioOp(decl: PrismDeclaration, op: StudioApiOp): Studi
         usesLocalAi: op.usesLocalAi !== undefined ? op.usesLocalAi : decl.concept.usesLocalAi,
         involvesPayments:
           op.involvesPayments !== undefined ? op.involvesPayments : decl.concept.involvesPayments,
+        compartmentId:
+          op.compartmentId !== undefined ? op.compartmentId.trim() || 'personal' : decl.concept.compartmentId,
       };
       const nextAssurance = decl.security.reviewedAt
         ? decl.security.assuranceLevel

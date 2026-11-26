@@ -80,6 +80,14 @@ export interface PrismBridgeRuntime {
     onChunk?: (accumulatedText: string) => void,
     signal?: AbortSignal,
   ): Promise<{ readonly status: number; readonly ok: boolean; readonly text: string }>;
+  handlePrismEmit(
+    prismId: string,
+    grants: VerdantPrismSnapshot['grants'],
+    name: string,
+    body: unknown,
+    attributes?: Record<string, string | number | boolean>,
+    traceContext?: OtelTraceContext,
+  ): { readonly accepted: boolean; readonly reason?: string };
   evictPrism(prismId: string): void;
 }
 
@@ -240,6 +248,13 @@ export class PrismHostPool implements PrismBridgeRuntime {
     return next;
   }
 
+  private resolvePrismCompartmentId(prismId: string): ContextCompartmentId {
+    const proj = this.store.get(prismId);
+    const declared = proj?.declaration?.concept.compartmentId;
+    if (declared && declared.trim()) return declared.trim();
+    return this.workerClient?.cognitiveObserver?.possession.getActiveCompartmentId() ?? 'personal';
+  }
+
   async getKv(
     prismId: string,
     grants: VerdantPrismSnapshot['grants'],
@@ -248,7 +263,8 @@ export class PrismHostPool implements PrismBridgeRuntime {
     if (!grants.storage || !this.grantsMatrix.isAllowed('prism-storage')) {
       throw new Error(`Storage grant denied for Prism "${prismId}" (FK-07).`);
     }
-    return this.store.getKv(prismId, key);
+    const space = this.resolvePrismCompartmentId(prismId);
+    return this.store.getKv(prismId, `space:${space}:${key}`);
   }
 
   async setKv(
@@ -260,7 +276,139 @@ export class PrismHostPool implements PrismBridgeRuntime {
     if (!grants.storage || !this.grantsMatrix.isAllowed('prism-storage')) {
       throw new Error(`Storage grant denied for Prism "${prismId}" (FK-07).`);
     }
-    await this.store.setKv(prismId, key, value);
+    const space = this.resolvePrismCompartmentId(prismId);
+    await this.store.setKv(prismId, `space:${space}:${key}`, value);
+  }
+
+  /**
+   * Mediates `window.verdant.emit('constraint' | 'sensory' | 'impulse' | custom, payload)`
+   * through `ContainerGrantMatrix` (FK-07) and `ContextBoundaryGate` (DEC-010).
+   */
+  handlePrismEmit(
+    prismId: string,
+    grants: VerdantPrismSnapshot['grants'],
+    name: string,
+    body: unknown,
+    attributes?: Record<string, string | number | boolean>,
+    traceContext?: OtelTraceContext,
+  ): { readonly accepted: boolean; readonly reason?: string } {
+    if (!grants.observer) {
+      return { accepted: false, reason: 'Observer stream grant is Off for this Prism.' };
+    }
+    const possession = this.workerClient?.cognitiveObserver?.possession;
+    const sourceSpace = this.resolvePrismCompartmentId(prismId);
+
+    if (possession && possession.isHalted() && (name === 'constraint' || name === 'impulse')) {
+      return { accepted: false, reason: 'Sharing is paused by owner kill switch.' };
+    }
+
+    if (name === 'constraint' && possession && body && typeof body === 'object') {
+      const payload = body as {
+        readonly opaqueOnly?: boolean;
+        readonly windows?: readonly {
+          readonly startMinuteOfDay?: number;
+          readonly endMinuteOfDay?: number;
+          readonly daysOfWeek?: readonly number[];
+        }[];
+      };
+      const proj = this.store.get(prismId);
+      const privLabel = proj?.draft.name || `prism:${prismId}`;
+      const windows = Array.isArray(payload.windows) ? payload.windows : [];
+      const nextConstraints = windows
+        .filter(
+          (w): w is { readonly startMinuteOfDay: number; readonly endMinuteOfDay: number; readonly daysOfWeek?: readonly number[] } =>
+            typeof w.startMinuteOfDay === 'number' && typeof w.endMinuteOfDay === 'number',
+        )
+        .map((w, idx) => ({
+          id: `${prismId}:live-win-${idx}`,
+          privateLabel: privLabel,
+          sourcePrismId: prismId,
+          startMinuteOfDay: w.startMinuteOfDay,
+          endMinuteOfDay: w.endMinuteOfDay,
+          daysOfWeek: Array.isArray(w.daysOfWeek) ? w.daysOfWeek : [0, 1, 2, 3, 4, 5, 6],
+          weightQ10: 960,
+          shareOpaqueAvailability: payload.opaqueOnly !== false,
+        }));
+      possession.replacePrismScheduleConstraints(sourceSpace, prismId, nextConstraints);
+      this.bus.emit({
+        name: 'prism.constraint.updated',
+        endpointKind: 'prism',
+        endpointId: prismId,
+        traceContext,
+        attributes: {
+          ...attributes,
+          'verdant.constraint.windows': windows.length,
+          'verdant.constraint.opaque': true,
+        },
+      });
+      return { accepted: true };
+    }
+
+    if (name === 'sensory' && possession) {
+      const payloadText = typeof body === 'string' ? body : JSON.stringify(body ?? '');
+      const res = possession.ingestSensoryFrame({
+        id: `sf_${prismId}_${Date.now().toString(36)}`,
+        prismId,
+        compartmentId: sourceSpace,
+        channel: 'browser',
+        sensitivity: 'internal',
+        payloadText,
+        receivedAt: Date.now(),
+      });
+      if (res.verdict === 'deny') {
+        return { accepted: false, reason: res.reason };
+      }
+      this.bus.emit({
+        name: 'prism.sensory',
+        endpointKind: 'prism',
+        endpointId: prismId,
+        traceContext,
+        attributes: { ...attributes, 'verdant.boundary.verdict': res.verdict },
+      });
+      return { accepted: true };
+    }
+
+    if (name === 'impulse' && possession && body && typeof body === 'object') {
+      const imp = body as {
+        readonly targetPrismId?: string;
+        readonly targetCompartmentId?: ContextCompartmentId;
+        readonly kind?: 'render-surface' | 'notify' | 'schedule-constraint' | 'stream-emit' | 'tool-invoke';
+        readonly payload?: unknown;
+        readonly opaqueOnly?: boolean;
+      };
+      const res = possession.dispatchActionImpulse({
+        id: `imp_${prismId}_${Date.now().toString(36)}`,
+        targetPrismId: String(imp.targetPrismId || prismId),
+        sourceCompartmentId: sourceSpace,
+        targetCompartmentId: imp.targetCompartmentId ?? sourceSpace,
+        kind: imp.kind ?? 'stream-emit',
+        payload: imp.payload ?? {},
+        opaqueOnly: Boolean(imp.opaqueOnly),
+        ownerApproved: grants.observer,
+        emittedAt: Date.now(),
+      });
+      if (res.verdict !== 'allow') {
+        return { accepted: false, reason: res.reason };
+      }
+      this.bus.emit({
+        name: 'prism.impulse',
+        endpointKind: 'prism',
+        endpointId: prismId,
+        traceContext,
+        attributes: { ...attributes, 'verdant.impulse.kind': imp.kind ?? 'stream-emit' },
+      });
+      return { accepted: true };
+    }
+
+    this.bus.emit({
+      name: String(name || 'prism.event'),
+      endpointKind: 'prism',
+      endpointId: prismId,
+      traceContext,
+      attributes,
+      body,
+    });
+    return { accepted: true };
   }
 
   async copyText(
@@ -752,14 +900,14 @@ export class PrismHostPool implements PrismBridgeRuntime {
         return;
       }
       if (msg.type === 'emit' && msg.payload) {
-        this.bus.emit({
-          name: String(msg.payload.name ?? 'prism.event'),
-          endpointKind: 'prism',
-          endpointId: prismId,
-          traceContext: msg.payload.traceContext ?? undefined,
-          attributes: msg.payload.attributes,
-          body: msg.payload.body,
-        });
+        this.handlePrismEmit(
+          prismId,
+          snapshot.grants,
+          String(msg.payload.name ?? 'prism.event'),
+          msg.payload.body,
+          msg.payload.attributes,
+          msg.payload.traceContext ?? undefined,
+        );
         return;
       }
       if (msg.type === 'runtime-error' && msg.payload) {

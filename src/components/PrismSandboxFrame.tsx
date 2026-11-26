@@ -197,15 +197,14 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
       }
 
       if (msg.type === 'emit' && msg.payload) {
-        if (!grantsRef.current.observer) return;
-        bus.emit({
-          name: String(msg.payload.name ?? 'prism.event'),
-          endpointKind: 'prism',
-          endpointId: prismId,
-          traceContext: msg.payload.traceContext ?? undefined,
-          attributes: msg.payload.attributes,
-          body: msg.payload.body,
-        });
+        bridgeRuntime.handlePrismEmit(
+          prismId,
+          grantsRef.current,
+          String(msg.payload.name ?? 'prism.event'),
+          msg.payload.body,
+          msg.payload.attributes,
+          msg.payload.traceContext ?? undefined,
+        );
         return;
       }
 
