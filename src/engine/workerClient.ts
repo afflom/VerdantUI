@@ -6,7 +6,12 @@
  */
 
 import type { ThreadMessage } from '@assistant-ui/react';
+import type { Tool } from 'assistant-stream';
 import { formatSpeculativePrefixForLlama } from './assistantAdapter';
+import {
+  estimateTextTokens,
+  UnifiedCognitiveContextGovernor,
+} from './cognitiveContext';
 import {
   UNIFIED_VERDANT_SYSTEM_PROMPT,
   VerdantCognitiveObserver,
@@ -268,7 +273,22 @@ export class LlamaVTensorWorkerClient {
   private lastSpeculativePrompt = '';
   private activeSpeculativeThreadId: string | null = null;
   private lastTokenStatePatchMs = 0;
+  private activeThreadId = 'default-thread';
+  private activeToolRegistry: Record<string, Tool<any, any>> | undefined;
   readonly cognitiveObserver = new VerdantCognitiveObserver();
+  readonly cognitiveContext = new UnifiedCognitiveContextGovernor();
+
+  getActiveThreadId(): string {
+    return this.activeThreadId;
+  }
+
+  setActiveThreadId(threadId: string): void {
+    this.activeThreadId = threadId || 'default-thread';
+  }
+
+  setActiveToolRegistry(tools: Record<string, Tool<any, any>> | undefined): void {
+    this.activeToolRegistry = tools;
+  }
   private readonly listeners = new Set<Listener>();
   private readonly pending = new Map<
     string,
@@ -774,15 +794,34 @@ export class LlamaVTensorWorkerClient {
     const mode = this.state.importedHarness?.promptMode ?? this.state.promptMode;
     const systemPrompt =
       systemMessage ?? this.state.importedHarness?.system ?? UNIFIED_VERDANT_SYSTEM_PROMPT;
+    const tid = threadId || this.activeThreadId;
+    const latchedTools =
+      this.cognitiveObserver.isToolsLatched(tid) &&
+      this.activeToolRegistry &&
+      Object.keys(this.activeToolRegistry).length > 0
+        ? this.activeToolRegistry
+        : undefined;
+    const projected = this.cognitiveContext.projectContext(tid, messages, {
+      latestUserText: '',
+      belief: this.cognitiveObserver.getThreadSnapshot(tid).belief,
+      maxContextWindow: model.maxContextWindow,
+      systemTokensEstimate: estimateTextTokens(systemPrompt) + (latchedTools ? 380 : 0),
+    });
+    const specOpts = {
+      tools: latchedTools,
+      epochManifestBlock: projected.epochManifestBlock,
+      preserveEmptyThinkPrefix: true,
+    };
     const stableWordDraft = trimToStableSpeculativePrefix(draftText, false);
     const fullDraft = trimToStableSpeculativePrefix(draftText, true);
 
     const wordPrompt = formatSpeculativePrefixForLlama(
-      messages,
+      projected.messages,
       stableWordDraft,
       model,
       mode,
       systemPrompt,
+      specOpts,
     );
     if (
       wordPrompt &&
@@ -797,11 +836,12 @@ export class LlamaVTensorWorkerClient {
 
     if (fullDraft !== stableWordDraft && fullDraft.length > 0) {
       const tailPrompt = formatSpeculativePrefixForLlama(
-        messages,
+        projected.messages,
         fullDraft,
         model,
         mode,
         systemPrompt,
+        specOpts,
       );
       if (
         tailPrompt &&

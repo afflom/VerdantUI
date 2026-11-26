@@ -91,9 +91,17 @@ const VerdantModelContextBridge: FC<{
           dispatchPrism: (prismId, payload, signal) =>
             prismPool.dispatchPublishedPrism(prismId, payload, { signal }),
         },
+        {
+          recallTurns: (q) =>
+            workerClient.cognitiveContext.recallTurns(workerClient.getActiveThreadId(), q),
+        },
       ),
     [workerClient, publishedPrisms, prismPool],
   );
+
+  useEffect(() => {
+    workerClient.setActiveToolRegistry(clientTools);
+  }, [workerClient, clientTools]);
 
   useEffect(() => {
     const context = buildUnifiedVerdantModelContext(

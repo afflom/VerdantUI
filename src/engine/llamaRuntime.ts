@@ -5542,13 +5542,21 @@ export class LlamaVTensorRuntime {
 
     const promptTokens = this.tokenizer.encode(prompt, this.tokenizer.addBosToken);
     // Allow users to input up to 100% of the selected model's native context window with zero artificial reservation.
+    // On extreme overflow, preserve the leading system/anchor prefix alongside the recent tail so instructions
+    // are never amputated and the pinned KV prefix remains reusable!
     const maxPrompt = Math.max(1, this.maxContextWindow);
     const promptTruncatedTokens = Math.max(0, promptTokens.length - maxPrompt);
     let truncatedPrompt: number[];
     if (promptTokens.length > maxPrompt) {
-      truncatedPrompt = this.tokenizer.addBosToken
-        ? [this.hparams.bosTokenId, ...promptTokens.slice(promptTokens.length - maxPrompt + 1)]
-        : promptTokens.slice(promptTokens.length - maxPrompt);
+      const keepHead = Math.min(
+        Math.max(1, this.kvPager.getPinnedPrefixPages() * 16),
+        Math.floor(maxPrompt * 0.25),
+      );
+      const keepTail = Math.max(1, maxPrompt - keepHead);
+      truncatedPrompt = [
+        ...promptTokens.slice(0, keepHead),
+        ...promptTokens.slice(promptTokens.length - keepTail),
+      ];
     } else {
       truncatedPrompt = promptTokens;
     }
@@ -5560,6 +5568,12 @@ export class LlamaVTensorRuntime {
     // Bit-exact live KV-cache prefix reuse + Unified Virtual Store Q8 block restore
     const aligned = this.alignAndRestorePrefix(truncatedPrompt, truncatedPrompt.length - 1);
     const commonPrefix = aligned.commonPrefix;
+    // Pin leading system/anchor KV pages above lossy Cold-Q4 demotion as multi-turn prefix stabilizes
+    const anchorPages = Math.max(
+      this.kvPager.getPinnedPrefixPages(),
+      Math.min(16, Math.max(1, Math.floor(Math.min(truncatedPrompt.length, Math.max(64, commonPrefix)) / 16))),
+    );
+    this.kvPager.setPinnedPrefixPages(anchorPages);
     const estMsPerPrefillToken =
       this.performanceContract && this.performanceContract.rooflinePrefillTokSec > 0
         ? 1000 / this.performanceContract.rooflinePrefillTokSec

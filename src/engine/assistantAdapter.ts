@@ -26,6 +26,7 @@ import type { Tool } from 'assistant-stream';
 import type { ReadonlyJSONObject } from 'assistant-stream/utils';
 import { applyCallSettingsToSampling } from './harnessConfig';
 import type { LoadedModelSummary } from './llamaRuntime';
+import { estimateTextTokens } from './cognitiveContext';
 import {
   formatDirectOperatorSummary,
   UNIFIED_VERDANT_SYSTEM_PROMPT,
@@ -52,6 +53,16 @@ export interface FormatPromptOptions {
   readonly tools?: Record<string, Tool<any, any>>;
   /** Optional in-progress assistant message from `unstable_getMessage()` carrying settled tool results for Step 2+. */
   readonly pendingAssistantMessage?: ThreadMessage | null;
+  /** Optional frozen `LOD1` Lossless Episodic Index appended cleanly to the epoch system prefix. */
+  readonly epochManifestBlock?: string | null;
+  /** Optional foveated `LOD3` bit-exact recalled turns placed at the active tail (preserves KV prefix!). */
+  readonly foveatedRecallBlock?: string | null;
+  /**
+   * When true on thinking-capable ChatML models (Qwen3), preserves `<think>\n\n</think>\n\n`
+   * ahead of prior non-reasoning assistant replies so Turn `k+1` matches Turn `k`'s live KV
+   * tokens bit-for-bit (eliminating 100% assistant-reply KV cache invalidation!).
+   */
+  readonly preserveEmptyThinkPrefix?: boolean;
 }
 
 export interface ParseAssistantStreamOptions {
@@ -439,6 +450,8 @@ export function parseAssistantStreamParts(
 interface ExtractedTurn {
   readonly role: 'system' | 'user' | 'assistant' | 'tool';
   readonly text: string;
+  /** True when this assistant turn was produced with no visible reasoning block (e.g. Fast/empty-think). */
+  readonly emptyThinkAssistant?: boolean;
 }
 
 function serializeToolResultPayload(part: ToolCallMessagePart): string {
@@ -494,14 +507,23 @@ function extractTurns(
     }
 
     if (m.role === 'assistant') {
+      const hasReasoningPart = m.content.some(
+        (p) => p.type === 'reasoning' && typeof (p as { text?: unknown }).text === 'string' && String((p as { text?: string }).text ?? '').trim().length > 0,
+      );
       // Preserve sequential assistant text / tool-call / tool-response interleaving across multi-step agent runs
       let pendingAssistantChunks: string[] = [];
       let pendingToolResponses: string[] = [];
+      let firstAssistantChunk = true;
 
       const flushAssistantAndTools = () => {
         const aText = pendingAssistantChunks.join('\n').trim();
         if (aText) {
-          turns.push({ role: 'assistant', text: aText });
+          turns.push({
+            role: 'assistant',
+            text: aText,
+            emptyThinkAssistant: firstAssistantChunk && !hasReasoningPart,
+          });
+          firstAssistantChunk = false;
         }
         pendingAssistantChunks = [];
         if (pendingToolResponses.length > 0) {
@@ -537,10 +559,30 @@ function extractTurns(
 function buildEffectiveSystemPrompt(
   explicitSystem: string,
   tools?: Record<string, Tool<any, any>>,
+  epochManifestBlock?: string | null,
 ): string {
+  const parts: string[] = [];
+  if (explicitSystem) parts.push(explicitSystem);
   const toolBlock = formatToolDeclarations(tools);
-  if (!toolBlock) return explicitSystem;
-  return explicitSystem ? `${explicitSystem}\n\n${toolBlock}` : toolBlock;
+  if (toolBlock) parts.push(toolBlock);
+  if (epochManifestBlock?.trim()) parts.push(epochManifestBlock.trim());
+  return parts.join('\n\n');
+}
+
+function attachFoveatedRecallToTail(
+  turns: ExtractedTurn[],
+  foveatedRecallBlock?: string | null,
+): ExtractedTurn[] {
+  const recall = foveatedRecallBlock?.trim();
+  if (!recall) return turns;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    if (turns[i].role === 'user') {
+      const next = [...turns];
+      next[i] = { ...next[i], text: `${recall}\n\n${next[i].text}` };
+      return next;
+    }
+  }
+  return turns;
 }
 
 /**
@@ -557,10 +599,21 @@ export function formatMessagesForLlama(
   systemPrompt?: string,
   options?: FormatPromptOptions,
 ): string {
-  const explicitSystem = buildEffectiveSystemPrompt(systemPrompt?.trim() || '', options?.tools);
-  const turns = extractTurns(messages, options?.pendingAssistantMessage);
+  const explicitSystem = buildEffectiveSystemPrompt(
+    systemPrompt?.trim() || '',
+    options?.tools,
+    options?.epochManifestBlock,
+  );
+  const turns = attachFoveatedRecallToTail(
+    extractTurns(messages, options?.pendingAssistantMessage),
+    options?.foveatedRecallBlock,
+  );
   const effectiveTemplate = resolveEffectiveTemplate(modelOrId, mode);
   const thinkingMode = options?.thinkingMode ?? 'auto';
+  const keepEmptyThink =
+    Boolean(options?.preserveEmptyThinkPrefix) &&
+    effectiveTemplate === 'chatml' &&
+    isThinkingCapableModel(modelOrId);
 
   if (effectiveTemplate === 'continuation') {
     const parts = turns.map((t) => t.text);
@@ -577,7 +630,11 @@ export function formatMessagesForLlama(
     }
     for (const t of turns) {
       const chatRole = t.role === 'tool' ? 'user' : t.role;
-      chunks.push(`<|im_start|>${chatRole}\n${t.text}<|im_end|>\n`);
+      const body =
+        keepEmptyThink && t.role === 'assistant' && t.emptyThinkAssistant
+          ? `<think>\n\n</think>\n\n${t.text}`
+          : t.text;
+      chunks.push(`<|im_start|>${chatRole}\n${body}<|im_end|>\n`);
     }
     if (shouldPrefillOpenThink(modelOrId, mode, thinkingMode)) {
       chunks.push('<|im_start|>assistant\n<think>\n');
@@ -700,12 +757,20 @@ export function formatSpeculativePrefixForLlama(
   modelOrId?: Pick<LoadedModelSummary, 'id' | 'hparams'> | string,
   mode: PromptFormatMode = 'auto',
   systemPrompt?: string,
-  options?: Pick<FormatPromptOptions, 'tools'>,
+  options?: Pick<FormatPromptOptions, 'tools' | 'epochManifestBlock' | 'preserveEmptyThinkPrefix'>,
 ): string {
-  const explicitSystem = buildEffectiveSystemPrompt(systemPrompt?.trim() || '', options?.tools);
+  const explicitSystem = buildEffectiveSystemPrompt(
+    systemPrompt?.trim() || '',
+    options?.tools,
+    options?.epochManifestBlock,
+  );
   const turns = extractTurns(messages);
   const effectiveTemplate = resolveEffectiveTemplate(modelOrId, mode);
   const openDraft = draftPrefix.trimStart();
+  const keepEmptyThink =
+    Boolean(options?.preserveEmptyThinkPrefix) &&
+    effectiveTemplate === 'chatml' &&
+    isThinkingCapableModel(modelOrId);
 
   if (effectiveTemplate === 'continuation') {
     if (turns.length === 0) return openDraft;
@@ -721,7 +786,11 @@ export function formatSpeculativePrefixForLlama(
     }
     for (const t of turns) {
       const chatRole = t.role === 'tool' ? 'user' : t.role;
-      chunks.push(`<|im_start|>${chatRole}\n${t.text}<|im_end|>\n`);
+      const body =
+        keepEmptyThink && t.role === 'assistant' && t.emptyThinkAssistant
+          ? `<think>\n\n</think>\n\n${t.text}`
+          : t.text;
+      chunks.push(`<|im_start|>${chatRole}\n${body}<|im_end|>\n`);
     }
     chunks.push(`<|im_start|>user\n${openDraft}`);
     return chunks.join('');
@@ -893,6 +962,9 @@ export function createLlamaVTensorAdapter(
       });
 
       const initialState = client.getState();
+      client.setActiveThreadId(threadId);
+      client.cognitiveContext.ingestMessages(threadId, messages);
+      const ledgerStats = client.cognitiveContext.getThreadLedgerStats(threadId);
       const publishedPrisms = studioBridge?.getPublishedPrisms() ?? [];
       const { certificate, snapshot } = client.cognitiveObserver.selectRoute({
         threadId,
@@ -904,6 +976,7 @@ export function createLlamaVTensorAdapter(
         isToolContinuationStep,
         hasImportedHarness: initialState.importedHarness !== null,
         publishedPrisms,
+        hasConsolidatedHistory: ledgerStats.consolidatedTurns > 0,
       });
       client.recordCognitiveObservation(certificate, snapshot);
       turnSpan?.setAttributes({
@@ -1082,8 +1155,17 @@ export function createLlamaVTensorAdapter(
         thinkingPolicy,
       );
 
+      // Project bounded, lossless O(1) active cognitive context with epoch-aligned KV stability
+      // and foveated lossless turn refaulting at the tail
+      const projected = client.cognitiveContext.projectContext(threadId, messages, {
+        latestUserText,
+        belief: snapshot.belief,
+        maxContextWindow: state.model.maxContextWindow,
+        systemTokensEstimate: estimateTextTokens(systemMessage) + (activeTools ? 380 : 0),
+      });
+
       const prompt = formatMessagesForLlama(
-        messages,
+        projected.messages,
         state.model,
         effectivePromptMode,
         systemMessage,
@@ -1091,6 +1173,9 @@ export function createLlamaVTensorAdapter(
           thinkingMode: thinkingPolicy,
           tools: activeTools,
           pendingAssistantMessage,
+          epochManifestBlock: projected.epochManifestBlock,
+          foveatedRecallBlock: projected.foveatedRecallBlock,
+          preserveEmptyThinkPrefix: true,
         },
       );
 
@@ -1181,6 +1266,20 @@ export function createLlamaVTensorAdapter(
       turnSpan?.end('ok');
 
       if (finalParts.length > 0) {
+        // Close the second-order cybernetic feedback loop for neural turns too
+        const visibleReply = finalParts
+          .filter((p): p is TextMessagePart => p.type === 'text')
+          .map((p) => p.text)
+          .join(' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (visibleReply && !hasToolCalls) {
+          const updatedSnap = client.cognitiveObserver.recordTurnOutcome(threadId, {
+            factKey: `turn_${snapshot.turnCount}`,
+            factSummary: visibleReply.slice(0, 140),
+          });
+          client.recordCognitiveObservation(certificate, updatedSnap);
+        }
         yield {
           content: finalParts,
           status: hasToolCalls

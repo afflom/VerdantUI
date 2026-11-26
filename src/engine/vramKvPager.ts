@@ -64,6 +64,7 @@ export interface VramKvTelemetry {
   readonly hotAttentionReads: number;
   readonly coldAttentionReads: number;
   readonly coldQ4AttentionReads: number;
+  readonly pinnedPrefixPages: number;
   readonly residencyBitsetHex: string;
 }
 
@@ -201,6 +202,8 @@ export class VramKvPager {
   private hotAttentionReads = 0;
   private coldAttentionReads = 0;
   private coldQ4AttentionReads = 0;
+  /** Number of leading KV pages (System Prompt + Anchor Manifest) protected from lossy 4-bit Cold Q4 demotion. */
+  private pinnedPrefixPages = 1;
 
   constructor(
     config: VramKvPagerConfig,
@@ -358,6 +361,24 @@ export class VramKvPager {
     this.hotAttentionReads = 0;
     this.coldAttentionReads = 0;
     this.coldQ4AttentionReads = 0;
+    this.pinnedPrefixPages = 1;
+  }
+
+  /**
+   * Pins leading prefix pages `[0 .. pinnedPrefixPages - 1]` (System Prompt, Tool Manifest,
+   * and frozen Lossless Episodic Epoch Index) above lossy Tier-2 Cold Q4 & Tier-3 Swap demotion,
+   * preserving instruction & constraint precision across arbitrarily long threads.
+   */
+  setPinnedPrefixPages(pages: number): void {
+    const requested = Math.max(1, Math.floor(pages));
+    const maxSafe = this.coldQ4Enabled
+      ? Math.max(1, Math.min(this.maxPages - 1, Math.max(1, this.warmQ8Limit - 2)))
+      : Math.max(1, this.maxPages - 1);
+    this.pinnedPrefixPages = Math.min(requested, maxSafe);
+  }
+
+  getPinnedPrefixPages(): number {
+    return this.pinnedPrefixPages;
   }
 
   /** Lazily allocates Tier-2 Cold Q4 WASM backing buffer on first cascade so boot RAM stays minimal. */
@@ -531,10 +552,19 @@ export class VramKvPager {
   private cascadeWarmToColdQ4(protectPageIdx: number): void {
     if (!this.coldQ4Enabled || !this.ensureColdQ4PoolAllocated()) return;
     let victim = -1;
-    for (let p = 1; p < this.maxPages; p++) {
+    // Prefer oldest unpinned Warm Q8 page (>= pinnedPrefixPages) so System/Anchor pages stay lossless Warm Q8
+    for (let p = this.pinnedPrefixPages; p < this.maxPages; p++) {
       if (p !== protectPageIdx && this.pageState[p] === VramPageState.COLD_COMPRESSED) {
         victim = p;
         break;
+      }
+    }
+    if (victim === -1) {
+      for (let p = 1; p < this.pinnedPrefixPages && p < this.maxPages; p++) {
+        if (p !== protectPageIdx && this.pageState[p] === VramPageState.COLD_COMPRESSED) {
+          victim = p;
+          break;
+        }
       }
     }
     if (victim === -1) return;
@@ -573,10 +603,18 @@ export class VramKvPager {
       return;
     }
     let victim = -1;
-    for (let p = 1; p < this.maxPages; p++) {
+    for (let p = this.pinnedPrefixPages; p < this.maxPages; p++) {
       if (p !== protectPageIdx && this.pageState[p] === VramPageState.COLD_Q4) {
         victim = p;
         break;
+      }
+    }
+    if (victim === -1) {
+      for (let p = 1; p < this.pinnedPrefixPages && p < this.maxPages; p++) {
+        if (p !== protectPageIdx && this.pageState[p] === VramPageState.COLD_Q4) {
+          victim = p;
+          break;
+        }
       }
     }
     if (victim === -1) return;
@@ -1652,6 +1690,7 @@ export class VramKvPager {
       hotAttentionReads: this.hotAttentionReads,
       coldAttentionReads: this.coldAttentionReads,
       coldQ4AttentionReads: this.coldQ4AttentionReads,
+      pinnedPrefixPages: this.pinnedPrefixPages,
       residencyBitsetHex,
     };
   }

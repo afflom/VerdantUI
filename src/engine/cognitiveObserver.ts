@@ -911,6 +911,8 @@ interface InternalThreadMemory {
   lastSurpriseQ10: number;
   lastInputDigest: string;
   retryEscalationLevel: number;
+  /** Monotonic per-thread tool latch: prevents toggling `<tools>` mid-thread and wiping the KV prefix! */
+  toolsLatched: boolean;
   workingMemory: WorkingMemoryFact[];
   lastCertificate: CognitiveRouteCertificate | null;
 }
@@ -928,6 +930,8 @@ export interface RouteDecisionContext {
   readonly isToolContinuationStep: boolean;
   readonly hasImportedHarness: boolean;
   readonly publishedPrisms?: readonly PublishedPrismSummary[];
+  /** True once the thread has consolidated turns in its lossless episodic ledger (`recall_thread_memory`). */
+  readonly hasConsolidatedHistory?: boolean;
 }
 
 /**
@@ -953,12 +957,19 @@ export class VerdantCognitiveObserver {
         lastSurpriseQ10: 0,
         lastInputDigest: '',
         retryEscalationLevel: 0,
+        toolsLatched: false,
         workingMemory: [],
         lastCertificate: null,
       };
       this.threads.set(key, mem);
     }
     return mem;
+  }
+
+  /** Returns whether tool schemas are monotonically latched for `threadId` (KV-prefix stability). */
+  isToolsLatched(threadId: string): boolean {
+    const key = threadId || 'default-thread';
+    return this.threads.get(key)?.toolsLatched ?? false;
   }
 
   getThreadSnapshot(threadId: string): CognitiveObserverSnapshot {
@@ -1220,16 +1231,23 @@ export class VerdantCognitiveObserver {
       `${winner.routeId}:${winner.freeEnergy}:${thinkingPolicy}:${needsTools ? 1 : 0}:${surpriseQ10}:${obs.inputDigest}`,
     );
 
+    const shouldAttachToolsNow =
+      winner.kind !== 'lod0-verified' &&
+      (mem.toolsLatched ||
+        needsTools ||
+        Boolean(ctx.hasConsolidatedHistory) ||
+        Boolean(ctx.publishedPrisms && ctx.publishedPrisms.length > 0));
+    if (shouldAttachToolsNow) {
+      mem.toolsLatched = true;
+    }
+
     const certificate: CognitiveRouteCertificate = {
       routeId: winner.routeId,
       label: winner.label,
       kind: winner.kind,
       modelId: winner.modelId,
       thinkingPolicy: winner.kind === 'lod0-verified' ? 'off' : thinkingPolicy,
-      attachTools:
-        winner.kind === 'lod0-verified'
-          ? false
-          : needsTools || Boolean(ctx.publishedPrisms && ctx.publishedPrisms.length > 0),
+      attachTools: shouldAttachToolsNow,
       recommendedSampling,
       directMatch: winner.kind === 'lod0-verified' ? effectiveDirectMatch : null,
       settlementRule,
@@ -1397,13 +1415,32 @@ export interface PublishedPrismToolBridge {
   ): Promise<{ readonly result: unknown; readonly prismName: string; readonly digest: string }>;
 }
 
+export interface EpisodicRecallToolBridge {
+  recallTurns(
+    query: {
+      readonly query?: string;
+      readonly turnIndex?: number;
+      readonly kappa?: string;
+      readonly limit?: number;
+    },
+  ): readonly {
+    readonly turnIndex: number;
+    readonly role: 'user' | 'assistant' | 'system';
+    readonly kappa: string;
+    readonly salienceQ10: number;
+    readonly verbatimText: string;
+  }[];
+}
+
 /**
  * Creates VerdantUI's 100% client-side `@assistant-ui/react` verified Tool registry,
- * dynamically registering every Published Prism via its JSON Schema 2020-12 input contract.
+ * dynamically registering every Published Prism via its JSON Schema 2020-12 input contract
+ * and optional bit-exact lossless episodic recall (`recall_thread_memory`).
  */
 export function createVerdantClientTools(
   getSnapshot: () => RuntimeToolSnapshot,
   publishedPrismBridge?: PublishedPrismToolBridge,
+  episodicRecallBridge?: EpisodicRecallToolBridge,
 ): Record<string, Tool<any, any>> {
   const tools: Record<string, Tool<any, any>> = {
     calculate: {
@@ -1646,6 +1683,35 @@ export function createVerdantClientTools(
         },
       };
     }
+  }
+
+  if (episodicRecallBridge) {
+    tools.recall_thread_memory = {
+      description:
+        'Retrieve bit-exact verbatim earlier turns from this conversation’s lossless content-addressed episodic ledger by kappa hash, turn index, or keyword query.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Keyword, symbol, or topic to recall verbatim.' },
+          kappa: { type: 'string', description: 'Optional 16-hex kappa address from the episodic index.' },
+          turnIndex: { type: 'number', description: 'Optional 0-based turn number.' },
+          limit: { type: 'number', description: 'Maximum matching turns to return (1..5, default 2).' },
+        },
+      },
+      execute: async (args: { query?: string; kappa?: string; turnIndex?: number; limit?: number }) => {
+        const hits = episodicRecallBridge.recallTurns({
+          query: typeof args?.query === 'string' ? args.query : undefined,
+          kappa: typeof args?.kappa === 'string' ? args.kappa : undefined,
+          turnIndex: typeof args?.turnIndex === 'number' ? args.turnIndex : undefined,
+          limit: typeof args?.limit === 'number' ? args.limit : 2,
+        });
+        return {
+          lossless: true,
+          hitCount: hits.length,
+          turns: hits,
+        };
+      },
+    };
   }
 
   return tools;
