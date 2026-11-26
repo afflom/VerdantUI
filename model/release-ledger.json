@@ -51,6 +51,26 @@
         "VUI-FEAT-008"
       ],
       "summary": "Procedural MediaType Prism Synthesis, Sparse Studio Activation & Multi-Modal Weight Routing; Unified Possession Model, Non-Leaking Cross-Context Boundary & Active Published Prism Organs"
+    },
+    {
+      "version": "0.4.0",
+      "tag": "v0.4.0",
+      "releasedAt": "2026-11-26T20:53:31.722Z",
+      "commit": "f9cf71b00924bd21bb7dbc38deb59a574cadb56c",
+      "engineTag": "v2.22.4",
+      "studioCommit": "da5083b5ee22e2d9942acee0e03a5b1a0a22e091",
+      "activeFeatureIds": [
+        "VUI-FEAT-001",
+        "VUI-FEAT-002",
+        "VUI-FEAT-003",
+        "VUI-FEAT-004",
+        "VUI-FEAT-005",
+        "VUI-FEAT-006",
+        "VUI-FEAT-007",
+        "VUI-FEAT-008",
+        "VUI-FEAT-009"
+      ],
+      "summary": "Coherent Multimodal Perception, 1-Step Image Synthesis, Modal Audio & Closed-Loop Vision Critique"
     }
   ]
 }
