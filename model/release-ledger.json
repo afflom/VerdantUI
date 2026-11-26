@@ -15,6 +15,23 @@
         "VUI-FEAT-004"
       ],
       "summary": "Initial multi-threaded Verdant vTensor WASM SIMD workbench, OPFS DIMM + UKV3 KV persistence, Lossless Cognitive Context Governor, and browser-native Prism Studio."
+    },
+    {
+      "version": "0.2.0",
+      "tag": "v0.2.0",
+      "releasedAt": "2026-11-26T19:31:28.791Z",
+      "commit": "1235259ee87af321c4ab3a4d7e66064b508f72d8",
+      "engineTag": "v2.22.4",
+      "studioCommit": "da5083b5ee22e2d9942acee0e03a5b1a0a22e091",
+      "activeFeatureIds": [
+        "VUI-FEAT-001",
+        "VUI-FEAT-002",
+        "VUI-FEAT-003",
+        "VUI-FEAT-004",
+        "VUI-FEAT-005",
+        "VUI-FEAT-006"
+      ],
+      "summary": "Verdant Studio Product & Feature Lifecycle Governance & Automated Releases; Free Public Benefit Service & Zero-Jargon Permanent Ratchets"
     }
   ]
 }
