@@ -230,7 +230,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       const entry = activeHolo.viewEntry ?? 'index.html';
       return {
         indexHtml: files[entry] ?? files['index.html'] ?? '',
-        prismCss: files['prism.css'] ?? '',
+        prismCss: files['prism.css'] ?? files['styles.css'] ?? '',
         prismUiJs: files['prism-ui.js'] ?? '',
         appJs: files['app.js'] ?? '',
         onInvoke: invokeModel,
@@ -671,6 +671,47 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     [engineState.model, engineState.promptMode, engineState.sampling, hasLocalModelReady, project.id, workerClient],
   );
 
+  const handleRunStudioAgentPrompt = useCallback(
+    async (
+      systemPrompt: string,
+      userPrompt: string,
+      maxTokens: number,
+      onProgress?: (charsGenerated: number) => void,
+    ): Promise<string> => {
+      if (!hasLocalModelReady || !engineState.model) {
+        throw new Error('On-device model is not ready yet.');
+      }
+      const syntheticUser: ThreadMessage = {
+        id: `agent_${Date.now()}`,
+        role: 'user',
+        createdAt: new Date(),
+        content: [{ type: 'text', text: userPrompt }],
+        attachments: [],
+        metadata: { custom: {} },
+      } as ThreadMessage;
+      const prompt = formatMessagesForLlama(
+        [syntheticUser],
+        engineState.model,
+        engineState.promptMode,
+        systemPrompt,
+        { thinkingMode: 'off' },
+      );
+      const ac = new AbortController();
+      let raw = '';
+      for await (const ev of workerClient.streamGenerate(
+        prompt,
+        ac.signal,
+        { ...engineState.sampling, temperature: 0.25, maxTokens },
+        `studio-agent:${project.id}`,
+      )) {
+        raw = stripReasoningTags(ev.accumulatedText);
+        onProgress?.(raw.length);
+      }
+      return raw;
+    },
+    [engineState.model, engineState.promptMode, engineState.sampling, hasLocalModelReady, project.id, workerClient],
+  );
+
   const handleSelectBlueprintStage = useCallback(
     (stage: StudioWizardStage) => {
       setWizardStage(stage);
@@ -787,10 +828,16 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                   Interface
                 </p>
                 <p className="mt-1 text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-                  {declaration ? `prism.design/1 (${declaration.theme.preset})` : 'HOLOVIEW'}
+                  {declaration?.view?.authoredView
+                    ? 'Interactive App (Authored)'
+                    : declaration
+                      ? `prism.design/1 (${declaration.theme.preset})`
+                      : 'HOLOVIEW'}
                 </p>
                 <p className="mt-0.5 text-[11px] text-zinc-500">
-                  Authored view · zero rules in page JS
+                  {declaration?.view?.authoredView
+                    ? 'Custom interactive view · core invariants proved'
+                    : 'Compiled view · zero rules in page JS'}
                 </p>
               </div>
             </div>
@@ -1409,7 +1456,15 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                       onSelectStep={setGuidedStep}
                       onDispatchOp={handleDispatchOp}
                       onSynthesizeWithLocalModel={handleSynthesizeIdeaWithLocalModel}
+                      onRunStudioAgentPrompt={handleRunStudioAgentPrompt}
                       hasLocalModelReady={hasLocalModelReady}
+                      engineStatus={engineState.status}
+                      engineProgressPercent={engineState.progressPercent}
+                      engineStatusDetail={engineState.statusDetail}
+                      loadedModelName={engineState.model?.displayName ?? null}
+                      onEnableModelStream={onEnableModelStream}
+                      runtimeError={runtimeError}
+                      onClearRuntimeError={() => setRuntimeError(null)}
                       onOpenPreview={() => setPreviewPaneMode('preview')}
                       onCheckAndBuild={() => void handleCheckAndBuild()}
                       onPublish={() => void handlePublish()}

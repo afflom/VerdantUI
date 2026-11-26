@@ -263,7 +263,20 @@ export interface AcceptanceVectorDecl {
   readonly isRefusal: boolean;
 }
 
-export type PrismViewpoint = 'decision-form' | 'calculator' | 'ledger-tracker' | 'request-reply';
+export type PrismViewpoint =
+  | 'decision-form'
+  | 'calculator'
+  | 'ledger-tracker'
+  | 'request-reply'
+  | 'interactive-app';
+
+export interface AuthoredPrismView {
+  readonly html: string;
+  readonly css: string;
+  readonly js: string;
+  readonly summary?: string;
+  readonly authorMode: 'studio-agent' | 'custom';
+}
 
 export type ViewElementSlot =
   | 'field-input'
@@ -289,6 +302,8 @@ export interface StudioViewDecl {
   readonly submitLabel: string;
   readonly disclosure?: string;
   readonly elements: readonly ViewElementDecl[];
+  /** Custom interactive app realization (`prism.app-view/1`) packed into HOLOVIEW when present. */
+  readonly authoredView?: AuthoredPrismView | null;
   readonly citation: StudioCitation;
 }
 
@@ -488,6 +503,15 @@ export type StudioApiOp =
   | {
       readonly op: 'declare-view';
       readonly view: StudioViewDecl;
+    }
+  | {
+      readonly op: 'admit-authored-view';
+      readonly authoredView: AuthoredPrismView;
+      readonly title?: string;
+      readonly eyebrow?: string;
+      readonly subtitle?: string;
+      readonly disclosure?: string;
+      readonly citation: StudioCitation;
     }
   | {
       readonly op: 'set-theme';
@@ -2234,15 +2258,19 @@ export function dispatchStudioOp(decl: PrismDeclaration, op: StudioApiOp): Studi
         current = seedReq.declaration;
       }
       const primaryReq = current.requirements[0].id;
+      const existingAuthored = current.view?.authoredView ?? null;
+      const keepAuthored =
+        existingAuthored !== null && (op.viewpoint === undefined || op.viewpoint === 'interactive-app');
       const formulaCount = current.features.filter((f) => f.outcome.kind === 'formula').length;
       const hasStateful = current.concept.opmObjects.some((o) => o.role === 'stateful-asset');
-      const viewpoint: PrismViewpoint =
-        op.viewpoint ??
-        (hasStateful
-          ? 'ledger-tracker'
-          : formulaCount > 0 && formulaCount >= current.features.length / 2
-            ? 'calculator'
-            : 'decision-form');
+      const viewpoint: PrismViewpoint = keepAuthored
+        ? 'interactive-app'
+        : (op.viewpoint ??
+          (hasStateful
+            ? 'ledger-tracker'
+            : formulaCount > 0 && formulaCount >= current.features.length / 2
+              ? 'calculator'
+              : 'decision-form'));
 
       const elements: ViewElementDecl[] = (current.encoding?.fields ?? []).map((f) => ({
         id: `el_${f.name}`,
@@ -2291,6 +2319,7 @@ export function dispatchStudioOp(decl: PrismDeclaration, op: StudioApiOp): Studi
           submitLabel: primaryProc ? primaryProc.slice(0, 28) : 'Evaluate',
           disclosure: current.view?.disclosure,
           elements,
+          authoredView: keepAuthored ? existingAuthored : null,
           citation: { kind: 'req', requirementId: primaryReq },
         },
       });
@@ -2748,6 +2777,101 @@ export function dispatchStudioOp(decl: PrismDeclaration, op: StudioApiOp): Studi
         auditLog: appendAudit(decl, op.op, `Declared ${op.view.viewpoint} view (${op.view.elements.length} elements)`),
       };
       return { ok: true, declaration: next, message: `Declared view "${op.view.title}" (${op.view.viewpoint}).` };
+    }
+
+    case 'admit-authored-view': {
+      const html = op.authoredView.html.trim();
+      const css = op.authoredView.css.trim();
+      const js = op.authoredView.js.trim();
+      if (!html) {
+        return {
+          ok: false,
+          code: 'view.empty-html',
+          message: 'Interactive app view requires non-empty HTML markup.',
+          remediation: 'Provide the interactive app HTML content.',
+        };
+      }
+      if (!js) {
+        return {
+          ok: false,
+          code: 'view.empty-js',
+          message: 'Interactive app view requires non-empty JavaScript logic.',
+          remediation: 'Provide the interactive app JavaScript behavior.',
+        };
+      }
+      if (/<script[^>]+src=["']https?:\/\//i.test(html) || /<link[^>]+href=["']https?:\/\//i.test(html)) {
+        return {
+          ok: false,
+          code: 'view.external-asset-refused',
+          message: 'Authored Prism views must be 100% self-contained with zero remote script or stylesheet URLs.',
+          remediation: 'Remove remote http(s) script/link tags and inline all styles and logic.',
+        };
+      }
+      const admittedSet = new Set(decl.admissions.map((a) => a.construct));
+      const citCheck = citationResolves(decl, admittedSet, op.citation);
+      if (!citCheck.ok) {
+        return {
+          ok: false,
+          code: 'admission.unresolved',
+          message: `Authored view refused: ${citCheck.detail}`,
+          remediation: 'Cite an admitted Requirement or staged Authority.',
+        };
+      }
+      const primaryReq =
+        op.citation.kind === 'req'
+          ? op.citation.requirementId
+          : (decl.requirements[0]?.id ?? 'REQ-01');
+      const elements: ViewElementDecl[] = (decl.encoding?.fields ?? []).map((f) => ({
+        id: `el_${f.name}`,
+        slot: f.kind === 'choice' ? 'choice-group' : 'field-input',
+        label: f.label,
+        binding: f.name,
+        requirementId: primaryReq,
+      }));
+      elements.push({
+        id: 'el_result',
+        slot: 'result-card',
+        label: decl.concept.opmObjects.find((o) => o.role === 'output')?.name || 'Interactive State',
+        binding: 'outcome',
+        requirementId: primaryReq,
+      });
+
+      const viewDecl: StudioViewDecl = {
+        viewpoint: 'interactive-app',
+        title: op.title?.trim() || decl.view?.title || decl.metadata.name,
+        eyebrow: op.eyebrow?.trim() || decl.view?.eyebrow || 'Interactive Prism',
+        subtitle:
+          op.subtitle?.trim() ||
+          decl.view?.subtitle ||
+          decl.concept.purpose ||
+          decl.metadata.description,
+        submitLabel: decl.view?.submitLabel || 'Run',
+        disclosure: op.disclosure !== undefined ? op.disclosure : decl.view?.disclosure,
+        elements,
+        authoredView: {
+          html,
+          css,
+          js,
+          summary: op.authoredView.summary,
+          authorMode: op.authoredView.authorMode,
+        },
+        citation: op.citation,
+      };
+      const next: PrismDeclaration = {
+        ...decl,
+        view: viewDecl,
+        admissions: upsertAdmission(decl.admissions, 'View.interactive-app', op.citation),
+        auditLog: appendAudit(
+          decl,
+          op.op,
+          `Admitted interactive app view "${viewDecl.title}" (${html.length}B HTML · ${js.length}B JS)`,
+        ),
+      };
+      return {
+        ok: true,
+        declaration: next,
+        message: `Admitted interactive app view "${viewDecl.title}".`,
+      };
     }
 
     case 'set-theme': {

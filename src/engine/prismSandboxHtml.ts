@@ -386,12 +386,20 @@ export function buildHoloviewSandboxDocument(opts: {
 })();
 `;
 
-  // Extract body inner HTML if full HTML doc was provided, stripping external prism asset tags
+  // Preserve any inline <style> blocks in <head> alongside compiled/authored CSS
+  const headMatch = opts.indexHtml.match(/<head[^>]*>([\s\S]*?)<\/head>/i);
+  const inlineHeadStyles = headMatch
+    ? Array.from(headMatch[1].matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi))
+        .map((m) => escapeClosingTag(m[1], 'style'))
+        .join('\n')
+    : '';
+
+  // Extract body inner HTML if full HTML doc was provided, stripping external prism/authored asset tags
   const bodyMatch = opts.indexHtml.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
   const rawBody = bodyMatch ? bodyMatch[1] : opts.indexHtml;
   const cleanedBody = rawBody
     .replace(/<script[^>]+src=["'](?:\.\/)?(?:prism\.js|prism-ui\.js|app\.js)["'][^>]*><\/script>/gi, '')
-    .replace(/<link[^>]+href=["'](?:\.\/)?prism\.css["'][^>]*\/?>/gi, '');
+    .replace(/<link[^>]+href=["'](?:\.\/)?(?:prism\.css|styles\.css)["'][^>]*\/?>/gi, '');
 
   const htmlAttr = opts.darkMode ? ' class="dark" data-theme="dark"' : ' data-theme="light"';
 
@@ -401,9 +409,9 @@ export function buildHoloviewSandboxDocument(opts: {
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta http-equiv="Content-Security-Policy" content="${VERDANT_SANDBOX_CSP}" />
-<style id="verdant-user-css">${safeCss}</style>
+<style id="verdant-user-css">${safeCss}${inlineHeadStyles ? `\n${inlineHeadStyles}` : ''}</style>
 <script>${prismBridgeScript}</script>
-<script>${safeUiJs}</script>
+${safeUiJs ? `<script>${safeUiJs}</script>` : ''}
 </head>
 <body>
 ${cleanedBody}

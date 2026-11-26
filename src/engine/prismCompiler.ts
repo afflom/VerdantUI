@@ -606,18 +606,95 @@ export function emitThemeJson(decl: PrismDeclaration): string {
 }
 
 /**
- * Mechanically emits `app/view/index.html` and `app/view/app.js` strictly using the
- * `prism.design/1` catalogue (`data-slot`, Tailwind utility tokens, zero arbitrary CSS,
- * zero business logic in JS — `globalThis.prism.invoke(line)` decides every answer).
+ * Emits `app/view/index.html`, optional `app/view/styles.css`, and `app/view/app.js`.
+ *
+ * - For authored interactive apps (`decl.view.authoredView`, `prism.app-view/1`):
+ *   emits the complete author/agent-synthesized interactive page with `styles.css`,
+ *   `prism.js` (`globalThis.prism.invoke`), and `app.js` — omitting `prism.css` so
+ *   `prism-code` packs the authored app cleanly into `HOLOVIEW` alongside its Lean-proved
+ *   model (`app/src/App.lex.tex`).
+ * - For structured declarative forms (`decision-form`, `calculator`, `ledger-tracker`,
+ *   `request-reply`): mechanically emits `prism.design/1` semantic HTML (`data-slot`)
+ *   and thin `globalThis.prism.invoke(line)` client JS.
  */
 export function emitDesignView(decl: PrismDeclaration): {
   readonly indexHtml: string;
+  readonly stylesCss: string | null;
   readonly appJs: string;
+  readonly isAuthoredApp: boolean;
 } {
   if (!decl.view) {
     throw new Error('Cannot emit prism.design/1 view: no Design View is declared yet.');
   }
   const view = decl.view;
+
+  // Custom authored interactive app (`prism.app-view/1`)
+  if (view.authoredView) {
+    const disclosureHtml = view.disclosure?.trim()
+      ? `\n  <footer class="v-prism-disclosure" role="note">${escapeHtml(view.disclosure.trim())}</footer>`
+      : '';
+    const authoredBody = view.authoredView.html.trim();
+    const indexHtml = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>${escapeHtml(view.title)}</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="styles.css">
+  <script type="module" src="prism.js"></script>
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+${authoredBody}${disclosureHtml}
+</body>
+</html>
+`;
+    const baseTokens = `:root {
+  --v-bg: #f8f9fa;
+  --v-surface: #ffffff;
+  --v-surface-alt: #f1f5f9;
+  --v-border: #d8dee9;
+  --v-text: #0f172a;
+  --v-muted: #64748b;
+  --v-accent: ${decl.theme.accent || '#0f5132'};
+  --v-accent-text: #ffffff;
+  color-scheme: light;
+}
+:root.dark, :root[data-theme="dark"] {
+  --v-bg: #0b0f14;
+  --v-surface: #111822;
+  --v-surface-alt: #182230;
+  --v-border: #263244;
+  --v-text: #f1f5f9;
+  --v-muted: #94a3b8;
+  --v-accent: ${decl.theme.accent || '#10b981'};
+  --v-accent-text: #062116;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+  background: var(--v-bg);
+  color: var(--v-text);
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.v-prism-disclosure {
+  margin: 12px auto 16px;
+  max-width: 680px;
+  padding: 0 16px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--v-muted);
+}
+`;
+    const stylesCss = `${baseTokens}\n${view.authoredView.css.trim()}\n`;
+    const appJs = `${view.authoredView.js.trim()}\n`;
+    return { indexHtml, stylesCss, appJs, isAuthoredApp: true };
+  }
   const fields = decl.encoding?.fields ?? [];
   const fieldByName = new Map(fields.map((f) => [f.name, f]));
   const hasHistory = view.elements.some((e) => e.slot === 'history-list');
@@ -998,7 +1075,7 @@ resetBtn.addEventListener('click', () => {
 evaluateCurrent();
 `;
 
-  return { indexHtml, appJs };
+  return { indexHtml, stylesCss: null, appJs, isAuthoredApp: false };
 }
 
 /**
@@ -1061,22 +1138,24 @@ export function compilePrismDeclaration(decl: PrismDeclaration): CompiledPrismWo
   const prismToml = emitPrismToml(decl);
   const { idsToml, featureGherkin, conformanceMd } = emitConformanceRegisters(decl, theoremMap);
   const themeJson = emitThemeJson(decl);
-  const { indexHtml, appJs } = emitDesignView(decl);
+  const { indexHtml, stylesCss, appJs, isAuthoredApp } = emitDesignView(decl);
   const routing = evaluateVerdantRouting(decl);
 
   const pageMap = new Map<string, Uint8Array>([
     ['index.html', enc.encode(indexHtml)],
     ['app.js', enc.encode(appJs)],
+    ...(stylesCss !== null ? [['styles.css', enc.encode(stylesCss)] as const] : []),
   ]);
   const themeBytes = enc.encode(themeJson);
-  const compiled = compileDesign(pageMap, themeBytes);
-  const designDiagnostics = checkDesign(pageMap, themeBytes);
+  const compiled = isAuthoredApp ? null : compileDesign(pageMap, themeBytes);
+  const designDiagnostics = isAuthoredApp ? [] : checkDesign(pageMap, themeBytes);
   const resolvedTheme = resolveTheme(themeBytes);
 
   const appFiles: Record<string, string> = {
     'src/App.lex.tex': appLexTex,
     'design/theme.json': themeJson,
     'view/index.html': indexHtml,
+    ...(stylesCss !== null ? { 'view/styles.css': stylesCss } : {}),
     'view/app.js': appJs,
   };
 
@@ -1085,6 +1164,7 @@ export function compilePrismDeclaration(decl: PrismDeclaration): CompiledPrismWo
     'app/src/App.lex.tex': appLexTex,
     'app/design/theme.json': themeJson,
     'app/view/index.html': indexHtml,
+    ...(stylesCss !== null ? { 'app/view/styles.css': stylesCss } : {}),
     'app/view/app.js': appJs,
     'model/ids.toml': idsToml,
     'features/suites/app.feature': featureGherkin,
@@ -1133,9 +1213,9 @@ export function compilePrismDeclaration(decl: PrismDeclaration): CompiledPrismWo
   return {
     files,
     appFiles,
-    compiledCss: compiled.css,
-    compiledUiJs: compiled.js,
-    designSlots: compiled.slots,
+    compiledCss: stylesCss ?? compiled?.css ?? '',
+    compiledUiJs: compiled?.js ?? '',
+    designSlots: compiled?.slots ?? [],
     designDiagnostics,
     themeModes: resolvedTheme.modes,
     theoremMap,

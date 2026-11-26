@@ -1649,7 +1649,7 @@ const AFFIRMATIVE_RE =
 const RECONCILE_ALL_RE =
   /\b(reconcile\s+(?:all|everything)|finish\s+(?:it|everything|setup|the\s+prism)|complete\s+(?:all|everything)|auto[-\s]?complete|build\s+the\s+rest)\b/i;
 
-function parseDesignPreferences(text: string): {
+export function parseDesignPreferences(text: string): {
   readonly theme?: PrismThemePreset;
   readonly viewpoint?: PrismViewpoint;
 } {
@@ -1671,7 +1671,7 @@ function parseDesignPreferences(text: string): {
   return { theme, viewpoint };
 }
 
-function parseContextReply(
+export function parseContextReply(
   decl: PrismDeclaration,
   text: string,
 ): { readonly ops: StudioApiOp[]; readonly changes: string[] } {
