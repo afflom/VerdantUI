@@ -13,7 +13,7 @@
  *   clean centered Prism Package/Verification modal
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type FC } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type FC } from 'react';
 import type { ThreadMessage } from '@assistant-ui/react';
 import {
   Activity,
@@ -126,6 +126,8 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   const [testRequestLine, setTestRequestLine] = useState('');
   const [testAnswer, setTestAnswer] = useState<string | null>(null);
   const [testRunning, setTestRunning] = useState(false);
+  const [draggingHolo, setDraggingHolo] = useState(false);
+  const [compiledCopied, setCompiledCopied] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const declaration = project.declaration ?? null;
@@ -164,6 +166,16 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     setAppPrismModalOpen(false);
     setRecentEvents(bus.getRecentEvents({ endpointId: project.id }).slice(-12));
   }, [project.id, project.draft.name, bus]);
+
+  // Close App-mode Prism modal cleanly on Escape
+  useEffect(() => {
+    if (!appPrismModalOpen) return;
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === 'Escape') setAppPrismModalOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [appPrismModalOpen]);
 
   // Subscribe to OTel events for this Prism
   useEffect(() => {
@@ -220,10 +232,10 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   }, [activeHolo, buildClient, compiled, declaration, isExternalHolo, project.id]);
 
   const handleDispatchOp = useCallback(
-    async (op: StudioApiOp): Promise<boolean> => {
+    async (op: StudioApiOp, opts?: { readonly pushRevision?: boolean }): Promise<boolean> => {
       setApiError(null);
       setBuildBanner(null);
-      const res = await store.applyStudioOp(project.id, op);
+      const res = await store.applyStudioOp(project.id, op, opts);
       if (!res.ok) {
         setApiError({ code: res.code, message: res.message, remediation: res.remediation });
         bus.emit({
@@ -395,44 +407,58 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     URL.revokeObjectURL(url);
   };
 
+  const importHoloFromFile = useCallback(
+    async (file: File) => {
+      setBuildBanner(null);
+      try {
+        const buf = new Uint8Array(await file.arrayBuffer());
+        const startsWithBrace = buf[0] === 0x7b;
+        if (startsWithBrace) {
+          const text = new TextDecoder().decode(buf);
+          const imported = await store.importHolo(text, false);
+          onSelectProject(imported.id, 'studio');
+          return;
+        }
+        setBuilding(true);
+        setBuildStage('verifying');
+        setBuildDetail(`Verifying ${file.name}…`);
+        const verified = await buildClient.verifyArchive({ prismId: project.id, holoBytes: buf });
+        if (!verified.identitiesVerified) {
+          setBuildBanner({ ok: false, text: `Refused ${file.name}: BLAKE3 archive integrity failed.` });
+          return;
+        }
+        const imported = await store.importBinaryHolo(buf, verified, true);
+        setBuildBanner({
+          ok: true,
+          text: `Verified ${file.name} (${verified.vectorsPassed}/${verified.vectorsTotal} vectors passed).`,
+        });
+        onSelectProject(imported.id, 'app');
+      } catch (error) {
+        setBuildBanner({
+          ok: false,
+          text: `Import failed: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      } finally {
+        setBuilding(false);
+        setBuildStage(null);
+        setBuildDetail('');
+      }
+    },
+    [buildClient, onSelectProject, project.id, store],
+  );
+
   const handleImportFileChange = async (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
-    if (!file) return;
-    setBuildBanner(null);
-    try {
-      const buf = new Uint8Array(await file.arrayBuffer());
-      // Detect JSON legacy .holo vs real binary prism/holo/4..6 archive
-      const startsWithBrace = buf[0] === 0x7b;
-      if (startsWithBrace) {
-        const text = new TextDecoder().decode(buf);
-        const imported = await store.importHolo(text, false);
-        onSelectProject(imported.id, 'studio');
-        return;
-      }
-      setBuilding(true);
-      setBuildStage('verifying');
-      setBuildDetail(`Verifying ${file.name}…`);
-      const verified = await buildClient.verifyArchive({ prismId: project.id, holoBytes: buf });
-      if (!verified.identitiesVerified) {
-        setBuildBanner({ ok: false, text: `Refused ${file.name}: BLAKE3 archive integrity failed.` });
-        return;
-      }
-      const imported = await store.importBinaryHolo(buf, verified, true);
-      setBuildBanner({
-        ok: true,
-        text: `Verified ${file.name} (${verified.vectorsPassed}/${verified.vectorsTotal} vectors passed).`,
-      });
-      onSelectProject(imported.id, 'app');
-    } catch (error) {
-      setBuildBanner({
-        ok: false,
-        text: `Import failed: ${error instanceof Error ? error.message : String(error)}`,
-      });
-    } finally {
-      setBuilding(false);
-      setBuildStage(null);
-      setBuildDetail('');
+    if (file) await importHoloFromFile(file);
+  };
+
+  const handleDropHolo = async (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setDraggingHolo(false);
+    const file = e.dataTransfer?.files?.[0];
+    if (file && /\.(holo|json)$/i.test(file.name)) {
+      await importHoloFromFile(file);
     }
   };
 
@@ -877,21 +903,35 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
 
         {panelTab === 'compiled' && compiled && (
           <div className="flex h-full min-h-[360px] flex-col gap-2">
-            <div className="flex flex-wrap gap-1">
-              {Object.keys(compiled.files).map((filePath) => (
-                <button
-                  key={filePath}
-                  type="button"
-                  onClick={() => setSelectedCompiledFile(filePath)}
-                  className={`rounded px-2 py-1 font-mono text-[11px] ${
-                    selectedCompiledFile === filePath
-                      ? 'bg-emerald-700 text-white'
-                      : 'bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-zinc-900 dark:text-zinc-300'
-                  }`}
-                >
-                  {filePath}
-                </button>
-              ))}
+            <div className="flex flex-wrap items-center justify-between gap-1">
+              <div className="flex flex-wrap gap-1">
+                {Object.keys(compiled.files).map((filePath) => (
+                  <button
+                    key={filePath}
+                    type="button"
+                    onClick={() => setSelectedCompiledFile(filePath)}
+                    className={`rounded px-2 py-1 font-mono text-[11px] ${
+                      selectedCompiledFile === filePath
+                        ? 'bg-emerald-700 text-white'
+                        : 'bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-zinc-900 dark:text-zinc-300'
+                    }`}
+                  >
+                    {filePath}
+                  </button>
+                ))}
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  void navigator.clipboard?.writeText(compiled.files[selectedCompiledFile] ?? '');
+                  setCompiledCopied(true);
+                  setTimeout(() => setCompiledCopied(false), 1400);
+                }}
+                className="inline-flex shrink-0 items-center gap-1 rounded border border-zinc-200 px-2 py-1 text-[11px] text-zinc-600 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+              >
+                {compiledCopied ? <Check className="h-3 w-3 text-emerald-600" /> : <Copy className="h-3 w-3" />}
+                {compiledCopied ? 'Copied' : 'Copy'}
+              </button>
             </div>
             <pre className="flex-1 overflow-auto rounded-lg border border-zinc-200 bg-zinc-50 p-3 font-mono text-[11px] leading-relaxed text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-200">
               {compiled.files[selectedCompiledFile] ?? ''}
@@ -903,7 +943,30 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   );
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-[#F8F9FA] dark:bg-[#0B0F14]">
+    <div
+      className="relative flex h-full min-h-0 flex-col bg-[#F8F9FA] dark:bg-[#0B0F14]"
+      onDragOver={(e) => {
+        if (e.dataTransfer?.types?.includes('Files')) {
+          e.preventDefault();
+          if (!draggingHolo) setDraggingHolo(true);
+        }
+      }}
+      onDragLeave={(e) => {
+        if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+        setDraggingHolo(false);
+      }}
+      onDrop={(e) => void handleDropHolo(e)}
+    >
+      {draggingHolo && (
+        <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-emerald-950/50 backdrop-blur-xs">
+          <div className="rounded-xl border-2 border-dashed border-emerald-400 bg-white/95 px-6 py-4 text-center shadow-xl dark:bg-zinc-900/95">
+            <Upload className="mx-auto h-6 w-6 text-emerald-600" />
+            <p className="mt-2 text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+              Drop .holo archive to verify &amp; run offline
+            </p>
+          </div>
+        </div>
+      )}
       <input
         ref={fileInputRef}
         type="file"
@@ -1143,6 +1206,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
           <div className="flex h-1/2 min-h-0 w-full flex-col border-b border-zinc-200 lg:h-full lg:w-[440px] lg:shrink-0 lg:border-r lg:border-b-0 dark:border-zinc-800">
             {isDeclarative && declaration && checkReport ? (
               <StudioDeclarativeBuilder
+                key={project.id}
                 declaration={declaration}
                 checkReport={checkReport}
                 agenda={agenda}

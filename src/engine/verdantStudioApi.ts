@@ -2377,9 +2377,9 @@ export function createDeclarativeStarter(kind: DeclarativeStarterId): PrismDecla
       view: {
         viewpoint: 'decision-form',
         title: 'New Prism',
-        eyebrow: 'Declarative Prism',
-        subtitle: 'Declare fields, rules, and refusals on the left to compile a verified Prism.',
-        submitLabel: 'Run Model',
+        eyebrow: 'Verified Prism',
+        subtitle: 'Every answer is computed deterministically by the declared model.',
+        submitLabel: 'Evaluate',
         elements: [
           { id: 'el_amount', slot: 'field-input', label: 'Value', binding: 'amount', requirementId: 'REQ-01' },
           { id: 'el_result', slot: 'result-card', label: 'Answer', binding: 'outcome', requirementId: 'REQ-01' },

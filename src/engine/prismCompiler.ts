@@ -819,6 +819,13 @@ ${historySection}
   const refusalMapJson = JSON.stringify(
     Object.fromEntries(decl.refusals.map((r) => [r.failureText, r.fieldHint ?? null])),
   );
+  const toneMapJson = JSON.stringify(
+    Object.fromEntries(
+      decl.features
+        .filter((f) => f.outcome.kind === 'label')
+        .map((f) => [f.outcome.label, f.outcome.kind === 'label' ? f.outcome.tone : 'default']),
+    ),
+  );
 
   const appJs = `// Mechanically compiled by Verdant Studio. The proved model decides every answer;
 // this script only serializes inputs, calls globalThis.prism.invoke(), and displays the answer (R1).
@@ -827,9 +834,11 @@ const { h } = globalThis.ui;
 
 const FIELDS = ${fieldSpecJson};
 const REFUSALS = ${refusalMapJson};
+const TONES = ${toneMapJson};
 const form = document.getElementById('model-form');
 const submitBtn = document.getElementById('submit-btn');
 const resetBtn = document.getElementById('reset-btn');
+const resultStat = document.getElementById('result-stat');
 const resultValue = document.getElementById('result-value');
 const refusalAlert = document.getElementById('refusal-alert');
 const refusalText = document.getElementById('refusal-text');
@@ -896,6 +905,7 @@ async function evaluateCurrent() {
     const isRefusal = Object.prototype.hasOwnProperty.call(REFUSALS, answer) || answer === 'Invalid request format.';
     if (isRefusal) {
       resultValue.textContent = 'Refused';
+      if (resultStat) resultStat.setAttribute('data-tone', 'destructive');
       refusalAlert.hidden = false;
       refusalText.textContent = answer;
       const hint = REFUSALS[answer];
@@ -907,6 +917,8 @@ async function evaluateCurrent() {
       }
     } else {
       resultValue.textContent = answer;
+      const tone = TONES[answer] || 'brand';
+      if (resultStat) resultStat.setAttribute('data-tone', tone);
     }
     protocolTrace.textContent = 'Request "' + line + '" -> "' + answer + '"';
     if (isRefusal) refusalTotal += 1;

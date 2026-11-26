@@ -11,7 +11,7 @@
  *   never raw HTML/CSS/JS).
  */
 
-import { useMemo, useState, type FC, type FormEvent } from 'react';
+import { useEffect, useMemo, useState, type FC, type FormEvent } from 'react';
 import {
   AlertTriangle,
   ArrowDown,
@@ -57,7 +57,7 @@ interface StudioDeclarativeBuilderProps {
   declaration: PrismDeclaration;
   checkReport: DeclarationCheckReport;
   agenda: readonly StudioAgendaItem[];
-  onDispatchOp: (op: StudioApiOp) => Promise<boolean>;
+  onDispatchOp: (op: StudioApiOp, opts?: { readonly pushRevision?: boolean }) => Promise<boolean>;
   onLoadStarter: (starter: DeclarativeStarterId) => void;
   onImportHoloFile: () => void;
   apiError: { code: string; message: string; remediation: string } | null;
@@ -117,11 +117,15 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
   const [ruleHasCondition, setRuleHasCondition] = useState(true);
   const [ruleOutcomeKind, setRuleOutcomeKind] = useState<'label' | 'formula'>('label');
   const [ruleOutcomeLabel, setRuleOutcomeLabel] = useState('Approved');
-  const [ruleFormulaOp, setRuleFormulaOp] = useState<'field' | 'add' | 'sub' | 'mul' | 'pct'>('pct');
+  const [ruleOutcomeTone, setRuleOutcomeTone] = useState<'default' | 'success' | 'warning' | 'destructive' | 'brand'>('success');
+  const [ruleFormulaOp, setRuleFormulaOp] = useState<'field' | 'add' | 'sub' | 'mul' | 'div' | 'pct'>('pct');
+  const [ruleFormulaRhsMode, setRuleFormulaRhsMode] = useState<'const' | 'field'>('const');
   const [ruleFormulaRight, setRuleFormulaRight] = useState('90');
+  const [ruleFormulaRightField, setRuleFormulaRightField] = useState(() => declaration.encoding?.fields[1]?.name ?? declaration.encoding?.fields[0]?.name ?? 'amount');
   const [ruleUnit, setRuleUnit] = useState('');
 
   const [addingRefusal, setAddingRefusal] = useState(false);
+  const [editingRefusalId, setEditingRefusalId] = useState<string | null>(null);
   const [refusalField, setRefusalField] = useState(() => declaration.encoding?.fields[0]?.name ?? 'amount');
   const [refusalOp, setRefusalOp] = useState<CompareOp>('eq');
   const [refusalValue, setRefusalValue] = useState('0');
@@ -130,12 +134,14 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
   const [addingVector, setAddingVector] = useState(false);
   const [vecInputs, setVecInputs] = useState<Record<string, number>>({});
 
-  // Data tab add-field state
+  // Data tab add/edit-field state
   const [addingField, setAddingField] = useState(false);
+  const [editingFieldName, setEditingFieldName] = useState<string | null>(null);
   const [newFieldName, setNewFieldName] = useState('');
   const [newFieldLabel, setNewFieldLabel] = useState('');
   const [newFieldKind, setNewFieldKind] = useState<FieldKind>('nat');
   const [newFieldMax, setNewFieldMax] = useState('10000');
+  const [newFieldDefault, setNewFieldDefault] = useState('0');
   const [newFieldUnit, setNewFieldUnit] = useState('');
   const [newFieldChoices, setNewFieldChoices] = useState('Standard, Pro, Enterprise');
   const [showRawSchema, setShowRawSchema] = useState(false);
@@ -150,6 +156,25 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
   const fields = declaration.encoding?.fields ?? [];
   const nextAgenda = agenda[0] ?? null;
   const firstReqId = declaration.requirements[0]?.id ?? 'REQ-01';
+
+  // Keep field dropdown selections aligned whenever encoding fields change
+  useEffect(() => {
+    if (fields.length === 0) return;
+    if (!fields.some((f) => f.name === ruleField)) setRuleField(fields[0].name);
+    if (!fields.some((f) => f.name === ruleRhsField)) setRuleRhsField(fields[1]?.name ?? fields[0].name);
+    if (!fields.some((f) => f.name === ruleFormulaRightField)) setRuleFormulaRightField(fields[1]?.name ?? fields[0].name);
+    if (!fields.some((f) => f.name === refusalField)) setRefusalField(fields[0].name);
+  }, [fields, ruleField, ruleRhsField, ruleFormulaRightField, refusalField]);
+
+  // Close Examples popover on Escape
+  useEffect(() => {
+    if (!examplesOpen) return;
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === 'Escape') setExamplesOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [examplesOpen]);
 
   const nextAppId = useMemo(() => {
     const existing = new Set([
@@ -215,7 +240,7 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
             kind: 'label' as const,
             code: declaration.features.length + 1,
             label,
-            tone: 'success' as const,
+            tone: ruleOutcomeTone,
           }
         : {
             kind: 'formula' as const,
@@ -227,7 +252,10 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                 : ({
                     op: ruleFormulaOp,
                     left: { op: 'field', field: targetField },
-                    right: { op: 'const', value: numericRight },
+                    right:
+                      ruleFormulaRhsMode === 'field' && fields.some((f) => f.name === ruleFormulaRightField)
+                        ? ({ op: 'field', field: ruleFormulaRightField } as const)
+                        : ({ op: 'const', value: numericRight } as const),
                   } as const),
           };
     const statement =
@@ -283,7 +311,9 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
     }
     setRuleOutcomeKind(feat.outcome.kind);
     setRuleOutcomeLabel(feat.outcome.label);
-    if (feat.outcome.kind === 'formula') {
+    if (feat.outcome.kind === 'label') {
+      setRuleOutcomeTone(feat.outcome.tone);
+    } else {
       setRuleUnit(feat.outcome.unit ?? '');
       if (feat.outcome.expr.op === 'field') {
         setRuleFormulaOp('field');
@@ -291,10 +321,15 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
         feat.outcome.expr.op === 'pct' ||
         feat.outcome.expr.op === 'add' ||
         feat.outcome.expr.op === 'sub' ||
-        feat.outcome.expr.op === 'mul'
+        feat.outcome.expr.op === 'mul' ||
+        feat.outcome.expr.op === 'div'
       ) {
         setRuleFormulaOp(feat.outcome.expr.op);
-        if (feat.outcome.expr.right.op === 'const') {
+        if (feat.outcome.expr.right.op === 'field') {
+          setRuleFormulaRhsMode('field');
+          setRuleFormulaRightField(feat.outcome.expr.right.field);
+        } else if (feat.outcome.expr.right.op === 'const') {
+          setRuleFormulaRhsMode('const');
           setRuleFormulaRight(String(feat.outcome.expr.right.value));
         }
       }
@@ -321,6 +356,26 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
       ? refusalField
       : (fields[0]?.name ?? 'amount');
     const numericVal = Math.max(0, Number.parseInt(refusalValue, 10) || 0);
+
+    if (editingRefusalId) {
+      const ok = await onDispatchOp({
+        op: 'update-refusal',
+        id: editingRefusalId,
+        patch: {
+          statement: `Refuse when ${targetField} ${COMPARE_LABELS[refusalOp]} ${numericVal}.`,
+          condition: { all: [{ field: targetField, op: refusalOp, value: numericVal }] },
+          failureText: refusalText.trim(),
+          fieldHint: targetField,
+        },
+      });
+      if (ok) {
+        setRefusalText('');
+        setEditingRefusalId(null);
+        setAddingRefusal(false);
+      }
+      return;
+    }
+
     const newId = nextAppId;
 
     // Build an automatic matching refusal example vector so R5 passes right away!
@@ -363,6 +418,20 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
     }
   };
 
+  const handleStartEditRefusal = (refId: string) => {
+    const ref = declaration.refusals.find((r) => r.id === refId);
+    if (!ref) return;
+    setEditingRefusalId(ref.id);
+    const pred = ref.condition.all[0];
+    if (pred) {
+      setRefusalField(pred.field);
+      setRefusalOp(pred.op);
+      setRefusalValue(String(pred.value));
+    }
+    setRefusalText(ref.failureText);
+    setAddingRefusal(true);
+  };
+
   const handleAddVector = async (e: FormEvent) => {
     e.preventDefault();
     const merged: Record<string, number> = {};
@@ -389,7 +458,7 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
     e.preventDefault();
     const label = newFieldLabel.trim() || newFieldName.trim();
     if (!label) return;
-    const rawName = (newFieldName.trim() || label).toLowerCase().replace(/[^a-z0-9]+/g, '_');
+    const rawName = editingFieldName ?? (newFieldName.trim() || label).toLowerCase().replace(/[^a-z0-9]+/g, '_');
     const choices =
       newFieldKind === 'choice'
         ? newFieldChoices
@@ -397,22 +466,43 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
             .map((s) => s.trim())
             .filter(Boolean)
         : undefined;
+    const maxVal =
+      newFieldKind === 'choice'
+        ? Math.max(0, (choices?.length ?? 2) - 1)
+        : newFieldKind === 'bool'
+          ? 1
+          : Math.max(1, Number.parseInt(newFieldMax, 10) || 10000);
+    const defaultVal = Math.max(0, Math.min(maxVal, Number.parseInt(newFieldDefault, 10) || 0));
     const nextField: EncodedField = {
       name: rawName,
       label,
       kind: newFieldKind,
       min: 0,
-      max:
-        newFieldKind === 'choice'
-          ? Math.max(0, (choices?.length ?? 2) - 1)
-          : newFieldKind === 'bool'
-            ? 1
-            : Math.max(1, Number.parseInt(newFieldMax, 10) || 10000),
+      max: maxVal,
       choices,
       unit: newFieldUnit.trim() || undefined,
-      defaultValue: 0,
+      defaultValue: defaultVal,
     };
-    const nextFields = [...fields, nextField];
+    const nextFields = editingFieldName
+      ? fields.map((f) => (f.name === editingFieldName ? nextField : f))
+      : [...fields, nextField];
+    const nextElements = editingFieldName
+      ? declaration.view.elements.map((el) =>
+          el.binding === editingFieldName
+            ? { ...el, label, slot: newFieldKind === 'choice' ? ('choice-group' as const) : ('field-input' as const) }
+            : el,
+        )
+      : [
+          ...declaration.view.elements,
+          {
+            id: `el_${rawName}`,
+            slot: newFieldKind === 'choice' ? ('choice-group' as const) : ('field-input' as const),
+            label,
+            binding: rawName,
+            requirementId: firstReqId,
+          },
+        ];
+
     const ok = await onDispatchOp({
       op: 'batch',
       ops: [
@@ -426,26 +516,31 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
           op: 'declare-view',
           view: {
             ...declaration.view,
-            elements: [
-              ...declaration.view.elements,
-              {
-                id: `el_${rawName}`,
-                slot: newFieldKind === 'choice' ? 'choice-group' : 'field-input',
-                label,
-                binding: rawName,
-                requirementId: firstReqId,
-              },
-            ],
+            elements: nextElements,
           },
         },
       ],
     });
     if (ok) {
+      setEditingFieldName(null);
       setNewFieldName('');
       setNewFieldLabel('');
+      setNewFieldDefault('0');
       setNewFieldUnit('');
       setAddingField(false);
     }
+  };
+
+  const handleStartEditField = (field: EncodedField) => {
+    setEditingFieldName(field.name);
+    setNewFieldName(field.name);
+    setNewFieldLabel(field.label);
+    setNewFieldKind(field.kind);
+    setNewFieldMax(String(field.max));
+    setNewFieldDefault(String(field.defaultValue));
+    setNewFieldUnit(field.unit ?? '');
+    setNewFieldChoices(field.choices?.join(', ') ?? 'Option A, Option B');
+    setAddingField(true);
   };
 
   const handleRemoveField = async (fieldName: string) => {
@@ -802,34 +897,89 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                       className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
                     />
                   </div>
+                  {ruleOutcomeKind === 'label' && (
+                    <div className="flex items-center gap-1.5 text-[11px] text-zinc-500">
+                      <span>Tone:</span>
+                      {(['default', 'success', 'warning', 'destructive', 'brand'] as const).map((t) => (
+                        <button
+                          key={t}
+                          type="button"
+                          onClick={() => setRuleOutcomeTone(t)}
+                          className={`rounded px-1.5 py-0.5 capitalize ${
+                            ruleOutcomeTone === t
+                              ? 'bg-emerald-700 text-white'
+                              : 'bg-zinc-200/70 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300'
+                          }`}
+                        >
+                          {t}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                   {ruleOutcomeKind === 'formula' && (
-                    <div className="grid grid-cols-3 gap-1.5">
-                      <select
-                        value={ruleFormulaOp}
-                        onChange={(e) => setRuleFormulaOp(e.target.value as typeof ruleFormulaOp)}
-                        className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
-                      >
-                        <option value="pct">% of {ruleField}</option>
-                        <option value="add">{ruleField} + N</option>
-                        <option value="sub">{ruleField} - N</option>
-                        <option value="mul">{ruleField} × N</option>
-                        <option value="field">Echo {ruleField}</option>
-                      </select>
-                      <input
-                        type="number"
-                        min={0}
-                        value={ruleFormulaRight}
-                        onChange={(e) => setRuleFormulaRight(e.target.value)}
-                        disabled={ruleFormulaOp === 'field'}
-                        className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-900"
-                      />
-                      <input
-                        type="text"
-                        value={ruleUnit}
-                        onChange={(e) => setRuleUnit(e.target.value)}
-                        placeholder="Unit (e.g. USD)"
-                        className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
-                      />
+                    <div className="space-y-1.5">
+                      <div className="grid grid-cols-3 gap-1.5">
+                        <select
+                          value={ruleFormulaOp}
+                          onChange={(e) => setRuleFormulaOp(e.target.value as typeof ruleFormulaOp)}
+                          className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
+                        >
+                          <option value="pct">% of {ruleField}</option>
+                          <option value="add">{ruleField} + …</option>
+                          <option value="sub">{ruleField} - …</option>
+                          <option value="mul">{ruleField} × …</option>
+                          <option value="div">{ruleField} ÷ …</option>
+                          <option value="field">Echo {ruleField}</option>
+                        </select>
+                        {ruleFormulaOp !== 'field' && ruleFormulaRhsMode === 'field' ? (
+                          <select
+                            value={ruleFormulaRightField}
+                            onChange={(e) => setRuleFormulaRightField(e.target.value)}
+                            className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
+                          >
+                            {fields.map((f) => (
+                              <option key={f.name} value={f.name}>
+                                {f.label}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <input
+                            type="number"
+                            min={0}
+                            value={ruleFormulaRight}
+                            onChange={(e) => setRuleFormulaRight(e.target.value)}
+                            disabled={ruleFormulaOp === 'field'}
+                            className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-900"
+                          />
+                        )}
+                        <input
+                          type="text"
+                          value={ruleUnit}
+                          onChange={(e) => setRuleUnit(e.target.value)}
+                          placeholder="Unit (e.g. USD)"
+                          className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
+                        />
+                      </div>
+                      {ruleFormulaOp !== 'field' && fields.length > 1 && (
+                        <div className="flex items-center gap-2 text-[11px] text-zinc-500">
+                          <span>Right operand:</span>
+                          <button
+                            type="button"
+                            onClick={() => setRuleFormulaRhsMode('const')}
+                            className={`rounded px-1.5 py-0.5 ${ruleFormulaRhsMode === 'const' ? 'bg-emerald-700 text-white' : 'bg-zinc-200/70 dark:bg-zinc-800'}`}
+                          >
+                            Constant
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setRuleFormulaRhsMode('field')}
+                            className={`rounded px-1.5 py-0.5 ${ruleFormulaRhsMode === 'field' ? 'bg-emerald-700 text-white' : 'bg-zinc-200/70 dark:bg-zinc-800'}`}
+                          >
+                            Field
+                          </button>
+                        </div>
+                      )}
                     </div>
                   )}
                   <input
@@ -1014,7 +1164,10 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                   <div className="flex justify-end gap-1.5">
                     <button
                       type="button"
-                      onClick={() => setAddingRefusal(false)}
+                      onClick={() => {
+                        setEditingRefusalId(null);
+                        setAddingRefusal(false);
+                      }}
                       className="rounded px-2 py-1 text-[11px] text-zinc-600 dark:text-zinc-400"
                     >
                       Cancel
@@ -1023,7 +1176,7 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                       type="submit"
                       className="rounded bg-red-700 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-red-800"
                     >
-                      Admit Refusal ({nextAppId})
+                      {editingRefusalId ? `Save ${editingRefusalId}` : `Admit Refusal (${nextAppId})`}
                     </button>
                   </div>
                 </form>
@@ -1053,15 +1206,25 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                           “{ref.failureText}”
                         </p>
                       </div>
-                      {!locked && (
+                      <div className="flex shrink-0 items-center gap-0.5">
                         <button
                           type="button"
-                          onClick={() => void onDispatchOp({ op: 'remove-refusal', id: ref.id })}
-                          className="shrink-0 rounded p-1 text-zinc-400 hover:bg-zinc-100 hover:text-red-600 dark:hover:bg-zinc-800"
+                          onClick={() => handleStartEditRefusal(ref.id)}
+                          title="Edit refusal via update-refusal"
+                          className="rounded p-1 text-zinc-400 hover:bg-zinc-100 hover:text-emerald-700 dark:hover:bg-zinc-800"
                         >
-                          <Trash2 className="h-3.5 w-3.5" />
+                          <Pencil className="h-3 w-3" />
                         </button>
-                      )}
+                        {!locked && (
+                          <button
+                            type="button"
+                            onClick={() => void onDispatchOp({ op: 'remove-refusal', id: ref.id })}
+                            className="rounded p-1 text-zinc-400 hover:bg-zinc-100 hover:text-red-600 dark:hover:bg-zinc-800"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        )}
+                      </div>
                     </div>
                   );
                 })}
@@ -1317,7 +1480,7 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                   </select>
                 </div>
                 {newFieldKind === 'nat' && (
-                  <div className="grid grid-cols-2 gap-1.5">
+                  <div className="grid grid-cols-3 gap-1.5">
                     <input
                       type="number"
                       min={1}
@@ -1327,10 +1490,18 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                       className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
                     />
                     <input
+                      type="number"
+                      min={0}
+                      value={newFieldDefault}
+                      onChange={(e) => setNewFieldDefault(e.target.value)}
+                      placeholder="Default"
+                      className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
+                    />
+                    <input
                       type="text"
                       value={newFieldUnit}
                       onChange={(e) => setNewFieldUnit(e.target.value)}
-                      placeholder="Unit (optional, e.g. USD)"
+                      placeholder="Unit (USD)"
                       className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
                     />
                   </div>
@@ -1347,7 +1518,10 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                 <div className="flex justify-end gap-1.5">
                   <button
                     type="button"
-                    onClick={() => setAddingField(false)}
+                    onClick={() => {
+                      setEditingFieldName(null);
+                      setAddingField(false);
+                    }}
                     className="rounded px-2 py-1 text-[11px] text-zinc-500"
                   >
                     Cancel
@@ -1356,7 +1530,7 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                     type="submit"
                     className="rounded bg-emerald-700 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-emerald-800"
                   >
-                    Propose Encoding
+                    {editingFieldName ? `Update ${editingFieldName}` : 'Propose Encoding'}
                   </button>
                 </div>
               </form>
@@ -1382,15 +1556,25 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                       <p className="mt-0.5 text-[11px] text-zinc-500">{f.choices.join(' · ')}</p>
                     )}
                   </div>
-                  {fields.length > 1 && (
+                  <div className="flex shrink-0 items-center gap-0.5">
                     <button
                       type="button"
-                      onClick={() => void handleRemoveField(f.name)}
-                      className="rounded p-1 text-zinc-400 hover:bg-zinc-100 hover:text-red-600 dark:hover:bg-zinc-800"
+                      onClick={() => handleStartEditField(f)}
+                      title="Edit field"
+                      className="rounded p-1 text-zinc-400 hover:bg-zinc-100 hover:text-emerald-700 dark:hover:bg-zinc-800"
                     >
-                      <Trash2 className="h-3.5 w-3.5" />
+                      <Pencil className="h-3 w-3" />
                     </button>
-                  )}
+                    {fields.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => void handleRemoveField(f.name)}
+                        className="rounded p-1 text-zinc-400 hover:bg-zinc-100 hover:text-red-600 dark:hover:bg-zinc-800"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </div>
                 </div>
               ))}
             </div>
@@ -1478,6 +1662,42 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                   );
                 })}
               </div>
+              <div className="flex items-center justify-between rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-xs dark:border-zinc-800 dark:bg-zinc-900/70">
+                <span className="text-[11px] font-medium text-zinc-600 dark:text-zinc-300">
+                  Custom Accent Override
+                </span>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="color"
+                    value={declaration.theme.accent ?? '#1f5e44'}
+                    onChange={(e) =>
+                      void onDispatchOp(
+                        {
+                          op: 'set-theme',
+                          theme: { preset: declaration.theme.preset, accent: e.target.value },
+                        },
+                        { pushRevision: false },
+                      )
+                    }
+                    className="h-6 w-8 cursor-pointer rounded border border-zinc-200 bg-transparent p-0.5 dark:border-zinc-700"
+                    aria-label="Custom accent color"
+                  />
+                  {declaration.theme.accent && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void onDispatchOp({
+                          op: 'set-theme',
+                          theme: { preset: declaration.theme.preset },
+                        })
+                      }
+                      className="text-[11px] text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200"
+                    >
+                      Reset
+                    </button>
+                  )}
+                </div>
+              </div>
             </section>
 
             {/* Viewpoint & Header Copy */}
@@ -1520,10 +1740,13 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                     type="text"
                     value={declaration.view.eyebrow}
                     onChange={(e) =>
-                      void onDispatchOp({
-                        op: 'declare-view',
-                        view: { ...declaration.view, eyebrow: e.target.value },
-                      })
+                      void onDispatchOp(
+                        {
+                          op: 'declare-view',
+                          view: { ...declaration.view, eyebrow: e.target.value },
+                        },
+                        { pushRevision: false },
+                      )
                     }
                     className="w-full rounded border border-zinc-200 bg-transparent px-2 py-1 text-xs dark:border-zinc-700"
                   />
@@ -1534,10 +1757,13 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                     type="text"
                     value={declaration.view.subtitle}
                     onChange={(e) =>
-                      void onDispatchOp({
-                        op: 'declare-view',
-                        view: { ...declaration.view, subtitle: e.target.value },
-                      })
+                      void onDispatchOp(
+                        {
+                          op: 'declare-view',
+                          view: { ...declaration.view, subtitle: e.target.value },
+                        },
+                        { pushRevision: false },
+                      )
                     }
                     className="w-full rounded border border-zinc-200 bg-transparent px-2 py-1 text-xs dark:border-zinc-700"
                   />
@@ -1548,10 +1774,13 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
                     type="text"
                     value={declaration.view.submitLabel}
                     onChange={(e) =>
-                      void onDispatchOp({
-                        op: 'declare-view',
-                        view: { ...declaration.view, submitLabel: e.target.value },
-                      })
+                      void onDispatchOp(
+                        {
+                          op: 'declare-view',
+                          view: { ...declaration.view, submitLabel: e.target.value },
+                        },
+                        { pushRevision: false },
+                      )
                     }
                     className="w-full rounded border border-zinc-200 bg-transparent px-2 py-1 text-xs dark:border-zinc-700"
                   />
