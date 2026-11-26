@@ -104,6 +104,7 @@ async function readOpfsSidecarBytes(
       mode: 'read-only',
       modelId,
       retryDelaysMs: [25, 50],
+      openTimeoutMs: 2_000,
     });
     try {
       const size = sync.getSize();
@@ -143,6 +144,7 @@ async function writeOpfsSidecarBytes(
       mode: 'readwrite',
       modelId,
       retryDelaysMs: [25, 50, 100],
+      openTimeoutMs: 2_000,
     });
     try {
       sync.truncate(0);

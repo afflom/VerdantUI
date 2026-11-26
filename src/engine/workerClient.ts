@@ -32,6 +32,7 @@ import {
   MODEL_CATALOG,
   findCatalogModelById,
   formatBytes,
+  isInternalBootstrapModel,
   type CatalogModel,
 } from './modelCatalog';
 import type { PrecisionContractMode } from './performanceContract';
@@ -849,10 +850,13 @@ export class LlamaVTensorWorkerClient {
       }
       this.clearSpeculativeTimers();
       this.lastSpeculativePrompt = '';
+      const isInternalBootstrap = isInternalBootstrapModel(msg.summary.id);
       this.patchState({
         status: 'ready',
         progressPercent: 100,
-        statusDetail: `${msg.summary.displayName} ready`,
+        statusDetail: isInternalBootstrap
+          ? 'LOD0 instant actions ready (Model Stream off)'
+          : `${msg.summary.displayName} ready`,
         errorMessage: null,
         prefillProgress: null,
         speculativePrefill: { active: false, readyTokens: 0, targetTokens: 0 },
@@ -861,8 +865,8 @@ export class LlamaVTensorWorkerClient {
         opfsStorage: msg.opfsStorage,
         cachedModelIds: computeCachedIds(msg.opfsStorage),
       });
-      // Warm initial prompt prefix for the unified VerdantUI model (skip on network demand-paged models)
-      if (msg.summary.backingKind !== 'opfs-demand') {
+      // Warm initial prompt prefix for real resident models (skip bootstrap & demand-paged models)
+      if (!isInternalBootstrap && msg.summary.backingKind !== 'opfs-demand') {
         const bootSystem = this.state.importedHarness?.system ?? UNIFIED_VERDANT_SYSTEM_PROMPT;
         const bootPrefix = formatSpeculativePrefixForLlama(
           [],
@@ -1010,6 +1014,12 @@ export class LlamaVTensorWorkerClient {
 
   async loadCatalogModel(model: CatalogModel): Promise<LoadedModelSummary> {
     this.lastRequestedCatalogModel = model;
+    if (model.id !== INTERNAL_BOOTSTRAP_MODEL.id && !this.state.modelStreamEnabled) {
+      saveModelStreamEnabled(true);
+      this.cognitiveObserver.grants.reset('network-weights');
+      this.cognitiveObserver.grants.grant('network-weights');
+      this.patchState({ modelStreamEnabled: true });
+    }
     return this.loadFromUrl(model.id, model.name, model.url, model.bundled);
   }
 
@@ -1041,12 +1051,14 @@ export class LlamaVTensorWorkerClient {
     this.activeLoadRequestId = requestId;
     const resolvedUrl = this.resolveWorkerFetchUrl(url);
 
-    this.patchState({
-      status: 'downloading',
-      progressPercent: 2,
-      errorMessage: null,
-      statusDetail: `Loading ${displayName}`,
-    });
+    if (!isInternalBootstrapModel(id)) {
+      this.patchState({
+        status: 'downloading',
+        progressPercent: 2,
+        errorMessage: null,
+        statusDetail: `Loading ${displayName}`,
+      });
+    }
 
     return new Promise<LoadedModelSummary>((resolve, reject) => {
       this.pending.set(requestId, {

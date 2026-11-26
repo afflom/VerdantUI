@@ -916,14 +916,19 @@ export class LlamaVTensorRuntime {
 
     const prepared = this.prepareParsedBacking(id, displayName, source, backing, parsed, options?.maxContextCap);
 
-    // Persist parsed GGUF header + tokenizer vocab/merges boot cache on cold parse
+    // Persist parsed GGUF header + tokenizer vocab/merges boot cache on cold parse.
+    // In real browser OPFS (`!options?.opfsDirectoryOverride`), run non-blocking in the background
+    // so serializing/flushing an 8 MB 150K-vocab header never delays first-turn readiness!
     if (useOpfsBootCache && !headerLoadedFromBootCache && contentFingerprint && !options?.signal?.aborted) {
-      await writeParsedGgufBootCacheToOpfs(
+      const writeHdrPromise = writeParsedGgufBootCacheToOpfs(
         contentFingerprint,
         contentFingerprint,
         parsed,
         options?.opfsDirectoryOverride,
       ).catch(() => false);
+      if (options?.opfsDirectoryOverride) {
+        await writeHdrPromise;
+      }
     }
 
     // Solve contract once upfront so we can preload RoPE LUT + hot metadata tensors concurrently!
@@ -1089,7 +1094,7 @@ export class LlamaVTensorRuntime {
     options?.onProgress?.({ percent: 99, detail: `Initializing ${displayName}` });
     this.allocateFromActiveBacking();
 
-    // Persist computed RoPE cos/sin LUT to `<fp>.rope.bin` on cold miss for instant future reloads
+    // Persist computed RoPE cos/sin LUT to `<fp>.rope.bin` on cold miss (non-blocking in browser OPFS)
     if (
       useOpfsBootCache &&
       !ropeWasCached &&
@@ -1103,12 +1108,15 @@ export class LlamaVTensorRuntime {
         freqBase: hp.ropeFreqBase,
         freqScale: hp.ropeFreqScale,
       };
-      await writeRopeTablesCacheToOpfs(
+      const writeRopePromise = writeRopeTablesCacheToOpfs(
         contentFingerprint,
         this.ropeTables,
         actualRopeParams,
         options?.opfsDirectoryOverride,
       ).catch(() => false);
+      if (options?.opfsDirectoryOverride) {
+        await writeRopePromise;
+      }
     }
 
     return this.modelSummary!;

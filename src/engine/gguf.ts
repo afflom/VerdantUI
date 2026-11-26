@@ -450,8 +450,10 @@ export function parseGgufFromBacking(backing: {
     throw new Error('Invalid GGUF backing: shorter than 24-byte header.');
   }
 
-  // Start at 4 MiB and double only if metadata/vocab exceeds the window (supports up to 128 MiB headers).
-  let windowBytes = Math.min(totalBytes, 4 * 1024 * 1024);
+  // Size initial header read window to parse large 150K-vocab Qwen3/Llama3 GGUF headers in 1 pass
+  // instead of wasting 2-3x redundant parse retries (supports up to 128 MiB headers).
+  const initialWindow = totalBytes >= 500 * 1024 * 1024 ? 12 * 1024 * 1024 : 4 * 1024 * 1024;
+  let windowBytes = Math.min(totalBytes, initialWindow);
   const maxHeaderCap = Math.min(totalBytes, 128 * 1024 * 1024);
 
   while (true) {
@@ -534,7 +536,9 @@ export async function parseGgufFromBackingAsync(
     throw new Error('Invalid GGUF backing: shorter than 24-byte header.');
   }
 
-  let windowBytes = Math.min(totalBytes, 2 * 1024 * 1024);
+  const initialAsyncWindow =
+    totalBytes >= 500 * 1024 * 1024 ? 12 * 1024 * 1024 : 2 * 1024 * 1024;
+  let windowBytes = Math.min(totalBytes, initialAsyncWindow);
   const maxHeaderCap = Math.min(totalBytes, 128 * 1024 * 1024);
   let loadedBuf = new Uint8Array(0);
 
