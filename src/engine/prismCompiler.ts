@@ -28,6 +28,7 @@ import {
   type StudioRefusal,
   sanitizeIdentifier,
 } from './verdantStudioApi';
+import { evaluateVerdantRouting, isPrismSynthesizable } from './verdantStandardsRouter';
 import { sha256HexSync } from './prismStudio';
 
 const enc = new TextEncoder();
@@ -146,9 +147,10 @@ export function emitLexLeanApp(decl: PrismDeclaration): {
   readonly source: string;
   readonly theoremMap: Record<string, string>;
 } {
-  const fields: readonly EncodedField[] = decl.encoding?.fields ?? [
-    { name: 'amount', label: 'Value', kind: 'nat', min: 0, max: 10000, defaultValue: 0 },
-  ];
+  if (!decl.encoding || decl.encoding.fields.length === 0) {
+    throw new Error('Cannot emit LexLean model: no System input encoding is declared yet.');
+  }
+  const fields: readonly EncodedField[] = decl.encoding.fields;
   const orderedFeatures: readonly StudioFeature[] = [...decl.features].sort(
     (a, b) => a.priority - b.priority || a.id.localeCompare(b.id),
   );
@@ -434,11 +436,13 @@ export function emitLexLeanApp(decl: PrismDeclaration): {
   }
 
   // 10. TextApplication record
+  const viewTitle = decl.view?.title ?? decl.metadata.name;
+  const viewSubmit = decl.view?.submitLabel ?? 'Evaluate';
   defs.push(`definition{
   name: application,
   parameters: [],
   result: Foundation.View.Text.V1.Model::TextApplication,
-  body: (record Foundation.View.Text.V1.Model::TextApplication {profile := "prismpm/text-application/1", name := "${escapeLexString(decl.metadata.slug)}", cargoName := "${escapeLexString(crateName)}", cargoVersion := "${escapeLexString(decl.metadata.version)}", cargoDescription := "${escapeLexString(decl.metadata.description)}", cargoRepository := "", cargoHomepage := "", libraryRoots := (cons "${modPrefix}.App.dispatch" (nil String)), acceptanceVectors := ${vectorsExpr}, entryRoot := "${modPrefix}.App.dispatch", coreContract := "hologram:guest/core-wasm@1", requestMaximum := (128 : UInt32), responseMaximum := (256 : UInt32), guestAllocationMaximum := (512 : UInt32), capabilitiesEmpty := true, fatArchive := true, primaryLayer := (0 : UInt8), viewLayer := (1 : UInt8), view := (record Foundation.View.Text.V1.Model::TextView {title := "${escapeLexString(decl.view.title)}", heading := "${escapeLexString(decl.view.title)}", inputLabel := "Request", submitLabel := "${escapeLexString(decl.view.submitLabel)}", outputLabel := "Answer", inputError := "Invalid request", responseError := "Invalid response"})})
+  body: (record Foundation.View.Text.V1.Model::TextApplication {profile := "prismpm/text-application/1", name := "${escapeLexString(decl.metadata.slug)}", cargoName := "${escapeLexString(crateName)}", cargoVersion := "${escapeLexString(decl.metadata.version)}", cargoDescription := "${escapeLexString(decl.metadata.description)}", cargoRepository := "", cargoHomepage := "", libraryRoots := (cons "${modPrefix}.App.dispatch" (nil String)), acceptanceVectors := ${vectorsExpr}, entryRoot := "${modPrefix}.App.dispatch", coreContract := "hologram:guest/core-wasm@1", requestMaximum := (128 : UInt32), responseMaximum := (256 : UInt32), guestAllocationMaximum := (512 : UInt32), capabilitiesEmpty := true, fatArchive := true, primaryLayer := (0 : UInt8), viewLayer := (1 : UInt8), view := (record Foundation.View.Text.V1.Model::TextView {title := "${escapeLexString(viewTitle)}", heading := "${escapeLexString(viewTitle)}", inputLabel := "Request", submitLabel := "${escapeLexString(viewSubmit)}", outputLabel := "Answer", inputError := "Invalid request", responseError := "Invalid response"})})
 }`);
 
   const source = `\\begin{lexlean}{App}
@@ -556,6 +560,30 @@ statement = "${escapeLexString(feat.statement)}"`);
     );
   }
 
+  const routing = evaluateVerdantRouting(decl);
+  mdRows.push(
+    '',
+    '## Verdant Prism Core Spine & Standards Applicability',
+    '',
+    '| Standard | Tier | Status | Trigger / Rationale |',
+    '| --- | --- | --- | --- |',
+  );
+  for (const core of routing.coreSpine) {
+    mdRows.push(
+      `| \`${core.authority.id}\` (${core.authority.name}) | Core | ${core.settledCount}/${core.totalCount} | ${core.reason} |`,
+    );
+  }
+  for (const layered of routing.activeLayeredStandards) {
+    mdRows.push(
+      `| \`${layered.authority.id}\` (${layered.authority.name}) | Applicable | ${layered.settledCount}/${layered.totalCount} settled | ${layered.reason} |`,
+    );
+  }
+  for (const excl of routing.excludedStandards) {
+    mdRows.push(
+      `| \`${excl.authority.id}\` (${excl.authority.name}) | Not Applicable | Excluded | ${excl.exclusionRationale} |`,
+    );
+  }
+
   return {
     idsToml: `${idBlocks.join('\n')}\n`,
     featureGherkin: `${scenarios.join('\n')}\n`,
@@ -586,13 +614,17 @@ export function emitDesignView(decl: PrismDeclaration): {
   readonly indexHtml: string;
   readonly appJs: string;
 } {
+  if (!decl.view) {
+    throw new Error('Cannot emit prism.design/1 view: no Design View is declared yet.');
+  }
+  const view = decl.view;
   const fields = decl.encoding?.fields ?? [];
   const fieldByName = new Map(fields.map((f) => [f.name, f]));
-  const hasHistory = decl.view.elements.some((e) => e.slot === 'history-list');
+  const hasHistory = view.elements.some((e) => e.slot === 'history-list');
 
   // Render declared input controls in declared View order
   const controlBlocks: string[] = [];
-  for (const el of decl.view.elements) {
+  for (const el of view.elements) {
     if (el.slot === 'field-input') {
       const f = fieldByName.get(el.binding);
       if (!f) continue;
@@ -644,7 +676,7 @@ ${radios}
   }
 
   const resultLabel =
-    decl.view.elements.find((e) => e.slot === 'result-card')?.label ?? 'Model Answer';
+    view.elements.find((e) => e.slot === 'result-card')?.label ?? 'Model Answer';
 
   const historySection = hasHistory
     ? `
@@ -664,17 +696,17 @@ ${radios}
     : '';
 
   const iconName =
-    decl.view.viewpoint === 'ledger-tracker'
+    view.viewpoint === 'ledger-tracker'
       ? 'wallet'
-      : decl.view.viewpoint === 'calculator'
+      : view.viewpoint === 'calculator'
         ? 'calculator'
-        : decl.view.viewpoint === 'request-reply'
+        : view.viewpoint === 'request-reply'
           ? 'message-square'
           : 'sparkles';
 
-  const isCalculator = decl.view.viewpoint === 'calculator';
-  const isLedger = decl.view.viewpoint === 'ledger-tracker';
-  const isRequestReply = decl.view.viewpoint === 'request-reply';
+  const isCalculator = view.viewpoint === 'calculator';
+  const isLedger = view.viewpoint === 'ledger-tracker';
+  const isRequestReply = view.viewpoint === 'request-reply';
 
   const ledgerSummaryRow = isLedger
     ? `
@@ -730,7 +762,7 @@ ${radios}
 ${controlBlocks.join('\n')}
         </div>
         <div data-slot="card-footer" class="flex items-center justify-between gap-3">
-          <button data-slot="button" id="submit-btn" type="submit">${escapeHtml(decl.view.submitLabel)}</button>
+          <button data-slot="button" id="submit-btn" type="submit">${escapeHtml(view.submitLabel)}</button>
           <button data-slot="button" data-variant="ghost" id="reset-btn" type="button">Reset</button>
         </div>
       </form>`
@@ -745,7 +777,7 @@ ${controlBlocks.join('\n')}
 ${controlBlocks.join('\n')}
           </div>
           <div data-slot="card-footer" class="flex items-center justify-between gap-3">
-            <button data-slot="button" id="submit-btn" type="submit">${escapeHtml(decl.view.submitLabel)}</button>
+            <button data-slot="button" id="submit-btn" type="submit">${escapeHtml(view.submitLabel)}</button>
             <button data-slot="button" data-variant="ghost" id="reset-btn" type="button">Reset</button>
           </div>
         </form>
@@ -769,12 +801,16 @@ ${controlBlocks.join('\n')}
         </section>
       </section>`;
 
+  const disclosureBlock = view.disclosure?.trim()
+    ? `\n      <p class="text-center text-xs text-muted-foreground">${escapeHtml(view.disclosure.trim())}</p>`
+    : '';
+
   const indexHtml = `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>${escapeHtml(decl.view.title)}</title>
+  <title>${escapeHtml(view.title)}</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="prism.css">
   <script src="prism-ui.js"></script>
@@ -786,20 +822,20 @@ ${controlBlocks.join('\n')}
     <header data-slot="toolbar">
       <div data-slot="brand" class="min-w-0">
         <span data-slot="brand-mark" aria-hidden="true"><span data-slot="icon" data-icon="${iconName}"></span></span>
-        <h1 data-slot="brand-name" class="truncate">${escapeHtml(decl.view.title)}</h1>
+        <h1 data-slot="brand-name" class="truncate">${escapeHtml(view.title)}</h1>
       </div>
       <span data-slot="badge" data-variant="success" data-tooltip="Every answer is computed by the app's proved model">Proved model</span>
     </header>
 
     <main data-slot="page" class="grid gap-6 py-8">
       <header data-slot="page-header">
-        <p data-slot="eyebrow">${escapeHtml(decl.view.eyebrow)}</p>
-        <h1>${escapeHtml(decl.view.title)}</h1>
-        <p>${escapeHtml(decl.view.subtitle)}</p>
+        <p data-slot="eyebrow">${escapeHtml(view.eyebrow)}</p>
+        <h1>${escapeHtml(view.title)}</h1>
+        <p>${escapeHtml(view.subtitle)}</p>
       </header>
 
 ${mainStage}
-${historySection}
+${historySection}${disclosureBlock}
       <p class="text-center text-xs text-muted-foreground">The model's rules are proved. This page is compiled from the declaration and only displays what the model answers.</p>
     </main>
   </div>
@@ -1014,13 +1050,19 @@ export function instantiateAppFoundation(
 /**
  * Full mechanical compilation of a `PrismDeclaration` into canonical Prism files +
  * compiled `prism.design/1` stylesheet/runtime for instant preview & WASM sealing.
+ *
+ * Returns `null` when the Prism is still undefined / not yet synthesizable (zero fake placeholders).
  */
-export function compilePrismDeclaration(decl: PrismDeclaration): CompiledPrismWorkspace {
+export function compilePrismDeclaration(decl: PrismDeclaration): CompiledPrismWorkspace | null {
+  if (!isPrismSynthesizable(decl)) {
+    return null;
+  }
   const { source: appLexTex, theoremMap } = emitLexLeanApp(decl);
   const prismToml = emitPrismToml(decl);
   const { idsToml, featureGherkin, conformanceMd } = emitConformanceRegisters(decl, theoremMap);
   const themeJson = emitThemeJson(decl);
   const { indexHtml, appJs } = emitDesignView(decl);
+  const routing = evaluateVerdantRouting(decl);
 
   const pageMap = new Map<string, Uint8Array>([
     ['index.html', enc.encode(indexHtml)],
@@ -1047,6 +1089,42 @@ export function compilePrismDeclaration(decl: PrismDeclaration): CompiledPrismWo
     'model/ids.toml': idsToml,
     'features/suites/app.feature': featureGherkin,
     'CONFORMANCE.md': conformanceMd,
+    'model/concept-opm.json': `${JSON.stringify(decl.concept, null, 2)}\n`,
+    'model/security-stride.json': `${JSON.stringify(
+      {
+        assuranceLevel: decl.security.assuranceLevel,
+        trustBoundaries: routing.trustBoundaries,
+        threats: decl.security.threats,
+      },
+      null,
+      2,
+    )}\n`,
+    'model/standards-routing.json': `${JSON.stringify(
+      {
+        summary: routing.summary,
+        coreSpine: routing.coreSpine.map((s) => ({
+          id: s.authority.id,
+          name: s.authority.name,
+          settled: s.settledCount,
+          total: s.totalCount,
+        })),
+        applicableLayered: routing.activeLayeredStandards.map((s) => ({
+          id: s.authority.id,
+          name: s.authority.name,
+          triggeredBy: s.triggeredBy,
+          reason: s.reason,
+          settled: s.settledCount,
+          total: s.totalCount,
+        })),
+        excluded: routing.excludedStandards.map((e) => ({
+          id: e.authority.id,
+          name: e.authority.name,
+          rationale: e.exclusionRationale,
+        })),
+      },
+      null,
+      2,
+    )}\n`,
     'model/requirements.json': `${JSON.stringify(decl.requirements, null, 2)}\n`,
     'model/admissions.json': `${JSON.stringify(decl.admissions, null, 2)}\n`,
     'model/owner-decisions.json': `${JSON.stringify(decl.decisions, null, 2)}\n`,

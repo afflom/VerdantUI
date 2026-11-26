@@ -21,6 +21,7 @@ import {
   Check,
   CheckCircle2,
   Code2,
+  Compass,
   Copy,
   Download,
   ExternalLink,
@@ -57,9 +58,12 @@ import {
   evaluateDeclaredModel,
   type DeclarativeStarterId,
   type StudioApiOp,
+  type StudioWizardStage,
 } from '../engine/verdantStudioApi';
+import { evaluateVerdantRouting } from '../engine/verdantStandardsRouter';
 import { isInternalBootstrapModel } from '../engine/modelCatalog';
 import type { EngineState, LlamaVTensorWorkerClient } from '../engine/workerClient';
+import { ModelBlueprintCanvas } from './ModelBlueprintCanvas';
 import { PrismSandboxFrame, type HoloviewMountConfig, type PrismRuntimeError } from './PrismSandboxFrame';
 import { StudioDeclarativeBuilder } from './StudioDeclarativeBuilder';
 
@@ -79,7 +83,7 @@ interface VerdantStudioViewProps {
 }
 
 type PrismPanelTab = 'overview' | 'package' | 'compiled';
-type PreviewPaneMode = 'preview' | 'prism';
+type PreviewPaneMode = 'blueprint' | 'preview' | 'prism';
 
 export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   project,
@@ -95,7 +99,8 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   onEnableModelStream,
   onSelectProject,
 }) => {
-  const [previewPaneMode, setPreviewPaneMode] = useState<PreviewPaneMode>('preview');
+  const [previewPaneMode, setPreviewPaneMode] = useState<PreviewPaneMode>('blueprint');
+  const [wizardStage, setWizardStage] = useState<StudioWizardStage>('concept');
   const [appPrismModalOpen, setAppPrismModalOpen] = useState(false);
   const [panelTab, setPanelTab] = useState<PrismPanelTab>('overview');
   const [selectedCompiledFile, setSelectedCompiledFile] = useState('app/src/App.lex.tex');
@@ -150,6 +155,10 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     () => (declaration ? checkDeclaration(declaration) : null),
     [declaration],
   );
+  const routing = useMemo(
+    () => (declaration ? evaluateVerdantRouting(declaration) : null),
+    [declaration],
+  );
   const agenda = useMemo(
     () => (declaration ? computeAgenda(declaration) : []),
     [declaration],
@@ -164,22 +173,26 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     setProposedOps(null);
     setTestAnswer(null);
     setAppPrismModalOpen(false);
-    setPreviewPaneMode('preview');
+    const initialRouting = project.declaration ? evaluateVerdantRouting(project.declaration) : null;
+    setPreviewPaneMode(initialRouting && !initialRouting.readyToPreview ? 'blueprint' : 'preview');
+    setWizardStage(initialRouting ? initialRouting.recommendedStage : 'concept');
     setRecentEvents(bus.getRecentEvents({ endpointId: project.id }).slice(-12));
-  }, [project.id, project.draft.name, bus]);
+  }, [project.id, project.draft.name, project.declaration?.schema, bus]);
 
-  // Escape closes Prism inspector back to Preview (Studio mode) or App (App mode)
+  // Escape closes Prism inspector back to Preview (if ready) or Blueprint (Studio mode) / App (App mode)
   useEffect(() => {
     if (!appPrismModalOpen && previewPaneMode !== 'prism') return;
     const onKey = (ev: KeyboardEvent) => {
       if (ev.key === 'Escape') {
         if (appPrismModalOpen) setAppPrismModalOpen(false);
-        if (previewPaneMode === 'prism') setPreviewPaneMode('preview');
+        if (previewPaneMode === 'prism') {
+          setPreviewPaneMode(routing?.readyToPreview ? 'preview' : 'blueprint');
+        }
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [appPrismModalOpen, previewPaneMode]);
+  }, [appPrismModalOpen, previewPaneMode, routing?.readyToPreview]);
 
   // Subscribe to OTel events for this Prism
   useEffect(() => {
@@ -297,7 +310,24 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
 
   /** Runs real LexLean WASM + Lean 4.32.2 WASM kernel + binary `prism/holo/6` seal in the Web Worker. */
   const handleCheckAndBuild = useCallback(async (): Promise<SealedHoloRecord | null> => {
-    if (!declaration || !compiled) return null;
+    if (!declaration) return null;
+    if (routing && !routing.readyToSeal) {
+      const nextStageReport = routing.stages.find((s) => s.stage === routing.recommendedStage);
+      setWizardStage(routing.recommendedStage);
+      setBuildBanner({
+        ok: false,
+        text: `Complete ${nextStageReport?.label ?? 'Core Models'} before building: ${nextStageReport?.missing[0] ?? 'Model incomplete.'}`,
+      });
+      return null;
+    }
+    if (!compiled) {
+      setWizardStage('concept');
+      setBuildBanner({
+        ok: false,
+        text: 'Define Concept, System, Security, and Design models before building.',
+      });
+      return null;
+    }
     if (checkReport && !checkReport.ok) {
       const first = checkReport.diagnostics[0];
       setBuildBanner({
@@ -372,7 +402,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       setBuildStage(null);
       setBuildDetail('');
     }
-  }, [buildClient, checkReport, compiled, declaration, project.id, store]);
+  }, [buildClient, checkReport, compiled, declaration, project.id, routing, store]);
 
   const handlePublish = async () => {
     bridgeRuntime.evictPrism(project.id);
@@ -724,6 +754,46 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                 {displayAddress}
               </code>
             </div>
+
+            {/* Core Spine & Routed Standards Summary */}
+            {routing && (
+              <div className="space-y-1.5 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-semibold text-zinc-600 dark:text-zinc-300">
+                    Verdant Prism Core Models &amp; Routed Standards
+                  </span>
+                  <span className="font-mono text-[10px] text-zinc-500">
+                    Core {routing.summary.coreComplete}/4 · Layered {routing.summary.activeLayeredCount} · Excluded {routing.summary.excludedCount}
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-1 pt-0.5">
+                  {routing.coreSpine.map((c) => (
+                    <span
+                      key={c.authority.id}
+                      className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                        c.settledCount >= c.totalCount
+                          ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
+                          : 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300'
+                      }`}
+                    >
+                      {c.authority.name} ({c.settledCount}/{c.totalCount})
+                    </span>
+                  ))}
+                  {routing.activeLayeredStandards.map((s) => (
+                    <span
+                      key={s.authority.id}
+                      className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                        s.settledCount >= s.totalCount
+                          ? 'bg-sky-100 text-sky-800 dark:bg-sky-950/60 dark:text-sky-300'
+                          : 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300'
+                      }`}
+                    >
+                      {s.authority.name} ({s.settledCount}/{s.totalCount})
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Traceability Matrix (REQ-D9) */}
             {checkReport && (
@@ -1226,17 +1296,23 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
         </div>
       ) : (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden lg:flex-row">
-          {/* Left Pane: Declarative Studio API Builder */}
-          <div className="flex h-1/2 min-h-0 min-w-0 w-full flex-col overflow-hidden border-b border-zinc-200 lg:h-full lg:w-[440px] lg:shrink-0 lg:border-r lg:border-b-0 dark:border-zinc-800">
-            {isDeclarative && declaration && checkReport ? (
+          {/* Left Pane: Guided Verdant Prism Wizard */}
+          <div className="flex h-1/2 min-h-0 min-w-0 w-full flex-col overflow-hidden border-b border-zinc-200 lg:h-full lg:w-[460px] lg:shrink-0 lg:border-r lg:border-b-0 dark:border-zinc-800">
+            {isDeclarative && declaration && checkReport && routing ? (
               <StudioDeclarativeBuilder
                 key={project.id}
                 declaration={declaration}
                 checkReport={checkReport}
+                routing={routing}
                 agenda={agenda}
+                activeStage={wizardStage}
+                onSelectStage={setWizardStage}
                 onDispatchOp={handleDispatchOp}
                 onLoadStarter={handleLoadStarter}
                 onImportHoloFile={() => fileInputRef.current?.click()}
+                onCheckAndBuild={() => void handleCheckAndBuild()}
+                onPublish={() => void handlePublish()}
+                building={building}
                 apiError={apiError}
                 onClearApiError={() => setApiError(null)}
                 modelStreamEnabled={engineState.modelStreamEnabled}
@@ -1266,24 +1342,45 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                 </p>
                 <button
                   type="button"
-                  onClick={() => handleLoadStarter('blank')}
+                  onClick={() => handleLoadStarter('undefined')}
                   className="rounded-lg bg-emerald-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-800"
                 >
-                  New Declarative Prism
+                  New Verdant Prism
                 </button>
               </div>
             )}
           </div>
 
-          {/* Right Pane: Live Compiled Preview with `Preview | Prism` Toggle */}
+          {/* Right Pane: Model Blueprint / Live Compiled Preview / Prism Toggle */}
           <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
             <div className="relative z-20 flex shrink-0 items-center justify-between gap-2 border-b border-zinc-200 bg-white px-3 py-1.5 dark:border-zinc-800 dark:bg-[#0E131B]">
               <div className="inline-flex rounded-lg border border-zinc-200 bg-zinc-100 p-0.5 text-xs dark:border-zinc-700 dark:bg-zinc-900">
+                {isDeclarative && routing && (
+                  <button
+                    type="button"
+                    aria-pressed={previewPaneMode === 'blueprint'}
+                    onClick={() => setPreviewPaneMode('blueprint')}
+                    className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 font-medium transition-colors ${
+                      previewPaneMode === 'blueprint'
+                        ? 'bg-white text-zinc-900 shadow-xs dark:bg-zinc-800 dark:text-zinc-100'
+                        : 'text-zinc-500 hover:text-zinc-800 dark:text-zinc-400'
+                    }`}
+                  >
+                    <Compass className="h-3.5 w-3.5" />
+                    Blueprint
+                  </button>
+                )}
                 <button
                   type="button"
+                  disabled={Boolean(isDeclarative && routing && !routing.readyToPreview)}
                   aria-pressed={previewPaneMode === 'preview'}
                   onClick={() => setPreviewPaneMode('preview')}
-                  className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 font-medium transition-colors ${
+                  title={
+                    isDeclarative && routing && !routing.readyToPreview
+                      ? 'Complete Concept, System, and Design to synthesize live Preview'
+                      : 'Live compiled Prism preview'
+                  }
+                  className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                     previewPaneMode === 'preview'
                       ? 'bg-white text-zinc-900 shadow-xs dark:bg-zinc-800 dark:text-zinc-100'
                       : 'text-zinc-500 hover:text-zinc-800 dark:text-zinc-400'
@@ -1295,7 +1392,11 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                 <button
                   type="button"
                   aria-pressed={previewPaneMode === 'prism'}
-                  onClick={() => setPreviewPaneMode((m) => (m === 'prism' ? 'preview' : 'prism'))}
+                  onClick={() =>
+                    setPreviewPaneMode((m) =>
+                      m === 'prism' ? (routing?.readyToPreview ? 'preview' : 'blueprint') : 'prism',
+                    )
+                  }
                   className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 font-medium transition-colors ${
                     previewPaneMode === 'prism'
                       ? 'bg-white text-zinc-900 shadow-xs dark:bg-zinc-800 dark:text-zinc-100'
@@ -1368,37 +1469,54 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
               </div>
             )}
 
-            {/* Preview & Prism Stack (Preview stays mounted underneath for zero state loss) */}
+            {/* Blueprint, Preview & Prism Stack */}
             <div className="relative min-h-0 flex-1 overflow-hidden bg-zinc-100/80 dark:bg-[#090D12]">
-              <div
-                className={`flex h-full w-full justify-center ${
-                  previewPaneMode === 'prism' ? 'invisible pointer-events-none' : ''
-                }`}
-              >
+              {(!isDeclarative || !routing || routing.readyToPreview) && (
                 <div
-                  className={`h-full transition-all ${
-                    viewportMode === 'mobile'
-                      ? 'my-2 h-[calc(100%-16px)] w-[390px] overflow-hidden rounded-2xl border border-zinc-300 shadow-lg dark:border-zinc-700'
-                      : 'w-full'
+                  className={`flex h-full w-full justify-center ${
+                    previewPaneMode !== 'preview' ? 'invisible pointer-events-none' : ''
                   }`}
                 >
-                  <PrismSandboxFrame
-                    prismId={project.id}
-                    snapshot={activeSnapshot}
-                    holoview={holoviewConfig}
-                    darkMode={effectivePreviewDark}
-                    bus={bus}
-                    bridgeRuntime={bridgeRuntime}
-                    reloadNonce={reloadNonce}
-                    onRuntimeError={setRuntimeError}
-                    className="h-full w-full border-0"
+                  <div
+                    className={`h-full transition-all ${
+                      viewportMode === 'mobile'
+                        ? 'my-2 h-[calc(100%-16px)] w-[390px] overflow-hidden rounded-2xl border border-zinc-300 shadow-lg dark:border-zinc-700'
+                        : 'w-full'
+                    }`}
+                  >
+                    <PrismSandboxFrame
+                      prismId={project.id}
+                      snapshot={activeSnapshot}
+                      holoview={holoviewConfig}
+                      darkMode={effectivePreviewDark}
+                      bus={bus}
+                      bridgeRuntime={bridgeRuntime}
+                      reloadNonce={reloadNonce}
+                      onRuntimeError={setRuntimeError}
+                      className="h-full w-full border-0"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {(previewPaneMode === 'blueprint' || (previewPaneMode === 'preview' && !routing?.readyToPreview)) && declaration && routing && (
+                <div className="absolute inset-0 z-10 overflow-hidden">
+                  <ModelBlueprintCanvas
+                    declaration={declaration}
+                    routing={routing}
+                    activeStage={wizardStage}
+                    onSelectStage={setWizardStage}
+                    onOpenPreview={() => setPreviewPaneMode('preview')}
                   />
                 </div>
-              </div>
+              )}
 
               {previewPaneMode === 'prism' && (
                 <div className="absolute inset-0 z-10 overflow-hidden">
-                  {renderPrismInspector(() => setPreviewPaneMode('preview'), 'Back to Preview')}
+                  {renderPrismInspector(
+                    () => setPreviewPaneMode(routing?.readyToPreview ? 'preview' : 'blueprint'),
+                    routing?.readyToPreview ? 'Back to Preview' : 'Back to Blueprint',
+                  )}
                 </div>
               )}
             </div>

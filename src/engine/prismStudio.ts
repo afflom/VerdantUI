@@ -13,6 +13,7 @@ import {
   createDeclarativeStarter,
   dispatchStudioOp,
   fieldsToJsonSchema,
+  upgradeDeclarationV1ToV2,
   type DeclarativeStarterId,
   type PrismDeclaration,
   type StudioApiOp,
@@ -1272,7 +1273,16 @@ export class PrismStore {
       const all = await idbReq<VerdantPrismProject[]>(tx.objectStore(STORE_PROJECTS).getAll());
       for (const proj of all) {
         if (proj && typeof proj.id === 'string' && proj.draft && !this.projects.has(proj.id)) {
-          this.projects.set(proj.id, proj);
+          const normalized = proj.declaration
+            ? {
+                ...proj,
+                declaration: upgradeDeclarationV1ToV2(proj.declaration),
+                declarationRevisions: (proj.declarationRevisions ?? []).map((rev) =>
+                  upgradeDeclarationV1ToV2(rev),
+                ),
+              }
+            : proj;
+          this.projects.set(proj.id, normalized);
         }
       }
       this.notify();
@@ -1604,7 +1614,7 @@ export class PrismStore {
   // ============================================================================
 
   async createDeclarative(
-    starterId: DeclarativeStarterId = 'blank',
+    starterId: DeclarativeStarterId = 'undefined',
     customName?: string,
   ): Promise<VerdantPrismProject> {
     let decl = createDeclarativeStarter(starterId);
@@ -1814,17 +1824,23 @@ export function snapshotFromDeclaration(decl: PrismDeclaration): VerdantPrismSna
     : DEFAULT_STREAM_CONTRACT.inputs;
   return buildSnapshot({
     name: decl.metadata.name,
-    summary: decl.metadata.description,
+    summary: decl.metadata.description || decl.concept.purpose || 'Undefined Prism draft',
     streams: {
       inputs,
       outputs: ['prism.ready', 'prism.output'],
     },
     grants: decl.capabilities,
-    app: {
-      html: compiled.appFiles['view/index.html'] ?? '',
-      css: compiled.compiledCss,
-      js: compiled.appFiles['view/app.js'] ?? '',
-    },
+    app: compiled
+      ? {
+          html: compiled.appFiles['view/index.html'] ?? '',
+          css: compiled.compiledCss,
+          js: compiled.appFiles['view/app.js'] ?? '',
+        }
+      : {
+          html: '',
+          css: '',
+          js: '',
+        },
   });
 }
 

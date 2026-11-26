@@ -17,7 +17,104 @@
 
 import type { JsonSchema2020Object, PrismGrants } from './prismStudio';
 
-export const DECLARATION_SCHEMA = 'verdant-studio/declaration/1' as const;
+export const DECLARATION_SCHEMA = 'verdant-studio/declaration/2' as const;
+export const LEGACY_DECLARATION_SCHEMA_V1 = 'verdant-studio/declaration/1' as const;
+
+export type PrismDomain =
+  | 'general'
+  | 'finance'
+  | 'health'
+  | 'education'
+  | 'games-media'
+  | 'enterprise-ops';
+
+export type PrismAudience = 'personal' | 'team' | 'public-adults' | 'includes-minors';
+export type DataClassification = 'none' | 'operational' | 'personal' | 'sensitive-regulated';
+export type PrismJurisdiction = 'none' | 'eu' | 'us' | 'uk' | 'global';
+
+export interface StakeholderDecl {
+  readonly id: string;
+  readonly name: string;
+  readonly provRole: 'producer' | 'consumer' | 'beneficiary' | 'regulator';
+  readonly concern: string;
+}
+
+export interface OpmObjectDecl {
+  readonly id: string;
+  readonly name: string;
+  readonly kind: FieldKind;
+  readonly states: readonly string[];
+  readonly role: 'input' | 'output' | 'stateful-asset';
+  readonly unit?: string;
+  readonly min?: number;
+  readonly max?: number;
+  readonly defaultValue?: number;
+  readonly description?: string;
+}
+
+export interface OpmProcessDecl {
+  readonly id: string;
+  readonly name: string;
+  readonly summary: string;
+  readonly consumesObjectIds: readonly string[];
+  readonly yieldsObjectIds: readonly string[];
+  readonly actorStakeholderIds: readonly string[];
+}
+
+export interface StudioConceptModel {
+  readonly purpose: string;
+  readonly domain: PrismDomain | null;
+  readonly audience: PrismAudience | null;
+  readonly dataClassification: DataClassification | null;
+  readonly jurisdictions: readonly PrismJurisdiction[];
+  readonly usesLocalAi: boolean;
+  readonly involvesPayments: boolean;
+  readonly stakeholders: readonly StakeholderDecl[];
+  readonly opmObjects: readonly OpmObjectDecl[];
+  readonly opmProcesses: readonly OpmProcessDecl[];
+}
+
+export type AssuranceLevel = 'L1' | 'L2' | 'L3';
+export type StrideCategory =
+  | 'spoofing'
+  | 'tampering'
+  | 'repudiation'
+  | 'information-disclosure'
+  | 'denial-of-service'
+  | 'elevation-of-privilege';
+
+export type ThreatDisposition =
+  | 'open'
+  | 'mitigated-by-refusal'
+  | 'mitigated-by-sandbox'
+  | 'not-applicable';
+
+export interface StrideThreatDecl {
+  readonly id: string;
+  readonly category: StrideCategory;
+  readonly title: string;
+  readonly asset: string;
+  readonly boundary: string;
+  readonly status: ThreatDisposition;
+  readonly linkedRefusalId?: string;
+  readonly rationale: string;
+  readonly citation: StudioCitation;
+}
+
+export interface StudioSecurityModel {
+  readonly assuranceLevel: AssuranceLevel;
+  readonly threats: readonly StrideThreatDecl[];
+  readonly reviewedAt?: string;
+}
+
+export interface SettledObligationRecord {
+  readonly obligationId: string;
+  readonly authorityId: string;
+  readonly status: 'settled';
+  readonly evidence: string;
+  readonly linkedId?: string;
+  readonly at: string;
+}
 
 export type PrismThemePreset =
   | 'paper'
@@ -190,6 +287,7 @@ export interface StudioViewDecl {
   readonly eyebrow: string;
   readonly subtitle: string;
   readonly submitLabel: string;
+  readonly disclosure?: string;
   readonly elements: readonly ViewElementDecl[];
   readonly citation: StudioCitation;
 }
@@ -231,16 +329,24 @@ export interface PrismDeclaration {
     readonly version: string;
     readonly description: string;
   };
+  /** Core 1: Conceptual Model (ISO/PAS 19450 OPM + W3C PROV-O Stakeholders + Routing Context). */
+  readonly concept: StudioConceptModel;
   readonly decisions: readonly OwnerDecision[];
   readonly authorities: readonly StudioAuthority[];
   readonly requirements: readonly StudioRequirement[];
+  /** Core 2: Architecture & System Encoding (JSON Schema 2020-12 -> LexLean Input). */
   readonly encoding: StudioEncoding | null;
   readonly features: readonly StudioFeature[];
   readonly refusals: readonly StudioRefusal[];
   readonly vectors: readonly AcceptanceVectorDecl[];
-  readonly view: StudioViewDecl;
+  /** Core 3: Security & Threat Model (STRIDE + OWASP ASVS 5.0.0). */
+  readonly security: StudioSecurityModel;
+  /** Core 4: Design & Experience View (`null` while Prism is undefined / not yet designed). */
+  readonly view: StudioViewDecl | null;
   readonly theme: StudioThemeDecl;
   readonly capabilities: PrismGrants;
+  /** Settled obligations for applicable layered standards routed by Core weights. */
+  readonly settledObligations: Readonly<Record<string, SettledObligationRecord>>;
   readonly admissions: readonly AdmissionDecl[];
   readonly lockedIds: readonly string[];
   readonly errors: readonly StudioErrorRecord[];
@@ -253,6 +359,71 @@ export type StudioApiOp =
       readonly name?: string;
       readonly version?: string;
       readonly description?: string;
+    }
+  | {
+      readonly op: 'set-concept-profile';
+      readonly purpose?: string;
+      readonly domain?: PrismDomain | null;
+      readonly audience?: PrismAudience | null;
+      readonly dataClassification?: DataClassification | null;
+      readonly jurisdictions?: readonly PrismJurisdiction[];
+      readonly usesLocalAi?: boolean;
+      readonly involvesPayments?: boolean;
+    }
+  | {
+      readonly op: 'admit-stakeholder';
+      readonly stakeholder: Omit<StakeholderDecl, 'id'> & { readonly id?: string };
+      readonly autoAdmitRequirement?: boolean;
+    }
+  | {
+      readonly op: 'remove-stakeholder';
+      readonly id: string;
+    }
+  | {
+      readonly op: 'admit-opm-object';
+      readonly object: Omit<OpmObjectDecl, 'id'> & { readonly id?: string };
+    }
+  | {
+      readonly op: 'remove-opm-object';
+      readonly id: string;
+    }
+  | {
+      readonly op: 'admit-opm-process';
+      readonly process: Omit<OpmProcessDecl, 'id'> & { readonly id?: string };
+    }
+  | {
+      readonly op: 'remove-opm-process';
+      readonly id: string;
+    }
+  | {
+      readonly op: 'derive-encoding-from-opm';
+      readonly encodingName?: string;
+    }
+  | {
+      readonly op: 'set-assurance-level';
+      readonly level: AssuranceLevel;
+    }
+  | {
+      readonly op: 'sync-stride-threats';
+    }
+  | {
+      readonly op: 'settle-stride-threat';
+      readonly id: string;
+      readonly status: Exclude<ThreatDisposition, 'open'>;
+      readonly linkedRefusalId?: string;
+      readonly rationale: string;
+    }
+  | {
+      readonly op: 'synthesize-view-from-system';
+      readonly viewpoint?: PrismViewpoint;
+    }
+  | {
+      readonly op: 'settle-standard-obligation';
+      readonly obligationId: string;
+      readonly authority: StudioAuthority;
+      readonly evidence: string;
+      readonly linkedId?: string;
+      readonly followUpOps?: readonly StudioApiOp[];
     }
   | {
       readonly op: 'record-decision';
@@ -385,17 +556,26 @@ export interface DeclarationCheckReport {
   }[];
 }
 
+export type StudioWizardStage =
+  | 'concept'
+  | 'architecture'
+  | 'security'
+  | 'design'
+  | 'standards'
+  | 'seal';
+
 export interface StudioAgendaItem {
   readonly id: string;
   readonly priority: number;
   readonly title: string;
   readonly detail: string;
   readonly actionLabel: string;
-  readonly targetTab: 'features' | 'data' | 'design' | 'capabilities';
+  readonly targetTab: StudioWizardStage | 'features' | 'data' | 'capabilities';
   readonly suggestedOp?: StudioApiOp;
 }
 
 export type DeclarativeStarterId =
+  | 'undefined'
   | 'budget-guard'
   | 'pricing-rules'
   | 'eligibility-gate'
@@ -930,24 +1110,33 @@ export function checkDeclaration(decl: PrismDeclaration): DeclarationCheckReport
 
   // 5. Bidirectional View Traceability (`REQ-D9` / ISO 29148)
   const reqIds = new Set(decl.requirements.map((r) => r.id));
-  for (const el of decl.view.elements) {
-    if (!reqIds.has(el.requirementId)) {
-      diagnostics.push({
-        code: 'view.uncited-element',
-        severity: 'error',
-        id: el.id,
-        message: `View element "${el.label}" cites unknown requirement "${el.requirementId}".`,
-        remediation: 'Bind every UI element to an admitted Requirement (REQ-D9).',
-      });
-    }
-    if ((el.slot === 'field-input' || el.slot === 'choice-group') && !fieldNames.has(el.binding)) {
-      diagnostics.push({
-        code: 'view.unbound-field',
-        severity: 'error',
-        id: el.id,
-        message: `View control "${el.label}" binds to undeclared field "${el.binding}".`,
-        remediation: `Declare "${el.binding}" in Data or rebind the control in Design.`,
-      });
+  if (!decl.view) {
+    diagnostics.push({
+      code: 'view.missing',
+      severity: 'error',
+      message: 'No interface view is declared yet.',
+      remediation: 'Complete Stage 4 (Design) to bind system fields and outcomes to a prism.design/1 view.',
+    });
+  } else {
+    for (const el of decl.view.elements) {
+      if (!reqIds.has(el.requirementId)) {
+        diagnostics.push({
+          code: 'view.uncited-element',
+          severity: 'error',
+          id: el.id,
+          message: `View element "${el.label}" cites unknown requirement "${el.requirementId}".`,
+          remediation: 'Bind every UI element to an admitted Requirement (REQ-D9).',
+        });
+      }
+      if ((el.slot === 'field-input' || el.slot === 'choice-group') && !fieldNames.has(el.binding)) {
+        diagnostics.push({
+          code: 'view.unbound-field',
+          severity: 'error',
+          id: el.id,
+          message: `View control "${el.label}" binds to undeclared field "${el.binding}".`,
+          remediation: `Declare "${el.binding}" in System or rebind the control in Design.`,
+        });
+      }
     }
   }
 
@@ -958,7 +1147,7 @@ export function checkDeclaration(decl: PrismDeclaration): DeclarationCheckReport
     const refusalIds = decl.refusals
       .filter((r) => r.citation.kind === 'req' && r.citation.requirementId === req.id)
       .map((r) => r.id);
-    const viewElementIds = decl.view.elements
+    const viewElementIds = (decl.view?.elements ?? [])
       .filter((e) => e.requirementId === req.id)
       .map((e) => e.id);
     const covered = featureIds.length > 0 || refusalIds.length > 0 || viewElementIds.length > 0;
@@ -1023,7 +1212,10 @@ export function deriveRepairOp(
       };
     }
   }
-  if (code === 'view.uncited-element' && targetId && decl.requirements.length > 0) {
+  if (code === 'view.missing' && decl.encoding && decl.encoding.fields.length > 0) {
+    return { op: 'synthesize-view-from-system' };
+  }
+  if (code === 'view.uncited-element' && targetId && decl.view && decl.requirements.length > 0) {
     const fallbackReq = decl.requirements[0].id;
     return {
       op: 'declare-view',
@@ -1035,7 +1227,7 @@ export function deriveRepairOp(
       },
     };
   }
-  if (code === 'view.unbound-field' && targetId) {
+  if (code === 'view.unbound-field' && targetId && decl.view) {
     return {
       op: 'declare-view',
       view: {
@@ -1059,7 +1251,7 @@ export function computeAgenda(decl: PrismDeclaration): readonly StudioAgendaItem
       title: `Repair ${err.code}`,
       detail: err.refusal,
       actionLabel: err.suggestedRepair ? 'Apply API Repair' : 'Inspect',
-      targetTab: 'capabilities',
+      targetTab: 'seal',
       suggestedOp: err.suggestedRepair,
     });
   }
@@ -1071,19 +1263,19 @@ export function computeAgenda(decl: PrismDeclaration): readonly StudioAgendaItem
       priority: 1,
       title: diag.message,
       detail: diag.remediation,
-      actionLabel: repair ? 'Apply Fix' : 'Open Tab',
+      actionLabel: repair ? 'Apply Fix' : 'Open Stage',
       targetTab:
         diag.code.startsWith('encoding') || diag.code.startsWith('rule.')
-          ? 'data'
+          ? 'architecture'
           : diag.code.startsWith('view.')
             ? 'design'
-            : 'features',
+            : 'architecture',
       suggestedOp: repair,
     });
   }
 
   // Check for declared input fields not yet bound in the View
-  if (decl.encoding) {
+  if (decl.encoding && decl.view) {
     const boundFields = new Set(decl.view.elements.map((e) => e.binding));
     const reqId = decl.requirements[0]?.id;
     for (const f of decl.encoding.fields) {
@@ -1092,7 +1284,7 @@ export function computeAgenda(decl: PrismDeclaration): readonly StudioAgendaItem
           id: `bind_field_${f.name}`,
           priority: 2,
           title: `Bind "${f.label}" field to interface`,
-          detail: `Field "${f.name}" is declared in Data but not yet shown in the Design view.`,
+          detail: `Field "${f.name}" is declared in System but not yet shown in the Design view.`,
           actionLabel: 'Bind Control',
           targetTab: 'design',
           suggestedOp: {
@@ -1125,7 +1317,7 @@ export function computeAgenda(decl: PrismDeclaration): readonly StudioAgendaItem
         title: `Add rule for ${trace.requirementId}`,
         detail: `Requirement ${trace.requirementId} has no feature rule or refusal attached yet.`,
         actionLabel: 'Add Rule',
-        targetTab: 'features',
+        targetTab: 'architecture',
       });
     }
   }
@@ -1165,31 +1357,295 @@ function upsertAdmission(
   return [...admissions, { construct, citation }];
 }
 
-export function createEmptyDeclaration(name = 'Untitled Prism'): PrismDeclaration {
-  const slug = slugifyPrismName(name);
+export const CORE_SPINE_AUTHORITIES: readonly StudioAuthority[] = [
+  {
+    id: 'PRISM-TEMPLATE-CONTRACT-2',
+    name: 'UOR Prism Template Contract 2',
+    edition: '2.0',
+    statement: 'Authoritative single-source model, typed refusals (R5), and Lean kernel proof boundary.',
+  },
+  {
+    id: 'ISO-PAS-19450',
+    name: 'ISO/PAS 19450 Object-Process Methodology (OPM)',
+    edition: '2015',
+    statement: 'Unified conceptual modeling of system Objects, States, Processes, and Beneficiaries.',
+  },
+  {
+    id: 'W3C-PROV-O',
+    name: 'W3C PROV-O Provenance Ontology',
+    edition: '2013',
+    statement: 'Stakeholders modeled as producers, consumers, and attributed agents (REQ-D10).',
+  },
+  {
+    id: 'ISO-IEC-IEEE-29148-2018',
+    name: 'ISO/IEC/IEEE 29148 Requirements Engineering',
+    edition: '2018',
+    statement: 'Stakeholder requirements with origin, rationale, and bidirectional traceability.',
+  },
+  {
+    id: 'ISO-IEC-IEEE-42010-2022',
+    name: 'ISO/IEC/IEEE 42010 Architecture Description',
+    edition: '2022',
+    statement: 'Stakeholders, concerns, viewpoints, and requirement-traced views (REQ-D9).',
+  },
+  {
+    id: 'JSON-SCHEMA-2020-12',
+    name: 'JSON Schema 2020-12',
+    edition: '2020-12',
+    statement: 'Machine-readable typed data encoding boundary compiled into LexLean.',
+  },
+  {
+    id: 'MICROSOFT-TMT-STRIDE',
+    name: 'STRIDE Threat Modeling Taxonomy',
+    edition: '1.0',
+    statement: 'Spoofing, Tampering, Repudiation, Information Disclosure, Denial of Service, Elevation of Privilege.',
+  },
+  {
+    id: 'OWASP-ASVS-5.0.0',
+    name: 'OWASP Application Security Verification Standard',
+    edition: '5.0.0',
+    statement: 'Tiered security verification assurance levels (L1, L2, L3).',
+  },
+  {
+    id: 'W3C-WCAG22-2024',
+    name: 'W3C WCAG 2.2 Accessibility Guidelines',
+    edition: '2.2',
+    statement: 'Contrast, labeling, keyboard operation, and non-color status messaging.',
+  },
+  {
+    id: 'ISO-9241-210',
+    name: 'ISO 9241-210 Human-Centred Design',
+    edition: '2019',
+    statement: 'Context of use, stakeholder goals, and usable interactive system views.',
+  },
+  {
+    id: 'PRISM-DESIGN-1',
+    name: 'Prism Design System (prism.design/1)',
+    edition: '1.0',
+    statement: 'Compiled shadcn/ui data-slot components and WCAG-checked token themes.',
+  },
+];
+
+export function recommendedAssuranceLevel(concept: StudioConceptModel): AssuranceLevel {
+  if (concept.dataClassification === 'sensitive-regulated' || concept.involvesPayments) {
+    return 'L3';
+  }
+  if (
+    concept.dataClassification === 'personal' ||
+    concept.audience === 'public-adults' ||
+    concept.audience === 'includes-minors' ||
+    concept.usesLocalAi
+  ) {
+    return 'L2';
+  }
+  return 'L1';
+}
+
+/**
+ * Deterministically computes the STRIDE threat matrix from populated Core weights
+ * (OPM assets + Architecture encoding & capabilities + Concept data/AI/payment profile).
+ */
+export function computeCandidateStrideThreats(decl: PrismDeclaration): readonly StrideThreatDecl[] {
+  const existing = new Map(decl.security.threats.map((t) => [t.id, t]));
+  const firstRefusalId = decl.refusals[0]?.id;
+  const candidates: StrideThreatDecl[] = [];
+
+  const keepOrInit = (draft: StrideThreatDecl): StrideThreatDecl => {
+    const prev = existing.get(draft.id);
+    if (!prev) return draft;
+    return {
+      ...draft,
+      status: prev.status,
+      linkedRefusalId: prev.linkedRefusalId,
+      rationale: prev.rationale || draft.rationale,
+    };
+  };
+
+  // 1. Tampering — always active once any input field or OPM input exists
+  const inputAsset =
+    decl.encoding?.fields.map((f) => f.label).slice(0, 3).join(', ') ||
+    decl.concept.opmObjects.filter((o) => o.role === 'input').map((o) => o.name).slice(0, 3).join(', ') ||
+    'User Input Payload';
+  candidates.push(
+    keepOrInit({
+      id: 'THR-TAMPER-INPUT',
+      category: 'tampering',
+      title: 'Malformed or out-of-domain input tampering',
+      asset: inputAsset,
+      boundary: 'User Input -> WASM Guest Boundary',
+      status: firstRefusalId ? 'mitigated-by-refusal' : 'open',
+      linkedRefusalId: firstRefusalId,
+      rationale: firstRefusalId
+        ? `Bounded by JSON Schema encoding and explicit typed refusal ${firstRefusalId}.`
+        : 'Bind at least one typed refusal or domain check to reject malformed/out-of-range inputs.',
+      citation: { kind: 'std', authorityId: 'MICROSOFT-TMT-STRIDE' },
+    }),
+  );
+
+  // 2. Denial of Service — unbounded arithmetic / division-by-zero / resource exhaustion
+  candidates.push(
+    keepOrInit({
+      id: 'THR-DOS-BOUNDS',
+      category: 'denial-of-service',
+      title: 'Unbounded input or division-by-zero exhaustion',
+      asset: 'Deterministic WASM Evaluator',
+      boundary: 'WASM Guest Execution Sandbox',
+      status: 'mitigated-by-sandbox',
+      rationale:
+        'Total Nat arithmetic in LexLean (total functions, saturating subtraction, bounded input ranges) prevents non-termination inside the WASM guest.',
+      citation: { kind: 'std', authorityId: 'MICROSOFT-TMT-STRIDE' },
+    }),
+  );
+
+  // 3. Elevation of Privilege — sandbox isolation boundary
+  candidates.push(
+    keepOrInit({
+      id: 'THR-EOP-SANDBOX',
+      category: 'elevation-of-privilege',
+      title: 'Unauthorized host or capability escalation',
+      asset: 'Host Runtime & DOM',
+      boundary: 'Zero-Origin Iframe & Deny-by-Default Capabilities',
+      status: decl.capabilities.network ? 'open' : 'mitigated-by-sandbox',
+      rationale: decl.capabilities.network
+        ? 'Network capability is enabled; verify outbound scope and input validation before sealing.'
+        : 'Zero-origin sandbox iframe + deny-by-default capabilities (network denied) + pure WASM guest eliminate ambient privilege escalation.',
+      citation: { kind: 'std', authorityId: 'MICROSOFT-TMT-STRIDE' },
+    }),
+  );
+
+  // 4. Spoofing — relevant when network, multi-user/public audience, or payments are active
+  const spoofingRelevant =
+    decl.capabilities.network ||
+    decl.concept.audience === 'public-adults' ||
+    decl.concept.audience === 'includes-minors' ||
+    decl.concept.involvesPayments;
+  candidates.push(
+    keepOrInit({
+      id: 'THR-SPOOF-ORIGIN',
+      category: 'spoofing',
+      title: 'Impersonated caller or tampered package provenance',
+      asset: 'Prism Package & Caller Identity',
+      boundary: decl.capabilities.network ? 'External Network Boundary' : 'Offline .holo Verification Boundary',
+      status: spoofingRelevant ? 'open' : 'not-applicable',
+      rationale: spoofingRelevant
+        ? 'Confirm BLAKE3 .holo provenance verification and caller/input validation for public or networked use.'
+        : 'Local single-user offline Prism with BLAKE3 content-addressed .holo verification and network denied.',
+      citation: { kind: 'std', authorityId: 'MICROSOFT-TMT-STRIDE' },
+    }),
+  );
+
+  // 5. Information Disclosure — active when storage, network, or personal/sensitive data is declared
+  const disclosureActive =
+    decl.capabilities.storage ||
+    decl.capabilities.network ||
+    decl.concept.dataClassification === 'personal' ||
+    decl.concept.dataClassification === 'sensitive-regulated';
+  candidates.push(
+    keepOrInit({
+      id: 'THR-INFO-LEAK',
+      category: 'information-disclosure',
+      title: 'Unintended data persistence or exfiltration',
+      asset:
+        decl.concept.dataClassification === 'personal' ||
+        decl.concept.dataClassification === 'sensitive-regulated'
+          ? 'Personal / Regulated User Data'
+          : 'Local Runtime State',
+      boundary: decl.capabilities.network
+        ? 'Network Egress Boundary'
+        : decl.capabilities.storage
+          ? 'Scoped Local Storage Boundary'
+          : 'Ephemeral In-Memory Sandbox',
+      status: disclosureActive ? 'open' : 'mitigated-by-sandbox',
+      rationale: disclosureActive
+        ? 'Confirm data minimization, scoped local-only storage, or explicit user disclosure before sealing.'
+        : 'No personal data declared, storage disabled, and network denied; all inputs remain ephemeral in local memory.',
+      citation: { kind: 'std', authorityId: 'MICROSOFT-TMT-STRIDE' },
+    }),
+  );
+
+  // 6. Repudiation — auditability of rules & decisions
+  candidates.push(
+    keepOrInit({
+      id: 'THR-REPUD-AUDIT',
+      category: 'repudiation',
+      title: 'Unattributed decision or opaque rule verdict',
+      asset: 'Model Decisions & Refusals',
+      boundary: 'Observer Stream & Conformance Ledger',
+      status: decl.capabilities.observer ? 'mitigated-by-sandbox' : 'open',
+      rationale: decl.capabilities.observer
+        ? 'Every evaluation emits deterministic W3C OpenTelemetry trace spans on the Observer bus backed by Lean-proved rules.'
+        : 'Observer tracing is disabled; document how verdicts are audited or enable Observer tracing.',
+      citation: { kind: 'std', authorityId: 'MICROSOFT-TMT-STRIDE' },
+    }),
+  );
+
+  return candidates;
+}
+
+/**
+ * Creates a genuinely EMPTY, UNDEFINED Verdant Prism declaration.
+ * Zero fields, zero rules, zero refusals, zero preview view — used when the user clicks "+ New Prism".
+ */
+export function createUndefinedDeclaration(name = 'Untitled Prism'): PrismDeclaration {
+  const cleanName = name.trim() || 'Untitled Prism';
   return {
     schema: DECLARATION_SCHEMA,
     metadata: {
-      name: name.trim() || 'Untitled Prism',
-      slug,
+      name: cleanName,
+      slug: slugifyPrismName(cleanName),
       version: '0.1.0',
-      description: 'A declarative Prism application compiled into a verified .holo archive.',
+      description: '',
+    },
+    concept: {
+      purpose: '',
+      domain: null,
+      audience: null,
+      dataClassification: null,
+      jurisdictions: [],
+      usesLocalAi: false,
+      involvesPayments: false,
+      stakeholders: [],
+      opmObjects: [],
+      opmProcesses: [],
     },
     decisions: [],
-    authorities: [
-      {
-        id: 'PRISM-TEMPLATE-CONTRACT-2',
-        name: 'UOR Prism Template Contract 2',
-        edition: '2.0',
-        statement: 'Authoritative single-source model, typed refusals (R5), and Lean kernel proof boundary.',
-      },
-      {
-        id: 'PRISM-DESIGN-1',
-        name: 'Prism Design System (prism.design/1)',
-        edition: '1.0',
-        statement: 'Compiled shadcn/ui data-slot components and WCAG-checked token themes.',
-      },
-    ],
+    authorities: [...CORE_SPINE_AUTHORITIES],
+    requirements: [],
+    encoding: null,
+    features: [],
+    refusals: [],
+    vectors: [],
+    security: {
+      assuranceLevel: 'L1',
+      threats: [],
+    },
+    view: null,
+    theme: { preset: 'evergreen' },
+    capabilities: {
+      observer: true,
+      storage: false,
+      browser: false,
+      network: false,
+    },
+    settledObligations: {},
+    admissions: [],
+    lockedIds: [],
+    errors: [],
+    auditLog: [],
+  };
+}
+
+/**
+ * Seed declaration with an initial REQ-01 (used internally by curated reference starters & schema tests).
+ */
+export function createEmptyDeclaration(name = 'Untitled Prism'): PrismDeclaration {
+  const base = createUndefinedDeclaration(name);
+  return {
+    ...base,
+    metadata: {
+      ...base.metadata,
+      description: 'A declarative Prism application compiled into a verified .holo archive.',
+    },
     requirements: [
       {
         id: 'REQ-01',
@@ -1199,40 +1655,110 @@ export function createEmptyDeclaration(name = 'Untitled Prism'): PrismDeclaratio
         evidence: 'Initial Prism declaration',
       },
     ],
-    encoding: null,
-    features: [],
-    refusals: [],
-    vectors: [],
-    view: {
-      viewpoint: 'decision-form',
-      title: name.trim() || 'Untitled Prism',
-      eyebrow: 'Verified Prism',
-      subtitle: 'Every answer is computed by the declared, proved model.',
-      submitLabel: 'Evaluate',
-      elements: [
+  };
+}
+
+/**
+ * Seamlessly migrates legacy `verdant-studio/declaration/1` projects stored in IndexedDB
+ * into `verdant-studio/declaration/2` without losing any user-authored fields, rules, or views.
+ */
+export function upgradeDeclarationV1ToV2(raw: PrismDeclaration | Record<string, unknown>): PrismDeclaration {
+  const rec = raw as Partial<PrismDeclaration> & { schema?: string };
+  if (rec.schema === DECLARATION_SCHEMA && rec.concept && rec.security && rec.settledObligations) {
+    return rec as PrismDeclaration;
+  }
+  const name = rec.metadata?.name ?? 'Untitled Prism';
+  const base = createUndefinedDeclaration(name);
+  const fields = rec.encoding?.fields ?? [];
+  const opmObjects: OpmObjectDecl[] = fields.map((f, idx) => ({
+    id: `OBJ-${String(idx + 1).padStart(2, '0')}`,
+    name: f.label,
+    kind: f.kind,
+    states: f.choices ? [...f.choices] : f.kind === 'bool' ? ['No', 'Yes'] : [],
+    role: 'input',
+    unit: f.unit,
+    min: f.min,
+    max: f.max,
+    defaultValue: f.defaultValue,
+    description: f.description,
+  }));
+  const stakeholders: StakeholderDecl[] = [
+    {
+      id: 'STK-01',
+      name: 'Creator',
+      provRole: 'producer',
+      concern: 'Define deterministic, proved rules for this Prism.',
+    },
+    {
+      id: 'STK-02',
+      name: 'End User',
+      provRole: 'consumer',
+      concern: 'Receive transparent, reliable answers and clear refusals.',
+    },
+  ];
+  const opmProcesses: OpmProcessDecl[] = opmObjects.length > 0
+    ? [
         {
-          id: 'el_result',
-          slot: 'result-card',
-          label: 'Model Answer',
-          binding: 'outcome',
-          requirementId: 'REQ-01',
+          id: 'PROC-01',
+          name: `Evaluate ${name}`,
+          summary: rec.metadata?.description || 'Evaluate declared inputs through proved rules.',
+          consumesObjectIds: opmObjects.map((o) => o.id),
+          yieldsObjectIds: [],
+          actorStakeholderIds: ['STK-02'],
         },
-      ],
-      citation: { kind: 'req', requirementId: 'REQ-01' },
+      ]
+    : [];
+
+  const mergedAuthorities: StudioAuthority[] = [...CORE_SPINE_AUTHORITIES];
+  for (const a of rec.authorities ?? []) {
+    if (!mergedAuthorities.some((m) => m.id === a.id)) {
+      mergedAuthorities.push(a);
+    }
+  }
+
+  const migrated: PrismDeclaration = {
+    ...base,
+    metadata: rec.metadata ?? base.metadata,
+    concept: {
+      purpose: rec.metadata?.description || `Deterministic Prism for ${name}.`,
+      domain: 'general',
+      audience: 'personal',
+      dataClassification: 'none',
+      jurisdictions: ['none'],
+      usesLocalAi: false,
+      involvesPayments: false,
+      stakeholders,
+      opmObjects,
+      opmProcesses,
     },
-    theme: { preset: 'evergreen' },
-    capabilities: {
-      observer: true,
-      storage: false,
-      browser: false,
-      network: false,
+    decisions: rec.decisions ?? [],
+    authorities: mergedAuthorities,
+    requirements: rec.requirements ?? [],
+    encoding: rec.encoding ?? null,
+    features: rec.features ?? [],
+    refusals: rec.refusals ?? [],
+    vectors: rec.vectors ?? [],
+    security: {
+      assuranceLevel: 'L1',
+      threats: [],
     },
-    admissions: [
-      { construct: 'View.Default', citation: { kind: 'req', requirementId: 'REQ-01' } },
-    ],
-    lockedIds: [],
-    errors: [],
-    auditLog: [],
+    view: rec.view ?? null,
+    theme: rec.theme ?? { preset: 'evergreen' },
+    capabilities: rec.capabilities ?? base.capabilities,
+    settledObligations: {},
+    admissions: rec.admissions ?? [],
+    lockedIds: rec.lockedIds ?? [],
+    errors: rec.errors ?? [],
+    auditLog: rec.auditLog ?? [],
+  };
+
+  return {
+    ...migrated,
+    security: {
+      assuranceLevel: 'L1',
+      threats: computeCandidateStrideThreats(migrated),
+      reviewedAt: new Date().toISOString(),
+    },
   };
 }
 
@@ -1270,13 +1796,554 @@ export function dispatchStudioOp(decl: PrismDeclaration, op: StudioApiOp): Studi
           version: op.version?.trim() || decl.metadata.version,
           description: op.description !== undefined ? op.description.trim() : decl.metadata.description,
         },
-        view: {
-          ...decl.view,
-          title: decl.view.title === decl.metadata.name ? nextName : decl.view.title,
-        },
+        view: decl.view
+          ? {
+              ...decl.view,
+              title: decl.view.title === decl.metadata.name ? nextName : decl.view.title,
+            }
+          : null,
         auditLog: appendAudit(decl, op.op, `Updated metadata (${nextName})`),
       };
       return { ok: true, declaration: next, message: `Updated metadata for "${nextName}".` };
+    }
+
+    case 'set-concept-profile': {
+      const nextConcept: StudioConceptModel = {
+        ...decl.concept,
+        purpose: op.purpose !== undefined ? op.purpose.trim() : decl.concept.purpose,
+        domain: op.domain !== undefined ? op.domain : decl.concept.domain,
+        audience: op.audience !== undefined ? op.audience : decl.concept.audience,
+        dataClassification:
+          op.dataClassification !== undefined ? op.dataClassification : decl.concept.dataClassification,
+        jurisdictions: op.jurisdictions !== undefined ? [...op.jurisdictions] : decl.concept.jurisdictions,
+        usesLocalAi: op.usesLocalAi !== undefined ? op.usesLocalAi : decl.concept.usesLocalAi,
+        involvesPayments:
+          op.involvesPayments !== undefined ? op.involvesPayments : decl.concept.involvesPayments,
+      };
+      const nextAssurance = decl.security.reviewedAt
+        ? decl.security.assuranceLevel
+        : recommendedAssuranceLevel(nextConcept);
+      const nextDesc =
+        !decl.metadata.description && nextConcept.purpose
+          ? nextConcept.purpose
+          : decl.metadata.description;
+      const next: PrismDeclaration = {
+        ...decl,
+        metadata: { ...decl.metadata, description: nextDesc },
+        concept: nextConcept,
+        security: { ...decl.security, assuranceLevel: nextAssurance },
+        admissions: upsertAdmission(decl.admissions, 'Concept.Profile', {
+          kind: 'std',
+          authorityId: 'ISO-PAS-19450',
+        }),
+        auditLog: appendAudit(decl, op.op, 'Updated conceptual context & routing profile'),
+      };
+      return { ok: true, declaration: next, message: 'Updated Conceptual Model profile.' };
+    }
+
+    case 'admit-stakeholder': {
+      const name = op.stakeholder.name.trim();
+      const concern = op.stakeholder.concern.trim();
+      if (!name || !concern) {
+        return {
+          ok: false,
+          code: 'concept.invalid-stakeholder',
+          message: 'A stakeholder must specify both a role name and primary concern (ISO 42010 / PROV-O).',
+          remediation: 'Enter the stakeholder name and what they need from this Prism.',
+        };
+      }
+      const id =
+        op.stakeholder.id?.trim().toUpperCase() ||
+        `STK-${String(decl.concept.stakeholders.length + 1).padStart(2, '0')}`;
+      const entry: StakeholderDecl = {
+        id,
+        name,
+        provRole: op.stakeholder.provRole,
+        concern,
+      };
+      const existingIdx = decl.concept.stakeholders.findIndex((s) => s.id === id);
+      const nextStakeholders =
+        existingIdx >= 0
+          ? decl.concept.stakeholders.map((s, i) => (i === existingIdx ? entry : s))
+          : [...decl.concept.stakeholders, entry];
+
+      let nextReqs = decl.requirements;
+      if (op.autoAdmitRequirement) {
+        const reqId = `REQ-${String(decl.requirements.length + 1).padStart(2, '0')}`;
+        if (!decl.requirements.some((r) => r.id === reqId)) {
+          nextReqs = [
+            ...decl.requirements,
+            {
+              id: reqId,
+              statement: concern,
+              stakeholder: name,
+              origin: op.stakeholder.provRole === 'regulator' ? 'constraint' : 'identity',
+              evidence: `PROV-O stakeholder ${id} (${op.stakeholder.provRole})`,
+            },
+          ];
+        }
+      }
+
+      const next: PrismDeclaration = {
+        ...decl,
+        concept: { ...decl.concept, stakeholders: nextStakeholders },
+        requirements: nextReqs,
+        admissions: upsertAdmission(decl.admissions, `Stakeholder.${id}`, {
+          kind: 'std',
+          authorityId: 'W3C-PROV-O',
+        }),
+        auditLog: appendAudit(decl, op.op, `Admitted stakeholder ${id} (${name})`),
+      };
+      return { ok: true, declaration: next, message: `Admitted stakeholder "${name}".` };
+    }
+
+    case 'remove-stakeholder': {
+      const next: PrismDeclaration = {
+        ...decl,
+        concept: {
+          ...decl.concept,
+          stakeholders: decl.concept.stakeholders.filter((s) => s.id !== op.id),
+          opmProcesses: decl.concept.opmProcesses.map((p) => ({
+            ...p,
+            actorStakeholderIds: p.actorStakeholderIds.filter((sid) => sid !== op.id),
+          })),
+        },
+        admissions: decl.admissions.filter((a) => a.construct !== `Stakeholder.${op.id}`),
+        auditLog: appendAudit(decl, op.op, `Removed stakeholder ${op.id}`),
+      };
+      return { ok: true, declaration: next, message: `Removed stakeholder ${op.id}.` };
+    }
+
+    case 'admit-opm-object': {
+      const name = op.object.name.trim();
+      if (!name) {
+        return {
+          ok: false,
+          code: 'concept.invalid-object',
+          message: 'An OPM Object must have a name (ISO/PAS 19450).',
+          remediation: 'Provide a noun name for the Object (e.g. Monthly Budget, Order Tier).',
+        };
+      }
+      const id =
+        op.object.id?.trim().toUpperCase() ||
+        `OBJ-${String(decl.concept.opmObjects.length + 1).padStart(2, '0')}`;
+      const cleanStates = op.object.states.map((s) => s.trim()).filter(Boolean);
+      const entry: OpmObjectDecl = {
+        ...op.object,
+        id,
+        name,
+        states:
+          op.object.kind === 'choice'
+            ? cleanStates.length > 0
+              ? cleanStates
+              : ['Option A', 'Option B']
+            : op.object.kind === 'bool'
+              ? cleanStates.length >= 2
+                ? cleanStates.slice(0, 2)
+                : ['No', 'Yes']
+              : cleanStates,
+      };
+      const idx = decl.concept.opmObjects.findIndex((o) => o.id === id);
+      const nextObjects =
+        idx >= 0
+          ? decl.concept.opmObjects.map((o, i) => (i === idx ? entry : o))
+          : [...decl.concept.opmObjects, entry];
+      const next: PrismDeclaration = {
+        ...decl,
+        concept: { ...decl.concept, opmObjects: nextObjects },
+        admissions: upsertAdmission(decl.admissions, `OpmObject.${id}`, {
+          kind: 'std',
+          authorityId: 'ISO-PAS-19450',
+        }),
+        auditLog: appendAudit(decl, op.op, `Admitted OPM object ${id} (${name})`),
+      };
+      return { ok: true, declaration: next, message: `Admitted OPM object "${name}".` };
+    }
+
+    case 'remove-opm-object': {
+      const next: PrismDeclaration = {
+        ...decl,
+        concept: {
+          ...decl.concept,
+          opmObjects: decl.concept.opmObjects.filter((o) => o.id !== op.id),
+          opmProcesses: decl.concept.opmProcesses.map((p) => ({
+            ...p,
+            consumesObjectIds: p.consumesObjectIds.filter((oid) => oid !== op.id),
+            yieldsObjectIds: p.yieldsObjectIds.filter((oid) => oid !== op.id),
+          })),
+        },
+        admissions: decl.admissions.filter((a) => a.construct !== `OpmObject.${op.id}`),
+        auditLog: appendAudit(decl, op.op, `Removed OPM object ${op.id}`),
+      };
+      return { ok: true, declaration: next, message: `Removed OPM object ${op.id}.` };
+    }
+
+    case 'admit-opm-process': {
+      const name = op.process.name.trim();
+      if (!name) {
+        return {
+          ok: false,
+          code: 'concept.invalid-process',
+          message: 'An OPM Process must have a verb/action name (ISO/PAS 19450).',
+          remediation: 'Name the transformation (e.g. Evaluating Expense, Calculating Quote).',
+        };
+      }
+      const id =
+        op.process.id?.trim().toUpperCase() ||
+        `PROC-${String(decl.concept.opmProcesses.length + 1).padStart(2, '0')}`;
+      const entry: OpmProcessDecl = {
+        ...op.process,
+        id,
+        name,
+        summary: op.process.summary.trim() || name,
+      };
+      const idx = decl.concept.opmProcesses.findIndex((p) => p.id === id);
+      const nextProcesses =
+        idx >= 0
+          ? decl.concept.opmProcesses.map((p, i) => (i === idx ? entry : p))
+          : [...decl.concept.opmProcesses, entry];
+      const next: PrismDeclaration = {
+        ...decl,
+        concept: { ...decl.concept, opmProcesses: nextProcesses },
+        admissions: upsertAdmission(decl.admissions, `OpmProcess.${id}`, {
+          kind: 'std',
+          authorityId: 'ISO-PAS-19450',
+        }),
+        auditLog: appendAudit(decl, op.op, `Admitted OPM process ${id} (${name})`),
+      };
+      return { ok: true, declaration: next, message: `Admitted OPM process "${name}".` };
+    }
+
+    case 'remove-opm-process': {
+      const next: PrismDeclaration = {
+        ...decl,
+        concept: {
+          ...decl.concept,
+          opmProcesses: decl.concept.opmProcesses.filter((p) => p.id !== op.id),
+        },
+        admissions: decl.admissions.filter((a) => a.construct !== `OpmProcess.${op.id}`),
+        auditLog: appendAudit(decl, op.op, `Removed OPM process ${op.id}`),
+      };
+      return { ok: true, declaration: next, message: `Removed OPM process ${op.id}.` };
+    }
+
+    case 'derive-encoding-from-opm': {
+      const inputObjects = decl.concept.opmObjects.filter(
+        (o) => o.role === 'input' || o.role === 'stateful-asset',
+      );
+      if (inputObjects.length === 0) {
+        return {
+          ok: false,
+          code: 'concept.no-input-objects',
+          message: 'Declare at least one input OPM Object in Concept before deriving the System Encoding.',
+          remediation: 'Add an OPM Object with role "Input" in Stage 1 (Concept).',
+        };
+      }
+      let current = decl;
+      if (current.requirements.length === 0) {
+        const seedReq = dispatchStudioOp(current, {
+          op: 'admit-requirement',
+          requirement: {
+            id: 'REQ-01',
+            statement:
+              current.concept.purpose ||
+              `Evaluate ${current.metadata.name} inputs deterministically.`,
+            stakeholder: current.concept.stakeholders[0]?.name || 'Creator',
+            origin: 'identity',
+            evidence: 'Derived from Conceptual Model (ISO/PAS 19450)',
+          },
+        });
+        if (!seedReq.ok) return seedReq;
+        current = seedReq.declaration;
+      }
+      const seenNames = new Set<string>();
+      const fields: EncodedField[] = inputObjects.map((obj, idx) => {
+        let baseName = sanitizeIdentifier(
+          obj.name
+            .replace(/[^a-zA-Z0-9\s]+/g, ' ')
+            .trim()
+            .split(/\s+/)
+            .map((w, wi) => (wi === 0 ? w.toLowerCase() : w[0].toUpperCase() + w.slice(1).toLowerCase()))
+            .join(''),
+        );
+        if (seenNames.has(baseName)) baseName = `${baseName}${idx + 1}`;
+        seenNames.add(baseName);
+        if (obj.kind === 'choice') {
+          const choices = obj.states.length > 0 ? obj.states : ['Option A', 'Option B'];
+          return {
+            name: baseName,
+            label: obj.name,
+            kind: 'choice',
+            min: 0,
+            max: choices.length - 1,
+            choices,
+            defaultValue: Math.min(choices.length - 1, Math.max(0, obj.defaultValue ?? 0)),
+            description: obj.description,
+          };
+        }
+        if (obj.kind === 'bool') {
+          return {
+            name: baseName,
+            label: obj.name,
+            kind: 'bool',
+            min: 0,
+            max: 1,
+            defaultValue: obj.defaultValue ? 1 : 0,
+            description: obj.description,
+          };
+        }
+        const min = Math.max(0, Math.floor(obj.min ?? 0));
+        const max = Math.max(min + 1, Math.floor(obj.max ?? 10000));
+        const def = Math.min(max, Math.max(min, Math.floor(obj.defaultValue ?? min)));
+        return {
+          name: baseName,
+          label: obj.name,
+          kind: 'nat',
+          min,
+          max,
+          unit: obj.unit,
+          defaultValue: def,
+          description: obj.description,
+        };
+      });
+      const encName =
+        op.encodingName?.trim() ||
+        sanitizeIdentifier(current.metadata.name.replace(/\s+/g, '')) ||
+        'Input';
+      return dispatchStudioOp(current, {
+        op: 'propose-encoding',
+        name: encName,
+        fields,
+        citation: { kind: 'req', requirementId: current.requirements[0].id },
+      });
+    }
+
+    case 'set-assurance-level': {
+      const next: PrismDeclaration = {
+        ...decl,
+        security: {
+          ...decl.security,
+          assuranceLevel: op.level,
+          reviewedAt: new Date().toISOString(),
+        },
+        admissions: upsertAdmission(decl.admissions, `Security.Asvs.${op.level}`, {
+          kind: 'std',
+          authorityId: 'OWASP-ASVS-5.0.0',
+        }),
+        auditLog: appendAudit(decl, op.op, `Set OWASP ASVS assurance tier to ${op.level}`),
+      };
+      return { ok: true, declaration: next, message: `Set assurance tier to OWASP ASVS ${op.level}.` };
+    }
+
+    case 'sync-stride-threats': {
+      const threats = computeCandidateStrideThreats(decl);
+      const next: PrismDeclaration = {
+        ...decl,
+        security: {
+          ...decl.security,
+          threats,
+          reviewedAt: new Date().toISOString(),
+        },
+        admissions: upsertAdmission(decl.admissions, 'Security.StrideMatrix', {
+          kind: 'std',
+          authorityId: 'MICROSOFT-TMT-STRIDE',
+        }),
+        auditLog: appendAudit(decl, op.op, `Synced ${threats.length} STRIDE threats from System Boundary`),
+      };
+      return { ok: true, declaration: next, message: `Derived ${threats.length} STRIDE threats from System Model.` };
+    }
+
+    case 'settle-stride-threat': {
+      const rationale = op.rationale.trim();
+      if (!rationale) {
+        return {
+          ok: false,
+          code: 'security.empty-rationale',
+          message: `Settling threat "${op.id}" requires an explicit rationale.`,
+          remediation: 'Explain how the threat is mitigated or why it is not applicable.',
+        };
+      }
+      if (op.status === 'mitigated-by-refusal') {
+        if (!op.linkedRefusalId || !decl.refusals.some((r) => r.id === op.linkedRefusalId)) {
+          return {
+            ok: false,
+            code: 'security.missing-refusal',
+            message: `Threat "${op.id}" must cite a registered typed Refusal ID when mitigated by refusal.`,
+            remediation: 'Select an admitted Refusal in Stage 2 (System) or create one first.',
+          };
+        }
+      }
+      const existingList =
+        decl.security.threats.length > 0 ? decl.security.threats : computeCandidateStrideThreats(decl);
+      const found = existingList.some((t) => t.id === op.id);
+      if (!found) {
+        return {
+          ok: false,
+          code: 'security.threat-not-found',
+          message: `Threat "${op.id}" is not in the active STRIDE register.`,
+          remediation: 'Sync STRIDE threats first.',
+        };
+      }
+      const nextThreats = existingList.map((t) =>
+        t.id === op.id
+          ? {
+              ...t,
+              status: op.status,
+              linkedRefusalId: op.status === 'mitigated-by-refusal' ? op.linkedRefusalId : undefined,
+              rationale,
+            }
+          : t,
+      );
+      const next: PrismDeclaration = {
+        ...decl,
+        security: {
+          ...decl.security,
+          threats: nextThreats,
+          reviewedAt: new Date().toISOString(),
+        },
+        admissions: upsertAdmission(decl.admissions, `Threat.${op.id}`, {
+          kind: 'std',
+          authorityId: 'MICROSOFT-TMT-STRIDE',
+        }),
+        auditLog: appendAudit(decl, op.op, `Settled ${op.id} as ${op.status}`),
+      };
+      return { ok: true, declaration: next, message: `Settled threat ${op.id} (${op.status}).` };
+    }
+
+    case 'synthesize-view-from-system': {
+      if (!decl.encoding || decl.encoding.fields.length === 0) {
+        return {
+          ok: false,
+          code: 'view.no-encoding',
+          message: 'Declare input fields in Stage 2 (System) before synthesizing the Design view.',
+          remediation: 'Add or derive System input fields first.',
+        };
+      }
+      let current = decl;
+      if (current.requirements.length === 0) {
+        const seedReq = dispatchStudioOp(current, {
+          op: 'admit-requirement',
+          requirement: {
+            id: 'REQ-01',
+            statement: current.concept.purpose || `Deliver verified answers for ${current.metadata.name}.`,
+            stakeholder: current.concept.stakeholders[0]?.name || 'Creator',
+            origin: 'identity',
+            evidence: 'Synthesized from Conceptual & System Models',
+          },
+        });
+        if (!seedReq.ok) return seedReq;
+        current = seedReq.declaration;
+      }
+      const primaryReq = current.requirements[0].id;
+      const formulaCount = current.features.filter((f) => f.outcome.kind === 'formula').length;
+      const hasStateful = current.concept.opmObjects.some((o) => o.role === 'stateful-asset');
+      const viewpoint: PrismViewpoint =
+        op.viewpoint ??
+        (hasStateful
+          ? 'ledger-tracker'
+          : formulaCount > 0 && formulaCount >= current.features.length / 2
+            ? 'calculator'
+            : 'decision-form');
+
+      const elements: ViewElementDecl[] = (current.encoding?.fields ?? []).map((f) => ({
+        id: `el_${f.name}`,
+        slot: f.kind === 'choice' ? 'choice-group' : 'field-input',
+        label: f.label,
+        binding: f.name,
+        requirementId: primaryReq,
+      }));
+      const outputObj = current.concept.opmObjects.find((o) => o.role === 'output');
+      elements.push({
+        id: 'el_result',
+        slot: 'result-card',
+        label: outputObj?.name || 'Model Answer',
+        binding: 'outcome',
+        requirementId: primaryReq,
+      });
+      if (viewpoint === 'ledger-tracker') {
+        elements.push({
+          id: 'el_history',
+          slot: 'history-list',
+          label: 'Recent Evaluations',
+          binding: 'history',
+          requirementId: primaryReq,
+        });
+      }
+      const domainLabel: Record<PrismDomain, string> = {
+        general: 'Verified Prism',
+        finance: 'Financial Policy',
+        health: 'Health & Wellness',
+        education: 'Learning Tool',
+        'games-media': 'Interactive Media',
+        'enterprise-ops': 'Operations',
+      };
+      const eyebrow = current.concept.domain ? domainLabel[current.concept.domain] : 'Verified Prism';
+      const primaryProc = current.concept.opmProcesses[0]?.name;
+      return dispatchStudioOp(current, {
+        op: 'declare-view',
+        view: {
+          viewpoint,
+          title: current.metadata.name,
+          eyebrow,
+          subtitle:
+            current.concept.purpose ||
+            current.metadata.description ||
+            'Every answer is computed deterministically by the declared, proved model.',
+          submitLabel: primaryProc ? primaryProc.slice(0, 28) : 'Evaluate',
+          disclosure: current.view?.disclosure,
+          elements,
+          citation: { kind: 'req', requirementId: primaryReq },
+        },
+      });
+    }
+
+    case 'settle-standard-obligation': {
+      const evidence = op.evidence.trim();
+      if (!evidence) {
+        return {
+          ok: false,
+          code: 'standard.empty-evidence',
+          message: `Settling obligation "${op.obligationId}" requires evidence or linked construct.`,
+          remediation: 'Provide how this Prism satisfies the routed standard obligation.',
+        };
+      }
+      let current = decl;
+      if (!current.authorities.some((a) => a.id === op.authority.id)) {
+        const staged = dispatchStudioOp(current, { op: 'stage-authority', authority: op.authority });
+        if (!staged.ok) return staged;
+        current = staged.declaration;
+      }
+      if (op.followUpOps && op.followUpOps.length > 0) {
+        for (const sub of op.followUpOps) {
+          const applied = dispatchStudioOp(current, sub);
+          // Skip duplicate IDs gracefully when re-settling an obligation
+          if (!applied.ok && applied.code !== 'admission.duplicate') {
+            return applied;
+          }
+          if (applied.ok) current = applied.declaration;
+        }
+      }
+      const record: SettledObligationRecord = {
+        obligationId: op.obligationId,
+        authorityId: op.authority.id,
+        status: 'settled',
+        evidence,
+        linkedId: op.linkedId,
+        at: new Date().toISOString(),
+      };
+      const next: PrismDeclaration = {
+        ...current,
+        settledObligations: {
+          ...current.settledObligations,
+          [op.obligationId]: record,
+        },
+        admissions: upsertAdmission(current.admissions, `Obligation.${op.obligationId}`, {
+          kind: 'std',
+          authorityId: op.authority.id,
+        }),
+        auditLog: appendAudit(current, op.op, `Settled ${op.authority.id} (${op.obligationId})`),
+      };
+      return { ok: true, declaration: next, message: `Settled ${op.authority.name} obligation.` };
     }
 
     case 'record-decision': {
@@ -1781,6 +2848,10 @@ function mustApply(decl: PrismDeclaration, ops: readonly StudioApiOp[]): PrismDe
 }
 
 export function createDeclarativeStarter(kind: DeclarativeStarterId): PrismDeclaration {
+  if (kind === 'undefined') {
+    return createUndefinedDeclaration('Untitled Prism');
+  }
+
   if (kind === 'budget-guard') {
     const base = createEmptyDeclaration('Monthly Budget Guard');
     return mustApply(base, [
@@ -1790,11 +2861,61 @@ export function createDeclarativeStarter(kind: DeclarativeStarterId): PrismDecla
         description: 'Checks every expense against a monthly budget with proved remaining-balance math and zero/over-limit refusals.',
       },
       {
+        op: 'set-concept-profile',
+        purpose: 'Guard monthly spending against a declared budget cap with proved balance math and zero/over-limit refusals.',
+        domain: 'finance',
+        audience: 'personal',
+        dataClassification: 'none',
+        jurisdictions: ['none'],
+        usesLocalAi: false,
+        involvesPayments: false,
+      },
+      {
+        op: 'admit-stakeholder',
+        stakeholder: {
+          id: 'STK-01',
+          name: 'Budget Owner',
+          provRole: 'consumer',
+          concern: 'Verify every expense against remaining monthly budget before spending.',
+        },
+      },
+      {
+        op: 'admit-opm-object',
+        object: { id: 'OBJ-01', name: 'Monthly Budget', kind: 'nat', states: [], role: 'input', unit: 'USD', min: 1, max: 100000, defaultValue: 2000 },
+      },
+      {
+        op: 'admit-opm-object',
+        object: { id: 'OBJ-02', name: 'Spent So Far', kind: 'nat', states: [], role: 'stateful-asset', unit: 'USD', min: 0, max: 100000, defaultValue: 850 },
+      },
+      {
+        op: 'admit-opm-object',
+        object: { id: 'OBJ-03', name: 'New Expense', kind: 'nat', states: [], role: 'input', unit: 'USD', min: 0, max: 100000, defaultValue: 120 },
+      },
+      {
+        op: 'admit-opm-object',
+        object: { id: 'OBJ-04', name: 'Category', kind: 'choice', states: ['Food', 'Home', 'Travel', 'Fun'], role: 'input', defaultValue: 0 },
+      },
+      {
+        op: 'admit-opm-object',
+        object: { id: 'OBJ-05', name: 'Remaining Balance', kind: 'nat', states: ['Within Budget', 'Over Budget'], role: 'output', unit: 'USD' },
+      },
+      {
+        op: 'admit-opm-process',
+        process: {
+          id: 'PROC-01',
+          name: 'Check Expense',
+          summary: 'Validate expense and budget inputs, detect over-cap spending, and compute remaining balance.',
+          consumesObjectIds: ['OBJ-01', 'OBJ-02', 'OBJ-03', 'OBJ-04'],
+          yieldsObjectIds: ['OBJ-05'],
+          actorStakeholderIds: ['STK-01'],
+        },
+      },
+      {
         op: 'admit-requirement',
         requirement: {
           id: 'REQ-02',
           statement: 'Refuse zero or over-cap expenses before computing remaining budget.',
-          stakeholder: 'creator',
+          stakeholder: 'Budget Owner',
           origin: 'constraint',
           evidence: 'Owner safety invariant',
         },
@@ -1911,6 +3032,7 @@ export function createDeclarativeStarter(kind: DeclarativeStarterId): PrismDecla
           isRefusal: true,
         },
       },
+      { op: 'sync-stride-threats' },
       {
         op: 'declare-view',
         view: {
@@ -1943,11 +3065,57 @@ export function createDeclarativeStarter(kind: DeclarativeStarterId): PrismDecla
         description: 'Computes net order totals with proved VIP and bulk discount rules.',
       },
       {
+        op: 'set-concept-profile',
+        purpose: 'Calculate deterministic order quotes with VIP and bulk discount tiers and zero-quantity refusals.',
+        domain: 'enterprise-ops',
+        audience: 'team',
+        dataClassification: 'operational',
+        jurisdictions: ['none'],
+        usesLocalAi: false,
+        involvesPayments: false,
+      },
+      {
+        op: 'admit-stakeholder',
+        stakeholder: {
+          id: 'STK-01',
+          name: 'Sales Desk',
+          provRole: 'consumer',
+          concern: 'Produce exact, repeatable order quotes matching approved discount tiers.',
+        },
+      },
+      {
+        op: 'admit-opm-object',
+        object: { id: 'OBJ-01', name: 'Unit Price', kind: 'nat', states: [], role: 'input', unit: 'USD', min: 1, max: 50000, defaultValue: 50 },
+      },
+      {
+        op: 'admit-opm-object',
+        object: { id: 'OBJ-02', name: 'Quantity', kind: 'nat', states: [], role: 'input', min: 0, max: 1000, defaultValue: 12 },
+      },
+      {
+        op: 'admit-opm-object',
+        object: { id: 'OBJ-03', name: 'Customer Tier', kind: 'choice', states: ['Standard', 'VIP'], role: 'input', defaultValue: 0 },
+      },
+      {
+        op: 'admit-opm-object',
+        object: { id: 'OBJ-04', name: 'Quoted Total', kind: 'nat', states: ['Standard', 'Bulk', 'VIP'], role: 'output', unit: 'USD' },
+      },
+      {
+        op: 'admit-opm-process',
+        process: {
+          id: 'PROC-01',
+          name: 'Calculate Quote',
+          summary: 'Apply VIP or bulk discounts and compute net order total.',
+          consumesObjectIds: ['OBJ-01', 'OBJ-02', 'OBJ-03'],
+          yieldsObjectIds: ['OBJ-04'],
+          actorStakeholderIds: ['STK-01'],
+        },
+      },
+      {
         op: 'admit-requirement',
         requirement: {
           id: 'REQ-02',
           statement: 'Apply a 20% discount to VIP orders and 10% to bulk orders of 10 or more units.',
-          stakeholder: 'creator',
+          stakeholder: 'Sales Desk',
           origin: 'identity',
           evidence: 'Pricing policy specification',
         },
@@ -2063,6 +3231,7 @@ export function createDeclarativeStarter(kind: DeclarativeStarterId): PrismDecla
           isRefusal: true,
         },
       },
+      { op: 'sync-stride-threats' },
       {
         op: 'declare-view',
         view: {
@@ -2093,11 +3262,57 @@ export function createDeclarativeStarter(kind: DeclarativeStarterId): PrismDecla
         description: 'Classifies membership applications into Approved, Manual Review, or Denied.',
       },
       {
+        op: 'set-concept-profile',
+        purpose: 'Classify membership applications deterministically by age policy and trust score.',
+        domain: 'enterprise-ops',
+        audience: 'team',
+        dataClassification: 'operational',
+        jurisdictions: ['none'],
+        usesLocalAi: false,
+        involvesPayments: false,
+      },
+      {
+        op: 'admit-stakeholder',
+        stakeholder: {
+          id: 'STK-01',
+          name: 'Policy Reviewer',
+          provRole: 'consumer',
+          concern: 'Enforce age threshold and trust score bands consistently without ad-hoc exceptions.',
+        },
+      },
+      {
+        op: 'admit-opm-object',
+        object: { id: 'OBJ-01', name: 'Applicant Age', kind: 'nat', states: [], role: 'input', unit: 'yrs', min: 0, max: 120, defaultValue: 26 },
+      },
+      {
+        op: 'admit-opm-object',
+        object: { id: 'OBJ-02', name: 'Trust Score', kind: 'nat', states: [], role: 'input', min: 0, max: 100, defaultValue: 82 },
+      },
+      {
+        op: 'admit-opm-object',
+        object: { id: 'OBJ-03', name: 'Requested Plan', kind: 'choice', states: ['Starter', 'Pro', 'Enterprise'], role: 'input', defaultValue: 1 },
+      },
+      {
+        op: 'admit-opm-object',
+        object: { id: 'OBJ-04', name: 'Verdict', kind: 'choice', states: ['Approved', 'Manual Review', 'Denied'], role: 'output' },
+      },
+      {
+        op: 'admit-opm-process',
+        process: {
+          id: 'PROC-01',
+          name: 'Evaluate Application',
+          summary: 'Refuse underage applicants and classify remaining applications by trust score.',
+          consumesObjectIds: ['OBJ-01', 'OBJ-02', 'OBJ-03'],
+          yieldsObjectIds: ['OBJ-04'],
+          actorStakeholderIds: ['STK-01'],
+        },
+      },
+      {
         op: 'admit-requirement',
         requirement: {
           id: 'REQ-02',
           statement: 'Refuse applicants under 18 years old.',
-          stakeholder: 'creator',
+          stakeholder: 'Policy Reviewer',
           origin: 'constraint',
           evidence: 'Minimum age policy',
         },
@@ -2180,6 +3395,7 @@ export function createDeclarativeStarter(kind: DeclarativeStarterId): PrismDecla
           isRefusal: true,
         },
       },
+      { op: 'sync-stride-threats' },
       {
         op: 'declare-view',
         view: {
@@ -2208,6 +3424,52 @@ export function createDeclarativeStarter(kind: DeclarativeStarterId): PrismDecla
         op: 'set-metadata',
         name: 'Bill & Tip Splitter',
         description: 'Splits a bill with tip evenly across diners, refusing zero diners or a zero bill.',
+      },
+      {
+        op: 'set-concept-profile',
+        purpose: 'Split a restaurant bill plus tip evenly per diner with zero-diner and zero-bill safety refusals.',
+        domain: 'general',
+        audience: 'personal',
+        dataClassification: 'none',
+        jurisdictions: ['none'],
+        usesLocalAi: false,
+        involvesPayments: false,
+      },
+      {
+        op: 'admit-stakeholder',
+        stakeholder: {
+          id: 'STK-01',
+          name: 'Diner Group',
+          provRole: 'consumer',
+          concern: 'Compute a fair per-person share with tip and clear validation errors.',
+        },
+      },
+      {
+        op: 'admit-opm-object',
+        object: { id: 'OBJ-01', name: 'Bill Amount', kind: 'nat', states: [], role: 'input', unit: 'USD', min: 0, max: 100000, defaultValue: 120 },
+      },
+      {
+        op: 'admit-opm-object',
+        object: { id: 'OBJ-02', name: 'Tip Percent', kind: 'nat', states: [], role: 'input', unit: '%', min: 0, max: 100, defaultValue: 20 },
+      },
+      {
+        op: 'admit-opm-object',
+        object: { id: 'OBJ-03', name: 'Diners', kind: 'nat', states: [], role: 'input', min: 0, max: 50, defaultValue: 4 },
+      },
+      {
+        op: 'admit-opm-object',
+        object: { id: 'OBJ-04', name: 'Per Person Share', kind: 'nat', states: [], role: 'output', unit: 'USD' },
+      },
+      {
+        op: 'admit-opm-process',
+        process: {
+          id: 'PROC-01',
+          name: 'Split Bill',
+          summary: 'Add tip percentage to bill and divide evenly across diners.',
+          consumesObjectIds: ['OBJ-01', 'OBJ-02', 'OBJ-03'],
+          yieldsObjectIds: ['OBJ-04'],
+          actorStakeholderIds: ['STK-01'],
+        },
       },
       {
         op: 'propose-encoding',
@@ -2298,6 +3560,7 @@ export function createDeclarativeStarter(kind: DeclarativeStarterId): PrismDecla
           isRefusal: true,
         },
       },
+      { op: 'sync-stride-threats' },
       {
         op: 'declare-view',
         view: {
@@ -2319,9 +3582,42 @@ export function createDeclarativeStarter(kind: DeclarativeStarterId): PrismDecla
     ]);
   }
 
-  // Blank minimal valid starter with 1 field, 1 rule, 1 refusal, and 2 vectors
-  const blank = createEmptyDeclaration('New Prism');
+  // Minimal complete reference starter (`blank` — retained for minimal proof tests; "+ New Prism" uses `'undefined'`)
+  const blank = createEmptyDeclaration('Minimal Value Guard');
   return mustApply(blank, [
+    {
+      op: 'set-concept-profile',
+      purpose: 'Validate a positive numeric value and refuse zero inputs.',
+      domain: 'general',
+      audience: 'personal',
+      dataClassification: 'none',
+      jurisdictions: ['none'],
+      usesLocalAi: false,
+      involvesPayments: false,
+    },
+    {
+      op: 'admit-stakeholder',
+      stakeholder: { id: 'STK-01', name: 'Creator', provRole: 'consumer', concern: 'Validate positive input values.' },
+    },
+    {
+      op: 'admit-opm-object',
+      object: { id: 'OBJ-01', name: 'Value', kind: 'nat', states: [], role: 'input', min: 0, max: 10000, defaultValue: 10 },
+    },
+    {
+      op: 'admit-opm-object',
+      object: { id: 'OBJ-02', name: 'Accepted Value', kind: 'nat', states: [], role: 'output' },
+    },
+    {
+      op: 'admit-opm-process',
+      process: {
+        id: 'PROC-01',
+        name: 'Validate Value',
+        summary: 'Accept positive values and refuse zero.',
+        consumesObjectIds: ['OBJ-01'],
+        yieldsObjectIds: ['OBJ-02'],
+        actorStakeholderIds: ['STK-01'],
+      },
+    },
     {
       op: 'propose-encoding',
       name: 'Input',
@@ -2372,11 +3668,12 @@ export function createDeclarativeStarter(kind: DeclarativeStarterId): PrismDecla
         isRefusal: true,
       },
     },
+    { op: 'sync-stride-threats' },
     {
       op: 'declare-view',
       view: {
         viewpoint: 'decision-form',
-        title: 'New Prism',
+        title: 'Minimal Value Guard',
         eyebrow: 'Verified Prism',
         subtitle: 'Every answer is computed deterministically by the declared model.',
         submitLabel: 'Evaluate',

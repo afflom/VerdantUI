@@ -318,7 +318,7 @@ export default function App() {
   }, [workerClient]);
 
   const handleCreatePrism = useCallback(() => {
-    void prismStore.createDeclarative('blank').then((created) => {
+    void prismStore.createDeclarative('undefined').then((created) => {
       setActiveView({ kind: 'prism', prismId: created.id, mode: 'studio' });
     });
   }, [prismStore]);

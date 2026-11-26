@@ -41,6 +41,7 @@ test('all declarative starters compile with zero prism.design/1 violations', () 
   for (const kind of starters) {
     const decl = createDeclarativeStarter(kind);
     const compiled = compilePrismDeclaration(decl);
+    assert.ok(compiled !== null, `Starter "${kind}" should be synthesizable`);
     const errors = compiled.designDiagnostics.filter((d) => d.severity === 'error');
     assert.equal(
       errors.length,
@@ -50,6 +51,9 @@ test('all declarative starters compile with zero prism.design/1 violations', () 
     assert.ok(compiled.compiledCss.length > 500);
     assert.ok(compiled.compiledUiJs.length > 100);
     assert.ok(compiled.files['app/src/App.lex.tex'].includes('theorem{'));
+    assert.ok(compiled.files['model/concept-opm.json'].includes('opmObjects'));
+    assert.ok(compiled.files['model/security-stride.json'].includes('threats'));
+    assert.ok(compiled.files['model/standards-routing.json'].includes('coreSpine'));
   }
 });
 
@@ -73,6 +77,7 @@ test('end-to-end real WASM LexLean check + Lean 4.32.2 kernel proof + binary pri
   for (const kind of ['budget-guard', 'pricing-rules', 'eligibility-gate', 'split-calc', 'blank'] as const) {
     const decl = createDeclarativeStarter(kind);
     const compiled = compilePrismDeclaration(decl);
+    assert.ok(compiled !== null, `Starter "${kind}" should compile`);
     const mergedApp = {
       ...instantiateAppFoundation(foundation, decl.metadata.slug),
       ...compiled.appFiles,

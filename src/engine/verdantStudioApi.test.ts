@@ -81,9 +81,9 @@ test('REQ-D9 refuses uncited view elements and R5 detects unreplayed refusals wi
   const badView = dispatchStudioOp(base, {
     op: 'declare-view',
     view: {
-      ...base.view,
+      ...base.view!,
       elements: [
-        ...base.view.elements,
+        ...base.view!.elements,
         {
           id: 'el_orphan',
           slot: 'stat',
