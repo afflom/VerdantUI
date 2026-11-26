@@ -1191,6 +1191,9 @@ function drawArtwork(canvas) {
     ctx.restore();
   }
   ctx.globalAlpha = 1;
+  if (window.verdant?.sense?.inspectCanvas) {
+    try { window.verdant.sense.inspectCanvas(canvas); } catch (_) {}
+  }
 }
 
 function render() {

@@ -168,6 +168,27 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     return () => window.removeEventListener('keydown', onKey);
   }, [detailsModalOpen, previewPaneMode]);
 
+  // Closed-loop visual check: listen for rendered canvas sensory reports from this creation
+  useEffect(() => {
+    return bus.subscribe((ev) => {
+      if (ev.endpointKind !== 'prism' || ev.endpointId !== project.id || ev.name !== 'sensory') {
+        return;
+      }
+      const body = ev.body as { modality?: string; coherent?: boolean } | null;
+      if (!body || body.modality !== 'vision') return;
+      if (body.coherent === false) {
+        setStatusBanner({
+          ok: false,
+          text: 'Visual check: low contrast detected — try brighter colors or a new variation.',
+        });
+      } else if (body.coherent === true) {
+        setStatusBanner((prev) =>
+          prev && prev.text.startsWith('Visual check:') ? null : prev,
+        );
+      }
+    });
+  }, [bus, project.id]);
+
   const holoviewConfig = useMemo<HoloviewMountConfig | null>(() => {
     const invokeModel = async (requestLine: string, traceContext?: OtelTraceContext): Promise<string> => {
       if (activeHolo && activeHolo.bytes.length > 0) {

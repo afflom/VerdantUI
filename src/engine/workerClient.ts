@@ -1345,6 +1345,7 @@ export class LlamaVTensorWorkerClient {
         width,
         height,
         rgbaBuffer: copy.buffer,
+        allowAutoLoad: this.state.modelStreamEnabled,
       };
       this.worker.postMessage(msg, [copy.buffer]);
     });
@@ -1374,6 +1375,7 @@ export class LlamaVTensorWorkerClient {
         requestId,
         sampleRate,
         pcmBuffer: copy.buffer,
+        allowAutoLoad: this.state.modelStreamEnabled,
       };
       this.worker.postMessage(msg, [copy.buffer]);
     });

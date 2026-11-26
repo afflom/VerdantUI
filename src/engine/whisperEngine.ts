@@ -8,12 +8,16 @@
  */
 
 import type { MelSpectrogram } from './audioFrontend';
+import { GgmlType, ggmlTensorByteSize } from './gguf';
 import {
   verdantAdd,
   verdantConv1d,
+  verdantDecodeRow,
   verdantGelu,
   verdantLayerNorm,
 } from './verdantKernels';
+
+export const WHISPER_GGML_MAGIC = 0x67676d6c;
 
 export interface WhisperConfig {
   readonly nMels: number;
@@ -85,6 +89,199 @@ export interface WhisperWeights {
   readonly decLnW: Float32Array;
   readonly decLnB: Float32Array;
   readonly vocab: readonly string[];
+}
+
+interface ParsedGgmlTensor {
+  readonly name: string;
+  readonly dims: readonly number[];
+  readonly type: GgmlType;
+  readonly offset: number;
+  readonly byteSize: number;
+}
+
+function decodeGgmlTensorToF32(bytes: Uint8Array, t: ParsedGgmlTensor): Float32Array {
+  const total = t.dims.reduce((a, b) => a * b, 1);
+  const out = new Float32Array(total);
+  const ne0 = t.dims[0] ?? total;
+  const rows = Math.max(1, Math.floor(total / ne0));
+  const rowBytes = Math.floor(t.byteSize / rows);
+  const rowBuf = new Float32Array(ne0);
+  for (let r = 0; r < rows; r++) {
+    verdantDecodeRow(bytes, t.offset + r * rowBytes, t.type, ne0, rowBuf);
+    out.set(rowBuf, r * ne0);
+  }
+  return out;
+}
+
+/**
+ * Parses an official `whisper.cpp` GGML binary model (`0x67676d6c`, e.g. `ggml-tiny.en-q8_0.bin`)
+ * into `WhisperWeights`, decoding F32/F16/Q4_0/Q5_0/Q8_0 tensors via shared `vTensor` kernels.
+ */
+export function loadWhisperWeightsFromGgml(bytes: Uint8Array): WhisperWeights {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let off = 0;
+  const readI32 = () => {
+    const v = dv.getInt32(off, true);
+    off += 4;
+    return v;
+  };
+  const readU32 = () => {
+    const v = dv.getUint32(off, true);
+    off += 4;
+    return v;
+  };
+
+  const magic = readU32();
+  if (magic !== WHISPER_GGML_MAGIC) {
+    throw new Error(`Invalid Whisper GGML magic: 0x${magic.toString(16)} (expected 0x67676d6c)`);
+  }
+
+  const nVocab = readI32();
+  const nAudioCtx = readI32();
+  const nAudioState = readI32();
+  const nAudioHead = readI32();
+  const nAudioLayer = readI32();
+  const nTextCtx = readI32();
+  const nTextState = readI32();
+  const nTextHead = readI32();
+  const nTextLayer = readI32();
+  const nMels = readI32();
+  /* ftype */ readI32();
+
+  // Skip mel filterbank matrix [filtersMel, filtersFft] float32
+  const filtersMel = readI32();
+  const filtersFft = readI32();
+  off += Math.max(0, filtersMel * filtersFft) * 4;
+
+  // Read BPE vocabulary tokens
+  const vocabCount = readI32();
+  const decoder = new TextDecoder('utf-8');
+  const vocab: string[] = [];
+  for (let i = 0; i < vocabCount; i++) {
+    const len = readI32();
+    const tok = decoder.decode(bytes.subarray(off, off + len));
+    off += len;
+    vocab.push(tok);
+  }
+  while (vocab.length < nVocab) vocab.push('');
+
+  // Index all GGML tensors
+  const tensors = new Map<string, ParsedGgmlTensor>();
+  while (off + 12 <= bytes.byteLength) {
+    const nDims = readI32();
+    const nameLen = readI32();
+    const ttype = readI32() as GgmlType;
+    if (nDims < 1 || nDims > 4 || nameLen <= 0 || nameLen > 256) {
+      throw new Error(`Malformed Whisper tensor header at offset ${off - 12}`);
+    }
+    const dims: number[] = [];
+    for (let d = 0; d < nDims; d++) dims.push(readI32());
+    const name = decoder.decode(bytes.subarray(off, off + nameLen));
+    off += nameLen;
+    const byteSize = ggmlTensorByteSize(ttype, dims);
+    if (off + byteSize > bytes.byteLength) {
+      throw new Error(`Truncated Whisper tensor "${name}" (${byteSize} bytes needed)`);
+    }
+    tensors.set(name, { name, dims, type: ttype, offset: off, byteSize });
+    off += byteSize;
+  }
+
+  const reqF32 = (name: string): Float32Array => {
+    const t = tensors.get(name);
+    if (!t) throw new Error(`Whisper GGML model missing required tensor "${name}"`);
+    return decodeGgmlTensorToF32(bytes, t);
+  };
+  const optF32 = (name: string): Float32Array | null => {
+    const t = tensors.get(name);
+    return t ? decodeGgmlTensorToF32(bytes, t) : null;
+  };
+  const reqLinear = (weightName: string, biasName?: string): DenseLinear => {
+    const t = tensors.get(weightName);
+    if (!t) throw new Error(`Whisper GGML model missing required linear weight "${weightName}"`);
+    const weight = decodeGgmlTensorToF32(bytes, t);
+    const inDim = t.dims[0] ?? 1;
+    const outDim = t.dims[1] ?? Math.floor(weight.length / inDim);
+    const bias = biasName ? optF32(biasName) : null;
+    return { weight, bias, inDim, outDim };
+  };
+
+  const encoderLayers: WhisperEncoderLayer[] = [];
+  for (let i = 0; i < nAudioLayer; i++) {
+    const p = `encoder.blocks.${i}`;
+    encoderLayers.push({
+      attnLnW: reqF32(`${p}.attn_ln.weight`),
+      attnLnB: reqF32(`${p}.attn_ln.bias`),
+      q: reqLinear(`${p}.attn.query.weight`, `${p}.attn.query.bias`),
+      k: reqLinear(`${p}.attn.key.weight`),
+      v: reqLinear(`${p}.attn.value.weight`, `${p}.attn.value.bias`),
+      o: reqLinear(`${p}.attn.out.weight`, `${p}.attn.out.bias`),
+      mlpLnW: reqF32(`${p}.mlp_ln.weight`),
+      mlpLnB: reqF32(`${p}.mlp_ln.bias`),
+      fc1: reqLinear(`${p}.mlp.0.weight`, `${p}.mlp.0.bias`),
+      fc2: reqLinear(`${p}.mlp.2.weight`, `${p}.mlp.2.bias`),
+    });
+  }
+
+  const decoderLayers: WhisperDecoderLayer[] = [];
+  for (let i = 0; i < nTextLayer; i++) {
+    const p = `decoder.blocks.${i}`;
+    decoderLayers.push({
+      selfLnW: reqF32(`${p}.attn_ln.weight`),
+      selfLnB: reqF32(`${p}.attn_ln.bias`),
+      selfQ: reqLinear(`${p}.attn.query.weight`, `${p}.attn.query.bias`),
+      selfK: reqLinear(`${p}.attn.key.weight`),
+      selfV: reqLinear(`${p}.attn.value.weight`, `${p}.attn.value.bias`),
+      selfO: reqLinear(`${p}.attn.out.weight`, `${p}.attn.out.bias`),
+      crossLnW: reqF32(`${p}.cross_attn_ln.weight`),
+      crossLnB: reqF32(`${p}.cross_attn_ln.bias`),
+      crossQ: reqLinear(`${p}.cross_attn.query.weight`, `${p}.cross_attn.query.bias`),
+      crossK: reqLinear(`${p}.cross_attn.key.weight`),
+      crossV: reqLinear(`${p}.cross_attn.value.weight`, `${p}.cross_attn.value.bias`),
+      crossO: reqLinear(`${p}.cross_attn.out.weight`, `${p}.cross_attn.out.bias`),
+      mlpLnW: reqF32(`${p}.mlp_ln.weight`),
+      mlpLnB: reqF32(`${p}.mlp_ln.bias`),
+      fc1: reqLinear(`${p}.mlp.0.weight`, `${p}.mlp.0.bias`),
+      fc2: reqLinear(`${p}.mlp.2.weight`, `${p}.mlp.2.bias`),
+    });
+  }
+
+  const isMultilingual = nVocab >= 51865;
+  const isEnglishFull = nVocab === 51864;
+  const sotIdx = vocab.indexOf('<sot>');
+  const eotIdx = vocab.indexOf('<eot>');
+  const eotTokenId = isMultilingual ? 50257 : isEnglishFull ? 50256 : eotIdx >= 0 ? eotIdx : 1;
+  const sotTokenId = isMultilingual ? 50258 : isEnglishFull ? 50257 : sotIdx >= 0 ? sotIdx : 0;
+
+  return {
+    config: {
+      nMels,
+      nAudioCtx,
+      nAudioState,
+      nAudioHead,
+      nAudioLayer,
+      nTextCtx,
+      nTextState,
+      nTextHead,
+      nTextLayer,
+      nVocab,
+      sotTokenId,
+      eotTokenId,
+    },
+    conv1W: reqF32('encoder.conv1.weight'),
+    conv1B: reqF32('encoder.conv1.bias'),
+    conv2W: reqF32('encoder.conv2.weight'),
+    conv2B: reqF32('encoder.conv2.bias'),
+    encPosEmbd: reqF32('encoder.positional_embedding'),
+    encoderLayers,
+    encLnPostW: reqF32('encoder.ln_post.weight'),
+    encLnPostB: reqF32('encoder.ln_post.bias'),
+    tokEmbd: reqF32('decoder.token_embedding'),
+    decPosEmbd: reqF32('decoder.positional_embedding'),
+    decoderLayers,
+    decLnW: reqF32('decoder.ln.weight'),
+    decLnB: reqF32('decoder.ln.bias'),
+    vocab,
+  };
 }
 
 function denseMatVec(lin: DenseLinear, x: Float32Array, out: Float32Array): void {

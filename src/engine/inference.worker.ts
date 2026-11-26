@@ -8,7 +8,7 @@ import {
   type SamplingConfig,
   type TokenStreamEvent,
 } from './llamaRuntime';
-import { formatBytes } from './modelCatalog';
+import { MULTIMODAL_CORE_MODELS, formatBytes } from './modelCatalog';
 import {
   MultimodalCoherenceCoordinator,
   computeMediaKappa,
@@ -16,6 +16,8 @@ import {
 } from './multimodalCoordinator';
 import type { PrecisionContractMode } from './performanceContract';
 import { perceiveImageFrame, type PerceivedImageReport } from './visionCritiqueLoop';
+import { SiglipVisionEncoder, loadVisionWeightsFromGguf } from './visionEncoder';
+import { WhisperAudioEngine, loadWhisperWeightsFromGgml } from './whisperEngine';
 import {
   OPFS_HANDOVER_CHANNEL_NAME,
   clearAllOpfsModels,
@@ -124,12 +126,14 @@ export type WorkerRequest =
       width: number;
       height: number;
       rgbaBuffer: ArrayBuffer;
+      allowAutoLoad?: boolean;
     }
   | {
       type: 'perceive_audio';
       requestId: string;
       sampleRate: number;
       pcmBuffer: ArrayBuffer;
+      allowAutoLoad?: boolean;
     }
   | {
       type: 'shutdown';
@@ -233,7 +237,90 @@ export type WorkerResponse =
 
 const runtime = new LlamaVTensorRuntime();
 const multimodalCoordinator = new MultimodalCoherenceCoordinator();
+let activeVisionEncoder: SiglipVisionEncoder | null = null;
+let activeWhisperEngine: WhisperAudioEngine | null = null;
+let visionLoadPromise: Promise<SiglipVisionEncoder | null> | null = null;
+let whisperLoadPromise: Promise<WhisperAudioEngine | null> | null = null;
 const threadPoolReadyPromise = runtime.initThreadPool().catch(() => undefined);
+
+function readBackingBytes(backing: VramBackingStore): Uint8Array {
+  const out = new Uint8Array(backing.byteLength);
+  let pos = 0;
+  const chunk = 8 * 1024 * 1024;
+  while (pos < backing.byteLength) {
+    const len = Math.min(chunk, backing.byteLength - pos);
+    const got = backing.readRange(pos, out, pos, len);
+    if (got <= 0) break;
+    pos += got;
+  }
+  return out;
+}
+
+async function ensureVisionEncoderOnDemand(): Promise<SiglipVisionEncoder | null> {
+  if (activeVisionEncoder) return activeVisionEncoder;
+  if (visionLoadPromise) return visionLoadPromise;
+  const spec = MULTIMODAL_CORE_MODELS.find((m) => m.modality === 'vision');
+  if (!spec) return null;
+  visionLoadPromise = (async () => {
+    try {
+      const backing = await streamUrlToVramBacking(spec.id, spec.url, { skipOpfs: false });
+      try {
+        const bytes = readBackingBytes(backing);
+        const weights = loadVisionWeightsFromGguf(bytes);
+        activeVisionEncoder = new SiglipVisionEncoder(weights);
+        multimodalCoordinator.activateModality({
+          modality: 'vision',
+          modelId: spec.id,
+          residentBytes: bytes.byteLength,
+          evict: () => {
+            activeVisionEncoder = null;
+          },
+        });
+        return activeVisionEncoder;
+      } finally {
+        backing.close();
+      }
+    } catch {
+      return null;
+    } finally {
+      visionLoadPromise = null;
+    }
+  })();
+  return visionLoadPromise;
+}
+
+async function ensureWhisperEngineOnDemand(): Promise<WhisperAudioEngine | null> {
+  if (activeWhisperEngine) return activeWhisperEngine;
+  if (whisperLoadPromise) return whisperLoadPromise;
+  const spec = MULTIMODAL_CORE_MODELS.find((m) => m.modality === 'audio');
+  if (!spec) return null;
+  whisperLoadPromise = (async () => {
+    try {
+      const backing = await streamUrlToVramBacking(spec.id, spec.url, { skipOpfs: false });
+      try {
+        const bytes = readBackingBytes(backing);
+        const weights = loadWhisperWeightsFromGgml(bytes);
+        activeWhisperEngine = new WhisperAudioEngine(weights);
+        multimodalCoordinator.activateModality({
+          modality: 'audio',
+          modelId: spec.id,
+          residentBytes: bytes.byteLength,
+          evict: () => {
+            activeWhisperEngine = null;
+          },
+        });
+        return activeWhisperEngine;
+      } finally {
+        backing.close();
+      }
+    } catch {
+      return null;
+    } finally {
+      whisperLoadPromise = null;
+    }
+  })();
+  return whisperLoadPromise;
+}
 
 const activeControllers = new Map<string, AbortController>();
 let activeSpeculativeController: AbortController | null = null;
@@ -761,16 +848,22 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
 
     if (req.type === 'perceive_image') {
       const rgba = new Uint8Array(req.rgbaBuffer);
-      multimodalCoordinator.activateModality({
-        modality: 'vision',
-        modelId: 'verdant-vision-sense',
-        residentBytes: rgba.byteLength,
-        evict: () => {},
-      });
+      // Warm SigLIP mmproj in the background when Local AI is enabled without blocking perception
+      if (req.allowAutoLoad && !activeVisionEncoder && !visionLoadPromise) {
+        void ensureVisionEncoderOnDemand();
+      }
+      if (!activeVisionEncoder) {
+        multimodalCoordinator.activateModality({
+          modality: 'vision',
+          modelId: 'verdant-vision-sense',
+          residentBytes: rgba.byteLength,
+          evict: () => {},
+        });
+      }
       const report = await perceiveImageFrame(
         req.name,
         { rgba, width: req.width, height: req.height },
-        { coordinator: multimodalCoordinator },
+        { visionEncoder: activeVisionEncoder, coordinator: multimodalCoordinator },
       );
       post({
         type: 'image_perceived',
@@ -783,12 +876,16 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
 
     if (req.type === 'perceive_audio') {
       const pcm = new Float32Array(req.pcmBuffer);
-      multimodalCoordinator.activateModality({
-        modality: 'audio',
-        modelId: 'verdant-audio-sense',
-        residentBytes: pcm.byteLength,
-        evict: () => {},
-      });
+      const whisper =
+        activeWhisperEngine ?? (req.allowAutoLoad ? await ensureWhisperEngineOnDemand() : null);
+      if (!whisper) {
+        multimodalCoordinator.activateModality({
+          modality: 'audio',
+          modelId: 'verdant-audio-sense',
+          residentBytes: pcm.byteLength,
+          evict: () => {},
+        });
+      }
       const kappa = computeMediaKappa('audio', pcm, `${req.sampleRate}hz:${pcm.length}`);
       let energySum = 0;
       for (let i = 0; i < pcm.length; i++) energySum += pcm[i]! * pcm[i]!;
@@ -797,15 +894,21 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       const mel = computeLogMelSpectrogram(pcm);
       const { entry, cacheHit } = await multimodalCoordinator.getOrTranscribeAudio(
         kappa,
-        async () => ({
-          durationSec: mel.durationSec,
-          text: '',
-          transcribeMs: 1,
-        }),
+        async () => {
+          const t0 = performance.now();
+          const text = whisper && speechDetected ? whisper.transcribe(mel, 48).text : '';
+          return {
+            durationSec: mel.durationSec,
+            text,
+            transcribeMs: Math.max(0.5, performance.now() - t0),
+          };
+        },
       );
-      const summary = speechDetected
-        ? `Voice clip attached (${entry.durationSec.toFixed(1)}s, ${mel.nFrames} acoustic frames, speech activity detected).`
-        : `Audio clip attached (${entry.durationSec.toFixed(1)}s, low ambient level).`;
+      const summary = entry.text
+        ? `Transcribed voice (${entry.durationSec.toFixed(1)}s): "${entry.text}"`
+        : speechDetected
+          ? `Voice clip attached (${entry.durationSec.toFixed(1)}s, ${mel.nFrames} acoustic frames, speech activity detected).`
+          : `Audio clip attached (${entry.durationSec.toFixed(1)}s, low ambient level).`;
       post({
         type: 'audio_perceived',
         requestId: req.requestId,

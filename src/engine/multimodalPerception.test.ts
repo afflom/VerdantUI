@@ -23,7 +23,13 @@ import {
   resampleLinearMono,
   WHISPER_SAMPLE_RATE,
 } from './audioFrontend';
-import { WhisperAudioEngine, type DenseLinear, type WhisperWeights } from './whisperEngine';
+import {
+  WHISPER_GGML_MAGIC,
+  WhisperAudioEngine,
+  loadWhisperWeightsFromGgml,
+  type DenseLinear,
+  type WhisperWeights,
+} from './whisperEngine';
 import {
   computeMediaKappa,
   FrameBudgetOracle,
@@ -353,4 +359,126 @@ test('MultimodalCoherenceCoordinator enforces kappa 0ms cache reuse, sparse moda
   const recovered = oracle.report();
   assert.equal(recovered.stable, true);
   assert.ok(recovered.recommendedSliceUs > slowed.recommendedSliceUs);
+});
+
+test('loadWhisperWeightsFromGgml parses real 0x67676d6c whisper.cpp binary format and runs transcription', () => {
+  const D = 8;
+  const nMels = 80;
+  const nAudioCtx = 16;
+  const nTextCtx = 8;
+  const nVocab = 6;
+  const vocab = ['<sot>', '<eot>', 'hello', ' verdant', ' world', '.'];
+  const enc = new TextEncoder();
+
+  const chunks: Uint8Array[] = [];
+  const pushI32 = (v: number) => {
+    const b = new Uint8Array(4);
+    new DataView(b.buffer).setInt32(0, v, true);
+    chunks.push(b);
+  };
+  const pushU32 = (v: number) => {
+    const b = new Uint8Array(4);
+    new DataView(b.buffer).setUint32(0, v, true);
+    chunks.push(b);
+  };
+  const pushTensor = (name: string, dims: number[], data: Float32Array) => {
+    const nameBytes = enc.encode(name);
+    pushI32(dims.length);
+    pushI32(nameBytes.length);
+    pushI32(GgmlType.F32);
+    for (const d of dims) pushI32(d);
+    chunks.push(nameBytes);
+    chunks.push(new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)));
+  };
+
+  pushU32(WHISPER_GGML_MAGIC);
+  for (const hp of [nVocab, nAudioCtx, D, 2, 1, nTextCtx, D, 2, 1, nMels, 0]) pushI32(hp);
+  // Empty 0x0 mel filters section
+  pushI32(0);
+  pushI32(0);
+  // Vocab section
+  pushI32(vocab.length);
+  for (const tok of vocab) {
+    const tb = enc.encode(tok);
+    pushI32(tb.length);
+    chunks.push(tb);
+  }
+
+  const ones = (n: number) => new Float32Array(n).fill(1);
+  const zeros = (n: number) => new Float32Array(n);
+  const small = (n: number) => new Float32Array(n).map((_, i) => Math.sin(i * 0.3) * 0.02);
+
+  pushTensor('encoder.conv1.weight', [3, nMels, D], small(3 * nMels * D));
+  pushTensor('encoder.conv1.bias', [D], zeros(D));
+  pushTensor('encoder.conv2.weight', [3, D, D], small(3 * D * D));
+  pushTensor('encoder.conv2.bias', [D], zeros(D));
+  pushTensor('encoder.positional_embedding', [D, nAudioCtx], zeros(D * nAudioCtx));
+  pushTensor('encoder.blocks.0.attn_ln.weight', [D], ones(D));
+  pushTensor('encoder.blocks.0.attn_ln.bias', [D], zeros(D));
+  pushTensor('encoder.blocks.0.attn.query.weight', [D, D], small(D * D));
+  pushTensor('encoder.blocks.0.attn.query.bias', [D], zeros(D));
+  pushTensor('encoder.blocks.0.attn.key.weight', [D, D], small(D * D));
+  pushTensor('encoder.blocks.0.attn.value.weight', [D, D], small(D * D));
+  pushTensor('encoder.blocks.0.attn.value.bias', [D], zeros(D));
+  pushTensor('encoder.blocks.0.attn.out.weight', [D, D], small(D * D));
+  pushTensor('encoder.blocks.0.attn.out.bias', [D], zeros(D));
+  pushTensor('encoder.blocks.0.mlp_ln.weight', [D], ones(D));
+  pushTensor('encoder.blocks.0.mlp_ln.bias', [D], zeros(D));
+  pushTensor('encoder.blocks.0.mlp.0.weight', [D, 16], small(D * 16));
+  pushTensor('encoder.blocks.0.mlp.0.bias', [16], zeros(16));
+  pushTensor('encoder.blocks.0.mlp.2.weight', [16, D], small(16 * D));
+  pushTensor('encoder.blocks.0.mlp.2.bias', [D], zeros(D));
+  pushTensor('encoder.ln_post.weight', [D], ones(D));
+  pushTensor('encoder.ln_post.bias', [D], zeros(D));
+
+  const tokEmbd = small(nVocab * D);
+  for (let d = 0; d < D; d++) tokEmbd[1 * D + d] = 1.0; // bias <eot> cleanly
+  pushTensor('decoder.token_embedding', [D, nVocab], tokEmbd);
+  pushTensor('decoder.positional_embedding', [D, nTextCtx], zeros(D * nTextCtx));
+  pushTensor('decoder.blocks.0.attn_ln.weight', [D], ones(D));
+  pushTensor('decoder.blocks.0.attn_ln.bias', [D], zeros(D));
+  pushTensor('decoder.blocks.0.attn.query.weight', [D, D], small(D * D));
+  pushTensor('decoder.blocks.0.attn.query.bias', [D], zeros(D));
+  pushTensor('decoder.blocks.0.attn.key.weight', [D, D], small(D * D));
+  pushTensor('decoder.blocks.0.attn.value.weight', [D, D], small(D * D));
+  pushTensor('decoder.blocks.0.attn.value.bias', [D], zeros(D));
+  pushTensor('decoder.blocks.0.attn.out.weight', [D, D], small(D * D));
+  pushTensor('decoder.blocks.0.attn.out.bias', [D], zeros(D));
+  pushTensor('decoder.blocks.0.cross_attn_ln.weight', [D], ones(D));
+  pushTensor('decoder.blocks.0.cross_attn_ln.bias', [D], zeros(D));
+  pushTensor('decoder.blocks.0.cross_attn.query.weight', [D, D], small(D * D));
+  pushTensor('decoder.blocks.0.cross_attn.query.bias', [D], zeros(D));
+  pushTensor('decoder.blocks.0.cross_attn.key.weight', [D, D], small(D * D));
+  pushTensor('decoder.blocks.0.cross_attn.value.weight', [D, D], small(D * D));
+  pushTensor('decoder.blocks.0.cross_attn.value.bias', [D], zeros(D));
+  pushTensor('decoder.blocks.0.cross_attn.out.weight', [D, D], small(D * D));
+  pushTensor('decoder.blocks.0.cross_attn.out.bias', [D], zeros(D));
+  pushTensor('decoder.blocks.0.mlp_ln.weight', [D], ones(D));
+  pushTensor('decoder.blocks.0.mlp_ln.bias', [D], zeros(D));
+  pushTensor('decoder.blocks.0.mlp.0.weight', [D, 16], small(D * 16));
+  pushTensor('decoder.blocks.0.mlp.0.bias', [16], zeros(16));
+  pushTensor('decoder.blocks.0.mlp.2.weight', [16, D], small(16 * D));
+  pushTensor('decoder.blocks.0.mlp.2.bias', [D], zeros(D));
+  pushTensor('decoder.ln.weight', [D], ones(D));
+  pushTensor('decoder.ln.bias', [D], zeros(D));
+
+  const totalLen = chunks.reduce((a, c) => a + c.byteLength, 0);
+  const bin = new Uint8Array(totalLen);
+  let cursor = 0;
+  for (const c of chunks) {
+    bin.set(c, cursor);
+    cursor += c.byteLength;
+  }
+
+  const loaded = loadWhisperWeightsFromGgml(bin);
+  assert.equal(loaded.config.nVocab, nVocab);
+  assert.equal(loaded.config.nAudioState, D);
+  assert.equal(loaded.config.sotTokenId, 0);
+  assert.equal(loaded.config.eotTokenId, 1);
+
+  const engine = new WhisperAudioEngine(loaded);
+  const mel = computeLogMelSpectrogram(new Float32Array(WHISPER_SAMPLE_RATE / 4).fill(0.1));
+  const out = engine.transcribe(mel, 4);
+  assert.ok(out.encoderFrames > 0);
+  assert.equal(out.tokenIds[0], 0);
 });
