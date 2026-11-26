@@ -1326,14 +1326,18 @@ const root = document.getElementById('organ-root');
 const dims = W.aspectRatio === '1:1' ? [540, 540] : W.aspectRatio === '9:16' ? [360, 640] : [640, 360];
 const totalDur = W.scenes.reduce((a, s) => a + s.durationSec, 0) || 6;
 let playing = true, tSec = 0, lastTs = 0;
+let recorder = null, recChunks = [], recording = false, recTimer = null;
 
 root.innerHTML = '';
 const bar = document.createElement('div'); bar.className = 'organ-row'; bar.style.marginBottom = '10px'; bar.style.justifyContent = 'space-between';
 const playBtn = document.createElement('button'); playBtn.className = 'organ-btn primary'; playBtn.textContent = 'Pause';
 const timeEl = document.createElement('span'); timeEl.className = 'organ-pill'; timeEl.textContent = '0.0s / ' + totalDur + 's';
 const left = document.createElement('div'); left.className = 'organ-row'; left.append(playBtn, timeEl);
+const right = document.createElement('div'); right.className = 'organ-row';
+const recBtn = document.createElement('button'); recBtn.className = 'organ-btn'; recBtn.textContent = 'Record WebM';
 const snapBtn = document.createElement('button'); snapBtn.className = 'organ-btn'; snapBtn.textContent = 'Save Frame PNG';
-bar.append(left, snapBtn);
+right.append(recBtn, snapBtn);
+bar.append(left, right);
 root.appendChild(bar);
 
 const canvas = document.createElement('canvas');
@@ -1344,6 +1348,51 @@ const ctx = canvas.getContext('2d');
 playBtn.onclick = () => { playing = !playing; playBtn.textContent = playing ? 'Pause' : 'Play'; };
 snapBtn.onclick = () => { const a = document.createElement('a'); a.href = canvas.toDataURL('image/png'); a.download = 'frame.png'; a.click(); };
 
+function stopRecording() {
+  if (recTimer) { clearTimeout(recTimer); recTimer = null; }
+  if (recorder && recorder.state !== 'inactive') {
+    try { recorder.stop(); } catch (_) {}
+  }
+  recording = false;
+  recBtn.textContent = 'Record WebM';
+  recBtn.className = 'organ-btn';
+}
+
+recBtn.onclick = () => {
+  if (recording) { stopRecording(); return; }
+  if (typeof canvas.captureStream !== 'function' || typeof window.MediaRecorder !== 'function') {
+    recBtn.textContent = 'WebM Unavailable';
+    return;
+  }
+  try {
+    const stream = canvas.captureStream(Math.max(15, Math.min(60, W.fps || 30)));
+    const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+      ? 'video/webm;codecs=vp9'
+      : MediaRecorder.isTypeSupported('video/webm')
+        ? 'video/webm'
+        : '';
+    recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+    recChunks = [];
+    recorder.ondataavailable = (ev) => { if (ev.data && ev.data.size > 0) recChunks.push(ev.data); };
+    recorder.onstop = () => {
+      if (recChunks.length === 0) return;
+      const blob = new Blob(recChunks, { type: mime || 'video/webm' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = 'verdant-video.webm'; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+    };
+    tSec = 0; playing = true; playBtn.textContent = 'Pause';
+    recorder.start(250);
+    recording = true;
+    recBtn.textContent = 'Stop Recording…';
+    recBtn.className = 'organ-btn primary';
+    recTimer = setTimeout(stopRecording, Math.round(totalDur * 1000) + 150);
+  } catch (_) {
+    recBtn.textContent = 'WebM Unavailable';
+  }
+};
+
+let sensedOnce = false;
 function drawFrame(sec) {
   let acc = 0, scene = W.scenes[0], localT = 0;
   for (const s of W.scenes) {
@@ -1366,6 +1415,10 @@ function drawFrame(sec) {
   ctx.fillStyle = scene.accent; ctx.font = '500 15px Inter, sans-serif'; ctx.fillText(scene.subtitle, cx, cy + 24 + yOff);
   ctx.restore();
   timeEl.textContent = sec.toFixed(1) + 's / ' + totalDur + 's';
+  if (!sensedOnce && window.verdant?.sense?.inspectCanvas) {
+    sensedOnce = true;
+    try { window.verdant.sense.inspectCanvas(canvas); } catch (_) {}
+  }
 }
 function loop(ts) {
   if (!lastTs) lastTs = ts;
@@ -1768,84 +1821,200 @@ const SCALES = {
   minor: [0, 2, 3, 5, 7, 8, 10, 12],
   dorian: [0, 2, 3, 5, 7, 9, 10, 12],
 };
-let bpm = W.bpm, playing = false, timer = null, step = 0, ctx = null;
+const PROG = [0, 3, 4, 2];
+let bpm = W.bpm, playing = false, timer = null, step = 0, ctx = null, masterFilter = null;
 function midiToHz(m) { return 440 * Math.pow(2, (m - 69) / 12); }
+
+function triggerModalVoice(hz, dur, vel, pan, partials) {
+  if (!ctx || !masterFilter) return;
+  const now = ctx.currentTime;
+  const outNode = typeof ctx.createStereoPanner === 'function' ? ctx.createStereoPanner() : ctx.createGain();
+  if ('pan' in outNode && outNode.pan) outNode.pan.setValueAtTime(pan, now);
+  outNode.connect(masterFilter);
+  for (const p of partials) {
+    const osc = ctx.createOscillator();
+    const g = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(hz * p.ratio, now);
+    g.gain.setValueAtTime(0.0008, now);
+    g.gain.exponentialRampToValueAtTime(Math.max(0.001, vel * p.amp), now + p.atk);
+    g.gain.exponentialRampToValueAtTime(0.0005, now + Math.max(p.atk + 0.05, dur * p.decayScale));
+    osc.connect(g); g.connect(outNode);
+    osc.start(now); osc.stop(now + dur + 0.08);
+  }
+}
+
 function playStep() {
-  if (!ctx) { const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return; ctx = new AC(); }
+  if (!ctx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    ctx = new AC();
+    masterFilter = ctx.createBiquadFilter();
+    masterFilter.type = 'lowpass';
+    masterFilter.frequency.value = 3400;
+    masterFilter.connect(ctx.destination);
+  }
   if (ctx.state === 'suspended') void ctx.resume();
   const scale = SCALES[W.scale] || SCALES.pentatonic;
-  const note = W.rootMidi + scale[step % scale.length] + (step % 8 === 0 ? -12 : 0);
-  const hz = midiToHz(note);
-  const now = ctx.currentTime;
-  const dur = Math.max(0.12, (60 / bpm) * (W.style === 'ambient-pad' ? 1.4 : 0.45));
-  const filter = ctx.createBiquadFilter();
-  filter.type = 'lowpass';
-  filter.frequency.setValueAtTime(2200, now);
-  filter.connect(ctx.destination);
+  const barIdx = Math.floor(step / 8);
+  const chordDeg = PROG[barIdx % PROG.length];
+  const stepDur = Math.max(0.14, (60 / bpm) * 0.5);
 
-  const osc = ctx.createOscillator();
-  const gain = ctx.createGain();
-  osc.type = W.style === 'ambient-pad' ? 'sine' : W.style === 'rhythm-pulse' ? 'triangle' : 'sawtooth';
-  osc.frequency.value = hz;
-  gain.gain.setValueAtTime(0.001, now);
-  gain.gain.exponentialRampToValueAtTime(0.13, now + 0.03);
-  gain.gain.exponentialRampToValueAtTime(0.001, now + dur);
-  osc.connect(gain); gain.connect(filter);
-  osc.start(now); osc.stop(now + dur + 0.02);
+  // Voice 1: Warm modal pad chord on bar downbeat
+  if (step % 8 === 0) {
+    for (const [k, off] of [0, 2, 4].entries()) {
+      const deg = (chordDeg + off) % scale.length;
+      const oct = Math.floor((chordDeg + off) / scale.length) * 12;
+      triggerModalVoice(
+        midiToHz(W.rootMidi - 12 + scale[deg] + oct),
+        stepDur * 7.5,
+        0.075,
+        (k - 1) * 0.35,
+        [{ ratio: 1, amp: 1, atk: 0.14, decayScale: 1 }, { ratio: 2, amp: 0.3, atk: 0.18, decayScale: 0.85 }],
+      );
+    }
+  }
+  // Voice 2: Plucked modal bass on quarter beats
+  if (step % 2 === 0) {
+    const bassNote = W.rootMidi - 24 + scale[chordDeg % scale.length] + (step % 4 === 2 ? 7 : 0);
+    triggerModalVoice(
+      midiToHz(bassNote),
+      stepDur * 1.8,
+      0.11,
+      -0.12,
+      [{ ratio: 1, amp: 1, atk: 0.01, decayScale: 0.9 }, { ratio: 2, amp: 0.42, atk: 0.01, decayScale: 0.55 }, { ratio: 3, amp: 0.14, atk: 0.01, decayScale: 0.35 }],
+    );
+  }
+  // Voice 3: Polyphonic modal bell / arpeggio lead
+  if (W.style !== 'ambient-pad' || step % 2 === 0) {
+    const arpIdx = (chordDeg + (step % 5) * 2) % scale.length;
+    const leadHz = midiToHz(W.rootMidi + scale[arpIdx] + (step % 6 === 5 ? 12 : 0));
+    triggerModalVoice(
+      leadHz,
+      stepDur * (W.style === 'ambient-pad' ? 2.8 : 1.3),
+      0.09,
+      Math.sin(step * 0.9) * 0.48,
+      [{ ratio: 1, amp: 1, atk: 0.008, decayScale: 1 }, { ratio: 2.0, amp: 0.38, atk: 0.008, decayScale: 0.65 }, { ratio: 3.01, amp: 0.18, atk: 0.008, decayScale: 0.4 }],
+    );
+  }
   step += 1;
   drawWave();
 }
+
 function stopPlay() { playing = false; if (timer) { clearInterval(timer); timer = null; } render(); }
 function startPlay() {
   playing = true;
   playStep();
-  timer = setInterval(playStep, Math.max(120, Math.round((60 / bpm) * 500)));
+  timer = setInterval(playStep, Math.max(115, Math.round((60 / bpm) * 500)));
   render();
 }
+
 function exportWav() {
-  const sr = 22050, total = sr * Math.min(12, W.durationSec);
-  const buf = new ArrayBuffer(44 + total * 2), dv = new DataView(buf);
-  const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
-  writeStr(0, 'RIFF'); dv.setUint32(4, 36 + total * 2, true); writeStr(8, 'WAVE');
-  writeStr(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
-  dv.setUint32(24, sr, true); dv.setUint32(28, sr * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
-  writeStr(36, 'data'); dv.setUint32(40, total * 2, true);
+  const sr = 22050, durSec = Math.min(12, Math.max(4, W.durationSec)), total = sr * durSec;
+  const left = new Float32Array(total), right = new Float32Array(total);
   const scale = SCALES[W.scale] || SCALES.pentatonic;
-  const stepSamples = Math.max(2048, Math.round(sr * (60 / bpm) * 0.5));
+  const stepSec = (60 / bpm) * 0.5;
+  const numSteps = Math.floor(durSec / stepSec);
+
+  function addModalNote(startSec, noteDur, hz, vel, pan, modes) {
+    const s0 = Math.max(0, Math.floor(startSec * sr));
+    const s1 = Math.min(total, Math.floor((startSec + noteDur) * sr));
+    const angle = (pan + 1) * Math.PI * 0.25;
+    const gL = Math.cos(angle) * vel, gR = Math.sin(angle) * vel;
+    for (let i = s0; i < s1; i++) {
+      const t = (i - s0) / sr;
+      const atk = Math.min(1, t / 0.015);
+      let v = 0;
+      for (let m = 0; m < modes.length; m++) {
+        const md = modes[m];
+        v += md.amp * Math.exp(-md.damp * t) * Math.sin(2 * Math.PI * hz * md.ratio * t);
+      }
+      const s = v * atk;
+      left[i] += s * gL;
+      right[i] += s * gR;
+    }
+  }
+
+  for (let st = 0; st < numSteps; st++) {
+    const t0 = st * stepSec;
+    const chordDeg = PROG[Math.floor(st / 8) % PROG.length];
+    if (st % 8 === 0) {
+      for (const [k, off] of [0, 2, 4].entries()) {
+        const deg = (chordDeg + off) % scale.length;
+        const oct = Math.floor((chordDeg + off) / scale.length) * 12;
+        addModalNote(t0, stepSec * 7.8, midiToHz(W.rootMidi - 12 + scale[deg] + oct), 0.14, (k - 1) * 0.35, [
+          { ratio: 1, amp: 1, damp: 0.45 }, { ratio: 2, amp: 0.28, damp: 0.9 },
+        ]);
+      }
+    }
+    if (st % 2 === 0) {
+      addModalNote(t0, stepSec * 1.8, midiToHz(W.rootMidi - 24 + scale[chordDeg % scale.length]), 0.22, -0.12, [
+        { ratio: 1, amp: 1, damp: 2.8 }, { ratio: 2, amp: 0.4, damp: 4.5 }, { ratio: 3, amp: 0.15, damp: 7 },
+      ]);
+    }
+    if (W.style !== 'ambient-pad' || st % 2 === 0) {
+      const arpIdx = (chordDeg + (st % 5) * 2) % scale.length;
+      addModalNote(t0, stepSec * 1.6, midiToHz(W.rootMidi + scale[arpIdx]), 0.18, Math.sin(st * 0.9) * 0.48, [
+        { ratio: 1, amp: 1, damp: 2.2 }, { ratio: 2, amp: 0.36, damp: 4.2 }, { ratio: 3.01, amp: 0.16, damp: 6.8 },
+      ]);
+    }
+  }
+
+  // 4-channel Hadamard FDN stereo reverb + tanh soft limiter
+  const dLens = [683, 829, 1013, 1217];
+  const bufs = dLens.map((n) => new Float32Array(n));
+  const idxs = [0, 0, 0, 0];
   for (let i = 0; i < total; i++) {
-    const idx = Math.floor(i / stepSamples);
-    const local = (i % stepSamples) / stepSamples;
-    const env = Math.sin(Math.min(1, local * 6) * Math.PI * 0.5) * Math.pow(1 - local, 1.5);
-    const hz = midiToHz(W.rootMidi + scale[idx % scale.length]);
-    const sample = Math.sin((2 * Math.PI * hz * i) / sr) * env * 0.4;
-    dv.setInt16(44 + i * 2, Math.max(-32767, Math.min(32767, Math.round(sample * 32767))), true);
+    const r0 = bufs[0][idxs[0]], r1 = bufs[1][idxs[1]], r2 = bufs[2][idxs[2]], r3 = bufs[3][idxs[3]];
+    const dryL = left[i], dryR = right[i];
+    const h0 = 0.5 * (r0 + r1 + r2 + r3), h1 = 0.5 * (r0 - r1 + r2 - r3), h2 = 0.5 * (r0 + r1 - r2 - r3), h3 = 0.5 * (r0 - r1 - r2 + r3);
+    bufs[0][idxs[0]] = dryL + h0 * 0.42; bufs[1][idxs[1]] = dryR + h1 * 0.42;
+    bufs[2][idxs[2]] = dryL + h2 * 0.42; bufs[3][idxs[3]] = dryR + h3 * 0.42;
+    for (let k = 0; k < 4; k++) idxs[k] = (idxs[k] + 1) % dLens[k];
+    left[i] = Math.tanh(dryL * 0.8 + (r0 + r2) * 0.16);
+    right[i] = Math.tanh(dryR * 0.8 + (r1 + r3) * 0.16);
+  }
+
+  const dataBytes = total * 4;
+  const buf = new ArrayBuffer(44 + dataBytes), dv = new DataView(buf);
+  const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
+  writeStr(0, 'RIFF'); dv.setUint32(4, 36 + dataBytes, true); writeStr(8, 'WAVE');
+  writeStr(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 2, true);
+  dv.setUint32(24, sr, true); dv.setUint32(28, sr * 4, true); dv.setUint16(32, 4, true); dv.setUint16(34, 16, true);
+  writeStr(36, 'data'); dv.setUint32(40, dataBytes, true);
+  let p = 44;
+  for (let i = 0; i < total; i++) {
+    dv.setInt16(p, Math.max(-32767, Math.min(32767, Math.round(left[i] * 32767))), true); p += 2;
+    dv.setInt16(p, Math.max(-32767, Math.min(32767, Math.round(right[i] * 32767))), true); p += 2;
   }
   const blob = new Blob([buf], { type: 'audio/wav' });
-  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'verdant-audio.wav'; a.click();
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'verdant-audio-stereo.wav'; a.click();
 }
 let canvasEl = null;
 function drawWave() {
   if (!canvasEl) return;
   const c2d = canvasEl.getContext('2d'), w = canvasEl.width, h = canvasEl.height;
   c2d.fillStyle = '#0b0f14'; c2d.fillRect(0, 0, w, h);
-  c2d.strokeStyle = '#10b981'; c2d.lineWidth = 2; c2d.beginPath();
-  for (let x = 0; x < w; x += 4) {
-    const y = h / 2 + Math.sin(x * 0.04 + step * 0.9) * (playing ? 34 : 12) * Math.cos(x * 0.01);
-    if (x === 0) c2d.moveTo(x, y); else c2d.lineTo(x, y);
+  for (const [layer, col, freq, amp] of [[0, '#10b981', 0.032, playing ? 34 : 12], [1, '#38bdf8', 0.055, playing ? 18 : 7]]) {
+    c2d.strokeStyle = col; c2d.lineWidth = layer === 0 ? 2 : 1.25; c2d.beginPath();
+    for (let x = 0; x < w; x += 4) {
+      const y = h / 2 + Math.sin(x * freq + step * (0.8 + layer * 0.4)) * amp * Math.cos(x * 0.011 + layer);
+      if (x === 0) c2d.moveTo(x, y); else c2d.lineTo(x, y);
+    }
+    c2d.stroke();
   }
-  c2d.stroke();
 }
 function render() {
   root.innerHTML = '';
   const bar = document.createElement('div'); bar.className = 'organ-row'; bar.style.justifyContent = 'space-between'; bar.style.marginBottom = '12px';
   const left = document.createElement('div'); left.className = 'organ-row';
-  const playBtn = document.createElement('button'); playBtn.className = 'organ-btn primary'; playBtn.textContent = playing ? 'Stop Audio' : 'Play Audio';
+  const playBtn = document.createElement('button'); playBtn.className = 'organ-btn primary'; playBtn.textContent = playing ? 'Stop Audio' : 'Play Stereo';
   playBtn.onclick = () => (playing ? stopPlay() : startPlay());
   const tempoBtn = document.createElement('button'); tempoBtn.className = 'organ-btn'; tempoBtn.textContent = bpm + ' BPM';
   tempoBtn.onclick = () => { bpm = bpm >= 160 ? 72 : bpm + 16; if (playing) { stopPlay(); startPlay(); } else render(); };
-  const scalePill = document.createElement('span'); scalePill.className = 'organ-pill'; scalePill.textContent = W.style + ' · ' + W.scale;
+  const scalePill = document.createElement('span'); scalePill.className = 'organ-pill'; scalePill.textContent = '3-Track Stereo · ' + W.scale;
   left.append(playBtn, tempoBtn, scalePill);
-  const wavBtn = document.createElement('button'); wavBtn.className = 'organ-btn'; wavBtn.textContent = 'Download WAV';
+  const wavBtn = document.createElement('button'); wavBtn.className = 'organ-btn'; wavBtn.textContent = 'Download Stereo WAV';
   wavBtn.onclick = exportWav;
   bar.append(left, wavBtn); root.appendChild(bar);
   canvasEl = document.createElement('canvas'); canvasEl.className = 'organ-canvas'; canvasEl.width = 640; canvasEl.height = 140;

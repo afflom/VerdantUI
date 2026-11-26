@@ -207,5 +207,14 @@ test('All 7 MediaTypes declare real capability requirements and synthesize clean
     const synth = synthesizeProceduralOrganView(routed.declaration, routed.declaration.view!.proceduralOrgan!);
     assert.ok(synth.indexHtml.includes('id="organ-root"'));
     assert.ok(synth.appJs.includes('zero LLM JS'));
+    if (mt === 'audio') {
+      assert.ok(synth.appJs.includes('createStereoPanner'));
+      assert.ok(synth.appJs.includes('Download Stereo WAV'));
+    }
+    if (mt === 'video') {
+      assert.ok(synth.appJs.includes('captureStream'));
+      assert.ok(synth.appJs.includes('MediaRecorder'));
+      assert.ok(synth.appJs.includes('Record WebM'));
+    }
   }
 });

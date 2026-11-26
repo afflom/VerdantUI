@@ -262,6 +262,31 @@ export function buildPrismSandboxDocument(opts: {
       callPrism(target, payload) { return callHost('ui.callPrism', { target: String(target || ''), payload }); },
       openPrism(target) { return callHost('ui.openPrism', { target: String(target || '') }); },
     }),
+    sense: Object.freeze({
+      inspectCanvas(canvas) {
+        if (!canvas || typeof canvas.getContext !== 'function') return null;
+        try {
+          const ctx = canvas.getContext('2d');
+          if (!ctx) return null;
+          const w = Math.max(1, canvas.width | 0), h = Math.max(1, canvas.height | 0);
+          const data = ctx.getImageData(0, 0, w, h).data;
+          const step = Math.max(1, Math.floor((w * h) / 4096));
+          let sum = 0, sumSq = 0, count = 0;
+          for (let i = 0; i < data.length; i += 4 * step) {
+            const lum = (0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2]) / 255;
+            sum += lum; sumSq += lum * lum; count += 1;
+          }
+          const meanLuminance = count > 0 ? sum / count : 0;
+          const contrastStdDev = count > 0 ? Math.sqrt(Math.max(0, sumSq / count - meanLuminance * meanLuminance)) : 0;
+          const report = { width: w, height: h, meanLuminance, contrastStdDev, coherent: contrastStdDev >= 0.025 };
+          post('emit', { name: 'sensory', body: { modality: 'vision', ...report }, traceContext: activeTraceContext });
+          return report;
+        } catch (_) { return null; }
+      },
+      emitVisualFrame(summary) {
+        post('emit', { name: 'sensory', body: { modality: 'vision', ...(summary || {}) }, traceContext: activeTraceContext });
+      },
+    }),
     fetch(url, init, opts) {
       return callHost('fetch', { url: String(url || ''), init: init || {} }, opts && opts.onChunk);
     },
@@ -478,6 +503,31 @@ export function buildHoloviewSandboxDocument(opts: {
       getState() { return callHost('ui.getState', {}); },
       callPrism(target, payload) { return callHost('ui.callPrism', { target: String(target || ''), payload }); },
       openPrism(target) { return callHost('ui.openPrism', { target: String(target || '') }); },
+    }),
+    sense: Object.freeze({
+      inspectCanvas(canvas) {
+        if (!canvas || typeof canvas.getContext !== 'function') return null;
+        try {
+          const ctx = canvas.getContext('2d');
+          if (!ctx) return null;
+          const w = Math.max(1, canvas.width | 0), h = Math.max(1, canvas.height | 0);
+          const data = ctx.getImageData(0, 0, w, h).data;
+          const step = Math.max(1, Math.floor((w * h) / 4096));
+          let sum = 0, sumSq = 0, count = 0;
+          for (let i = 0; i < data.length; i += 4 * step) {
+            const lum = (0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2]) / 255;
+            sum += lum; sumSq += lum * lum; count += 1;
+          }
+          const meanLuminance = count > 0 ? sum / count : 0;
+          const contrastStdDev = count > 0 ? Math.sqrt(Math.max(0, sumSq / count - meanLuminance * meanLuminance)) : 0;
+          const report = { width: w, height: h, meanLuminance, contrastStdDev, coherent: contrastStdDev >= 0.025 };
+          post('emit', { name: 'sensory', body: { modality: 'vision', ...report }, traceContext: activeTraceContext });
+          return report;
+        } catch (_) { return null; }
+      },
+      emitVisualFrame(summary) {
+        post('emit', { name: 'sensory', body: { modality: 'vision', ...(summary || {}) }, traceContext: activeTraceContext });
+      },
     }),
     fetch(url, init, opts) {
       return callHost('fetch', { url: String(url || ''), init: init || {} }, opts && opts.onChunk);

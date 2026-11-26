@@ -88,6 +88,17 @@
       "invariantId": "VUI-OBSERVER-01",
       "citation": { "kind": "req", "decisionId": "DEC-010" },
       "publicBenefitImpact": "Protects user privacy across Personal/Work/Health contexts via zero-detail opaque constraint projection while letting Published Prisms act as unified cognitive organs."
+    },
+    {
+      "id": "VUI-FEAT-009",
+      "title": "Coherent Multimodal Perception, 1-Step Image Synthesis, Modal Audio & Closed-Loop Vision Critique",
+      "stage": "active",
+      "introducedIn": "0.5.0",
+      "ownerFile": "src/engine/multimodalCoordinator.ts",
+      "testFile": "src/engine/multimodalSynthesis.test.ts",
+      "invariantId": "VUI-ENGINE-01",
+      "citation": { "kind": "req", "decisionId": "DEC-012" },
+      "publicBenefitImpact": "Unifies real on-device vision (SigLIP), speech (Whisper), 1-step image creation, and multi-track stereo modal audio on one shared verdant-engine substrate with zero user tunables or technical jargon."
     }
   ]
 }

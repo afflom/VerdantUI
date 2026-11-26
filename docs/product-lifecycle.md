@@ -2,7 +2,7 @@
 
 > Generated mechanically by `npm run studio:publish` from `model/features.json` and `model/release-ledger.json`.
 
-- **Active Features:** 8
+- **Active Features:** 9
 - **Proposed / Planned Features:** 0
 - **Recorded Releases:** 3
 
@@ -18,6 +18,7 @@
 | `VUI-FEAT-006` | **active** | `v0.2.0` | `VUI-PUBLIC-BENEFIT-01` | Free Public Benefit Service & Zero-Jargon Permanent Ratchets |
 | `VUI-FEAT-007` | **active** | `v0.3.0` | `VUI-STUDIO-02` | Procedural MediaType Prism Synthesis, Sparse Studio Activation & Multi-Modal Weight Routing |
 | `VUI-FEAT-008` | **active** | `v0.4.0` | `VUI-OBSERVER-01` | Unified Possession Model, Non-Leaking Cross-Context Boundary & Active Published Prism Organs |
+| `VUI-FEAT-009` | **active** | `v0.5.0` | `VUI-ENGINE-01` | Coherent Multimodal Perception, 1-Step Image Synthesis, Modal Audio & Closed-Loop Vision Critique |
 
 ## Release Ledger
 

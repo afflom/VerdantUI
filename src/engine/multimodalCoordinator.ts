@@ -150,7 +150,7 @@ export class FrameBudgetOracle {
  */
 export function computeMediaKappa(
   kind: 'visual' | 'audio',
-  bytes: Uint8Array | Float32Array,
+  bytes: Uint8Array | Uint8ClampedArray | Float32Array,
   dimsTag: string,
 ): string {
   const u8 =
