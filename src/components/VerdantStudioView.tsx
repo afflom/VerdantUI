@@ -1178,7 +1178,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                 </p>
                 <button
                   type="button"
-                  onClick={() => handleLoadStarter('budget-guard')}
+                  onClick={() => handleLoadStarter('blank')}
                   className="rounded-lg bg-emerald-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-800"
                 >
                   New Declarative Prism

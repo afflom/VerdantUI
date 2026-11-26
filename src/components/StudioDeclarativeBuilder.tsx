@@ -17,6 +17,7 @@ import {
   ArrowDown,
   ArrowRight,
   ArrowUp,
+  BookOpen,
   Check,
   CheckCircle2,
   Database,
@@ -98,6 +99,7 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
   onDismissProposedOps,
 }) => {
   const [activeTab, setActiveTab] = useState<BuilderTab>('features');
+  const [examplesOpen, setExamplesOpen] = useState(false);
 
   // Inline forms state
   const [addingReq, setAddingReq] = useState(false);
@@ -546,15 +548,67 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
             );
           })}
         </div>
-        <button
-          type="button"
-          onClick={onImportHoloFile}
-          title="Import any binary .holo archive to verify and run offline"
-          className="inline-flex items-center gap-1 rounded-md border border-zinc-200 bg-white px-2 py-1 text-[11px] font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
-        >
-          <Upload className="h-3 w-3" />
-          Import .holo
-        </button>
+        <div className="relative flex items-center gap-1">
+          <button
+            type="button"
+            onClick={() => setExamplesOpen((v) => !v)}
+            title="Optional reference examples (opens in a separate Prism)"
+            className="inline-flex items-center gap-1 rounded-md border border-zinc-200 bg-white px-2 py-1 text-[11px] font-medium text-zinc-600 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
+          >
+            <BookOpen className="h-3 w-3" />
+            <span className="hidden sm:inline">Examples</span>
+          </button>
+          <button
+            type="button"
+            onClick={onImportHoloFile}
+            title="Import any binary .holo archive to verify and run offline"
+            className="inline-flex items-center gap-1 rounded-md border border-zinc-200 bg-white px-2 py-1 text-[11px] font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
+          >
+            <Upload className="h-3 w-3" />
+            <span className="hidden sm:inline">Import</span>
+          </button>
+          {examplesOpen && (
+            <div className="absolute right-0 top-full z-30 mt-1.5 w-64 rounded-lg border border-zinc-200 bg-white p-2 shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+              <div className="mb-1.5 flex items-center justify-between px-1">
+                <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
+                  Reference Examples
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setExamplesOpen(false)}
+                  className="text-[10px] text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200"
+                >
+                  Close
+                </button>
+              </div>
+              <div className="space-y-1">
+                {DECLARATIVE_STARTERS.map((s) => (
+                  <button
+                    key={s.id}
+                    type="button"
+                    onClick={() => {
+                      setExamplesOpen(false);
+                      onLoadStarter(s.id);
+                    }}
+                    className="w-full rounded-md px-2 py-1.5 text-left transition-colors hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                  >
+                    <div className="flex items-center justify-between gap-1">
+                      <span className="text-xs font-medium text-zinc-800 dark:text-zinc-100">
+                        {s.label}
+                      </span>
+                      <span className="rounded bg-zinc-100 px-1 py-0.5 text-[10px] text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+                        {s.preset}
+                      </span>
+                    </div>
+                    <p className="mt-0.5 line-clamp-1 text-[10px] text-zinc-500 dark:text-zinc-400">
+                      {s.description}
+                    </p>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* API Refusal Banner */}
@@ -608,38 +662,6 @@ export const StudioDeclarativeBuilder: FC<StudioDeclarativeBuilderProps> = ({
       <div className="flex-1 space-y-4 overflow-y-auto px-3 py-3">
         {activeTab === 'features' && (
           <>
-            {/* Curated Declarative Starters */}
-            <section className="space-y-1.5">
-              <div className="flex items-center justify-between">
-                <h3 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
-                  Declarative Templates
-                </h3>
-                <span className="text-[11px] text-zinc-400">Compiled from API declarations</span>
-              </div>
-              <div className="grid grid-cols-2 gap-1.5">
-                {DECLARATIVE_STARTERS.map((s) => (
-                  <button
-                    key={s.id}
-                    type="button"
-                    onClick={() => onLoadStarter(s.id)}
-                    className="rounded-lg border border-zinc-200 bg-white p-2 text-left transition-colors hover:border-emerald-500/60 hover:bg-emerald-50/40 dark:border-zinc-800 dark:bg-zinc-900/70 dark:hover:border-emerald-500/50 dark:hover:bg-emerald-950/20"
-                  >
-                    <div className="flex items-center justify-between gap-1">
-                      <span className="truncate text-xs font-semibold text-zinc-800 dark:text-zinc-100">
-                        {s.label}
-                      </span>
-                      <span className="rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
-                        {s.preset}
-                      </span>
-                    </div>
-                    <p className="mt-0.5 line-clamp-2 text-[11px] text-zinc-500 dark:text-zinc-400">
-                      {s.description}
-                    </p>
-                  </button>
-                ))}
-              </div>
-            </section>
-
             {/* Rules & Outcomes */}
             <section className="space-y-2">
               <div className="flex items-center justify-between">
