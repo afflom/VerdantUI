@@ -41,7 +41,14 @@ import {
   prismToolName,
   shortPrismDigest,
   type PublishedPrismSummary,
+  type VerdantPrismProject,
 } from './prismStudio';
+import {
+  formatOpaqueConstraintsForContext,
+  ObserverPossessionStore,
+  type ContextCompartmentId,
+  type PublishedPrismOrgan,
+} from './unifiedPossessionModel';
 
 export type VerdantThinkingPolicy = 'auto' | 'on' | 'off';
 
@@ -942,6 +949,68 @@ export interface RouteDecisionContext {
 export class VerdantCognitiveObserver {
   private readonly threads = new Map<string, InternalThreadMemory>();
   readonly grants = new ContainerGrantMatrix();
+  /** Unified possession hierarchy (`Observer ⊇ User ⊇ {Threads, Prisms, ContextCompartments}`) & non-leaking boundary. */
+  readonly possession = new ObserverPossessionStore('personal');
+
+  /**
+   * Registers all Published Prisms as active Observer cognitive weight organs and syncs any
+   * opaque schedule constraints declared by Tool Organs (e.g. Healthy Habits in Personal space).
+   */
+  syncPublishedPrisms(projects: readonly VerdantPrismProject[]): void {
+    for (const proj of projects) {
+      if (!proj.published) continue;
+      const decl = proj.declaration;
+      const proc = decl?.view?.proceduralOrgan;
+      const mediaType = proc?.mediaType ?? decl?.concept.mediaType ?? 'tool-organ';
+      const compartmentId: ContextCompartmentId =
+        (decl?.concept.compartmentId as ContextCompartmentId | undefined) ?? 'personal';
+      const organ: PublishedPrismOrgan = {
+        prismId: proj.id,
+        name: proj.published.name,
+        slug: proj.id,
+        digest: proj.published.digest,
+        mediaType,
+        compartmentId,
+        cognitiveWeightsQ10:
+          mediaType === 'interactive-game'
+            ? [128, 384, 256, 512, 128, 256, 256, 640]
+            : mediaType === 'research-program'
+              ? [640, 768, 128, 512, 256, 512, 512, 512]
+              : [256, 256, 128, 640, 128, 384, 256, 768],
+        sensoryChannels: ['browser', 'storage', 'schedule'],
+        impulseChannels: ['render-surface', 'notify', 'schedule-constraint', 'tool-invoke'],
+        shareOpaqueConstraints:
+          proc?.weights.mediaType === 'tool-organ' ? proc.weights.emitsOpaqueConstraints : false,
+      };
+      this.possession.registerPublishedPrismOrgan(organ);
+
+      if (proc?.weights.mediaType === 'tool-organ' && proc.weights.scheduleWindows.length > 0) {
+        const toolWeights = proc.weights;
+        toolWeights.scheduleWindows.forEach((win, idx) => {
+          this.possession.upsertScheduleConstraint(compartmentId, {
+            id: `${proj.id}:win:${idx}`,
+            privateLabel: win.label,
+            sourcePrismId: proj.id,
+            startMinuteOfDay: win.startMinuteOfDay,
+            endMinuteOfDay: win.endMinuteOfDay,
+            daysOfWeek: win.daysOfWeek,
+            weightQ10: 960,
+            shareOpaqueAvailability: toolWeights.emitsOpaqueConstraints && win.protectedWindow,
+          });
+        });
+      }
+    }
+  }
+
+  /**
+   * Returns zero-detail opaque availability constraints projected from other user spaces into the
+   * currently active space (zero private labels, zero Prism names, zero source space leakage).
+   */
+  getOpaqueConstraintsPromptForSpace(spaceId?: ContextCompartmentId): string {
+    const target = spaceId ?? this.possession.getActiveCompartmentId();
+    const projected = this.possession.getProjectedConstraintsFor(target);
+    return formatOpaqueConstraintsForContext(projected);
+  }
 
   private getOrCreateThread(threadId: string): InternalThreadMemory {
     const key = threadId || 'default-thread';
@@ -1777,9 +1846,13 @@ export function buildUnifiedVerdantModelContext(
   clientTools: Record<string, Tool<any, any>>,
   importedHarness: ImportedHarnessSpec | null,
   samplingOverride?: { readonly temperature?: number; readonly topP?: number },
+  opaqueConstraintsNotice?: string,
 ): ModelContext {
+  const systemText = opaqueConstraintsNotice?.trim()
+    ? `${UNIFIED_VERDANT_SYSTEM_PROMPT}\n\n${opaqueConstraintsNotice.trim()}`
+    : UNIFIED_VERDANT_SYSTEM_PROMPT;
   const baseContext: ModelContext = {
-    system: UNIFIED_VERDANT_SYSTEM_PROMPT,
+    system: systemText,
     callSettings: {
       ...(samplingOverride?.temperature !== undefined
         ? { temperature: samplingOverride.temperature }

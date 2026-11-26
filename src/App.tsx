@@ -11,7 +11,7 @@ import {
   useLocalRuntime,
   useRemoteThreadListRuntime,
 } from '@assistant-ui/react';
-import { Menu, Moon, SlidersHorizontal, Sun } from 'lucide-react';
+import { Menu, Moon, Shield, ShieldOff, SlidersHorizontal, Sun } from 'lucide-react';
 import { ThreadSidebar } from './components/ThreadSidebar';
 import { ThreadView } from './components/ThreadView';
 import { createLlamaVTensorAdapter } from './engine/assistantAdapter';
@@ -27,6 +27,10 @@ import {
   buildUnifiedVerdantModelContext,
   createVerdantClientTools,
 } from './engine/cognitiveObserver';
+import {
+  DEFAULT_USER_SPACES,
+  type ContextCompartmentId,
+} from './engine/unifiedPossessionModel';
 import type { ImportedHarnessSpec } from './engine/harnessConfig';
 import { isInternalBootstrapModel } from './engine/modelCatalog';
 import { ObserverStreamBus } from './engine/observerStreamBus';
@@ -65,6 +69,7 @@ const VerdantModelContextBridge: FC<{
   workerClient: LlamaVTensorWorkerClient;
   publishedPrisms: readonly PublishedPrismSummary[];
   prismPool: PrismHostPool;
+  opaqueConstraintsNotice: string;
 }> = ({
   importedHarness,
   sampling,
@@ -72,6 +77,7 @@ const VerdantModelContextBridge: FC<{
   workerClient,
   publishedPrisms,
   prismPool,
+  opaqueConstraintsNotice,
 }) => {
   const aui = useAui();
   const clientTools = useMemo(
@@ -110,6 +116,7 @@ const VerdantModelContextBridge: FC<{
       samplingCustomized
         ? { temperature: sampling.temperature, topP: sampling.topP }
         : undefined,
+      opaqueConstraintsNotice,
     );
     return aui.modelContext.register({
       getModelContext: () => context,
@@ -121,6 +128,7 @@ const VerdantModelContextBridge: FC<{
     samplingCustomized,
     sampling.temperature,
     sampling.topP,
+    opaqueConstraintsNotice,
   ]);
 
   return null;
@@ -184,6 +192,8 @@ export default function App() {
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [darkMode, setDarkMode] = useState<boolean>(readInitialDarkMode);
+  const [activeSpace, setActiveSpace] = useState<ContextCompartmentId>('personal');
+  const [sharingPaused, setSharingPaused] = useState(false);
 
   const publishedPrisms = useMemo(
     () => prismStore.listPublishedSummaries(),
@@ -191,6 +201,14 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [prismStore, prisms],
   );
+
+  // Sync owned Prisms, active space, and global pause switch into unified possession model
+  const opaqueConstraintsNotice = useMemo(() => {
+    workerClient.cognitiveObserver.possession.setActiveCompartment(activeSpace);
+    workerClient.cognitiveObserver.possession.setHalted(sharingPaused);
+    workerClient.cognitiveObserver.syncPublishedPrisms(prisms);
+    return workerClient.cognitiveObserver.getOpaqueConstraintsPromptForSpace(activeSpace);
+  }, [workerClient, activeSpace, sharingPaused, prisms]);
 
   useEffect(() => {
     let toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -403,6 +421,7 @@ export default function App() {
         workerClient={workerClient}
         publishedPrisms={publishedPrisms}
         prismPool={prismPool}
+        opaqueConstraintsNotice={opaqueConstraintsNotice}
       />
       <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#F8F9FA] text-slate-900 dark:bg-[#0B0F14] dark:text-slate-100">
         {/* Top Bar Contract: Single-line brand wordmark on left, concise workspace actions on right */}
@@ -422,6 +441,47 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
+            {/* Plain-language Active Space selector & global Pause Sharing kill switch (DEC-010 / DEC-011) */}
+            <div className="hidden md:flex items-center gap-1 rounded-lg border border-slate-200 bg-slate-50/80 p-0.5 dark:border-slate-700 dark:bg-[#141B26]">
+              {DEFAULT_USER_SPACES.map((sp) => {
+                const isActive = activeSpace === sp.id;
+                return (
+                  <button
+                    key={sp.id}
+                    type="button"
+                    onClick={() => setActiveSpace(sp.id)}
+                    title={`Switch active space to ${sp.label} (keeps private details isolated across spaces)`}
+                    className={`rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
+                      isActive
+                        ? 'bg-emerald-700 text-white'
+                        : 'text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white'
+                    }`}
+                  >
+                    {sp.label}
+                  </button>
+                );
+              })}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setSharingPaused((p) => !p)}
+              aria-pressed={sharingPaused}
+              title={
+                sharingPaused
+                  ? 'External & cross-space sharing is paused. Click to resume privacy-shielded availability.'
+                  : 'Privacy Shield active: private details never leave their space. Click to pause all external sharing.'
+              }
+              className={`hidden sm:inline-flex h-9 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                sharingPaused
+                  ? 'border-amber-500/50 bg-amber-50 text-amber-900 hover:bg-amber-100 dark:border-amber-500/40 dark:bg-amber-950/50 dark:text-amber-200'
+                  : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800'
+              }`}
+            >
+              {sharingPaused ? <ShieldOff className="h-3.5 w-3.5" /> : <Shield className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />}
+              <span>{sharingPaused ? 'Paused' : 'Private'}</span>
+            </button>
+
             {(() => {
               const streamOn = engineState.modelStreamEnabled;
               const isStreaming =

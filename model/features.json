@@ -81,10 +81,10 @@
     {
       "id": "VUI-FEAT-008",
       "title": "Unified Possession Model, Non-Leaking Cross-Context Boundary & Active Published Prism Organs",
-      "stage": "proposed",
+      "stage": "active",
       "introducedIn": "0.4.0",
-      "ownerFile": "src/engine/cognitiveObserver.ts",
-      "testFile": "src/engine/cognitiveObserver.test.ts",
+      "ownerFile": "src/engine/unifiedPossessionModel.ts",
+      "testFile": "src/engine/unifiedPossessionModel.test.ts",
       "invariantId": "VUI-OBSERVER-01",
       "citation": { "kind": "req", "decisionId": "DEC-010" },
       "publicBenefitImpact": "Protects user privacy across Personal/Work/Health contexts via zero-detail opaque constraint projection while letting Published Prisms act as unified cognitive organs."

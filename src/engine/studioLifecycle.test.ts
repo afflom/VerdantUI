@@ -86,13 +86,52 @@ test('Verdant Studio lifecycle refuses dropped locked IDs, unresolved citations,
 
 test('Semantic release planner derives exact minor/patch/none bumps and deterministic docs from model/', () => {
   const model = loadStudioLifecycleModel(process.cwd());
-  const plan = planSemanticRelease(model, 'auto');
-  assert.equal(plan.bump, 'minor');
-  assert.equal(plan.nextVersion, '0.2.0');
-  assert.ok(plan.newlyActiveFeatures.some((f) => f.id === 'VUI-FEAT-005'));
-  assert.ok(plan.releaseNotesMarkdown.includes('VerdantUI v0.2.0'));
+  const latest = model.releaseLedger.releases[model.releaseLedger.releases.length - 1]!;
+  const [maj, min, pat] = latest.version.split('.').map(Number);
 
-  const agenda = deriveStudioAgenda(model);
+  // 1. Newly active feature beyond latest release ledger triggers a minor bump
+  const withNewFeat: StudioLifecycleModel = {
+    ...model,
+    features: [
+      ...model.features,
+      {
+        id: 'VUI-FEAT-TEST-NEW',
+        title: 'Synthetic New Active Feature',
+        stage: 'active',
+        introducedIn: `${maj}.${min + 1}.0`,
+        ownerFile: 'src/engine/vtensorProvider.ts',
+        testFile: 'src/engine/vtensorProvider.test.ts',
+        invariantId: 'VUI-ENGINE-01',
+        citation: { kind: 'req', decisionId: 'DEC-001' },
+        publicBenefitImpact: 'Test minor bump',
+      },
+    ],
+  };
+  const minorPlan = planSemanticRelease(withNewFeat, 'auto');
+  assert.equal(minorPlan.bump, 'minor');
+  assert.equal(minorPlan.nextVersion, `${maj}.${min + 1}.0`);
+  assert.ok(minorPlan.releaseNotesMarkdown.includes(`VerdantUI v${maj}.${min + 1}.0`));
+
+  // 2. Engine pin bump with all active features already released triggers a patch bump
+  const allActiveIds = model.features.filter((f) => f.stage === 'active').map((f) => f.id);
+  const syncedLedger: StudioLifecycleModel = {
+    ...model,
+    releaseLedger: {
+      schema: 'verdant-ui/release-ledger/1',
+      releases: [{ ...latest, activeFeatureIds: allActiveIds }],
+    },
+  };
+  assert.equal(planSemanticRelease(syncedLedger, 'auto').bump, 'none');
+
+  const engineBumpModel: StudioLifecycleModel = {
+    ...syncedLedger,
+    enginePin: { ...model.enginePin, tag: 'v2.99.0' },
+  };
+  const patchPlan = planSemanticRelease(engineBumpModel, 'auto');
+  assert.equal(patchPlan.bump, 'patch');
+  assert.equal(patchPlan.nextVersion, `${maj}.${min}.${pat + 1}`);
+
+  const agenda = deriveStudioAgenda(withNewFeat);
   assert.ok(agenda.some((item) => item.kind === 'release-ready'));
 
   const docs = renderGeneratedDocs(model);

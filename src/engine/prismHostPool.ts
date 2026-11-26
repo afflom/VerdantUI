@@ -17,6 +17,7 @@ import type { PrismBuildWorkerClient } from './prismBuildClient';
 import { buildPrismSandboxDocument } from './prismSandboxHtml';
 import type { PrismStore, VerdantPrismSnapshot } from './prismStudio';
 import { evaluateDeclaredModel, formatRequestLine, type PrismDeclaration } from './verdantStudioApi';
+import { evaluateContextBoundary, type ContextCompartmentId } from './unifiedPossessionModel';
 import { isInternalBootstrapModel } from './modelCatalog';
 import type { LlamaVTensorWorkerClient } from './workerClient';
 
@@ -439,6 +440,30 @@ export class PrismHostPool implements PrismBridgeRuntime {
       const msg = `Network grant is Off for this Prism. Enable Network in the Prism Focus drawer to allow fetching ${url}.`;
       span.end('error', msg);
       throw new Error(msg);
+    }
+
+    // Enforce DEC-010 non-leaking cross-context boundary & global owner kill switch on outbound fetch
+    const possession = this.workerClient?.cognitiveObserver?.possession;
+    if (possession) {
+      const proj = this.store.get(prismId);
+      const sourceSpace: ContextCompartmentId =
+        (proj?.declaration?.concept.compartmentId as ContextCompartmentId | undefined) ?? 'personal';
+      const user = possession.getUser();
+      const boundary = evaluateContextBoundary({
+        sourceCompartmentId: sourceSpace,
+        destination: 'network',
+        label: 'internal',
+        payloadText: `${url}\n${init?.body ?? ''}`,
+        ownerApproved: grants.network,
+        bytesMatchSeen: true,
+        halted: user.halted,
+        foreignCompartments: Object.values(user.compartments),
+      });
+      if (boundary.verdict === 'deny') {
+        const msg = `Outbound request blocked by privacy boundary: ${boundary.reason}`;
+        span.end('error', msg);
+        throw new Error(msg);
+      }
     }
 
     let parsedUrl: URL;
