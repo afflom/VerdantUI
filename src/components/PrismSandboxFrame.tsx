@@ -14,7 +14,7 @@ import { useEffect, useMemo, useRef, type FC } from 'react';
 import type { ObserverStreamBus, OtelTraceContext } from '../engine/observerStreamBus';
 import type { PrismBridgeRuntime } from '../engine/prismHostPool';
 import { buildPrismSandboxDocument } from '../engine/prismSandboxHtml';
-import type { VerdantPrismSnapshot } from '../engine/prismStudio';
+import { sha256HexSync, type VerdantPrismSnapshot } from '../engine/prismStudio';
 
 export interface PrismRuntimeError {
   readonly message: string;
@@ -60,12 +60,18 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
   const onReadyRef = useRef(onReady);
   onReadyRef.current = onReady;
 
-  const channelId = useMemo(
-    () => `vframe_${prismId}_${snapshot.digest.slice(-10)}_${reloadNonce}`,
-    [prismId, snapshot.digest, reloadNonce],
+  // Structural key excludes CSS so CSS edits hot-swap without reloading iframe state!
+  const structuralKey = useMemo(
+    () => sha256HexSync(`${snapshot.app.html}\0${snapshot.app.js}`).slice(0, 12),
+    [snapshot.app.html, snapshot.app.js],
   );
 
-  // Build srcDoc only when Prism code/digest or reloadNonce changes — NOT on theme toggles!
+  const channelId = useMemo(
+    () => `vframe_${prismId}_${structuralKey}_${reloadNonce}`,
+    [prismId, structuralKey, reloadNonce],
+  );
+
+  // Build srcDoc only when HTML/JS structure or reloadNonce changes — NOT on theme or CSS-only edits!
   const initialDarkRef = useRef(darkMode);
   const srcDoc = useMemo(() => {
     initialDarkRef.current = darkMode;
@@ -76,7 +82,17 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
       darkMode: initialDarkRef.current,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [prismId, channelId, snapshot.digest]);
+  }, [prismId, channelId, structuralKey]);
+
+  // Live hot-swap CSS without reloading the sandbox iframe
+  useEffect(() => {
+    const win = iframeRef.current?.contentWindow;
+    if (!win) return;
+    win.postMessage(
+      { __verdant: true, channelId, type: 'hot-css', payload: { css: snapshot.app.css } },
+      '*',
+    );
+  }, [snapshot.app.css, channelId]);
 
   // Sync light/dark theme live without reloading the sandbox iframe
   useEffect(() => {
@@ -189,12 +205,56 @@ export const PrismSandboxFrame: FC<PrismSandboxFrameProps> = ({
               },
             });
             reply(true, text);
+          } else if (method === 'browser.copyText') {
+            reply(true, await bridgeRuntime.copyText(prismId, grants, String(args?.text ?? '')));
+          } else if (method === 'browser.downloadFile') {
+            reply(
+              true,
+              await bridgeRuntime.downloadFile(
+                prismId,
+                grants,
+                String(args?.filename ?? 'export.txt'),
+                String(args?.content ?? ''),
+                String(args?.mimeType ?? 'text/plain'),
+              ),
+            );
+          } else if (method === 'browser.notify') {
+            reply(
+              true,
+              await bridgeRuntime.notify(
+                prismId,
+                grants,
+                String(args?.title ?? ''),
+                String(args?.body ?? ''),
+              ),
+            );
+          } else if (method === 'ui.getState') {
+            reply(true, await bridgeRuntime.getUiState(prismId, grants));
+          } else if (method === 'ui.callPrism') {
+            reply(
+              true,
+              await bridgeRuntime.callPrism(
+                prismId,
+                grants,
+                String(args?.target ?? ''),
+                args?.payload,
+              ),
+            );
+          } else if (method === 'ui.openPrism') {
+            reply(true, await bridgeRuntime.openPrism(prismId, grants, String(args?.target ?? '')));
           } else if (method === 'fetch') {
             const res = await bridgeRuntime.proxiedFetch(
               prismId,
               grants,
               String(args?.url ?? ''),
               args?.init as { method?: string; headers?: Record<string, string>; body?: string },
+              undefined,
+              (partial) => {
+                iframeRef.current?.contentWindow?.postMessage(
+                  { __verdant: true, channelId, type: 'rpc-token', payload: { reqId, text: partial } },
+                  '*',
+                );
+              },
             );
             reply(true, res);
           } else {

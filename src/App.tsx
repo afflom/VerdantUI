@@ -165,6 +165,7 @@ export default function App() {
   const [engineState, setEngineState] = useState<EngineState>(() => workerClient.getState());
   const [prisms, setPrisms] = useState<readonly VerdantPrismProject[]>(() => prismStore.list());
   const [activeView, setActiveView] = useState<ActiveWorkspaceView>({ kind: 'thread' });
+  const [prismToast, setPrismToast] = useState<{ title: string; body: string } | null>(null);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [darkMode, setDarkMode] = useState<boolean>(readInitialDarkMode);
@@ -177,6 +178,17 @@ export default function App() {
   );
 
   useEffect(() => {
+    let toastTimer: ReturnType<typeof setTimeout> | null = null;
+    prismPool.setCallbacks({
+      onNotify: ({ title, body }) => {
+        setPrismToast({ title, body });
+        if (toastTimer) clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => setPrismToast(null), 3500);
+      },
+      onOpenPrism: (prismId) => {
+        setActiveView({ kind: 'prism', prismId, mode: 'app' });
+      },
+    });
     const unsubStore = prismStore.subscribe(setPrisms);
     void prismStore.hydrate();
     const unsubBus = observerBus.subscribe((ev) => {
@@ -185,6 +197,7 @@ export default function App() {
       }
     });
     return () => {
+      if (toastTimer) clearTimeout(toastTimer);
       unsubStore();
       unsubBus();
       prismPool.dispose();
@@ -308,6 +321,10 @@ export default function App() {
 
   const handleOpenPrismApp = useCallback((prismId: string) => {
     setActiveView({ kind: 'prism', prismId, mode: 'app' });
+  }, []);
+
+  const handleEditPrismStudio = useCallback((prismId: string) => {
+    setActiveView({ kind: 'prism', prismId, mode: 'studio' });
   }, []);
 
   const handleDeletePrism = useCallback(
@@ -478,6 +495,8 @@ export default function App() {
                 onDismissError={handleDismissError}
                 onToggleInspector={handleToggleInspector}
                 onOpenPrism={handleOpenPrismApp}
+                onEditPrism={handleEditPrismStudio}
+                publishedPrisms={publishedPrisms}
                 onSpeculativeDraftChange={handleSpeculativeDraftChange}
                 onCountTokens={handleCountTokens}
               />
@@ -490,6 +509,8 @@ export default function App() {
                 open={inspectorOpen}
                 onClose={() => setInspectorOpen(false)}
                 engineState={engineState}
+                publishedPrisms={publishedPrisms}
+                observerBus={observerBus}
                 onClearHarness={handleClearHarness}
                 onClearCache={handleClearCache}
                 onUpdateSampling={(patch) => workerClient.updateSampling(patch)}
@@ -504,6 +525,19 @@ export default function App() {
             </Suspense>
           )}
         </div>
+
+        {prismToast && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="fixed right-4 bottom-4 z-50 max-w-xs rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-xs shadow-lg dark:border-slate-700 dark:bg-[#141B26]"
+          >
+            <div className="font-semibold text-slate-900 dark:text-white">{prismToast.title}</div>
+            {prismToast.body && (
+              <div className="mt-0.5 text-slate-500 dark:text-slate-400">{prismToast.body}</div>
+            )}
+          </div>
+        )}
       </div>
     </AssistantRuntimeProvider>
   );

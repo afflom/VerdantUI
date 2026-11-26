@@ -11,6 +11,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState, type FC, type FormEvent } from 'react';
+import type { ThreadMessage } from '@assistant-ui/react';
 import {
   Activity,
   AlertTriangle,
@@ -26,6 +27,7 @@ import {
   Monitor,
   Play,
   RotateCcw,
+  Send,
   Smartphone,
   Sparkles,
   Square,
@@ -33,6 +35,10 @@ import {
   Upload,
   Wrench,
 } from 'lucide-react';
+import {
+  formatMessagesForLlama,
+  stripReasoningTags,
+} from '../engine/assistantAdapter';
 import type { ObserverStreamBus, OtelEvent } from '../engine/observerStreamBus';
 import type { PrismBridgeRuntime } from '../engine/prismHostPool';
 import {
@@ -41,6 +47,7 @@ import {
   createStarterSnapshot,
   extractPrismPatchFromModelOutput,
   shortPrismDigest,
+  type JsonSchema2020Object,
   type PrismStarterId,
   type PrismStore,
   type VerdantPrismProject,
@@ -96,6 +103,14 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   const [justPublished, setJustPublished] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState(project.draft.name);
+  const [testInputText, setTestInputText] = useState('{"action": "status"}');
+  const [testResultText, setTestResultText] = useState<string | null>(null);
+  const [testRunning, setTestRunning] = useState(false);
+  const [schemaDraft, setSchemaDraft] = useState(() =>
+    JSON.stringify(project.draft.streams.inputs, null, 2),
+  );
+  const [schemaError, setSchemaError] = useState<string | null>(null);
+  const sourceSnapshotPushedRef = useRef(false);
 
   const abortRef = useRef<AbortController | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
@@ -111,10 +126,14 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
 
   useEffect(() => {
     setTitleDraft(project.draft.name);
+    setSchemaDraft(JSON.stringify(project.draft.streams.inputs, null, 2));
+    setSchemaError(null);
+    setTestResultText(null);
     setRuntimeError(null);
     setImportError(null);
+    sourceSnapshotPushedRef.current = false;
     setRecentEvents(bus.getRecentEvents({ endpointId: project.id }).slice(-12));
-  }, [project.id, project.draft.name, bus]);
+  }, [project.id, project.draft.name, project.draft.streams.inputs, bus]);
 
   useEffect(() => {
     const unsub = bus.subscribe(
@@ -256,11 +275,21 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       try {
         const currentProj = store.get(project.id) ?? project;
         const sysPrompt = buildStudioSystemPrompt(currentProj.draft);
-        const recentHistory = currentProj.messages
-          .slice(-6)
-          .map((m) => `<|im_start|>${m.role}\n${m.content}<|im_end|>`)
-          .join('\n');
-        const fullPrompt = `<|im_start|>system\n${sysPrompt}<|im_end|>\n${recentHistory}\n<|im_start|>user\n${trimmed}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`;
+        const historyMessages: ThreadMessage[] = currentProj.messages.slice(-6).map((m) => ({
+          id: m.id,
+          role: m.role,
+          createdAt: new Date(m.createdAt),
+          content: [{ type: 'text', text: m.content }],
+          attachments: [],
+          metadata: { custom: {} },
+        })) as ThreadMessage[];
+        const fullPrompt = formatMessagesForLlama(
+          historyMessages,
+          engineState.model!,
+          engineState.promptMode,
+          sysPrompt,
+          { thinkingMode: 'auto' },
+        );
 
         let accumulated = '';
         for await (const ev of workerClient.streamGenerate(
@@ -273,8 +302,9 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
           setStreamingReply(accumulated);
         }
 
+        const cleanedOutput = stripReasoningTags(accumulated);
         const latestProj = store.get(project.id) ?? project;
-        const extracted = extractPrismPatchFromModelOutput(accumulated, latestProj.draft);
+        const extracted = extractPrismPatchFromModelOutput(cleanedOutput, latestProj.draft);
         if (extracted) {
           await store.updateDraft(project.id, () => ({
             name: extracted.snapshot.name,
@@ -284,10 +314,10 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
             app: extracted.snapshot.app,
           }));
           const summaryNote =
-            accumulated
+            cleanedOutput
               .replace(/```[\s\S]*?```/g, '')
               .trim()
-              .slice(0, 320) ||
+              .slice(0, 360) ||
             `Updated ${extracted.updatedSections.join(', ').toUpperCase()} in the live preview.`;
           await store.appendMessage(project.id, {
             role: 'assistant',
@@ -300,7 +330,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
         } else {
           await store.appendMessage(project.id, {
             role: 'assistant',
-            content: accumulated.trim() || 'No code changes emitted.',
+            content: cleanedOutput.trim() || 'No code changes emitted.',
           });
         }
         span.end('ok');
@@ -508,8 +538,8 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
           </div>
 
           {drawerTab === 'streams' && (
-            <div className="grid gap-3 md:grid-cols-2">
-              <div className="space-y-2">
+            <div className="grid gap-3 lg:grid-cols-2">
+              <div className="space-y-2.5">
                 <label className="block">
                   <span className="text-[11px] font-medium text-slate-600 dark:text-slate-400">
                     Summary (used by VerdantUI to route requests)
@@ -528,82 +558,184 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                     className="mt-1 w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-900 dark:border-slate-700 dark:bg-[#0F141C] dark:text-slate-100"
                   />
                 </label>
-                <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                  Addressable in any Thread via{' '}
-                  <code className="rounded bg-slate-200/70 px-1 py-0.5 font-mono text-slate-800 dark:bg-slate-800 dark:text-slate-200">
-                    @{project.draft.name}
-                  </code>{' '}
-                  once published.
+
+                <div className="space-y-1.5">
+                  <div className="text-[11px] font-medium text-slate-600 dark:text-slate-400">
+                    Capability Grants (FK-07 Denial-Wins)
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {(
+                      [
+                        { key: 'observer', label: 'Observer' },
+                        { key: 'storage', label: 'Storage' },
+                        { key: 'browser', label: 'Browser' },
+                        { key: 'network', label: 'Network' },
+                      ] as const
+                    ).map(({ key, label }) => {
+                      const enabled = project.draft.grants[key];
+                      return (
+                        <button
+                          key={key}
+                          type="button"
+                          role="switch"
+                          aria-checked={enabled}
+                          onClick={() =>
+                            void store.updateDraft(project.id, (prev) => ({
+                              ...prev,
+                              grants: { ...prev.grants, [key]: !prev.grants[key] },
+                            }))
+                          }
+                          className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-medium transition-colors ${
+                            enabled
+                              ? 'border-emerald-700/40 bg-emerald-50 text-emerald-900 dark:border-emerald-500/40 dark:bg-emerald-950/50 dark:text-emerald-200'
+                              : 'border-slate-200 bg-white text-slate-600 dark:border-slate-700 dark:bg-[#0F141C] dark:text-slate-400'
+                          }`}
+                        >
+                          {key === 'network' && <Globe className="h-3 w-3" />}
+                          <span>{label}</span>
+                          <span className="font-mono text-[10px] opacity-80">
+                            {enabled ? 'On' : 'Off'}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-medium text-slate-600 dark:text-slate-400">
+                      Test Stream Dispatch (calls window.verdant.onInput)
+                    </span>
+                    <span className="text-[10px] text-slate-400">
+                      Thread syntax: <code>@{project.draft.name}</code>
+                    </span>
+                  </div>
+                  <div className="flex gap-1.5">
+                    <input
+                      type="text"
+                      value={testInputText}
+                      onChange={(e) => setTestInputText(e.target.value)}
+                      className="flex-1 rounded-md border border-slate-200 bg-white px-2 py-1 font-mono text-[11px] text-slate-900 dark:border-slate-700 dark:bg-[#0F141C] dark:text-slate-100"
+                    />
+                    <button
+                      type="button"
+                      disabled={testRunning}
+                      onClick={async () => {
+                        setTestRunning(true);
+                        setTestResultText(null);
+                        try {
+                          let parsed: unknown = testInputText;
+                          try {
+                            parsed = JSON.parse(testInputText);
+                          } catch {
+                            parsed = { message: testInputText };
+                          }
+                          const t0 = performance.now();
+                          const { result } = await bus.dispatchToEndpoint(project.id, parsed);
+                          const ms = Math.max(1, Math.round(performance.now() - t0));
+                          setTestResultText(
+                            `${ms}ms · ${typeof result === 'string' ? result : JSON.stringify(result, null, 2)}`,
+                          );
+                        } catch (err) {
+                          setTestResultText(
+                            `Error: ${err instanceof Error ? err.message : String(err)}`,
+                          );
+                        } finally {
+                          setTestRunning(false);
+                        }
+                      }}
+                      className="inline-flex items-center gap-1 rounded-md bg-slate-900 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-slate-700 disabled:opacity-50 dark:bg-emerald-700 dark:hover:bg-emerald-600"
+                    >
+                      <Send className="h-3 w-3" />
+                      <span>{testRunning ? 'Sending…' : 'Dispatch'}</span>
+                    </button>
+                  </div>
+                  {testResultText && (
+                    <pre className="max-h-24 overflow-auto rounded-md border border-slate-200 bg-white p-2 font-mono text-[11px] text-slate-700 dark:border-slate-700 dark:bg-[#0B0F14] dark:text-slate-300">
+                      {testResultText}
+                    </pre>
+                  )}
                 </div>
               </div>
 
               <div className="space-y-1.5">
-                <div className="text-[11px] font-medium text-slate-600 dark:text-slate-400">
-                  Capability Grants (FK-07 Denial-Wins)
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {(
-                    [
-                      { key: 'observer', label: 'Observer Stream' },
-                      { key: 'storage', label: 'Local Storage' },
-                      { key: 'network', label: 'Network Fetch' },
-                    ] as const
-                  ).map(({ key, label }) => {
-                    const enabled = project.draft.grants[key];
-                    return (
-                      <button
-                        key={key}
-                        type="button"
-                        role="switch"
-                        aria-checked={enabled}
-                        onClick={() =>
-                          void store.updateDraft(project.id, (prev) => ({
-                            ...prev,
-                            grants: { ...prev.grants, [key]: !prev.grants[key] },
-                          }))
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-medium text-slate-600 dark:text-slate-400">
+                    Input Contract (JSON Schema 2020-12)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      try {
+                        const parsed = JSON.parse(schemaDraft) as JsonSchema2020Object;
+                        if (!parsed || parsed.type !== 'object' || typeof parsed.properties !== 'object') {
+                          throw new Error('Schema must be an object with "type": "object" and "properties".');
                         }
-                        className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-[11px] font-medium transition-colors ${
-                          enabled
-                            ? 'border-emerald-700/40 bg-emerald-50 text-emerald-900 dark:border-emerald-500/40 dark:bg-emerald-950/50 dark:text-emerald-200'
-                            : 'border-slate-200 bg-white text-slate-600 dark:border-slate-700 dark:bg-[#0F141C] dark:text-slate-400'
-                        }`}
-                      >
-                        {key === 'network' && <Globe className="h-3 w-3" />}
-                        <span>{label}</span>
-                        <span className="font-mono text-[10px] opacity-80">
-                          {enabled ? 'On' : 'Off'}
-                        </span>
-                      </button>
-                    );
-                  })}
+                        setSchemaError(null);
+                        void store.updateDraft(project.id, (prev) => ({
+                          ...prev,
+                          streams: { ...prev.streams, inputs: parsed },
+                        }));
+                      } catch (err) {
+                        setSchemaError(err instanceof Error ? err.message : String(err));
+                      }
+                    }}
+                    className="rounded border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#0F141C] dark:text-slate-200"
+                  >
+                    Apply Schema
+                  </button>
                 </div>
+                <textarea
+                  rows={6}
+                  spellCheck={false}
+                  value={schemaDraft}
+                  onChange={(e) => setSchemaDraft(e.target.value)}
+                  className="w-full rounded-md border border-slate-200 bg-white p-2 font-mono text-[11px] text-slate-900 focus:border-emerald-700 focus:outline-none dark:border-slate-700 dark:bg-[#0B0F14] dark:text-slate-100"
+                />
+                {schemaError && (
+                  <div className="text-[11px] text-red-600 dark:text-red-400">{schemaError}</div>
+                )}
               </div>
             </div>
           )}
 
           {drawerTab === 'source' && (
             <div className="space-y-2">
-              <div className="flex items-center gap-1">
-                {(['html', 'css', 'js'] as const).map((f) => (
-                  <button
-                    key={f}
-                    type="button"
-                    onClick={() => setSourceTab(f)}
-                    className={`inline-flex items-center gap-1 rounded px-2 py-0.5 font-mono text-[11px] uppercase ${
-                      sourceTab === f
-                        ? 'bg-slate-900 text-white dark:bg-emerald-700'
-                        : 'bg-white text-slate-600 ring-1 ring-slate-200 dark:bg-[#0F141C] dark:text-slate-300 dark:ring-slate-700'
-                    }`}
-                  >
-                    <Code2 className="h-3 w-3" />
-                    {f}
-                  </button>
-                ))}
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1">
+                  {(['html', 'css', 'js'] as const).map((f) => (
+                    <button
+                      key={f}
+                      type="button"
+                      onClick={() => {
+                        setSourceTab(f);
+                        sourceSnapshotPushedRef.current = false;
+                      }}
+                      className={`inline-flex items-center gap-1 rounded px-2 py-0.5 font-mono text-[11px] uppercase ${
+                        sourceTab === f
+                          ? 'bg-slate-900 text-white dark:bg-emerald-700'
+                          : 'bg-white text-slate-600 ring-1 ring-slate-200 dark:bg-[#0F141C] dark:text-slate-300 dark:ring-slate-700'
+                      }`}
+                    >
+                      <Code2 className="h-3 w-3" />
+                      {f}
+                    </button>
+                  ))}
+                </div>
+                <span className="text-[10px] text-slate-400">
+                  {sourceTab === 'css' ? 'Hot-swaps live without reloading app state' : 'Auto-updates live preview'}
+                </span>
               </div>
               <textarea
                 value={project.draft.app[sourceTab]}
+                onBlur={() => {
+                  sourceSnapshotPushedRef.current = false;
+                }}
                 onChange={(e) => {
                   const nextVal = e.target.value;
+                  const shouldPushRevision = !sourceSnapshotPushedRef.current;
+                  sourceSnapshotPushedRef.current = true;
                   setRuntimeError(null);
                   void store.updateDraft(
                     project.id,
@@ -611,7 +743,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                       ...prev,
                       app: { ...prev.app, [sourceTab]: nextVal },
                     }),
-                    { pushRevision: false },
+                    { pushRevision: shouldPushRevision },
                   );
                 }}
                 rows={7}
@@ -776,11 +908,21 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
                 <div className="rounded-xl border border-emerald-700/30 bg-emerald-50/40 px-3 py-2 text-xs leading-relaxed text-slate-700 dark:border-emerald-500/30 dark:bg-emerald-950/30 dark:text-slate-200">
                   <div className="mb-1 flex items-center gap-1.5 text-[11px] font-medium text-emerald-800 dark:text-emerald-400">
                     <Loader2 className="h-3 w-3 animate-spin" />
-                    <span>Synthesizing Prism update…</span>
+                    <span>
+                      {streamingReply.includes('<think>') && !streamingReply.includes('</think>')
+                        ? 'Planning app changes…'
+                        : 'Writing Prism update…'}
+                    </span>
                   </div>
-                  <div className="max-h-40 overflow-y-auto font-mono text-[11px] whitespace-pre-wrap opacity-80">
-                    {streamingReply.slice(-600)}
-                  </div>
+                  {(() => {
+                    const visible = stripReasoningTags(streamingReply).trim();
+                    if (!visible) return null;
+                    return (
+                      <div className="max-h-36 overflow-y-auto font-mono text-[11px] whitespace-pre-wrap opacity-80">
+                        {visible.slice(-500)}
+                      </div>
+                    );
+                  })()}
                 </div>
               )}
               <div ref={chatEndRef} />

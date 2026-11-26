@@ -9,12 +9,19 @@
  *    Prism is not mounted full-screen.
  */
 
+import type { ThreadMessage } from '@assistant-ui/react';
+import { formatMessagesForLlama, stripReasoningTags } from './assistantAdapter';
 import type { ContainerGrantMatrix } from './cognitiveObserver';
 import type { ObserverStreamBus, OtelTraceContext } from './observerStreamBus';
 import { buildPrismSandboxDocument } from './prismSandboxHtml';
 import type { PrismStore, VerdantPrismSnapshot } from './prismStudio';
 import { isInternalBootstrapModel } from './modelCatalog';
 import type { LlamaVTensorWorkerClient } from './workerClient';
+
+export interface PrismHostCallbacks {
+  readonly onNotify?: (notice: { readonly prismId: string; readonly title: string; readonly body: string }) => void;
+  readonly onOpenPrism?: (prismId: string) => void;
+}
 
 export interface PrismAskRequest {
   readonly prismId: string;
@@ -33,12 +40,41 @@ export interface PrismBridgeRuntime {
     key: string,
     value: unknown,
   ): Promise<void>;
+  copyText(prismId: string, grants: VerdantPrismSnapshot['grants'], text: string): Promise<boolean>;
+  downloadFile(
+    prismId: string,
+    grants: VerdantPrismSnapshot['grants'],
+    filename: string,
+    content: string,
+    mimeType: string,
+  ): Promise<boolean>;
+  notify(
+    prismId: string,
+    grants: VerdantPrismSnapshot['grants'],
+    title: string,
+    body: string,
+  ): Promise<boolean>;
+  getUiState(prismId: string, grants: VerdantPrismSnapshot['grants']): Promise<Record<string, unknown>>;
+  callPrism(
+    callerPrismId: string,
+    grants: VerdantPrismSnapshot['grants'],
+    targetNameOrId: string,
+    payload: unknown,
+    parentContext?: OtelTraceContext,
+    depth?: number,
+  ): Promise<unknown>;
+  openPrism(
+    callerPrismId: string,
+    grants: VerdantPrismSnapshot['grants'],
+    targetNameOrId: string,
+  ): Promise<boolean>;
   proxiedFetch(
     prismId: string,
     grants: VerdantPrismSnapshot['grants'],
     url: string,
     init?: { readonly method?: string; readonly headers?: Record<string, string>; readonly body?: string },
     parentContext?: OtelTraceContext,
+    onChunk?: (accumulatedText: string) => void,
   ): Promise<{ readonly status: number; readonly ok: boolean; readonly text: string }>;
 }
 
@@ -55,6 +91,7 @@ interface PooledPrismInstance {
 const MAX_POOLED_PRISMS = 2;
 const IDLE_EVICT_MS = 60_000;
 const READY_TIMEOUT_MS = 3_000;
+const MAX_PRISM_CALL_DEPTH = 4;
 
 export class PrismHostPool implements PrismBridgeRuntime {
   private askTail: Promise<unknown> = Promise.resolve();
@@ -65,16 +102,23 @@ export class PrismHostPool implements PrismBridgeRuntime {
   >();
   private dispatchSeq = 1;
   private evictTimer: ReturnType<typeof setInterval> | null = null;
+  private callbacks: PrismHostCallbacks = {};
 
   constructor(
     private readonly bus: ObserverStreamBus,
     private readonly store: PrismStore,
     private readonly grantsMatrix: ContainerGrantMatrix,
     private readonly workerClient: LlamaVTensorWorkerClient | null,
+    callbacks?: PrismHostCallbacks,
   ) {
+    if (callbacks) this.callbacks = callbacks;
     if (typeof window !== 'undefined') {
       this.evictTimer = setInterval(() => this.evictIdle(), 15_000);
     }
+  }
+
+  setCallbacks(callbacks: PrismHostCallbacks): void {
+    this.callbacks = callbacks;
   }
 
   dispose(): void {
@@ -117,7 +161,21 @@ export class PrismHostPool implements PrismBridgeRuntime {
           throw new Error(notice);
         }
 
-        const prompt = `<|im_start|>system\nYou are VerdantUI assisting a live local Prism app. Be concise and accurate.<|im_end|>\n<|im_start|>user\n${req.prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`;
+        const syntheticUser: ThreadMessage = {
+          id: `prism_ask_${Date.now()}`,
+          role: 'user',
+          createdAt: new Date(),
+          content: [{ type: 'text', text: req.prompt }],
+          attachments: [],
+          metadata: { custom: {} },
+        } as ThreadMessage;
+        const prompt = formatMessagesForLlama(
+          [syntheticUser],
+          state.model!,
+          state.promptMode,
+          'You are VerdantUI assisting a live local Prism app. Be concise, direct, and accurate.',
+          { thinkingMode: 'off' },
+        );
         const abortCtrl = new AbortController();
         const onOuterAbort = () => abortCtrl.abort();
         if (req.signal) {
@@ -130,10 +188,10 @@ export class PrismHostPool implements PrismBridgeRuntime {
           for await (const ev of this.workerClient.streamGenerate(
             prompt,
             abortCtrl.signal,
-            { ...state.sampling, temperature: 0.4, maxTokens: 512 },
+            { ...state.sampling, temperature: 0.4, maxTokens: 768 },
             `prism:${req.prismId}`,
           )) {
-            finalText = ev.accumulatedText;
+            finalText = stripReasoningTags(ev.accumulatedText);
             req.onToken?.(finalText);
           }
         } finally {
@@ -182,12 +240,163 @@ export class PrismHostPool implements PrismBridgeRuntime {
     await this.store.setKv(prismId, key, value);
   }
 
+  async copyText(
+    prismId: string,
+    grants: VerdantPrismSnapshot['grants'],
+    text: string,
+  ): Promise<boolean> {
+    if (!grants.browser) {
+      throw new Error(`Browser grant is Off for Prism "${prismId}".`);
+    }
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    }
+    this.bus.emit({
+      name: 'prism.browser.copy',
+      endpointKind: 'browser',
+      endpointId: prismId,
+      attributes: { 'verdant.chars': text.length },
+    });
+    return true;
+  }
+
+  async downloadFile(
+    prismId: string,
+    grants: VerdantPrismSnapshot['grants'],
+    filename: string,
+    content: string,
+    mimeType: string,
+  ): Promise<boolean> {
+    if (!grants.browser) {
+      throw new Error(`Browser grant is Off for Prism "${prismId}".`);
+    }
+    const safeName = filename.replace(/[/\\]/g, '_').trim() || 'export.txt';
+    if (typeof document !== 'undefined' && typeof URL !== 'undefined') {
+      const blob = new Blob([content], { type: mimeType || 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = safeName;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+    this.bus.emit({
+      name: 'prism.browser.download',
+      endpointKind: 'browser',
+      endpointId: prismId,
+      attributes: { 'file.name': safeName, 'file.size': content.length },
+    });
+    return true;
+  }
+
+  async notify(
+    prismId: string,
+    grants: VerdantPrismSnapshot['grants'],
+    title: string,
+    body: string,
+  ): Promise<boolean> {
+    if (!grants.browser) {
+      throw new Error(`Browser grant is Off for Prism "${prismId}".`);
+    }
+    this.callbacks.onNotify?.({ prismId, title, body });
+    this.bus.emit({
+      name: 'prism.browser.notify',
+      endpointKind: 'browser',
+      endpointId: prismId,
+      attributes: { title },
+      body,
+    });
+    return true;
+  }
+
+  async getUiState(
+    prismId: string,
+    grants: VerdantPrismSnapshot['grants'],
+  ): Promise<Record<string, unknown>> {
+    if (!grants.observer) {
+      throw new Error(`Observer grant is Off for Prism "${prismId}".`);
+    }
+    const engine = this.workerClient?.getState();
+    const published = this.store.listPublishedSummaries();
+    return {
+      darkMode:
+        typeof document !== 'undefined'
+          ? document.documentElement.classList.contains('dark')
+          : false,
+      modelStreamEnabled: engine?.modelStreamEnabled ?? false,
+      modelReady:
+        Boolean(engine?.model && !isInternalBootstrapModel(engine.model.id)),
+      publishedPrisms: published.map((p) => ({
+        id: p.id,
+        slug: p.slug,
+        name: p.name,
+        summary: p.summary,
+      })),
+    };
+  }
+
+  private resolveTargetPrismId(targetNameOrId: string): string | null {
+    const clean = targetNameOrId.trim();
+    if (!clean) return null;
+    const direct = this.store.get(clean);
+    if (direct?.published) return direct.id;
+    const lower = clean.toLowerCase();
+    const match = this.store
+      .listPublishedSummaries()
+      .find((p) => p.name.toLowerCase() === lower || p.slug.toLowerCase() === lower);
+    return match ? match.id : null;
+  }
+
+  async callPrism(
+    callerPrismId: string,
+    grants: VerdantPrismSnapshot['grants'],
+    targetNameOrId: string,
+    payload: unknown,
+    parentContext?: OtelTraceContext,
+    depth = 0,
+  ): Promise<unknown> {
+    if (!grants.observer) {
+      throw new Error(`Observer grant is Off for Prism "${callerPrismId}".`);
+    }
+    if (depth >= MAX_PRISM_CALL_DEPTH) {
+      throw new Error(`Prism-to-Prism call depth exceeded limit (${MAX_PRISM_CALL_DEPTH}).`);
+    }
+    const targetId = this.resolveTargetPrismId(targetNameOrId);
+    if (!targetId) {
+      throw new Error(`Published Prism "${targetNameOrId}" not found.`);
+    }
+    if (targetId === callerPrismId) {
+      throw new Error('Self-recursive Prism call refused.');
+    }
+    const { result } = await this.dispatchPublishedPrism(targetId, payload, {
+      parentContext,
+    });
+    return result;
+  }
+
+  async openPrism(
+    callerPrismId: string,
+    grants: VerdantPrismSnapshot['grants'],
+    targetNameOrId: string,
+  ): Promise<boolean> {
+    if (!grants.observer) {
+      throw new Error(`Observer grant is Off for Prism "${callerPrismId}".`);
+    }
+    const targetId = this.resolveTargetPrismId(targetNameOrId);
+    if (!targetId) {
+      throw new Error(`Published Prism "${targetNameOrId}" not found.`);
+    }
+    this.callbacks.onOpenPrism?.(targetId);
+    return true;
+  }
+
   async proxiedFetch(
     prismId: string,
     grants: VerdantPrismSnapshot['grants'],
     url: string,
     init?: { readonly method?: string; readonly headers?: Record<string, string>; readonly body?: string },
     parentContext?: OtelTraceContext,
+    onChunk?: (accumulatedText: string) => void,
   ): Promise<{ readonly status: number; readonly ok: boolean; readonly text: string }> {
     const span = this.bus.startSpan(`prism.fetch:${prismId}`, {
       endpointKind: 'network',
@@ -223,7 +432,20 @@ export class PrismHostPool implements PrismBridgeRuntime {
         headers: init?.headers,
         body: init?.body,
       });
-      const text = await res.text();
+      let text = '';
+      if (onChunk && res.body && typeof res.body.getReader === 'function') {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        while (text.length < 128_000) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          text += decoder.decode(value, { stream: true });
+          onChunk(text.slice(0, 128_000));
+        }
+        text += decoder.decode();
+      } else {
+        text = await res.text();
+      }
       span.setAttributes({ 'http.response.status_code': res.status });
       span.end(res.ok ? 'ok' : 'error');
       return { status: res.status, ok: res.ok, text: text.slice(0, 128_000) };
@@ -415,12 +637,56 @@ export class PrismHostPool implements PrismBridgeRuntime {
               },
             });
             reply(true, text);
+          } else if (method === 'browser.copyText') {
+            reply(true, await this.copyText(prismId, snapshot.grants, String(args?.text ?? '')));
+          } else if (method === 'browser.downloadFile') {
+            reply(
+              true,
+              await this.downloadFile(
+                prismId,
+                snapshot.grants,
+                String(args?.filename ?? 'export.txt'),
+                String(args?.content ?? ''),
+                String(args?.mimeType ?? 'text/plain'),
+              ),
+            );
+          } else if (method === 'browser.notify') {
+            reply(
+              true,
+              await this.notify(
+                prismId,
+                snapshot.grants,
+                String(args?.title ?? ''),
+                String(args?.body ?? ''),
+              ),
+            );
+          } else if (method === 'ui.getState') {
+            reply(true, await this.getUiState(prismId, snapshot.grants));
+          } else if (method === 'ui.callPrism') {
+            reply(
+              true,
+              await this.callPrism(
+                prismId,
+                snapshot.grants,
+                String(args?.target ?? ''),
+                args?.payload,
+              ),
+            );
+          } else if (method === 'ui.openPrism') {
+            reply(true, await this.openPrism(prismId, snapshot.grants, String(args?.target ?? '')));
           } else if (method === 'fetch') {
             const res = await this.proxiedFetch(
               prismId,
               snapshot.grants,
               String(args?.url ?? ''),
               args?.init as { method?: string; headers?: Record<string, string>; body?: string },
+              undefined,
+              (partial) => {
+                iframe.contentWindow?.postMessage(
+                  { __verdant: true, channelId, type: 'rpc-token', payload: { reqId, text: partial } },
+                  '*',
+                );
+              },
             );
             reply(true, res);
           } else {

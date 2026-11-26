@@ -37,6 +37,7 @@ export interface PrismStreamContract {
 export interface PrismGrants {
   readonly observer: boolean;
   readonly storage: boolean;
+  readonly browser: boolean;
   /** Denied by default per FK-07 until explicitly granted by the user. */
   readonly network: boolean;
 }
@@ -85,7 +86,7 @@ export interface PublishedPrismSummary {
   readonly grants: PrismGrants;
 }
 
-export type PrismStarterId = 'blank' | 'dashboard' | 'game' | 'ai-helper';
+export type PrismStarterId = 'blank' | 'kanban' | 'focus' | 'budget' | 'writer';
 
 export interface PrismStarterSpec {
   readonly id: PrismStarterId;
@@ -95,30 +96,31 @@ export interface PrismStarterSpec {
 
 export const PRISM_STARTERS: readonly PrismStarterSpec[] = [
   {
-    id: 'dashboard',
-    label: 'Live Telemetry Dashboard',
-    description: 'Interactive monitor wired to Observer sensory streams and theme tokens.',
+    id: 'kanban',
+    label: 'Task Board',
+    description: '3-column Kanban board with local persistence, Markdown export, and Thread actions.',
   },
   {
-    id: 'game',
-    label: 'Arcade Reflex Canvas',
-    description: '60fps interactive Canvas mini-game with scoped high-score storage.',
+    id: 'focus',
+    label: 'Focus Timer',
+    description: 'Circular Pomodoro timer with audio chime, session log, and live Thread status.',
   },
   {
-    id: 'ai-helper',
-    label: 'AI Writing Studio',
-    description: 'AI-enabled app that streams prompts through VerdantUI via verdant.ask().',
+    id: 'budget',
+    label: 'Expense Tracker',
+    description: 'Interactive expense table with category breakdown bars and CSV export.',
   },
   {
-    id: 'blank',
-    label: 'Blank Prism App',
-    description: 'Minimal reactive HTML/CSS/JS starter ready to shape in chat.',
+    id: 'writer',
+    label: 'AI Writing Assistant',
+    description: 'Summarize, tighten, or extract action items locally via VerdantUI.',
   },
 ];
 
 export const DEFAULT_PRISM_GRANTS: PrismGrants = Object.freeze({
   observer: true,
   storage: true,
+  browser: true,
   network: false,
 });
 
@@ -280,6 +282,7 @@ export function buildSnapshot(
     grants: {
       observer: Boolean(fields.grants.observer),
       storage: Boolean(fields.grants.storage),
+      browser: fields.grants.browser !== false,
       network: Boolean(fields.grants.network),
     },
     app: {
@@ -378,6 +381,7 @@ export function parseHoloArchive(raw: string | Uint8Array): VerdantPrismSnapshot
     grants: {
       observer: grantsObj.observer !== false,
       storage: grantsObj.storage !== false,
+      browser: grantsObj.browser !== false,
       // Imported Prisms always preserve declared network flag, but UI still gates via FK-07
       network: grantsObj.network === true,
     },
@@ -404,273 +408,544 @@ export function parseHoloArchive(raw: string | Uint8Array): VerdantPrismSnapshot
 
 export function createStarterSnapshot(starterId: PrismStarterId): VerdantPrismSnapshot {
   switch (starterId) {
-    case 'dashboard':
+    case 'kanban':
       return buildSnapshot({
-        name: 'Sensory Monitor',
-        summary: 'Live interactive telemetry and stream control panel wired to VerdantUI Observer.',
+        name: 'Task Board',
+        summary: 'Three-column Kanban board with local persistence, Markdown export, and Thread task commands.',
         streams: {
           inputs: {
             type: 'object',
             properties: {
               action: {
                 type: 'string',
-                enum: ['ping', 'note', 'status'],
-                description: 'Monitor command to execute.',
+                enum: ['list', 'add', 'complete', 'status'],
+                description: 'List tasks, add a new task, or mark a task done.',
               },
-              message: { type: 'string', description: 'Optional status note or payload.' },
+              message: { type: 'string', description: 'Task title when adding or completing.' },
             },
           },
-          outputs: ['monitor.ping', 'monitor.note'],
+          outputs: ['task.added', 'task.moved', 'task.completed'],
         },
         grants: { ...DEFAULT_PRISM_GRANTS },
         app: {
-          html: `<div class="v-shell">
-  <header class="v-header">
+          html: `<div class="kb-app">
+  <header class="kb-head">
     <div>
-      <h1>Sensory Monitor</h1>
-      <p class="v-muted">Live Observer stream endpoint</p>
+      <h1>Task Board</h1>
+      <p id="counts" class="v-muted">0 tasks</p>
     </div>
-    <span id="badge" class="v-pill">Ready</span>
+    <button id="exportBtn" class="v-btn">Export Markdown</button>
   </header>
-  <section class="v-grid">
-    <div class="v-card"><div class="v-label">Events Emitted</div><div id="count" class="v-metric">0</div></div>
-    <div class="v-card"><div class="v-label">Last Latency</div><div id="latency" class="v-metric">0 ms</div></div>
-  </section>
-  <form id="noteForm" class="v-row">
-    <input id="noteInput" class="v-input" placeholder="Send a sensory note to the Observer..." />
-    <button type="submit" class="v-btn v-btn-primary">Emit</button>
+  <form id="addForm" class="kb-form">
+    <input id="taskInput" class="v-input" placeholder="Add a new task..." />
+    <button type="submit" class="v-btn v-btn-primary">Add</button>
   </form>
-  <ul id="feed" class="v-list"></ul>
-</div>`,
-          css: `.v-shell { max-width: 680px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
-.v-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.v-header h1 { margin: 0; font-size: 18px; font-weight: 700; }
-.v-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.v-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--v-muted); }
-.v-metric { font-size: 24px; font-weight: 700; margin-top: 4px; font-variant-numeric: tabular-nums; }
-.v-row { display: flex; gap: 8px; }
-.v-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; }
-.v-list li { padding: 8px 12px; border: 1px solid var(--v-border); border-radius: 8px; background: var(--v-surface); font-size: 13px; display: flex; justify-content: space-between; gap: 8px; }`,
-          js: `const countEl = document.getElementById('count');
-const latencyEl = document.getElementById('latency');
-const feedEl = document.getElementById('feed');
-const badgeEl = document.getElementById('badge');
-const inputEl = document.getElementById('noteInput');
-let count = 0;
-
-function appendLog(label, detail) {
-  const li = document.createElement('li');
-  li.innerHTML = '<strong>' + label + '</strong><span class="v-muted">' + detail + '</span>';
-  feedEl.prepend(li);
-  while (feedEl.children.length > 8) feedEl.lastChild.remove();
-}
-
-async function init() {
-  const saved = await window.verdant.storage.get('count');
-  if (typeof saved === 'number') {
-    count = saved;
-    countEl.textContent = String(count);
-  }
-}
-
-document.getElementById('noteForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const msg = inputEl.value.trim() || 'Pulse check';
-  const t0 = performance.now();
-  count += 1;
-  countEl.textContent = String(count);
-  window.verdant.emit('monitor.note', { message: msg, count });
-  await window.verdant.storage.set('count', count);
-  latencyEl.textContent = Math.max(1, Math.round(performance.now() - t0)) + ' ms';
-  appendLog('Emitted', msg);
-  inputEl.value = '';
-});
-
-window.verdant.onInput(async (payload) => {
-  const msg = (payload && (payload.message || payload.action)) || 'status';
-  badgeEl.textContent = 'Synced';
-  count += 1;
-  countEl.textContent = String(count);
-  appendLog('Observer -> Prism', String(msg));
-  return { status: 'ok', count, received: msg, timestamp: new Date().toISOString() };
-});
-
-init();`,
-        },
-      });
-
-    case 'game':
-      return buildSnapshot({
-        name: 'Pulse Catcher',
-        summary: '60fps Canvas reflex mini-game with persistent best score and Observer telemetry.',
-        streams: {
-          inputs: {
-            type: 'object',
-            properties: {
-              action: {
-                type: 'string',
-                enum: ['status', 'reset'],
-                description: 'Inspect current high score or reset the game.',
-              },
-            },
-          },
-          outputs: ['game.score', 'game.best'],
-        },
-        grants: { ...DEFAULT_PRISM_GRANTS },
-        app: {
-          html: `<div class="game-wrap">
-  <header class="game-bar">
-    <div><strong>Pulse Catcher</strong> <span class="v-muted">Click rings before they fade</span></div>
-    <div class="scores">Score <b id="score">0</b> · Best <b id="best">0</b></div>
-  </header>
-  <canvas id="stage" width="600" height="340"></canvas>
-  <div class="game-actions">
-    <button id="resetBtn" class="v-btn">Reset Round</button>
+  <div class="kb-cols">
+    <section class="kb-col" data-col="todo"><h2>To Do</h2><div class="kb-list" id="col-todo"></div></section>
+    <section class="kb-col" data-col="doing"><h2>In Progress</h2><div class="kb-list" id="col-doing"></div></section>
+    <section class="kb-col" data-col="done"><h2>Done</h2><div class="kb-list" id="col-done"></div></section>
   </div>
 </div>`,
-          css: `.game-wrap { max-width: 640px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
-.game-bar { display: flex; align-items: center; justify-content: space-between; font-size: 13px; }
-.scores { font-variant-numeric: tabular-nums; }
-#stage { width: 100%; height: auto; border-radius: 12px; border: 1px solid var(--v-border); background: var(--v-surface); cursor: crosshair; display: block; }
-.game-actions { display: flex; justify-content: flex-end; }`,
-          js: `const canvas = document.getElementById('stage');
-const ctx = canvas.getContext('2d');
-const scoreEl = document.getElementById('score');
-const bestEl = document.getElementById('best');
-let score = 0;
-let best = 0;
-let target = { x: 300, y: 170, r: 28, ttl: 1 };
+          css: `.kb-app { max-width: 920px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+.kb-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.kb-head h1 { margin: 0; font-size: 18px; font-weight: 700; }
+.kb-head p { margin: 2px 0 0; font-size: 12px; }
+.kb-form { display: flex; gap: 8px; }
+.kb-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.kb-col { background: var(--v-surface); border: 1px solid var(--v-border); border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 8px; min-height: 220px; }
+.kb-col h2 { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--v-muted); }
+.kb-list { display: flex; flex-direction: column; gap: 8px; }
+.kb-card { border: 1px solid var(--v-border); border-radius: 8px; padding: 10px; background: var(--v-bg); display: flex; flex-direction: column; gap: 8px; }
+.kb-title { font-size: 13px; font-weight: 500; word-break: break-word; }
+.kb-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.kb-mini { height: 26px; padding: 0 8px; font-size: 11px; border-radius: 6px; }`,
+          js: `let tasks = [
+  { id: 't1', title: 'Draft architecture notes', col: 'todo' },
+  { id: 't2', title: 'Review open tasks', col: 'doing' },
+];
+const cols = ['todo', 'doing', 'done'];
+const countsEl = document.getElementById('counts');
+const inputEl = document.getElementById('taskInput');
 
-function spawnTarget() {
-  target = {
-    x: 48 + Math.random() * (canvas.width - 96),
-    y: 48 + Math.random() * (canvas.height - 96),
-    r: 22 + Math.random() * 14,
-    ttl: 1,
-  };
+async function save() {
+  await window.verdant.storage.set('tasks', tasks);
 }
 
-canvas.addEventListener('pointerdown', async (e) => {
-  const rect = canvas.getBoundingClientRect();
-  const x = (e.clientX - rect.left) * (canvas.width / rect.width);
-  const y = (e.clientY - rect.top) * (canvas.height / rect.height);
-  if (Math.hypot(x - target.x, y - target.y) <= target.r + 8) {
-    score += 1;
-    scoreEl.textContent = String(score);
-    if (score > best) {
-      best = score;
-      bestEl.textContent = String(best);
-      await window.verdant.storage.set('best', best);
-      window.verdant.emit('game.best', { best });
+function render() {
+  const doneCount = tasks.filter((t) => t.col === 'done').length;
+  countsEl.textContent = tasks.length + ' total · ' + doneCount + ' completed';
+  for (const col of cols) {
+    const container = document.getElementById('col-' + col);
+    container.innerHTML = '';
+    const items = tasks.filter((t) => t.col === col);
+    for (const item of items) {
+      const card = document.createElement('div');
+      card.className = 'kb-card';
+      const title = document.createElement('div');
+      title.className = 'kb-title';
+      title.textContent = item.title;
+      const actions = document.createElement('div');
+      actions.className = 'kb-actions';
+      const idx = cols.indexOf(col);
+      if (idx > 0) {
+        const back = document.createElement('button');
+        back.className = 'v-btn kb-mini';
+        back.textContent = '←';
+        back.onclick = async () => { item.col = cols[idx - 1]; await save(); render(); };
+        actions.appendChild(back);
+      }
+      if (idx < cols.length - 1) {
+        const next = document.createElement('button');
+        next.className = 'v-btn kb-mini';
+        next.textContent = idx === 1 ? 'Done ✓' : '→';
+        next.onclick = async () => {
+          item.col = cols[idx + 1];
+          await save();
+          window.verdant.emit(item.col === 'done' ? 'task.completed' : 'task.moved', { title: item.title, col: item.col });
+          render();
+        };
+        actions.appendChild(next);
+      }
+      const del = document.createElement('button');
+      del.className = 'v-btn kb-mini';
+      del.textContent = '×';
+      del.onclick = async () => { tasks = tasks.filter((t) => t.id !== item.id); await save(); render(); };
+      actions.appendChild(del);
+      card.append(title, actions);
+      container.appendChild(card);
     }
-    spawnTarget();
   }
+}
+
+document.getElementById('addForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const title = inputEl.value.trim();
+  if (!title) return;
+  tasks.unshift({ id: 't_' + Date.now().toString(36), title, col: 'todo' });
+  inputEl.value = '';
+  await save();
+  window.verdant.emit('task.added', { title });
+  render();
 });
 
-document.getElementById('resetBtn').addEventListener('click', () => {
-  score = 0;
-  scoreEl.textContent = '0';
-  spawnTarget();
+document.getElementById('exportBtn').addEventListener('click', async () => {
+  const md = cols.map((c) => '## ' + c.toUpperCase() + '\\n' + tasks.filter((t) => t.col === c).map((t) => '- ' + t.title).join('\\n')).join('\\n\\n');
+  await window.verdant.browser.downloadFile('task-board.md', md, 'text/markdown');
+  await window.verdant.browser.notify('Exported', 'Saved task-board.md');
 });
 
 window.verdant.onInput(async (payload) => {
-  if (payload && payload.action === 'reset') {
-    score = 0;
-    scoreEl.textContent = '0';
-    spawnTarget();
+  const raw = String(payload?.message || '').trim();
+  const action = String(payload?.action || '').toLowerCase();
+  if (action === 'add' || /^add\\s+/i.test(raw)) {
+    const title = raw.replace(/^add\\s+/i, '').replace(/^["']|["']$/g, '').trim();
+    if (title) {
+      tasks.unshift({ id: 't_' + Date.now().toString(36), title, col: 'todo' });
+      await save();
+      render();
+      return { added: title, total: tasks.length };
+    }
   }
-  return { game: 'Pulse Catcher', score, best };
+  return {
+    total: tasks.length,
+    todo: tasks.filter((t) => t.col === 'todo').map((t) => t.title),
+    inProgress: tasks.filter((t) => t.col === 'doing').map((t) => t.title),
+    done: tasks.filter((t) => t.col === 'done').map((t) => t.title),
+  };
 });
 
-function tick() {
-  target.ttl -= 0.008;
-  if (target.ttl <= 0) spawnTarget();
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.beginPath();
-  ctx.arc(target.x, target.y, target.r * (0.65 + 0.35 * target.ttl), 0, Math.PI * 2);
-  ctx.fillStyle = 'rgba(15, 81, 50, ' + (0.25 + 0.65 * target.ttl) + ')';
-  ctx.fill();
-  ctx.lineWidth = 2.5;
-  ctx.strokeStyle = '#10b981';
-  ctx.stroke();
-  requestAnimationFrame(tick);
-}
-
-window.verdant.storage.get('best').then((v) => {
-  if (typeof v === 'number') {
-    best = v;
-    bestEl.textContent = String(best);
-  }
-});
-tick();`,
+window.verdant.storage.get('tasks').then((saved) => {
+  if (Array.isArray(saved) && saved.length > 0) tasks = saved;
+  render();
+});`,
         },
       });
 
-    case 'ai-helper':
+    case 'focus':
       return buildSnapshot({
-        name: 'Draft Refiner',
-        summary: 'AI-enabled text refiner that streams local cognition via verdant.ask().',
+        name: 'Focus Timer',
+        summary: 'Circular Pomodoro focus timer with audio chime, daily session tracking, and Thread status.',
         streams: {
           inputs: {
             type: 'object',
             properties: {
-              text: { type: 'string', description: 'Text to refine or summarize.' },
-              tone: {
+              action: {
                 type: 'string',
-                enum: ['concise', 'technical', 'friendly'],
-                description: 'Target tone.',
+                enum: ['status', 'start', 'pause', 'reset'],
+                description: 'Query or control the focus timer.',
+              },
+            },
+          },
+          outputs: ['focus.started', 'focus.completed'],
+        },
+        grants: { ...DEFAULT_PRISM_GRANTS },
+        app: {
+          html: `<div class="ft-wrap">
+  <div class="ft-modes">
+    <button class="v-btn ft-tab active" data-mins="25" data-label="Focus">Focus · 25m</button>
+    <button class="v-btn ft-tab" data-mins="5" data-label="Short Break">Break · 5m</button>
+    <button class="v-btn ft-tab" data-mins="15" data-label="Long Break">Long · 15m</button>
+  </div>
+  <div class="ft-ring-box">
+    <svg viewBox="0 0 180 180" class="ft-svg">
+      <circle cx="90" cy="90" r="78" class="ft-track" />
+      <circle id="arc" cx="90" cy="90" r="78" class="ft-progress" stroke-dasharray="490" stroke-dashoffset="0" />
+    </svg>
+    <div class="ft-center">
+      <div id="clock" class="ft-clock">25:00</div>
+      <div id="modeLabel" class="v-muted">Focus</div>
+    </div>
+  </div>
+  <div class="ft-controls">
+    <button id="toggleBtn" class="v-btn v-btn-primary">Start</button>
+    <button id="resetBtn" class="v-btn">Reset</button>
+  </div>
+  <div id="stats" class="v-muted ft-stats">Completed sessions today: 0</div>
+</div>`,
+          css: `.ft-wrap { max-width: 420px; margin: 12px auto; display: flex; flex-direction: column; align-items: center; gap: 18px; }
+.ft-modes { display: flex; gap: 6px; }
+.ft-tab { height: 32px; font-size: 12px; }
+.ft-tab.active { background: var(--v-accent); color: var(--v-accent-text); border-color: transparent; }
+.ft-ring-box { position: relative; width: 210px; height: 210px; display: grid; place-items: center; }
+.ft-svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+.ft-track { fill: none; stroke: var(--v-border); stroke-width: 8; }
+.ft-progress { fill: none; stroke: var(--v-accent); stroke-width: 8; stroke-linecap: round; transition: stroke-dashoffset 250ms linear; }
+.ft-center { position: absolute; text-align: center; }
+.ft-clock { font-size: 40px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+.ft-controls { display: flex; gap: 10px; }
+.ft-stats { font-size: 12px; }`,
+          js: `const CIRC = 2 * Math.PI * 78;
+let totalSec = 25 * 60;
+let remaining = totalSec;
+let modeLabel = 'Focus';
+let running = false;
+let sessions = 0;
+let timer = null;
+
+const clockEl = document.getElementById('clock');
+const arcEl = document.getElementById('arc');
+const labelEl = document.getElementById('modeLabel');
+const toggleBtn = document.getElementById('toggleBtn');
+const statsEl = document.getElementById('stats');
+
+function fmt(s) {
+  const m = Math.floor(s / 60).toString().padStart(2, '0');
+  const sec = (s % 60).toString().padStart(2, '0');
+  return m + ':' + sec;
+}
+
+function chime() {
+  try {
+    const ctx = new AudioContext();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = 660;
+    gain.gain.setValueAtTime(0.15, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.5);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.5);
+  } catch (_) {}
+}
+
+function render() {
+  clockEl.textContent = fmt(remaining);
+  labelEl.textContent = modeLabel;
+  arcEl.style.strokeDasharray = String(CIRC);
+  arcEl.style.strokeDashoffset = String(CIRC * (1 - remaining / Math.max(1, totalSec)));
+  toggleBtn.textContent = running ? 'Pause' : 'Start';
+  statsEl.textContent = 'Completed sessions: ' + sessions;
+}
+
+function start() {
+  if (running) return;
+  running = true;
+  window.verdant.emit('focus.started', { mode: modeLabel, remaining });
+  timer = setInterval(async () => {
+    remaining -= 1;
+    if (remaining <= 0) {
+      clearInterval(timer);
+      running = false;
+      remaining = 0;
+      if (modeLabel === 'Focus') {
+        sessions += 1;
+        await window.verdant.storage.set('sessions', sessions);
+      }
+      chime();
+      window.verdant.emit('focus.completed', { mode: modeLabel, sessions });
+      await window.verdant.browser.notify('Timer complete', modeLabel + ' session finished.');
+    }
+    render();
+  }, 1000);
+  render();
+}
+
+function pause() {
+  running = false;
+  if (timer) clearInterval(timer);
+  render();
+}
+
+toggleBtn.addEventListener('click', () => (running ? pause() : start()));
+document.getElementById('resetBtn').addEventListener('click', () => { pause(); remaining = totalSec; render(); });
+
+document.querySelectorAll('.ft-tab').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    pause();
+    document.querySelectorAll('.ft-tab').forEach((b) => b.classList.remove('active'));
+    btn.classList.add('active');
+    totalSec = Number(btn.dataset.mins) * 60;
+    remaining = totalSec;
+    modeLabel = btn.dataset.label;
+    render();
+  });
+});
+
+window.verdant.onInput(async (payload) => {
+  const act = String(payload?.action || payload?.message || 'status').toLowerCase();
+  if (act.includes('start')) start();
+  else if (act.includes('pause') || act.includes('stop')) pause();
+  else if (act.includes('reset')) { pause(); remaining = totalSec; render(); }
+  return { mode: modeLabel, remaining: fmt(remaining), running, completedSessions: sessions };
+});
+
+window.verdant.storage.get('sessions').then((v) => {
+  if (typeof v === 'number') sessions = v;
+  render();
+});`,
+        },
+      });
+
+    case 'budget':
+      return buildSnapshot({
+        name: 'Expense Tracker',
+        summary: 'Interactive expense tracker with live category bars, CSV export, and Thread summaries.',
+        streams: {
+          inputs: {
+            type: 'object',
+            properties: {
+              action: {
+                type: 'string',
+                enum: ['summary', 'add'],
+                description: 'Summarize spending or add an expense.',
+              },
+              message: { type: 'string', description: 'Expense description and amount (e.g. "Coffee 5.50").' },
+            },
+          },
+          outputs: ['expense.added'],
+        },
+        grants: { ...DEFAULT_PRISM_GRANTS },
+        app: {
+          html: `<div class="ex-app">
+  <header class="ex-head">
+    <div>
+      <h1>Expense Tracker</h1>
+      <div id="total" class="ex-total">$0.00</div>
+    </div>
+    <button id="csvBtn" class="v-btn">Export CSV</button>
+  </header>
+  <form id="exForm" class="ex-form">
+    <input id="desc" class="v-input" placeholder="Description (e.g. Coffee)" required />
+    <input id="amt" class="v-input" type="number" step="0.01" min="0" placeholder="Amount" style="max-width:110px" required />
+    <select id="cat" class="v-input" style="max-width:130px">
+      <option>Food</option><option>Tools</option><option>Travel</option><option>Other</option>
+    </select>
+    <button type="submit" class="v-btn v-btn-primary">Add</button>
+  </form>
+  <div id="bars" class="v-card ex-bars"></div>
+  <div id="rows" class="ex-rows"></div>
+</div>`,
+          css: `.ex-app { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+.ex-head { display: flex; align-items: center; justify-content: space-between; }
+.ex-head h1 { margin: 0; font-size: 16px; color: var(--v-muted); font-weight: 600; }
+.ex-total { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.ex-form { display: flex; flex-wrap: wrap; gap: 8px; }
+.ex-bars { display: flex; flex-direction: column; gap: 8px; }
+.ex-bar-row { display: grid; grid-template-columns: 72px 1fr 72px; align-items: center; gap: 10px; font-size: 12px; }
+.ex-bar-track { height: 8px; border-radius: 999px; background: var(--v-border); overflow: hidden; }
+.ex-bar-fill { height: 100%; background: var(--v-accent); border-radius: 999px; }
+.ex-rows { display: flex; flex-direction: column; gap: 6px; }
+.ex-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 12px; border: 1px solid var(--v-border); border-radius: 8px; background: var(--v-surface); font-size: 13px; }`,
+          js: `let items = [
+  { id: 'e1', desc: 'Domain renewal', amount: 14.0, category: 'Tools' },
+  { id: 'e2', desc: 'Espresso', amount: 4.5, category: 'Food' },
+];
+const totalEl = document.getElementById('total');
+const barsEl = document.getElementById('bars');
+const rowsEl = document.getElementById('rows');
+
+async function save() { await window.verdant.storage.set('expenses', items); }
+
+function summarize() {
+  const total = items.reduce((s, x) => s + x.amount, 0);
+  const byCategory = {};
+  for (const x of items) byCategory[x.category] = (byCategory[x.category] || 0) + x.amount;
+  return { total: Number(total.toFixed(2)), count: items.length, byCategory };
+}
+
+function render() {
+  const sum = summarize();
+  totalEl.textContent = '$' + sum.total.toFixed(2);
+  barsEl.innerHTML = '';
+  const cats = Object.entries(sum.byCategory).sort((a, b) => b[1] - a[1]);
+  if (cats.length === 0) {
+    barsEl.innerHTML = '<span class="v-muted" style="font-size:12px">No expenses yet.</span>';
+  } else {
+    for (const [cat, val] of cats) {
+      const pct = sum.total > 0 ? Math.round((val / sum.total) * 100) : 0;
+      const row = document.createElement('div');
+      row.className = 'ex-bar-row';
+      row.innerHTML = '<span>' + cat + '</span><div class="ex-bar-track"><div class="ex-bar-fill" style="width:' + pct + '%"></div></div><span style="text-align:right;font-variant-numeric:tabular-nums">$' + val.toFixed(2) + '</span>';
+      barsEl.appendChild(row);
+    }
+  }
+  rowsEl.innerHTML = '';
+  for (const it of items) {
+    const el = document.createElement('div');
+    el.className = 'ex-item';
+    const left = document.createElement('div');
+    left.innerHTML = '<strong>' + it.desc + '</strong> <span class="v-pill" style="margin-left:6px">' + it.category + '</span>';
+    const right = document.createElement('div');
+    right.style.display = 'flex';
+    right.style.alignItems = 'center';
+    right.style.gap = '8px';
+    const amt = document.createElement('span');
+    amt.style.fontVariantNumeric = 'tabular-nums';
+    amt.textContent = '$' + it.amount.toFixed(2);
+    const del = document.createElement('button');
+    del.className = 'v-btn';
+    del.style.height = '26px';
+    del.style.padding = '0 8px';
+    del.textContent = '×';
+    del.onclick = async () => { items = items.filter((x) => x.id !== it.id); await save(); render(); };
+    right.append(amt, del);
+    el.append(left, right);
+    rowsEl.appendChild(el);
+  }
+}
+
+document.getElementById('exForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const desc = document.getElementById('desc').value.trim();
+  const amount = Number(document.getElementById('amt').value);
+  const category = document.getElementById('cat').value;
+  if (!desc || !Number.isFinite(amount) || amount <= 0) return;
+  items.unshift({ id: 'e_' + Date.now().toString(36), desc, amount, category });
+  document.getElementById('desc').value = '';
+  document.getElementById('amt').value = '';
+  await save();
+  window.verdant.emit('expense.added', { desc, amount, category });
+  render();
+});
+
+document.getElementById('csvBtn').addEventListener('click', async () => {
+  const csv = 'Description,Category,Amount\\n' + items.map((x) => JSON.stringify(x.desc) + ',' + x.category + ',' + x.amount.toFixed(2)).join('\\n');
+  await window.verdant.browser.downloadFile('expenses.csv', csv, 'text/csv');
+  await window.verdant.browser.notify('CSV Exported', 'Saved expenses.csv');
+});
+
+window.verdant.onInput(async (payload) => {
+  const raw = String(payload?.message || '').trim();
+  const m = raw.match(/^(?:add\\s+)?(.+?)\\s+\\$?([0-9]+(?:\\.[0-9]{1,2})?)$/i);
+  if (m) {
+    const desc = m[1].trim();
+    const amount = Number(m[2]);
+    items.unshift({ id: 'e_' + Date.now().toString(36), desc, amount, category: 'Other' });
+    await save();
+    render();
+    return { added: { desc, amount }, ...summarize() };
+  }
+  return summarize();
+});
+
+window.verdant.storage.get('expenses').then((saved) => {
+  if (Array.isArray(saved) && saved.length > 0) items = saved;
+  render();
+});`,
+        },
+      });
+
+    case 'writer':
+      return buildSnapshot({
+        name: 'AI Writing Assistant',
+        summary: 'Local AI writing tool to summarize, tighten, or extract action items using VerdantUI.',
+        streams: {
+          inputs: {
+            type: 'object',
+            properties: {
+              text: { type: 'string', description: 'Source text to transform.' },
+              mode: {
+                type: 'string',
+                enum: ['summarize', 'tighten', 'actions', 'polish'],
+                description: 'Editing transformation.',
               },
             },
             required: ['text'],
           },
-          outputs: ['refiner.completed'],
+          outputs: ['writer.completed'],
         },
         grants: { ...DEFAULT_PRISM_GRANTS },
         app: {
-          html: `<div class="ai-app">
-  <header class="ai-head">
-    <h1>Draft Refiner</h1>
-    <select id="tone" class="v-input" style="width:auto">
-      <option value="concise">Concise</option>
-      <option value="technical">Technical</option>
-      <option value="friendly">Friendly</option>
+          html: `<div class="wr-app">
+  <header class="wr-head">
+    <h1>AI Writing Assistant</h1>
+    <select id="mode" class="v-input" style="width:auto">
+      <option value="tighten">Tighten &amp; Clarify</option>
+      <option value="summarize">Summarize (3 bullets)</option>
+      <option value="actions">Extract Action Items</option>
+      <option value="polish">Polish Grammar</option>
     </select>
   </header>
-  <textarea id="source" class="v-input" rows="5" placeholder="Paste rough notes or a paragraph to refine locally..."></textarea>
-  <div class="ai-actions">
-    <button id="runBtn" class="v-btn v-btn-primary">Refine with VerdantUI</button>
+  <textarea id="source" class="v-input" rows="5" placeholder="Paste draft text, meeting notes, or an email..."></textarea>
+  <div class="wr-actions">
+    <button id="runBtn" class="v-btn v-btn-primary">Run Locally</button>
+    <button id="copyBtn" class="v-btn" disabled>Copy Output</button>
     <span id="status" class="v-muted"></span>
   </div>
-  <div id="output" class="v-card ai-out">Output will stream here...</div>
+  <div id="output" class="v-card wr-out">Result will stream here...</div>
 </div>`,
-          css: `.ai-app { max-width: 680px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
-.ai-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.ai-head h1 { margin: 0; font-size: 18px; font-weight: 700; }
-.ai-actions { display: flex; align-items: center; gap: 12px; font-size: 12px; }
-.ai-out { min-height: 96px; white-space: pre-wrap; line-height: 1.55; font-size: 13.5px; }`,
+          css: `.wr-app { max-width: 700px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
+.wr-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.wr-head h1 { margin: 0; font-size: 18px; font-weight: 700; }
+.wr-actions { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.wr-out { min-height: 110px; white-space: pre-wrap; line-height: 1.6; font-size: 13.5px; }`,
           js: `const srcEl = document.getElementById('source');
-const toneEl = document.getElementById('tone');
+const modeEl = document.getElementById('mode');
 const outEl = document.getElementById('output');
 const statusEl = document.getElementById('status');
 const runBtn = document.getElementById('runBtn');
+const copyBtn = document.getElementById('copyBtn');
+let lastOutput = '';
 
-async function refine(text, tone) {
-  statusEl.textContent = 'Streaming from Observer...';
+const INSTRUCTIONS = {
+  tighten: 'Rewrite the following text to be clearer and more concise. Return only the improved text.',
+  summarize: 'Summarize the following text in 3 concise bullet points.',
+  actions: 'Extract concrete action items as a clean Markdown checklist.',
+  polish: 'Fix grammar and flow while preserving tone and meaning. Return only the edited text.',
+};
+
+async function transform(text, mode) {
+  statusEl.textContent = 'Streaming locally...';
   outEl.textContent = '';
   runBtn.disabled = true;
+  copyBtn.disabled = true;
   try {
-    const prompt = 'Rewrite the following text in a ' + tone + ' tone. Return only the improved text:\\n\\n' + text;
+    const prompt = (INSTRUCTIONS[mode] || INSTRUCTIONS.tighten) + '\\n\\n' + text;
     const final = await window.verdant.ask(prompt, {
       onToken: (partial) => { outEl.textContent = partial; },
     });
+    lastOutput = final;
     outEl.textContent = final;
-    statusEl.textContent = 'Done';
-    window.verdant.emit('refiner.completed', { tone, chars: final.length });
-    return { refined: final, tone };
+    copyBtn.disabled = !final;
+    statusEl.textContent = 'Ready';
+    window.verdant.emit('writer.completed', { mode, chars: final.length });
+    return { mode, output: final };
   } catch (err) {
     const msg = err && err.message ? err.message : String(err);
     outEl.textContent = msg;
-    statusEl.textContent = 'Notice';
+    statusEl.textContent = 'Model Stream required';
     return { error: msg };
   } finally {
     runBtn.disabled = false;
@@ -679,17 +954,22 @@ async function refine(text, tone) {
 
 runBtn.addEventListener('click', () => {
   const txt = srcEl.value.trim();
-  if (!txt) { statusEl.textContent = 'Enter text first.'; return; }
-  void refine(txt, toneEl.value);
+  if (!txt) { statusEl.textContent = 'Paste some text first.'; return; }
+  void transform(txt, modeEl.value);
+});
+
+copyBtn.addEventListener('click', async () => {
+  if (!lastOutput) return;
+  await window.verdant.browser.copyText(lastOutput);
+  await window.verdant.browser.notify('Copied', 'Output copied to clipboard.');
 });
 
 window.verdant.onInput(async (payload) => {
-  const txt = payload && typeof payload.text === 'string' ? payload.text : String(payload?.message || '');
-  const tone = payload && typeof payload.tone === 'string' ? payload.tone : 'concise';
+  const txt = String(payload?.text || payload?.message || '').trim();
+  const mode = String(payload?.mode || 'tighten');
+  if (!txt) return { error: 'Provide text to transform.' };
   srcEl.value = txt;
-  toneEl.value = tone;
-  if (!txt.trim()) return { error: 'Provide text to refine.' };
-  return refine(txt, tone);
+  return transform(txt, mode);
 });`,
         },
       });
@@ -698,27 +978,21 @@ window.verdant.onInput(async (payload) => {
     default:
       return buildSnapshot({
         name: 'Untitled Prism',
-        summary: 'Interactive client-side Prism app connected to VerdantUI.',
+        summary: 'Client-side app built in Verdant Studio.',
         streams: { ...DEFAULT_STREAM_CONTRACT },
         grants: { ...DEFAULT_PRISM_GRANTS },
         app: {
-          html: `<div class="v-card" style="max-width:560px;margin:24px auto;">
-  <h1 style="margin:0 0 6px;font-size:18px;">New Prism</h1>
-  <p class="v-muted" style="margin:0 0 14px;">Describe what you want to build in Verdant Studio, or edit HTML/CSS/JS directly.</p>
-  <button id="helloBtn" class="v-btn v-btn-primary">Send Sensory Pulse</button>
-  <p id="status" class="v-muted" style="margin:12px 0 0;font-size:12px;"></p>
-</div>`,
-          css: ``,
-          js: `const statusEl = document.getElementById('status');
-document.getElementById('helloBtn').addEventListener('click', () => {
-  const at = new Date().toLocaleTimeString();
-  window.verdant.emit('prism.output', { message: 'Pulse at ' + at });
-  statusEl.textContent = 'Sent sensory pulse to Observer at ' + at;
-});
-window.verdant.onInput(async (payload) => {
-  statusEl.textContent = 'Received input: ' + JSON.stringify(payload);
-  return { ok: true, echo: payload };
-});`,
+          html: `<main class="empty-stage">
+  <div class="empty-card">
+    <h1>Untitled Prism</h1>
+    <p class="v-muted">Describe the app you want to build in the chat on the left, pick a starter, or open the <strong>Prism</strong> bar above to edit HTML, CSS, and JS directly.</p>
+  </div>
+</main>`,
+          css: `.empty-stage { min-height: calc(100vh - 40px); display: grid; place-items: center; }
+.empty-card { max-width: 440px; text-align: center; padding: 28px 24px; border-radius: 14px; border: 1px dashed var(--v-border); background: var(--v-surface); }
+.empty-card h1 { margin: 0 0 8px; font-size: 18px; font-weight: 700; }
+.empty-card p { margin: 0; font-size: 13px; line-height: 1.6; }`,
+          js: `window.verdant.onInput(async (payload) => ({ ok: true, received: payload }));`,
         },
       });
   }
@@ -730,15 +1004,22 @@ window.verdant.onInput(async (payload) => {
 
 export function buildStudioSystemPrompt(draft: VerdantPrismSnapshot): string {
   return [
-    'You are Verdant Studio, building a live client-side Prism web app inside VerdantUI.',
-    'The app runs in a sandboxed iframe with built-in Verdant theme CSS variables (--v-bg, --v-surface, --v-border, --v-text, --v-muted, --v-accent) and utility classes (.v-card, .v-btn, .v-btn-primary, .v-input, .v-pill, .v-muted).',
-    'The sandbox exposes window.verdant: emit(name, body), onInput(async (payload) => result), ask(prompt, { onToken }), storage.get(k)/set(k, v), and fetch(url, init).',
-    'Respond concisely and emit ONLY the sections that need to change using fenced code blocks:',
+    'You are Verdant Studio, building a polished, self-contained client-side web app (a Prism) inside VerdantUI.',
+    'Theme tokens available automatically: --v-bg, --v-surface, --v-border, --v-text, --v-muted, --v-accent, --v-accent-text, plus utility classes (.v-card, .v-btn, .v-btn-primary, .v-input, .v-pill, .v-muted).',
+    'Sandbox API on window.verdant:',
+    '- verdant.storage.get(key) / set(key, value): persistent local app state',
+    '- verdant.ask(prompt, { onToken }): stream local AI completions from VerdantUI',
+    '- verdant.onInput(async (payload) => result): respond when invoked from a Thread or another Prism',
+    '- verdant.emit(eventName, body): emit structured OTel telemetry/state events',
+    '- verdant.browser.copyText(text) / downloadFile(name, content, mime) / notify(title, body)',
+    '- verdant.ui.getState() / callPrism(nameOrId, payload) / openPrism(nameOrId)',
+    '- verdant.fetch(url, init): HTTP fetch (requires user Network grant)',
+    'Emit ONLY the sections that need to change using fenced code blocks:',
     '- ```html ... ``` for body markup',
     '- ```css ... ``` for styles',
     '- ```js ... ``` for script logic',
-    '- Optional ```json ... ``` with {"name","summary"} when renaming or updating metadata.',
-    'Keep code clean, self-contained, accessible, and bug-free (no external CDN scripts).',
+    '- Optional ```json ... ``` with {"name","summary","streams"} when updating metadata or input schema.',
+    'Design clean, high-craft UIs with real interactivity and zero external CDN dependencies.',
     '',
     `Current Prism: "${draft.name}" — ${draft.summary}`,
     'Current HTML:',

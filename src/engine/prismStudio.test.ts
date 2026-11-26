@@ -84,16 +84,16 @@ test('Canonical SHA-256 .holo archive round-trips deterministically and rejects 
   );
   assert.equal(canonicalizeJson({ b: 2, a: 1 }), '{"a":1,"b":2}');
 
-  const starter = createStarterSnapshot('dashboard');
+  const starter = createStarterSnapshot('kanban');
   const serialized = serializeHoloArchive(starter);
   const parsed = parseHoloArchive(serialized);
 
   assert.equal(parsed.digest, starter.digest);
-  assert.equal(parsed.name, starter.name);
+  assert.equal(parsed.name, 'Task Board');
   assert.equal(parsed.app.js, starter.app.js);
 
   // Tamper with a single character in app HTML while keeping original digest
-  const tampered = serialized.replace('Sensory Monitor', 'Tampered Monitor');
+  const tampered = serialized.replace('Task Board', 'Tampered Board');
   assert.throws(() => parseHoloArchive(tampered), /Integrity check failed/);
 
   // Detect external binary HOLO magic cleanly
@@ -103,7 +103,7 @@ test('Canonical SHA-256 .holo archive round-trips deterministically and rejects 
 
 test('PrismStore isolates draft vs immutable published snapshot, supports Undo, and isolates per-Prism KV', async () => {
   const store = new PrismStore();
-  const created = await store.create('game', 'Reflex Arena');
+  const created = await store.create('focus', 'Deep Focus');
   const initialDigest = created.draft.digest;
   assert.equal(created.published, null);
 
@@ -130,40 +130,40 @@ test('PrismStore isolates draft vs immutable published snapshot, supports Undo, 
   assert.equal(undone!.revisions.length, 0);
 
   // Scoped per-Prism KV isolation
-  const second = await store.create('blank', 'Second App');
-  await store.setKv(created.id, 'score', 42);
-  await store.setKv(second.id, 'score', 7);
-  assert.equal(await store.getKv(created.id, 'score'), 42);
-  assert.equal(await store.getKv(second.id, 'score'), 7);
+  const second = await store.create('budget', 'Monthly Budget');
+  await store.setKv(created.id, 'sessions', 4);
+  await store.setKv(second.id, 'sessions', 1);
+  assert.equal(await store.getKv(created.id, 'sessions'), 4);
+  assert.equal(await store.getKv(second.id, 'sessions'), 1);
 });
 
 test('extractPrismPatchFromModelOutput applies targeted CSS/JS patches without clobbering untouched sections', () => {
   const base = createStarterSnapshot('blank');
   const modelOutput = [
-    'I styled the card with a softer border and updated the click label.',
+    'Updated the card border and renamed the Prism.',
     '```css',
-    '.v-card { border-width: 2px; }',
+    '.empty-card { border-width: 2px; }',
     '```',
     '```json',
-    '{"name": "Pulse Card"}',
+    '{"name": "Scratchpad"}',
     '```',
   ].join('\n');
 
   const patch = extractPrismPatchFromModelOutput(modelOutput, base);
   assert.ok(patch);
   assert.deepEqual([...patch!.updatedSections].sort(), ['css', 'meta']);
-  assert.equal(patch!.snapshot.name, 'Pulse Card');
-  assert.equal(patch!.snapshot.app.css, '.v-card { border-width: 2px; }');
+  assert.equal(patch!.snapshot.name, 'Scratchpad');
+  assert.equal(patch!.snapshot.app.css, '.empty-card { border-width: 2px; }');
   // Untouched HTML & JS remain byte-identical
   assert.equal(patch!.snapshot.app.html, base.app.html);
   assert.equal(patch!.snapshot.app.js, base.app.js);
   assert.equal(patch!.snapshot.digest, computePrismDigest(patch!.snapshot));
 });
 
-test('Sandbox HTML enforces strict CSP, inherits theme tokens, and FK-07 blocks ungranted network fetches', async () => {
+test('Sandbox HTML enforces strict CSP, hot-CSS hook, browser/ui bridge, and FK-07 capability grants', async () => {
   const snap = buildSnapshot({
-    ...createStarterSnapshot('blank'),
-    grants: { observer: true, storage: true, network: false },
+    ...createStarterSnapshot('writer'),
+    grants: { observer: true, storage: true, browser: true, network: false },
   });
   const html = buildPrismSandboxDocument({
     prismId: 'prism-sec',
@@ -174,18 +174,59 @@ test('Sandbox HTML enforces strict CSP, inherits theme tokens, and FK-07 blocks 
 
   assert.ok(html.includes(VERDANT_SANDBOX_CSP));
   assert.ok(html.includes("connect-src 'none'"));
+  assert.ok(html.includes('id="verdant-user-css"'));
+  assert.ok(html.includes("msg.type === 'hot-css'"));
+  assert.ok(html.includes('browser: Object.freeze'));
+  assert.ok(html.includes('ui: Object.freeze'));
   assert.ok(html.includes('class="dark"'));
-  assert.ok(html.includes('window.verdant = Object.freeze'));
 
   const bus = new ObserverStreamBus();
   const store = new PrismStore();
   const grants = new ContainerGrantMatrix();
-  const pool = new PrismHostPool(bus, store, grants, null);
+  let notifiedTitle = '';
+  const pool = new PrismHostPool(bus, store, grants, null, {
+    onNotify: ({ title }) => {
+      notifiedTitle = title;
+    },
+  });
 
   // Network grant is false by default -> refused before fetch
   await assert.rejects(
     () => pool.proxiedFetch('prism-sec', snap.grants, 'https://example.com/data.json'),
     /Network grant is Off/,
+  );
+
+  // Browser notify succeeds when browser grant is enabled, refused when disabled
+  await pool.notify('prism-sec', snap.grants, 'Saved', 'Export complete');
+  assert.equal(notifiedTitle, 'Saved');
+  await assert.rejects(
+    () =>
+      pool.copyText(
+        'prism-sec',
+        { ...snap.grants, browser: false },
+        'secret',
+      ),
+    /Browser grant is Off/,
+  );
+
+  // Prism-to-Prism composition & self-recursion guard
+  const p1 = await store.create('kanban', 'Task Board');
+  const p2 = await store.create('budget', 'Expense Tracker');
+  await store.publish(p1.id);
+  await store.publish(p2.id);
+
+  const composed = (await pool.callPrism(
+    p1.id,
+    p1.draft.grants,
+    'Expense Tracker',
+    { action: 'summary' },
+  )) as Record<string, unknown>;
+  assert.equal(composed.ok, true);
+  assert.equal(composed.name, 'Expense Tracker');
+
+  await assert.rejects(
+    () => pool.callPrism(p1.id, p1.draft.grants, 'Task Board', {}),
+    /Self-recursive Prism call refused/,
   );
 
   // Explicit FK-07 denial on prism-storage overrides Prism's own storage=true grant
@@ -203,22 +244,22 @@ test('Published Prisms register JSON Schema 2020-12 tools and route predictably 
   const observer = new VerdantCognitiveObserver();
   const pool = new PrismHostPool(bus, store, observer.grants, null);
 
-  const proj = await store.create('dashboard', 'Sensory Monitor');
+  const proj = await store.create('kanban', 'Task Board');
   await store.publish(proj.id);
   const published = store.listPublishedSummaries();
   assert.equal(published.length, 1);
 
-  // Normal conversation mentioning the word "monitor" MUST NOT be hijacked
+  // Normal conversation mentioning "task board" MUST NOT be hijacked
   assert.equal(
-    detectExplicitPrismAddress('Can you explain how a heart monitor works?', published),
+    detectExplicitPrismAddress('Can you explain how a kanban task board works?', published),
     null,
   );
 
-  // Explicit @Sensory Monitor routes deterministically at LOD0 even with Model Stream Off
+  // Explicit @Task Board routes deterministically at LOD0 even with Model Stream Off
   const route = observer.selectRoute({
     threadId: 'thread-a',
     messages: [],
-    latestUserText: '@Sensory Monitor check status',
+    latestUserText: '@Task Board add Ship v2',
     hasAttachment: false,
     activeModel: null,
     cachedModelIds: [],
@@ -249,7 +290,7 @@ test('Published Prisms register JSON Schema 2020-12 tools and route predictably 
   assert.equal((tools[toolKey].parameters as { type?: string }).type, 'object');
 
   const execResult = (await tools[toolKey].execute!(
-    { action: 'status' },
+    { action: 'list' },
     { toolCallId: 'tc_1', abortSignal: new AbortController().signal, human: async () => undefined } as never,
   )) as Record<string, unknown>;
   assert.equal(execResult.__prismInvocation, true);

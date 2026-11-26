@@ -8,6 +8,7 @@ import {
   ErrorPrimitive,
   MessagePrimitive,
   ThreadPrimitive,
+  useAui,
   useAuiState,
   type ReasoningMessagePartProps,
   type ThreadMessage,
@@ -45,7 +46,7 @@ import {
   type CognitiveRouteCertificate,
 } from '../engine/cognitiveObserver';
 import { isInternalBootstrapModel } from '../engine/modelCatalog';
-import { shortPrismDigest } from '../engine/prismStudio';
+import { shortPrismDigest, type PublishedPrismSummary } from '../engine/prismStudio';
 import type { EngineState } from '../engine/workerClient';
 
 interface ThreadViewProps {
@@ -55,6 +56,8 @@ interface ThreadViewProps {
   onDismissError?: () => void;
   onToggleInspector: () => void;
   onOpenPrism?: (prismId: string) => void;
+  onEditPrism?: (prismId: string) => void;
+  publishedPrisms?: readonly PublishedPrismSummary[];
   onSpeculativeDraftChange?: (
     messages: readonly ThreadMessage[],
     draftText: string,
@@ -200,6 +203,77 @@ const ComposerContextMeter: FC<{
   );
 };
 
+const ComposerPrismMentionPicker: FC<{
+  publishedPrisms: readonly PublishedPrismSummary[];
+  forceOpen: boolean;
+  onClose: () => void;
+}> = ({ publishedPrisms, forceOpen, onClose }) => {
+  const aui = useAui();
+  const composerText = useAuiState((s) => s.composer.text);
+
+  if (publishedPrisms.length === 0) return null;
+
+  const trimmed = composerText.trimStart();
+  const atMatch = trimmed.match(/^@([^\n:]*)$/);
+  const query = atMatch ? atMatch[1].toLowerCase() : '';
+  const open = forceOpen || Boolean(atMatch);
+  if (!open) return null;
+
+  const matches = publishedPrisms.filter((p) => {
+    if (!query) return true;
+    return (
+      p.name.toLowerCase().includes(query) ||
+      p.slug.toLowerCase().includes(query) ||
+      p.summary.toLowerCase().includes(query)
+    );
+  });
+
+  if (matches.length === 0) return null;
+
+  return (
+    <div
+      role="listbox"
+      aria-label="Published Prisms"
+      className="mx-3 mt-2 rounded-lg border border-slate-200 bg-slate-50/90 p-1.5 shadow-xs dark:border-slate-700 dark:bg-[#0F141C]"
+    >
+      <div className="mb-1 flex items-center justify-between px-2 text-[10px] font-semibold tracking-wide text-slate-500 uppercase dark:text-slate-400">
+        <span>Published Prisms</span>
+        {forceOpen && (
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+          >
+            Close
+          </button>
+        )}
+      </div>
+      <div className="space-y-0.5">
+        {matches.map((p) => (
+          <button
+            key={p.id}
+            type="button"
+            role="option"
+            onClick={() => {
+              aui.composer().setText(`@${p.name} `);
+              onClose();
+            }}
+            className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-emerald-50 dark:hover:bg-emerald-950/50 transition-colors"
+          >
+            <span className="inline-flex min-w-0 items-center gap-1.5 font-medium text-slate-900 dark:text-slate-100">
+              <Sparkles className="h-3.5 w-3.5 shrink-0 text-emerald-700 dark:text-emerald-400" />
+              <span className="truncate">@{p.name}</span>
+            </span>
+            <span className="truncate text-[11px] text-slate-500 dark:text-slate-400">
+              {p.summary}
+            </span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+};
+
 const MarkdownText: FC = () => (
   <div className="aui-md">
     <MarkdownTextPrimitive remarkPlugins={[remarkGfm]} />
@@ -277,7 +351,7 @@ const VerdantToolCallPart: ToolCallMessagePartComponent = ({
   isError,
   status,
 }) => {
-  const { onOpenPrism } = useContext(AssistantMessageContext);
+  const { onOpenPrism, onEditPrism } = useContext(AssistantMessageContext);
   const [expanded, setExpanded] = useState(false);
   const isRunning = status?.type === 'running' || (result === undefined && !isError);
   const formattedArgs = argsText?.trim() || formatToolJson(args);
@@ -295,12 +369,22 @@ const VerdantToolCallPart: ToolCallMessagePartComponent = ({
       : null;
 
   if (prismPayload) {
+    const outObj =
+      prismPayload.output && typeof prismPayload.output === 'object' && !Array.isArray(prismPayload.output)
+        ? (prismPayload.output as Record<string, unknown>)
+        : null;
+    const summaryEntries = outObj
+      ? Object.entries(outObj)
+          .filter(([, v]) => typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean')
+          .slice(0, 4)
+      : [];
+
     return (
       <div
         data-testid={`prism-stream-card-${prismPayload.prismId}`}
         className="my-2.5 rounded-xl border border-emerald-700/30 bg-emerald-50/40 dark:border-emerald-500/30 dark:bg-emerald-950/20"
       >
-        <div className="flex items-center justify-between gap-2 px-3 py-2">
+        <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
           <button
             type="button"
             aria-expanded={expanded}
@@ -318,17 +402,38 @@ const VerdantToolCallPart: ToolCallMessagePartComponent = ({
               #{shortPrismDigest(prismPayload.digest)}
             </span>
           </button>
-          {onOpenPrism && (
-            <button
-              type="button"
-              onClick={() => onOpenPrism(prismPayload.prismId)}
-              className="inline-flex shrink-0 items-center gap-1 rounded-md bg-[#0F5132] px-2 py-1 text-[11px] font-medium text-white hover:bg-[#0B3D25] transition-colors"
-            >
-              <ExternalLink className="h-3 w-3" />
-              <span>Open App</span>
-            </button>
-          )}
+          <div className="flex shrink-0 items-center gap-1.5">
+            {onEditPrism && (
+              <button
+                type="button"
+                onClick={() => onEditPrism(prismPayload.prismId)}
+                className="inline-flex items-center rounded-md border border-emerald-700/30 bg-white px-2 py-1 text-[11px] font-medium text-emerald-900 hover:bg-emerald-50 dark:border-emerald-500/30 dark:bg-[#0F141C] dark:text-emerald-300 dark:hover:bg-emerald-950/50 transition-colors"
+              >
+                Studio
+              </button>
+            )}
+            {onOpenPrism && (
+              <button
+                type="button"
+                onClick={() => onOpenPrism(prismPayload.prismId)}
+                className="inline-flex items-center gap-1 rounded-md bg-[#0F5132] px-2 py-1 text-[11px] font-medium text-white hover:bg-[#0B3D25] transition-colors"
+              >
+                <ExternalLink className="h-3 w-3" />
+                <span>Open App</span>
+              </button>
+            )}
+          </div>
         </div>
+        {summaryEntries.length > 0 && !expanded && (
+          <div className="flex flex-wrap gap-x-3 gap-y-1 border-t border-emerald-700/15 px-3 py-1.5 text-[11px] text-slate-700 dark:border-emerald-500/15 dark:text-slate-300">
+            {summaryEntries.map(([k, v]) => (
+              <span key={k}>
+                <span className="text-slate-500 dark:text-slate-400">{k}:</span>{' '}
+                <strong className="font-mono font-medium">{String(v)}</strong>
+              </span>
+            ))}
+          </div>
+        )}
         {expanded && (
           <div className="border-t border-emerald-700/20 px-3 py-2 text-[11px] dark:border-emerald-500/20">
             <pre className="overflow-x-auto rounded-md bg-white p-2 font-mono text-slate-700 dark:bg-[#0B0F14] dark:text-slate-300">
@@ -514,6 +619,7 @@ interface AssistantMessageContextValue {
   readonly statusDetail: string;
   readonly onInspectRoute: () => void;
   readonly onOpenPrism?: (prismId: string) => void;
+  readonly onEditPrism?: (prismId: string) => void;
 }
 
 const AssistantMessageContext = createContext<AssistantMessageContextValue>({
@@ -615,9 +721,12 @@ export const ThreadView: FC<ThreadViewProps> = ({
   onDismissError,
   onToggleInspector,
   onOpenPrism,
+  onEditPrism,
+  publishedPrisms = [],
   onSpeculativeDraftChange,
   onCountTokens,
 }) => {
+  const [prismPickerOpen, setPrismPickerOpen] = useState(false);
   const isDownloading = engineState.status === 'downloading';
   const isModelLoading = isDownloading || engineState.status === 'loading';
   const modelReady = engineState.model !== null && !isModelLoading;
@@ -635,8 +744,9 @@ export const ThreadView: FC<ThreadViewProps> = ({
       statusDetail: engineState.statusDetail,
       onInspectRoute: onToggleInspector,
       onOpenPrism,
+      onEditPrism,
     }),
-    [engineState.statusDetail, onToggleInspector, onOpenPrism],
+    [engineState.statusDetail, onToggleInspector, onOpenPrism, onEditPrism],
   );
 
   return (
@@ -854,6 +964,12 @@ export const ThreadView: FC<ThreadViewProps> = ({
           </div>
 
           <ComposerPrimitive.Root className="rounded-xl border border-slate-200 bg-white shadow-xs focus-within:border-emerald-800 dark:border-slate-800 dark:bg-[#121821] dark:focus-within:border-emerald-500 transition-colors">
+            <ComposerPrismMentionPicker
+              publishedPrisms={publishedPrisms}
+              forceOpen={prismPickerOpen}
+              onClose={() => setPrismPickerOpen(false)}
+            />
+
             <div className="flex flex-wrap gap-1.5 px-3 pt-2.5 empty:hidden">
               <ComposerPrimitive.Attachments
                 components={{ Attachment: ComposerAttachmentItem }}
@@ -862,7 +978,11 @@ export const ThreadView: FC<ThreadViewProps> = ({
 
             <ComposerPrimitive.Input
               aria-label="Message prompt"
-              placeholder="Ask VerdantUI anything..."
+              placeholder={
+                publishedPrisms.length > 0
+                  ? 'Ask VerdantUI anything, or type @ to address a Published Prism...'
+                  : 'Ask VerdantUI anything...'
+              }
               rows={2}
               autoFocus
               className="max-h-56 w-full resize-none overflow-y-auto bg-transparent px-4 pt-3.5 pb-2 text-[15px] text-slate-900 outline-none placeholder:text-slate-400 dark:text-slate-100 dark:placeholder:text-slate-500"
@@ -885,6 +1005,22 @@ export const ThreadView: FC<ThreadViewProps> = ({
                 >
                   VerdantUI
                 </button>
+                {publishedPrisms.length > 0 && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <button
+                      type="button"
+                      onClick={() => setPrismPickerOpen((prev) => !prev)}
+                      className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-medium text-emerald-800 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/50 transition-colors"
+                      title="Address a Published Prism with @"
+                    >
+                      <Sparkles className="h-3 w-3" />
+                      <span>
+                        {publishedPrisms.length} Prism{publishedPrisms.length === 1 ? '' : 's'}
+                      </span>
+                    </button>
+                  </>
+                )}
                 <ComposerContextMeter
                   engineState={engineState}
                   modelReady={modelReady}

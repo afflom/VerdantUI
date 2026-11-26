@@ -2,8 +2,10 @@ import { useState, type FC } from 'react';
 import { CheckCircle2, Play, RotateCcw, ShieldCheck, X, XCircle } from 'lucide-react';
 import { formatBytes } from '../engine/modelCatalog';
 import type { SamplingConfig } from '../engine/llamaRuntime';
+import type { ObserverStreamBus } from '../engine/observerStreamBus';
 import type { PrecisionContractMode } from '../engine/performanceContract';
 import { COGNITIVE_AXIS_LABELS } from '../engine/cognitiveObserver';
+import type { PublishedPrismSummary } from '../engine/prismStudio';
 import type { WeightResidencyPolicy } from '../engine/vramWeightPager';
 import type { EngineState, PromptFormatMode } from '../engine/workerClient';
 import { VTENSOR_CONTRACT } from '../engine/vtensorProvider';
@@ -12,6 +14,8 @@ interface VTensorInspectorProps {
   open: boolean;
   onClose: () => void;
   engineState: EngineState;
+  publishedPrisms?: readonly PublishedPrismSummary[];
+  observerBus?: ObserverStreamBus;
   onClearHarness: () => void;
   onClearCache?: () => Promise<void>;
   onUpdateSampling: (patch: Partial<SamplingConfig>) => void;
@@ -28,6 +32,8 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
   open,
   onClose,
   engineState,
+  publishedPrisms = [],
+  observerBus,
   onClearHarness,
   onClearCache,
   onUpdateSampling,
@@ -786,6 +792,46 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
                       </dd>
                     </div>
                   )}
+                </dl>
+              </section>
+            )}
+
+            {observerBus && (
+              <section>
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="font-semibold text-slate-900 dark:text-slate-100">
+                    Prisms &amp; OpenTelemetry Traces
+                  </h3>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const json = JSON.stringify(observerBus.toOtlpJson(), null, 2);
+                      const blob = new Blob([json], { type: 'application/json' });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = 'verdant-ui-otlp.json';
+                      a.click();
+                      URL.revokeObjectURL(url);
+                    }}
+                    className="inline-flex h-7 items-center rounded-md border border-slate-200 bg-white px-2 text-[11px] font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800 transition-colors"
+                  >
+                    Export OTLP
+                  </button>
+                </div>
+                <dl className="mt-2 divide-y divide-slate-100 rounded-lg border border-slate-200 dark:divide-slate-800 dark:border-slate-800">
+                  <div className="flex justify-between px-3 py-1.5">
+                    <dt className="text-slate-500 dark:text-slate-400">Published Prisms</dt>
+                    <dd className="font-mono tabular-nums text-slate-900 dark:text-slate-100">
+                      {publishedPrisms.length}
+                    </dd>
+                  </div>
+                  <div className="flex justify-between px-3 py-1.5">
+                    <dt className="text-slate-500 dark:text-slate-400">Recorded Spans / Events</dt>
+                    <dd className="font-mono tabular-nums text-slate-900 dark:text-slate-100">
+                      {observerBus.getRecentSpans().length} / {observerBus.getRecentEvents().length}
+                    </dd>
+                  </div>
                 </dl>
               </section>
             )}

@@ -154,6 +154,11 @@ export function buildPrismSandboxDocument(opts: {
       document.documentElement.classList.toggle('dark', Boolean(msg.payload && msg.payload.dark));
       return;
     }
+    if (msg.type === 'hot-css') {
+      const styleEl = document.getElementById('verdant-user-css');
+      if (styleEl) styleEl.textContent = String((msg.payload && msg.payload.css) || '');
+      return;
+    }
     if (msg.type === 'rpc-token' && msg.payload && msg.payload.reqId) {
       const cb = tokenCallbacks.get(msg.payload.reqId);
       if (cb) { try { cb(msg.payload.text); } catch (_) {} }
@@ -219,8 +224,26 @@ export function buildPrismSandboxDocument(opts: {
       get(key) { return callHost('storage.get', { key: String(key || '') }); },
       set(key, value) { return callHost('storage.set', { key: String(key || ''), value }); },
     }),
-    fetch(url, init) {
-      return callHost('fetch', { url: String(url || ''), init: init || {} });
+    browser: Object.freeze({
+      copyText(text) { return callHost('browser.copyText', { text: String(text || '') }); },
+      downloadFile(filename, content, mimeType) {
+        return callHost('browser.downloadFile', {
+          filename: String(filename || 'export.txt'),
+          content: String(content || ''),
+          mimeType: String(mimeType || 'text/plain'),
+        });
+      },
+      notify(title, body) {
+        return callHost('browser.notify', { title: String(title || ''), body: String(body || '') });
+      },
+    }),
+    ui: Object.freeze({
+      getState() { return callHost('ui.getState', {}); },
+      callPrism(target, payload) { return callHost('ui.callPrism', { target: String(target || ''), payload }); },
+      openPrism(target) { return callHost('ui.openPrism', { target: String(target || '') }); },
+    }),
+    fetch(url, init, opts) {
+      return callHost('fetch', { url: String(url || ''), init: init || {} }, opts && opts.onChunk);
     },
   });
 
@@ -237,7 +260,7 @@ export function buildPrismSandboxDocument(opts: {
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta http-equiv="Content-Security-Policy" content="${VERDANT_SANDBOX_CSP}" />
 <style>${VERDANT_BASE_STYLES}</style>
-<style>${safeCss}</style>
+<style id="verdant-user-css">${safeCss}</style>
 <script>${bridgeScript}</script>
 </head>
 <body>
