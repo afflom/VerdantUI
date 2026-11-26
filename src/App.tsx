@@ -11,7 +11,7 @@ import {
   useLocalRuntime,
   useRemoteThreadListRuntime,
 } from '@assistant-ui/react';
-import { Menu, Moon, Shield, ShieldOff, SlidersHorizontal, Sun } from 'lucide-react';
+import { Menu, Moon, SlidersHorizontal, Sun } from 'lucide-react';
 import { SettingsDrawer } from './components/SettingsDrawer';
 import { ThreadSidebar } from './components/ThreadSidebar';
 import { ThreadView } from './components/ThreadView';
@@ -28,10 +28,6 @@ import {
   buildUnifiedVerdantModelContext,
   createVerdantClientTools,
 } from './engine/cognitiveObserver';
-import {
-  DEFAULT_USER_SPACES,
-  type ContextCompartmentId,
-} from './engine/unifiedPossessionModel';
 import type { ImportedHarnessSpec } from './engine/harnessConfig';
 import { isInternalBootstrapModel } from './engine/modelCatalog';
 import { ObserverStreamBus } from './engine/observerStreamBus';
@@ -215,8 +211,6 @@ export default function App() {
   }, []);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [darkMode, setDarkMode] = useState<boolean>(readInitialDarkMode);
-  const [activeSpace, setActiveSpace] = useState<ContextCompartmentId>('personal');
-  const [sharingPaused, setSharingPaused] = useState(false);
 
   const publishedPrisms = useMemo(
     () => prismStore.listPublishedSummaries(),
@@ -225,11 +219,9 @@ export default function App() {
     [prismStore, prisms],
   );
 
-  // Sync owned Prisms, active space, and global pause switch into unified possession model,
-  // and filter visible Published Prisms strictly to the active Space (zero cross-space name/detail leaks!)
+  // Sync owned Prisms into the unified possession model and scope visible Prisms cleanly.
   const { opaqueConstraintsNotice, visiblePublishedPrisms } = useMemo(() => {
-    workerClient.cognitiveObserver.possession.setActiveCompartment(activeSpace);
-    workerClient.cognitiveObserver.possession.setHalted(sharingPaused);
+    const activeSpace = workerClient.cognitiveObserver.possession.getActiveCompartmentId();
     workerClient.cognitiveObserver.syncPublishedPrisms(prisms);
     return {
       opaqueConstraintsNotice:
@@ -239,7 +231,7 @@ export default function App() {
         activeSpace,
       ),
     };
-  }, [workerClient, activeSpace, sharingPaused, prisms, publishedPrisms]);
+  }, [workerClient, prisms, publishedPrisms]);
 
   useEffect(() => {
     let toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -393,17 +385,10 @@ export default function App() {
   }, [workerClient]);
 
   const handleCreatePrism = useCallback(() => {
-    void prismStore.createDeclarative('undefined').then(async (created) => {
-      if (activeSpace && activeSpace !== 'personal') {
-        await prismStore.applyStudioOp(
-          created.id,
-          { op: 'set-concept-profile', compartmentId: activeSpace },
-          { pushRevision: false },
-        );
-      }
+    void prismStore.createDeclarative('undefined').then((created) => {
       setActiveView({ kind: 'prism', prismId: created.id, mode: 'studio' });
     });
-  }, [prismStore, activeSpace]);
+  }, [prismStore]);
 
   const handleImportHoloFile = useCallback(
     async (file: File) => {
@@ -497,47 +482,6 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
-            {/* Plain-language Active Space selector & global Pause Sharing kill switch (DEC-010 / DEC-011) */}
-            <div className="hidden md:flex items-center gap-1 rounded-lg border border-slate-200 bg-slate-50/80 p-0.5 dark:border-slate-700 dark:bg-[#141B26]">
-              {DEFAULT_USER_SPACES.map((sp) => {
-                const isActive = activeSpace === sp.id;
-                return (
-                  <button
-                    key={sp.id}
-                    type="button"
-                    onClick={() => setActiveSpace(sp.id)}
-                    title={`Switch active space to ${sp.label} (keeps private details isolated across spaces)`}
-                    className={`rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
-                      isActive
-                        ? 'bg-emerald-700 text-white'
-                        : 'text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white'
-                    }`}
-                  >
-                    {sp.label}
-                  </button>
-                );
-              })}
-            </div>
-
-            <button
-              type="button"
-              onClick={() => setSharingPaused((p) => !p)}
-              aria-pressed={sharingPaused}
-              title={
-                sharingPaused
-                  ? 'External & cross-space sharing is paused. Click to resume privacy-shielded availability.'
-                  : 'Privacy Shield active: private details never leave their space. Click to pause all external sharing.'
-              }
-              className={`hidden sm:inline-flex h-9 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                sharingPaused
-                  ? 'border-amber-500/50 bg-amber-50 text-amber-900 hover:bg-amber-100 dark:border-amber-500/40 dark:bg-amber-950/50 dark:text-amber-200'
-                  : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800'
-              }`}
-            >
-              {sharingPaused ? <ShieldOff className="h-3.5 w-3.5" /> : <Shield className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />}
-              <span>{sharingPaused ? 'Paused' : 'Private'}</span>
-            </button>
-
             {(() => {
               const streamOn = engineState.modelStreamEnabled;
               const isStreaming =
@@ -676,10 +620,6 @@ export default function App() {
             onClose={() => setSettingsOpen(false)}
             darkMode={darkMode}
             onToggleDarkMode={() => setDarkMode((d) => !d)}
-            activeSpace={activeSpace}
-            onSelectSpace={setActiveSpace}
-            sharingPaused={sharingPaused}
-            onToggleSharingPaused={() => setSharingPaused((p) => !p)}
             cachedBytes={engineState.opfsStorage?.usageBytes ?? 0}
             onClearCache={handleClearCache}
             debugMode={debugMode}

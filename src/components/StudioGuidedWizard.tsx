@@ -1,11 +1,8 @@
 /**
  * Conversational Verdant Studio Creator (`src/components/StudioGuidedWizard.tsx`)
  *
- * Implements DEC-011 (Zero Technical Jargon) & DEC-012 (Zero User Tunables / Zero Manual Uploads):
- * - Plain human language only — no "routing", "weights", "models", "WASM", or engineering terms.
- * - Clean creation types: Game, Picture, Audio, Writing, Video, Research, Tool.
- * - Per-creation Space selector (Personal, Work, Health, Research) and Privacy Shield switch
- *   ("Share busy times only — never details").
+ * Implements DEC-011 (Zero Technical Jargon), DEC-012 (Zero User Tunables / Zero Manual Uploads),
+ * and DEC-013 (Automatic Natural-Language Media Selection — no media-type or space button clutter).
  */
 
 import {
@@ -22,7 +19,6 @@ import {
   Globe,
   Loader2,
   Send,
-  Shield,
   Sparkles,
   Square,
 } from 'lucide-react';
@@ -51,7 +47,6 @@ import {
   type AgentChatTurn,
 } from '../engine/prismStudioAgent';
 import { PRISM_MEDIA_CATALOG, type PrismMediaType } from '../engine/prismMediaOrgans';
-import { DEFAULT_USER_SPACES, type ContextCompartmentId } from '../engine/unifiedPossessionModel';
 import type { EngineStatus } from '../engine/workerClient';
 
 interface StudioGuidedWizardProps {
@@ -142,48 +137,6 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
     onCancelStudioAgent?.();
     setThinking(false);
   }, [onCancelStudioAgent]);
-
-  const handleChangeSpace = useCallback(
-    async (nextSpace: ContextCompartmentId) => {
-      if (declaration.view?.proceduralOrgan) {
-        const primaryReq = declaration.requirements[0]?.id ?? 'REQ-01';
-        const curW = declaration.view.proceduralOrgan.weights;
-        const nextWeights =
-          curW.mediaType === 'tool-organ' || curW.mediaType === 'research-program'
-            ? { ...curW, compartmentId: nextSpace }
-            : curW;
-        await onDispatchOp({
-          op: 'route-prism-weights',
-          mediaType: declaration.view.proceduralOrgan.mediaType,
-          activeOrgans: declaration.view.proceduralOrgan.activeOrgans,
-          weights: nextWeights,
-          compartmentId: nextSpace,
-          citation: { kind: 'req', requirementId: primaryReq },
-        });
-      } else {
-        await onDispatchOp({
-          op: 'set-concept-profile',
-          compartmentId: nextSpace,
-        });
-      }
-    },
-    [declaration, onDispatchOp],
-  );
-
-  const handleToggleOpaqueSharing = useCallback(async () => {
-    const organ = declaration.view?.proceduralOrgan;
-    if (!organ || organ.weights.mediaType !== 'tool-organ') return;
-    const primaryReq = declaration.requirements[0]?.id ?? 'REQ-01';
-    const nextShare = !organ.weights.emitsOpaqueConstraints;
-    await onDispatchOp({
-      op: 'route-prism-weights',
-      mediaType: organ.mediaType,
-      activeOrgans: organ.activeOrgans,
-      weights: { ...organ.weights, emitsOpaqueConstraints: nextShare },
-      compartmentId: declaration.concept.compartmentId,
-      citation: { kind: 'req', requirementId: primaryReq },
-    });
-  }, [declaration, onDispatchOp]);
 
   const submitNaturalMessage = useCallback(
     async (rawMessage: string) => {
@@ -347,63 +300,13 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
     return currentPrompt.quickReplies;
   }, [activeStep, agentQuickReplies, currentPrompt.quickReplies, routing.isUndefined]);
 
-  const activeMediaForUi =
-    declaration.view?.proceduralOrgan?.mediaType ?? declaration.concept.mediaType ?? null;
-
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col bg-white dark:bg-[#0E131B]">
-      {/* Space & Privacy Bar (shown cleanly without media-type button clutter; model infers type automatically) */}
-      {(activeMediaForUi !== null || declaration.concept.compartmentId || isLoadingAi) && (
-        <div className="flex shrink-0 flex-wrap items-center justify-between gap-1.5 border-b border-zinc-100 bg-white px-3 py-1.5 text-[11px] dark:border-zinc-800/80 dark:bg-[#0E131B]">
-          <div className="flex items-center gap-1">
-            <span className="font-medium text-zinc-500 dark:text-zinc-400">Space:</span>
-            {DEFAULT_USER_SPACES.map((sp) => {
-              const currentSpace = declaration.concept.compartmentId ?? 'personal';
-              const isSelected = currentSpace === sp.id;
-              return (
-                <button
-                  key={sp.id}
-                  type="button"
-                  onClick={() => void handleChangeSpace(sp.id)}
-                  className={`rounded px-2 py-0.5 font-medium transition-colors ${
-                    isSelected
-                      ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
-                      : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
-                  }`}
-                >
-                  {sp.label}
-                </button>
-              );
-            })}
-          </div>
-          <div className="flex items-center gap-1.5">
-            {isLoadingAi && (
-              <span className="text-[10px] font-medium text-zinc-500 tabular-nums">
-                Preparing AI {Math.round(engineProgressPercent)}%
-              </span>
-            )}
-            {declaration.view?.proceduralOrgan?.weights.mediaType === 'tool-organ' && (
-              <button
-                type="button"
-                role="switch"
-                aria-checked={declaration.view.proceduralOrgan.weights.emitsOpaqueConstraints}
-                onClick={() => void handleToggleOpaqueSharing()}
-                className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors ${
-                  declaration.view.proceduralOrgan.weights.emitsOpaqueConstraints
-                    ? 'border-emerald-500/50 bg-emerald-50 text-emerald-800 dark:border-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300'
-                    : 'border-zinc-200 bg-zinc-50 text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400'
-                }`}
-                title="Share busy time blocks across spaces without revealing any private details"
-              >
-                <Shield className="h-2.5 w-2.5" />
-                <span>
-                  {declaration.view.proceduralOrgan.weights.emitsOpaqueConstraints
-                    ? 'Share busy times only (never details)'
-                    : 'Private to this space only'}
-                </span>
-              </button>
-            )}
-          </div>
+      {isLoadingAi && (
+        <div className="flex shrink-0 items-center justify-end border-b border-zinc-100 bg-white px-3 py-1.5 text-[11px] dark:border-zinc-800/80 dark:bg-[#0E131B]">
+          <span className="text-[10px] font-medium text-zinc-500 tabular-nums">
+            Preparing AI {Math.round(engineProgressPercent)}%
+          </span>
         </div>
       )}
 
