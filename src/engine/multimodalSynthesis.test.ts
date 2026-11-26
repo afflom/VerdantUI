@@ -11,7 +11,7 @@ import {
   encodeStereoWav,
   synthesizeCompositionStereoPcm,
 } from './audioSynthesisEngine';
-import { evaluateRenderedFrameCoherence } from './visionCritiqueLoop';
+import { evaluateRenderedFrameCoherence, perceiveImageFrame } from './visionCritiqueLoop';
 import { MultimodalCoherenceCoordinator } from './multimodalCoordinator';
 import { GgmlType } from './gguf';
 import { SiglipVisionEncoder, type TensorSlice, type VisionWeights } from './visionEncoder';
@@ -208,4 +208,15 @@ test('Closed-loop Vision self-critique catches blank frames, approves coherent v
   assert.equal(pass1.visionTokensEncoded, 1);
   assert.equal(pass1.visionCacheHit, false);
   assert.equal(pass2.visionCacheHit, true);
+
+  // 3. Full perceiveImageFrame extracts dominant palette hex swatches + human summary + 0ms kappa cache
+  const freshCoord = new MultimodalCoherenceCoordinator();
+  const pA = await perceiveImageFrame('emerald-grid.png', { rgba: rich, width: 16, height: 16 }, { coordinator: freshCoord });
+  const pB = await perceiveImageFrame('emerald-grid.png', { rgba: rich, width: 16, height: 16 }, { coordinator: freshCoord });
+  assert.ok(pA.dominantColors.length >= 2);
+  assert.ok(pA.dominantColors.every((c) => /^#[0-9a-f]{6}$/.test(c)));
+  assert.ok(pA.summary.includes('emerald-grid.png'));
+  assert.equal(pA.visionCacheHit, false);
+  assert.equal(pB.visionCacheHit, true);
+  assert.equal(freshCoord.getTelemetry().visualCacheHits, 1);
 });

@@ -46,7 +46,9 @@ import {
   UNIFIED_VERDANT_SYSTEM_PROMPT,
 } from '../engine/cognitiveObserver';
 import { shortPrismDigest, type PublishedPrismSummary } from '../engine/prismStudio';
-import { BrowserVoiceRecorder, computeLogMelSpectrogram } from '../engine/audioFrontend';
+import { BrowserVoiceRecorder } from '../engine/audioFrontend';
+import type { PerceivedAudioReport } from '../engine/inference.worker';
+import type { PerceivedImageReport } from '../engine/visionCritiqueLoop';
 import type { EngineState } from '../engine/workerClient';
 
 interface ThreadViewProps {
@@ -65,6 +67,10 @@ interface ThreadViewProps {
     threadId?: string,
   ) => void;
   onCountTokens?: (prompt: string) => Promise<{ tokenCount: number; maxContextWindow: number }>;
+  onPerceiveImage?: (name: string, width: number, height: number, rgba: Uint8Array) => Promise<PerceivedImageReport>;
+  onClearPendingImage?: () => void;
+  onPerceiveAudio?: (pcm16k: Float32Array) => Promise<PerceivedAudioReport>;
+  onClearPendingAudio?: () => void;
 }
 
 const SpeculativePrefillDriver: FC<{
@@ -638,14 +644,43 @@ export const ThreadView: FC<ThreadViewProps> = ({
   onEditPrism,
   publishedPrisms = [],
   onSpeculativeDraftChange,
-  onCountTokens,
+  onPerceiveImage,
+  onClearPendingImage,
+  onPerceiveAudio,
+  onClearPendingAudio,
 }) => {
   const [prismPickerOpen, setPrismPickerOpen] = useState(false);
-  const [attachedImage, setAttachedImage] = useState<{ readonly name: string; readonly previewUrl: string; readonly width: number; readonly height: number } | null>(null);
+  const [attachedImage, setAttachedImage] = useState<{
+    readonly name: string;
+    readonly previewUrl: string;
+    readonly width: number;
+    readonly height: number;
+    readonly ready: boolean;
+  } | null>(null);
   const [recordingVoice, setRecordingVoice] = useState(false);
   const [voiceNoteSummary, setVoiceNoteSummary] = useState<string | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const voiceRecorderRef = useRef<BrowserVoiceRecorder | null>(null);
+  const hadPendingImageRef = useRef(false);
+  const hadPendingAudioRef = useRef(false);
+
+  // Clear local preview badges automatically once consumed by an outgoing message
+  useEffect(() => {
+    const hasImg = engineState.pendingImageContext !== null;
+    if (hadPendingImageRef.current && !hasImg && attachedImage) {
+      URL.revokeObjectURL(attachedImage.previewUrl);
+      setAttachedImage(null);
+    }
+    hadPendingImageRef.current = hasImg;
+  }, [engineState.pendingImageContext, attachedImage]);
+
+  useEffect(() => {
+    const hasAud = engineState.pendingAudioContext !== null;
+    if (hadPendingAudioRef.current && !hasAud && voiceNoteSummary) {
+      setVoiceNoteSummary(null);
+    }
+    hadPendingAudioRef.current = hasAud;
+  }, [engineState.pendingAudioContext, voiceNoteSummary]);
 
   const handlePickImage = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -656,8 +691,35 @@ export const ThreadView: FC<ThreadViewProps> = ({
     img.onload = () => {
       setAttachedImage((prev) => {
         if (prev) URL.revokeObjectURL(prev.previewUrl);
-        return { name: file.name, previewUrl: url, width: img.naturalWidth, height: img.naturalHeight };
+        return {
+          name: file.name,
+          previewUrl: url,
+          width: img.naturalWidth,
+          height: img.naturalHeight,
+          ready: !onPerceiveImage,
+        };
       });
+      if (onPerceiveImage) {
+        const maxSide = 384;
+        const scale = Math.min(1, maxSide / Math.max(1, img.naturalWidth, img.naturalHeight));
+        const w = Math.max(1, Math.round(img.naturalWidth * scale));
+        const h = Math.max(1, Math.round(img.naturalHeight * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx2d = canvas.getContext('2d');
+        if (ctx2d) {
+          ctx2d.drawImage(img, 0, 0, w, h);
+          const pixels = ctx2d.getImageData(0, 0, w, h).data;
+          void onPerceiveImage(file.name, w, h, new Uint8Array(pixels.buffer))
+            .then(() => {
+              setAttachedImage((cur) => (cur && cur.previewUrl === url ? { ...cur, ready: true } : cur));
+            })
+            .catch(() => {
+              setAttachedImage((cur) => (cur && cur.previewUrl === url ? { ...cur, ready: true } : cur));
+            });
+        }
+      }
     };
     img.src = url;
   };
@@ -667,8 +729,16 @@ export const ThreadView: FC<ThreadViewProps> = ({
       setRecordingVoice(false);
       try {
         const pcm16k = await voiceRecorderRef.current.stop();
-        const mel = computeLogMelSpectrogram(pcm16k);
-        setVoiceNoteSummary(`Voice clip captured (${mel.durationSec.toFixed(1)}s)`);
+        if (onPerceiveAudio) {
+          const report = await onPerceiveAudio(pcm16k);
+          setVoiceNoteSummary(
+            report.transcript
+              ? `Voice: "${report.transcript.slice(0, 48)}"`
+              : `Voice clip ready (${report.durationSec.toFixed(1)}s)`,
+          );
+        } else {
+          setVoiceNoteSummary(`Voice clip ready (${(pcm16k.length / 16000).toFixed(1)}s)`);
+        }
       } catch {
         setVoiceNoteSummary(null);
       }
@@ -679,6 +749,7 @@ export const ThreadView: FC<ThreadViewProps> = ({
       voiceRecorderRef.current = rec;
       await rec.start();
       setVoiceNoteSummary(null);
+      onClearPendingAudio?.();
       setRecordingVoice(true);
     } catch {
       setRecordingVoice(false);
@@ -892,12 +963,18 @@ export const ThreadView: FC<ThreadViewProps> = ({
                     className="h-6 w-6 rounded object-cover"
                   />
                   <span className="max-w-[140px] truncate">{attachedImage.name}</span>
+                  {attachedImage.ready ? (
+                    <Check className="h-3 w-3 text-emerald-600 dark:text-emerald-400" />
+                  ) : (
+                    <Loader2 className="h-3 w-3 animate-spin text-slate-400" />
+                  )}
                   <button
                     type="button"
                     aria-label="Remove image"
                     onClick={() => {
                       URL.revokeObjectURL(attachedImage.previewUrl);
                       setAttachedImage(null);
+                      onClearPendingImage?.();
                     }}
                     className="text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
                   >
@@ -912,7 +989,10 @@ export const ThreadView: FC<ThreadViewProps> = ({
                   <button
                     type="button"
                     aria-label="Clear voice clip"
-                    onClick={() => setVoiceNoteSummary(null)}
+                    onClick={() => {
+                      setVoiceNoteSummary(null);
+                      onClearPendingAudio?.();
+                    }}
                     className="text-emerald-700 hover:text-emerald-950 dark:text-emerald-300"
                   >
                     <X className="h-3 w-3" />

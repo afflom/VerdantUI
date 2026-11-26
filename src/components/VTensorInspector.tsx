@@ -241,6 +241,45 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
               </dl>
             </section>
 
+            {engineState.multimodalTelemetry && (
+              <section data-testid="multimodal-coherence-panel">
+                <h3 className="font-semibold text-slate-900 dark:text-slate-100">
+                  Multimodal Coherence (verdant-engine)
+                </h3>
+                <dl className="mt-2 divide-y divide-slate-100 rounded-lg border border-slate-200 dark:divide-slate-800 dark:border-slate-800">
+                  <div className="flex items-center justify-between px-3 py-2">
+                    <dt className="text-slate-500 dark:text-slate-400">Active modalities</dt>
+                    <dd className="font-mono text-slate-900 dark:text-slate-100">
+                      {engineState.multimodalTelemetry.activeModalities.length > 0
+                        ? engineState.multimodalTelemetry.activeModalities.join(', ')
+                        : 'language'}
+                    </dd>
+                  </div>
+                  <div className="flex items-center justify-between px-3 py-2">
+                    <dt className="text-slate-500 dark:text-slate-400">κ cache hits (vis / aud)</dt>
+                    <dd className="font-mono tabular-nums text-emerald-800 dark:text-emerald-400">
+                      {engineState.multimodalTelemetry.visualCacheHits} /{' '}
+                      {engineState.multimodalTelemetry.audioCacheHits}
+                    </dd>
+                  </div>
+                  <div className="flex items-center justify-between px-3 py-2">
+                    <dt className="text-slate-500 dark:text-slate-400">O(nnz) evictions</dt>
+                    <dd className="font-mono tabular-nums text-slate-900 dark:text-slate-100">
+                      {engineState.multimodalTelemetry.modalityEvictions}
+                    </dd>
+                  </div>
+                  <div className="flex items-center justify-between px-3 py-2">
+                    <dt className="text-slate-500 dark:text-slate-400">64-frame oracle p50/p95</dt>
+                    <dd className="font-mono tabular-nums text-slate-900 dark:text-slate-100">
+                      {engineState.multimodalTelemetry.frameBudget.samples > 0
+                        ? `${(engineState.multimodalTelemetry.frameBudget.p50Us / 1000).toFixed(1)}ms / ${(engineState.multimodalTelemetry.frameBudget.p95Us / 1000).toFixed(1)}ms`
+                        : 'idle'}
+                    </dd>
+                  </div>
+                </dl>
+              </section>
+            )}
+
             {engineState.observerSnapshot && (
               <section data-testid="cognitive-observer-panel">
                 <div className="flex items-center justify-between gap-2">

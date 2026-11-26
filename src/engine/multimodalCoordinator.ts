@@ -47,6 +47,16 @@ export interface CachedAudioTranscript {
   readonly cachedAt: number;
 }
 
+export interface MultimodalCoherenceTelemetry {
+  readonly activeModalities: readonly CoherentModality[];
+  readonly visualCacheSize: number;
+  readonly audioCacheSize: number;
+  readonly visualCacheHits: number;
+  readonly audioCacheHits: number;
+  readonly modalityEvictions: number;
+  readonly frameBudget: FrameBudgetStabilityReport;
+}
+
 export interface FrameBudgetStabilityReport {
   readonly samples: number;
   readonly targetBudgetUs: number;
@@ -318,15 +328,7 @@ export class MultimodalCoherenceCoordinator {
     return { entry, cacheHit: false };
   }
 
-  getTelemetry(): {
-    readonly activeModalities: readonly CoherentModality[];
-    readonly visualCacheSize: number;
-    readonly audioCacheSize: number;
-    readonly visualCacheHits: number;
-    readonly audioCacheHits: number;
-    readonly modalityEvictions: number;
-    readonly frameBudget: FrameBudgetStabilityReport;
-  } {
+  getTelemetry(): MultimodalCoherenceTelemetry {
     return {
       activeModalities: Array.from(this.residentSlots.keys()),
       visualCacheSize: this.visualCache.size,

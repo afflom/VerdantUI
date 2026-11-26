@@ -24,7 +24,7 @@ import {
   saveHarnessToStorage,
   type ImportedHarnessSpec,
 } from './harnessConfig';
-import type { WorkerRequest, WorkerResponse } from './inference.worker';
+import type { PerceivedAudioReport, WorkerRequest, WorkerResponse } from './inference.worker';
 import {
   DEFAULT_SAMPLING_CONFIG,
   type LoadedModelSummary,
@@ -40,7 +40,9 @@ import {
   isInternalBootstrapModel,
   type CatalogModel,
 } from './modelCatalog';
+import type { MultimodalCoherenceTelemetry } from './multimodalCoordinator';
 import type { PrecisionContractMode } from './performanceContract';
+import type { PerceivedImageReport } from './visionCritiqueLoop';
 import type { OpfsQuotaSnapshot } from './vramBackingStore';
 import { trimToStableSpeculativePrefix } from './vramUnifiedStore';
 import type { WeightResidencyPolicy } from './vramWeightPager';
@@ -111,6 +113,9 @@ export interface EngineState {
   readonly opfsStorage: OpfsQuotaSnapshot;
   readonly conformanceReport: ConformanceSuiteReport | null;
   readonly conformanceRunning: boolean;
+  readonly multimodalTelemetry: MultimodalCoherenceTelemetry | null;
+  readonly pendingImageContext: PerceivedImageReport | null;
+  readonly pendingAudioContext: PerceivedAudioReport | null;
 }
 
 const INITIAL_OPFS_STORAGE: OpfsQuotaSnapshot = {
@@ -327,7 +332,7 @@ export class LlamaVTensorWorkerClient {
     this.state = {
       status: 'idle',
       progressPercent: 0,
-      statusDetail: savedStreamEnabled ? 'Initializing model stream' : 'Model stream off (LOD0 ready)',
+      statusDetail: savedStreamEnabled ? 'Starting local AI' : 'Local AI off',
       errorMessage: null,
       model: null,
       telemetry: INITIAL_TELEMETRY,
@@ -350,6 +355,9 @@ export class LlamaVTensorWorkerClient {
       opfsStorage: INITIAL_OPFS_STORAGE,
       conformanceReport: null,
       conformanceRunning: false,
+      multimodalTelemetry: null,
+      pendingImageContext: null,
+      pendingAudioContext: null,
     };
 
     this.worker = new Worker(new URL('./inference.worker.ts', import.meta.url), {
@@ -973,6 +981,7 @@ export class LlamaVTensorWorkerClient {
         prefillProgress: null,
         statusDetail: `${this.state.model?.displayName ?? 'Model'} ready`,
         telemetry: msg.telemetry,
+        ...(msg.multimodalTelemetry ? { multimodalTelemetry: msg.multimodalTelemetry } : {}),
       });
       entry.resolve(undefined);
       return;
@@ -980,8 +989,31 @@ export class LlamaVTensorWorkerClient {
 
     if (msg.type === 'telemetry') {
       this.pending.delete(msg.requestId);
-      this.patchState({ telemetry: msg.telemetry });
+      this.patchState({
+        telemetry: msg.telemetry,
+        ...(msg.multimodalTelemetry ? { multimodalTelemetry: msg.multimodalTelemetry } : {}),
+      });
       entry.resolve(msg.telemetry);
+      return;
+    }
+
+    if (msg.type === 'image_perceived') {
+      this.pending.delete(msg.requestId);
+      this.patchState({
+        pendingImageContext: msg.report,
+        multimodalTelemetry: msg.multimodalTelemetry,
+      });
+      entry.resolve(msg.report);
+      return;
+    }
+
+    if (msg.type === 'audio_perceived') {
+      this.pending.delete(msg.requestId);
+      this.patchState({
+        pendingAudioContext: msg.report,
+        multimodalTelemetry: msg.multimodalTelemetry,
+      });
+      entry.resolve(msg.report);
       return;
     }
 
@@ -1286,6 +1318,92 @@ export class LlamaVTensorWorkerClient {
         });
       }
     }
+  }
+
+  /**
+   * Speculatively perceives an attached image inside the Web Worker (zero-copy RGBA transfer)
+   * using the shared `MultimodalCoherenceCoordinator` (`kappa` 0 ms cache on repeat images).
+   */
+  async perceiveImage(
+    name: string,
+    width: number,
+    height: number,
+    rgba: Uint8Array,
+  ): Promise<PerceivedImageReport> {
+    const requestId = this.nextRequestId('img');
+    const copy = new Uint8Array(rgba.byteLength);
+    copy.set(rgba);
+    return new Promise<PerceivedImageReport>((resolve, reject) => {
+      this.pending.set(requestId, {
+        resolve: resolve as (v: unknown) => void,
+        reject,
+      });
+      const msg: WorkerRequest = {
+        type: 'perceive_image',
+        requestId,
+        name,
+        width,
+        height,
+        rgbaBuffer: copy.buffer,
+      };
+      this.worker.postMessage(msg, [copy.buffer]);
+    });
+  }
+
+  clearPendingImageContext(): void {
+    if (this.state.pendingImageContext !== null) {
+      this.patchState({ pendingImageContext: null });
+    }
+  }
+
+  /**
+   * Perceives a captured 16 kHz mono voice clip inside the Web Worker (zero-copy transfer),
+   * computing Log-Mel acoustic features and caching via content-addressed `kappa`.
+   */
+  async perceiveAudio(pcm16k: Float32Array, sampleRate = 16_000): Promise<PerceivedAudioReport> {
+    const requestId = this.nextRequestId('aud');
+    const copy = new Float32Array(pcm16k.length);
+    copy.set(pcm16k);
+    return new Promise<PerceivedAudioReport>((resolve, reject) => {
+      this.pending.set(requestId, {
+        resolve: resolve as (v: unknown) => void,
+        reject,
+      });
+      const msg: WorkerRequest = {
+        type: 'perceive_audio',
+        requestId,
+        sampleRate,
+        pcmBuffer: copy.buffer,
+      };
+      this.worker.postMessage(msg, [copy.buffer]);
+    });
+  }
+
+  clearPendingAudioContext(): void {
+    if (this.state.pendingAudioContext !== null) {
+      this.patchState({ pendingAudioContext: null });
+    }
+  }
+
+  /**
+   * Consumes any pending speculative visual/audio sensory observations for the active turn
+   * so they attach cleanly at the tail without mutating prior cached KV turns.
+   */
+  consumePendingSensoryBlock(): string | null {
+    const img = this.state.pendingImageContext;
+    const aud = this.state.pendingAudioContext;
+    if (!img && !aud) return null;
+    const lines: string[] = [];
+    if (img) lines.push(`[Visual Perception] ${img.summary}`);
+    if (aud) {
+      lines.push(
+        aud.transcript
+          ? `[Voice Input] ${aud.transcript}`
+          : `[Audio Perception] ${aud.summary}`,
+      );
+    }
+    this.patchState({ pendingImageContext: null, pendingAudioContext: null });
+    return lines.join('\n');
   }
 
   dispose(): void {

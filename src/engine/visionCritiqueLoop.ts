@@ -141,3 +141,93 @@ export async function evaluateRenderedFrameCoherence(
     suggestions,
   };
 }
+
+export interface PerceivedImageReport extends VisualCoherenceReport {
+  readonly name: string;
+  readonly dominantColors: readonly string[];
+  readonly summary: string;
+}
+
+function extractDominantColors(rgba: Uint8Array | Uint8ClampedArray, width: number, height: number): string[] {
+  const bins = new Uint32Array(64);
+  const sumR = new Uint32Array(64);
+  const sumG = new Uint32Array(64);
+  const sumB = new Uint32Array(64);
+  const total = Math.max(1, width * height);
+  const stride = Math.max(1, Math.floor(total / 4096));
+  for (let p = 0; p < total; p += stride) {
+    const idx = p * 4;
+    const r = rgba[idx] ?? 0;
+    const g = rgba[idx + 1] ?? 0;
+    const b = rgba[idx + 2] ?? 0;
+    const bin = ((r >> 6) << 4) | ((g >> 6) << 2) | (b >> 6);
+    bins[bin] = bins[bin]! + 1;
+    sumR[bin] = sumR[bin]! + r;
+    sumG[bin] = sumG[bin]! + g;
+    sumB[bin] = sumB[bin]! + b;
+  }
+  const ranked: { bin: number; count: number }[] = [];
+  for (let i = 0; i < 64; i++) {
+    if (bins[i]! > 0) ranked.push({ bin: i, count: bins[i]! });
+  }
+  ranked.sort((a, b) => b.count - a.count);
+  const hex2 = (n: number) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, '0');
+  return ranked.slice(0, 3).map(({ bin, count }) => {
+    const r = sumR[bin]! / count;
+    const g = sumG[bin]! / count;
+    const b = sumB[bin]! / count;
+    return `#${hex2(r)}${hex2(g)}${hex2(b)}`;
+  });
+}
+
+/**
+ * Full on-device visual perception pass for user-attached images and rendered Studio frames:
+ * computes content-addressed `kappa` caching, dominant palette, luminance/contrast/edge metrics,
+ * and optional SigLIP visual embeddings on the shared `MultimodalCoherenceCoordinator`.
+ */
+export async function perceiveImageFrame(
+  name: string,
+  frame: VisualFrameInput,
+  opts?: {
+    readonly visionEncoder?: SiglipVisionEncoder | null;
+    readonly coordinator?: MultimodalCoherenceCoordinator | null;
+  },
+): Promise<PerceivedImageReport> {
+  const report = await evaluateRenderedFrameCoherence(frame, opts);
+  let visionCacheHit = report.visionCacheHit;
+  // Even when a full SigLIP mmproj checkpoint is not loaded yet, still register the lightweight
+  // visual summary embedding in `MultimodalCoherenceCoordinator` so repeat frames hit 0 ms `kappa` cache.
+  if (!opts?.visionEncoder && opts?.coordinator) {
+    const { cacheHit } = await opts.coordinator.getOrEncodeVisual(report.kappa, async () => ({
+      width: frame.width,
+      height: frame.height,
+      tokenCount: 1,
+      embeddingDim: 4,
+      embeddings: [
+        new Float32Array([
+          report.meanLuminance,
+          report.contrastSpan,
+          report.nonUniformRatio,
+          report.edgeDensity,
+        ]),
+      ],
+      encodeMs: 0.4,
+    }));
+    visionCacheHit = cacheHit;
+  }
+
+  const dominantColors = extractDominantColors(frame.rgba, frame.width, frame.height);
+  const tone =
+    report.meanLuminance > 0.65 ? 'bright' : report.meanLuminance < 0.3 ? 'dark' : 'balanced';
+  const detail =
+    report.edgeDensity > 0.16 ? 'high-detail' : report.edgeDensity > 0.05 ? 'moderate-detail' : 'minimal';
+  const summary = `Attached image "${name}" (${frame.width}x${frame.height}, ${tone} lighting, ${detail} structure, contrast ${Math.round(report.contrastSpan * 100)}%, dominant colors ${dominantColors.join(', ')}).`;
+
+  return {
+    ...report,
+    visionCacheHit,
+    name,
+    dominantColors,
+    summary,
+  };
+}

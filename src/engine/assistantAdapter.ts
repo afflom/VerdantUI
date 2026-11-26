@@ -1080,7 +1080,7 @@ export function createLlamaVTensorAdapter(
             content: [
               {
                 type: 'text' as const,
-                text: 'Model Stream is currently **Off**. Toggle **Model Stream** on in the top bar to stream and cache VerdantUI\'s local neural weights.\n\n*(Verified local actions, Verdant Studio, and Published Prisms addressed with `@PrismName` work immediately even while Model Stream is off.)*',
+                text: 'Local AI is currently **Off**. Turn **Local AI** on in the top bar to enable private on-device responses.\n\n*(Quick actions, Studio creations, and your saved apps addressed with `@AppName` work immediately even while Local AI is off.)*',
               },
             ],
             status: { type: 'complete', reason: 'stop' },
@@ -1094,7 +1094,7 @@ export function createLlamaVTensorAdapter(
             content: [
               {
                 type: 'text' as const,
-                text: `Model Stream is still initializing (${initialState.progressPercent}% · ${initialState.statusDetail}). Wait for it to finish and send again.`,
+                text: `Local AI is still getting ready (${initialState.progressPercent}% · ${initialState.statusDetail}). Wait a moment and send again.`,
               },
             ],
             status: { type: 'complete', reason: 'stop' },
@@ -1114,7 +1114,7 @@ export function createLlamaVTensorAdapter(
           content: [
             {
               type: 'text' as const,
-              text: 'Model Stream is currently **Off**. Toggle **Model Stream** on in the top bar to activate local neural inference.',
+              text: 'Local AI is currently **Off**. Turn **Local AI** on in the top bar to start private on-device AI.',
             },
           ],
           status: { type: 'complete', reason: 'stop' },
@@ -1164,6 +1164,11 @@ export function createLlamaVTensorAdapter(
         systemTokensEstimate: estimateTextTokens(systemMessage) + (activeTools ? 380 : 0),
       });
 
+      const sensoryBlock = client.consumePendingSensoryBlock();
+      const combinedTailRecall = [projected.foveatedRecallBlock, sensoryBlock]
+        .filter((s): s is string => Boolean(s && s.trim()))
+        .join('\n\n') || null;
+
       const prompt = formatMessagesForLlama(
         projected.messages,
         state.model,
@@ -1174,7 +1179,7 @@ export function createLlamaVTensorAdapter(
           tools: activeTools,
           pendingAssistantMessage,
           epochManifestBlock: projected.epochManifestBlock,
-          foveatedRecallBlock: projected.foveatedRecallBlock,
+          foveatedRecallBlock: combinedTailRecall,
           preserveEmptyThinkPrefix: true,
         },
       );

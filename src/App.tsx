@@ -345,6 +345,25 @@ export default function App() {
     [workerClient],
   );
 
+  const handlePerceiveImage = useCallback(
+    (name: string, width: number, height: number, rgba: Uint8Array) =>
+      workerClient.perceiveImage(name, width, height, rgba),
+    [workerClient],
+  );
+
+  const handleClearPendingImage = useCallback(() => {
+    workerClient.clearPendingImageContext();
+  }, [workerClient]);
+
+  const handlePerceiveAudio = useCallback(
+    (pcm16k: Float32Array) => workerClient.perceiveAudio(pcm16k),
+    [workerClient],
+  );
+
+  const handleClearPendingAudio = useCallback(() => {
+    workerClient.clearPendingAudioContext();
+  }, [workerClient]);
+
   const handleClearCache = useCallback(async () => {
     await workerClient.clearModelCache();
   }, [workerClient]);
@@ -625,6 +644,10 @@ export default function App() {
                 publishedPrisms={publishedPrisms}
                 onSpeculativeDraftChange={handleSpeculativeDraftChange}
                 onCountTokens={handleCountTokens}
+                onPerceiveImage={handlePerceiveImage}
+                onClearPendingImage={handleClearPendingImage}
+                onPerceiveAudio={handlePerceiveAudio}
+                onClearPendingAudio={handleClearPendingAudio}
               />
             )}
           </main>

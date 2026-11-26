@@ -1,5 +1,6 @@
 /// <reference lib="webworker" />
 
+import { computeLogMelSpectrogram } from './audioFrontend';
 import {
   LlamaVTensorRuntime,
   type LoadedModelSummary,
@@ -8,7 +9,13 @@ import {
   type TokenStreamEvent,
 } from './llamaRuntime';
 import { formatBytes } from './modelCatalog';
+import {
+  MultimodalCoherenceCoordinator,
+  computeMediaKappa,
+  type MultimodalCoherenceTelemetry,
+} from './multimodalCoordinator';
 import type { PrecisionContractMode } from './performanceContract';
+import { perceiveImageFrame, type PerceivedImageReport } from './visionCritiqueLoop';
 import {
   OPFS_HANDOVER_CHANNEL_NAME,
   clearAllOpfsModels,
@@ -111,8 +118,33 @@ export type WorkerRequest =
       prompt: string;
     }
   | {
+      type: 'perceive_image';
+      requestId: string;
+      name: string;
+      width: number;
+      height: number;
+      rgbaBuffer: ArrayBuffer;
+    }
+  | {
+      type: 'perceive_audio';
+      requestId: string;
+      sampleRate: number;
+      pcmBuffer: ArrayBuffer;
+    }
+  | {
       type: 'shutdown';
     };
+
+export interface PerceivedAudioReport {
+  readonly kappa: string;
+  readonly durationSec: number;
+  readonly frames: number;
+  readonly rmsEnergy: number;
+  readonly speechDetected: boolean;
+  readonly transcript: string;
+  readonly cacheHit: boolean;
+  readonly summary: string;
+}
 
 export type WorkerResponse =
   | {
@@ -146,11 +178,25 @@ export type WorkerResponse =
       type: 'done';
       requestId: string;
       telemetry: VTensorTelemetrySnapshot;
+      multimodalTelemetry?: MultimodalCoherenceTelemetry;
     }
   | {
       type: 'telemetry';
       requestId: string;
       telemetry: VTensorTelemetrySnapshot;
+      multimodalTelemetry?: MultimodalCoherenceTelemetry;
+    }
+  | {
+      type: 'image_perceived';
+      requestId: string;
+      report: PerceivedImageReport;
+      multimodalTelemetry: MultimodalCoherenceTelemetry;
+    }
+  | {
+      type: 'audio_perceived';
+      requestId: string;
+      report: PerceivedAudioReport;
+      multimodalTelemetry: MultimodalCoherenceTelemetry;
     }
   | {
       type: 'opfs_storage';
@@ -186,6 +232,7 @@ export type WorkerResponse =
     };
 
 const runtime = new LlamaVTensorRuntime();
+const multimodalCoordinator = new MultimodalCoherenceCoordinator();
 const threadPoolReadyPromise = runtime.initThreadPool().catch(() => undefined);
 
 const activeControllers = new Map<string, AbortController>();
@@ -707,6 +754,72 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         type: 'telemetry',
         requestId: req.requestId,
         telemetry: runtime.getTelemetry(),
+        multimodalTelemetry: multimodalCoordinator.getTelemetry(),
+      });
+      return;
+    }
+
+    if (req.type === 'perceive_image') {
+      const rgba = new Uint8Array(req.rgbaBuffer);
+      multimodalCoordinator.activateModality({
+        modality: 'vision',
+        modelId: 'verdant-vision-sense',
+        residentBytes: rgba.byteLength,
+        evict: () => {},
+      });
+      const report = await perceiveImageFrame(
+        req.name,
+        { rgba, width: req.width, height: req.height },
+        { coordinator: multimodalCoordinator },
+      );
+      post({
+        type: 'image_perceived',
+        requestId: req.requestId,
+        report,
+        multimodalTelemetry: multimodalCoordinator.getTelemetry(),
+      });
+      return;
+    }
+
+    if (req.type === 'perceive_audio') {
+      const pcm = new Float32Array(req.pcmBuffer);
+      multimodalCoordinator.activateModality({
+        modality: 'audio',
+        modelId: 'verdant-audio-sense',
+        residentBytes: pcm.byteLength,
+        evict: () => {},
+      });
+      const kappa = computeMediaKappa('audio', pcm, `${req.sampleRate}hz:${pcm.length}`);
+      let energySum = 0;
+      for (let i = 0; i < pcm.length; i++) energySum += pcm[i]! * pcm[i]!;
+      const rmsEnergy = pcm.length > 0 ? Math.sqrt(energySum / pcm.length) : 0;
+      const speechDetected = rmsEnergy >= 0.008;
+      const mel = computeLogMelSpectrogram(pcm);
+      const { entry, cacheHit } = await multimodalCoordinator.getOrTranscribeAudio(
+        kappa,
+        async () => ({
+          durationSec: mel.durationSec,
+          text: '',
+          transcribeMs: 1,
+        }),
+      );
+      const summary = speechDetected
+        ? `Voice clip attached (${entry.durationSec.toFixed(1)}s, ${mel.nFrames} acoustic frames, speech activity detected).`
+        : `Audio clip attached (${entry.durationSec.toFixed(1)}s, low ambient level).`;
+      post({
+        type: 'audio_perceived',
+        requestId: req.requestId,
+        report: {
+          kappa,
+          durationSec: entry.durationSec,
+          frames: mel.nFrames,
+          rmsEnergy,
+          speechDetected,
+          transcript: entry.text,
+          cacheHit,
+          summary,
+        },
+        multimodalTelemetry: multimodalCoordinator.getTelemetry(),
       });
       return;
     }
@@ -951,6 +1064,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           // Theorem T7 zero-clamp MessageChannel cooperative yield gated by 16,666 µs frame budget
           const stepUs = (nowMs - lastStepMs) * 1000;
           lastStepMs = nowMs;
+          multimodalCoordinator.frameOracle.recordFrame(stepUs);
           await runtime.maybeYieldGenerationStep(stepUs);
         }
 
@@ -961,6 +1075,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           type: 'done',
           requestId: req.requestId,
           telemetry: runtime.getTelemetry(),
+          multimodalTelemetry: multimodalCoordinator.getTelemetry(),
         });
       } finally {
         activeGenerationCount = Math.max(0, activeGenerationCount - 1);
