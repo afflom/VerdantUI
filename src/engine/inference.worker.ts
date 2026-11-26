@@ -196,6 +196,52 @@ let activeLoadPromise: Promise<void> | null = null;
 let activeGenerationController: AbortController | null = null;
 let activeGenerationPromise: Promise<void> | null = null;
 let activeGenerationCount = 0;
+let activeOpfsPersistPromise: Promise<void> | null = null;
+let opfsPersistEpoch = 0;
+
+/**
+ * Cancels any queued background `.unified.kv` OPFS persist and waits for an in-flight write to close
+ * its SyncAccessHandle cleanly before model loads, deletions, handover, or worker shutdown.
+ */
+async function drainBackgroundOpfsPersist(): Promise<void> {
+  opfsPersistEpoch += 1;
+  while (activeOpfsPersistPromise) {
+    const pending = activeOpfsPersistPromise;
+    try {
+      await pending;
+    } catch {
+      // Ignore best-effort persistence failures
+    }
+  }
+}
+
+/**
+ * Schedules serialized, coalesced background OPFS KV persistence AFTER posting `{ type: 'done' }`
+ * so interactive turn completion has 0 ms storage/flush latency while warm prefixes still survive reloads.
+ */
+function scheduleBackgroundOpfsPersist(): void {
+  const epoch = ++opfsPersistEpoch;
+  const prev = activeOpfsPersistPromise ?? Promise.resolve();
+  const task = prev
+    .catch(() => undefined)
+    .then(async () => {
+      if (
+        epoch !== opfsPersistEpoch ||
+        activeGenerationCount > 0 ||
+        activeLoadController !== null ||
+        !runtime.isLoaded
+      ) {
+        return;
+      }
+      await runtime.persistUnifiedStoreToOpfs().catch(() => 0);
+    });
+  const tracked = task.finally(() => {
+    if (activeOpfsPersistPromise === tracked) {
+      activeOpfsPersistPromise = null;
+    }
+  });
+  activeOpfsPersistPromise = tracked;
+}
 
 const workerInstanceId =
   typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
@@ -221,16 +267,19 @@ if (typeof BroadcastChannel === 'function') {
         loaded !== null &&
         (loaded.backingKind === 'opfs-sync' || loaded.backingKind === 'opfs-demand');
       if (holdsOpfs && (!msg.modelId || msg.modelId === loaded.id)) {
-        runtime.unload();
-        try {
-          opfsHandoverChannel?.postMessage({
-            type: 'released',
-            senderId: workerInstanceId,
-            modelId: loaded.id,
-          });
-        } catch {
-          // Ignore closed channel
-        }
+        void drainBackgroundOpfsPersist().finally(() => {
+          if (activeGenerationCount > 0 || activeLoadController !== null) return;
+          runtime.unload();
+          try {
+            opfsHandoverChannel?.postMessage({
+              type: 'released',
+              senderId: workerInstanceId,
+              modelId: loaded.id,
+            });
+          } catch {
+            // Ignore closed channel
+          }
+        });
       }
     };
   } catch {
@@ -373,6 +422,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       if (activeLoadController) activeLoadController.abort();
       for (const ctrl of activeControllers.values()) ctrl.abort();
       activeControllers.clear();
+      await drainBackgroundOpfsPersist();
       runtime.unload();
       runtime.disposeThreadPool();
       try {
@@ -388,6 +438,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       await preemptSpeculativePrefill();
       await preemptActiveGeneration();
       await preemptActiveLoad();
+      await drainBackgroundOpfsPersist();
       await threadPoolReadyPromise;
       const summary = runtime.loadFromBuffer(
         req.id,
@@ -412,6 +463,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       await preemptSpeculativePrefill();
       await preemptActiveGeneration();
       await preemptActiveLoad();
+      await drainBackgroundOpfsPersist();
       await threadPoolReadyPromise;
       const controller = new AbortController();
       activeControllers.set(req.requestId, controller);
@@ -529,6 +581,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       await preemptSpeculativePrefill();
       await preemptActiveGeneration();
       await preemptActiveLoad();
+      await drainBackgroundOpfsPersist();
       await threadPoolReadyPromise;
       const controller = new AbortController();
       activeControllers.set(req.requestId, controller);
@@ -717,6 +770,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     if (req.type === 'delete_opfs_model') {
       await preemptSpeculativePrefill();
       await preemptActiveGeneration();
+      await drainBackgroundOpfsPersist();
       let modelUnloaded = false;
       if (runtime.getModelSummary()?.id === req.modelId) {
         runtime.unload();
@@ -736,6 +790,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     if (req.type === 'clear_opfs_models') {
       await preemptSpeculativePrefill();
       await preemptActiveGeneration();
+      await drainBackgroundOpfsPersist();
       const activeId = runtime.getModelSummary()?.id;
       const before = await inspectOpfsVramStorage();
       const activeKind = runtime.getModelSummary()?.backingKind;
@@ -833,6 +888,8 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     if (req.type === 'generate') {
       await preemptSpeculativePrefill();
       await preemptActiveGeneration();
+      // Cancel any queued idle persist from the prior turn so generation never contends with OPFS
+      opfsPersistEpoch += 1;
       const controller = new AbortController();
       activeControllers.set(req.requestId, controller);
       activeGenerationController = controller;
@@ -843,6 +900,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         finishGen = resolve;
       });
       activeGenerationPromise = genDone;
+      let shouldPersistAfterTurn = false;
 
       try {
         let count = 0;
@@ -896,7 +954,9 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           await runtime.maybeYieldGenerationStep(stepUs);
         }
 
-        await runtime.persistUnifiedStoreToOpfs().catch(() => 0);
+        // Post `done` immediately (0 ms OPFS flush stall on interactive turn completion);
+        // persist warm KV prefixes asynchronously in a serialized background micro-job!
+        shouldPersistAfterTurn = !controller.signal.aborted;
         post({
           type: 'done',
           requestId: req.requestId,
@@ -912,6 +972,9 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           activeGenerationPromise = null;
         }
         finishGen();
+        if (shouldPersistAfterTurn && activeGenerationCount === 0 && activeLoadController === null) {
+          scheduleBackgroundOpfsPersist();
+        }
       }
     }
   } catch (err) {

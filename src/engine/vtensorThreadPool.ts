@@ -511,6 +511,8 @@ export function runComputeWorkerLoop(
   }
 }
 
+const HELPER_JOIN_WATCHDOG_MS = 15_000;
+
 interface ManagedWorkerHandle {
   terminate(): void | Promise<number>;
 }
@@ -531,6 +533,8 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
   private readonly localGroupStarts = new Int32Array(MAX_GROUP_ENTRIES);
   private readonly localGroupCounts = new Int32Array(MAX_GROUP_ENTRIES);
   private active = false;
+  private helperFaulted = false;
+  private disposing = false;
   private jobSeq = 0;
   private dispatches = 0;
   private bytesProcessed = 0;
@@ -631,6 +635,12 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
           const worker = new Worker(new URL('./vtensorCompute.worker.ts', import.meta.url), {
             type: 'module',
           });
+          worker.onerror = () => {
+            pool.failoverToSingleThread('Helper worker error detected; failed over cleanly to single-thread WASM SIMD.');
+          };
+          worker.onmessageerror = () => {
+            pool.failoverToSingleThread('Helper worker message fault detected; failed over cleanly to single-thread WASM SIMD.');
+          };
           worker.postMessage({
             wasmModule: arena.compiledModule,
             memory: arena.memory,
@@ -646,7 +656,10 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
           Worker: new (
             code: string,
             opts: { eval: boolean; workerData: unknown },
-          ) => ManagedWorkerHandle & { unref?: () => void };
+          ) => ManagedWorkerHandle & {
+            unref?: () => void;
+            on?: (event: string, listener: (...args: unknown[]) => void) => void;
+          };
         };
         const inlineWorkerScript = `
           const { workerData } = require('node:worker_threads');
@@ -983,6 +996,14 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
               workerIndex: w,
             },
           });
+          worker.on?.('error', () => {
+            pool.failoverToSingleThread('Helper thread error detected; failed over cleanly to single-thread WASM SIMD.');
+          });
+          worker.on?.('exit', (code) => {
+            if (!pool.disposing && pool.active && code !== 0) {
+              pool.failoverToSingleThread(`Helper thread exited unexpectedly (code ${String(code)}); failed over cleanly to single-thread WASM SIMD.`);
+            }
+          });
           worker.unref?.();
           pool.workers.push(worker);
         }
@@ -1075,18 +1096,46 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
     return Math.max(0.4, Math.min(18, elapsedUs));
   }
 
-  private joinHelpers(nextSeq: number): void {
-    const ctrl = this.ctrl;
+  private failoverToSingleThread(reason: string): void {
+    if (this.helperFaulted) return;
+    this.helperFaulted = true;
+    this.active = false;
+    this.reason = reason;
+    // Wake any waiting coordinator immediately on all helper done slots
     for (let w = 0; w < this.helperCount; w++) {
+      const doneIdx = WORKER_SLOT_BASE + w * WORKER_SLOT_STRIDE + SLOT_DONE_SEQ;
+      try {
+        Atomics.notify(this.ctrl, doneIdx, 1);
+      } catch {
+        // ignore
+      }
+    }
+    this.dispose();
+  }
+
+  private joinHelpers(nextSeq: number): boolean {
+    const ctrl = this.ctrl;
+    let deadlineMs = 0;
+    for (let w = 0; w < this.helperCount; w++) {
+      if (this.helperFaulted) return false;
       const doneIdx = WORKER_SLOT_BASE + w * WORKER_SLOT_STRIDE + SLOT_DONE_SEQ;
       let done = Atomics.load(ctrl, doneIdx);
       for (let spin = 0; spin < COORDINATOR_JOIN_SPIN && done !== nextSeq; spin++) {
         done = Atomics.load(ctrl, doneIdx);
       }
       while (done !== nextSeq) {
+        if (this.helperFaulted) return false;
+        if (deadlineMs === 0) {
+          deadlineMs = performance.now() + HELPER_JOIN_WATCHDOG_MS;
+        } else if (performance.now() > deadlineMs) {
+          this.failoverToSingleThread(
+            `Helper barrier watchdog exceeded ${HELPER_JOIN_WATCHDOG_MS} ms; failed over cleanly to single-thread WASM SIMD.`,
+          );
+          return false;
+        }
         Atomics.store(ctrl, CTRL_COORDINATOR_WAITING, 1);
         done = Atomics.load(ctrl, doneIdx);
-        if (done !== nextSeq) {
+        if (done !== nextSeq && !this.helperFaulted) {
           try {
             Atomics.wait(ctrl, doneIdx, done, 5);
           } catch {
@@ -1097,6 +1146,7 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
         Atomics.store(ctrl, CTRL_COORDINATOR_WAITING, 0);
       }
     }
+    return !this.helperFaulted;
   }
 
   /**
@@ -1162,7 +1212,11 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
     // Coordinator computes stripe 0 immediately on its own WASM SIMD instance
     runLocalStripe(this.stripeStarts[0], this.stripeCounts[0]);
 
-    this.joinHelpers(nextSeq);
+    if (!this.joinHelpers(nextSeq)) {
+      // Transparent single-thread recovery if a helper faulted mid-dispatch
+      runLocalStripe(0, rows);
+      return;
+    }
     this.dispatches += 1;
     this.bytesProcessed += rowBytes * rows;
   }
@@ -1244,7 +1298,15 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
         }
       }
 
-      this.joinHelpers(nextSeq);
+      if (!this.joinHelpers(nextSeq)) {
+        for (let g = 0; g < groupCount; g++) {
+          runLocalStripe(baseIdx + g, 0, entries[baseIdx + g].rows);
+        }
+        for (let r = baseIdx + groupCount; r < entries.length; r++) {
+          runLocalStripe(r, 0, entries[r].rows);
+        }
+        return;
+      }
       this.dispatches += 1;
       this.bytesProcessed += chunkBytes;
     }
@@ -1349,7 +1411,10 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
       WASM_ATTN_WORKER_SCRATCH_BASE,
     );
 
-    this.joinHelpers(nextSeq);
+    if (!this.joinHelpers(nextSeq)) {
+      runLocalHeads(0, nHeads, WASM_ATTN_WORKER_SCRATCH_BASE);
+      return;
+    }
     this.dispatches += 1;
   }
 
@@ -1405,22 +1470,28 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
       ctrl[eBase + 3] = f32ToI32Bits(params.weights[k]);
     }
 
+    let effectiveThreads = activeThreads;
     if (activeThreads > 1) {
       const nextSeq = (this.jobSeq + 1) | 0;
       this.jobSeq = nextSeq;
       this.publishJob(nextSeq);
       runMoeWorkerSlice(kernels, ctrl, 0);
-      this.joinHelpers(nextSeq);
-      this.dispatches += 1;
+      if (this.joinHelpers(nextSeq)) {
+        this.dispatches += 1;
+      } else {
+        ctrl[m + 18] = 1;
+        effectiveThreads = 1;
+        runMoeWorkerSlice(kernels, ctrl, 0);
+      }
     } else {
       runMoeWorkerSlice(kernels, ctrl, 0);
     }
 
-    // Deterministic SIMD reduction across thread accumulators `0..activeThreads-1`
+    // Deterministic SIMD reduction across thread accumulators `0..effectiveThreads-1`
     const stride = params.layout.strideBytes;
     const offAcc = params.layout.offAccum;
     if (params.accumulate) {
-      for (let t = 0; t < activeThreads; t++) {
+      for (let t = 0; t < effectiveThreads; t++) {
         kernels.add_f32(
           params.outPtr,
           params.workerScratchBase + t * stride + offAcc,
@@ -1430,7 +1501,7 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
       }
     } else {
       kernels.copy_bytes(params.outPtr, params.workerScratchBase + offAcc, params.dim * 4);
-      for (let t = 1; t < activeThreads; t++) {
+      for (let t = 1; t < effectiveThreads; t++) {
         kernels.add_f32(
           params.outPtr,
           params.workerScratchBase + t * stride + offAcc,
@@ -1500,13 +1571,19 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
       ctrl[eBase + 7] = f32ToI32Bits(params.weights[wBase + 3]);
     }
 
+    let effectiveThreads = activeThreads;
     if (activeThreads > 1) {
       const nextSeq = (this.jobSeq + 1) | 0;
       this.jobSeq = nextSeq;
       this.publishJob(nextSeq);
       runMoeBatch4WorkerSlice(kernels, ctrl, 0);
-      this.joinHelpers(nextSeq);
-      this.dispatches += 1;
+      if (this.joinHelpers(nextSeq)) {
+        this.dispatches += 1;
+      } else {
+        ctrl[m + 21] = 1;
+        effectiveThreads = 1;
+        runMoeBatch4WorkerSlice(kernels, ctrl, 0);
+      }
     } else {
       runMoeBatch4WorkerSlice(kernels, ctrl, 0);
     }
@@ -1514,7 +1591,7 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
     const stride = params.layout.strideBytes;
     const offAcc = params.layout.offAccum;
     if (params.accumulate) {
-      for (let t = 0; t < activeThreads; t++) {
+      for (let t = 0; t < effectiveThreads; t++) {
         kernels.add_f32(
           params.outPtr,
           params.workerScratchBase + t * stride + offAcc,
@@ -1524,7 +1601,7 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
       }
     } else {
       kernels.copy_bytes(params.outPtr, params.workerScratchBase + offAcc, totalFloats * 4);
-      for (let t = 1; t < activeThreads; t++) {
+      for (let t = 1; t < effectiveThreads; t++) {
         kernels.add_f32(
           params.outPtr,
           params.workerScratchBase + t * stride + offAcc,
@@ -1540,6 +1617,7 @@ export class VTensorThreadPool implements VTensorThreadPoolLike {
   }
 
   async disposeAsync(): Promise<void> {
+    this.disposing = true;
     if (this.workers.length > 0) {
       const nextSeq = (this.jobSeq + 1) | 0;
       this.jobSeq = nextSeq;

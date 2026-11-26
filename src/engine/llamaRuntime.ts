@@ -359,16 +359,20 @@ export function sampleNextToken(
   }
 
   try {
-    // Greedy argmax when temperature <= 0.01 (100% in-Verdant WASM SIMD when arena-backed)
+    // Greedy argmax when temperature <= 0.01 (100% in-Verdant WASM SIMD when arena-backed,
+    // guarded against non-finite logits so numerical spikes never poison greedy output)
     if (config.temperature <= 0.01) {
       if (arena && logitsPtr >= 0) {
-        return arena.kernels.argmax_f32(logitsPtr, vocabSize);
+        const wasmBest = arena.kernels.argmax_f32(logitsPtr, vocabSize);
+        if (wasmBest >= 0 && wasmBest < vocabSize && Number.isFinite(logits[wasmBest])) {
+          return wasmBest;
+        }
       }
       let bestId = 0;
       let bestVal = -Infinity;
       for (let i = 0; i < vocabSize; i++) {
         const v = logits[i];
-        if (v > bestVal) {
+        if (Number.isFinite(v) && v > bestVal) {
           bestVal = v;
           bestId = i;
         }
@@ -384,7 +388,7 @@ export function sampleNextToken(
     if (k <= 1024) {
       candIds = samplerTopkIds;
       if (arena && logitsPtr >= 0) {
-        candCount = arena.kernels.topk_f32(
+        const rawCount = arena.kernels.topk_f32(
           logitsPtr,
           vocabSize,
           k,
@@ -397,12 +401,17 @@ export function sampleNextToken(
           cachedTopkIdsView = new Int32Array(memBuf, WASM_TOPK_IDS_OFFSET, 1024);
           cachedTopkValsView = new Float32Array(memBuf, WASM_TOPK_VALS_OFFSET, 1024);
         }
-        for (let i = 0; i < candCount; i++) {
-          samplerTopkIds[i] = cachedTopkIdsView[i];
-          samplerTopkVals[i] = cachedTopkValsView[i];
+        candCount = 0;
+        for (let i = 0; i < rawCount; i++) {
+          const val = cachedTopkValsView[i];
+          if (Number.isFinite(val)) {
+            samplerTopkIds[candCount] = cachedTopkIdsView[i];
+            samplerTopkVals[candCount] = val;
+            candCount += 1;
+          }
         }
       } else {
-        candCount = k;
+        candCount = 0;
         for (let i = 0; i < k; i++) {
           samplerTopkIds[i] = 0;
           samplerTopkVals[i] = -Infinity;
@@ -411,7 +420,9 @@ export function sampleNextToken(
         let minVal = -Infinity;
         for (let i = 0; i < vocabSize; i++) {
           const v = logits[i];
+          if (!Number.isFinite(v)) continue;
           if (v > minVal) {
+            if (candCount < k) candCount += 1;
             samplerTopkIds[minSlot] = i;
             samplerTopkVals[minSlot] = v;
             minVal = samplerTopkVals[0];
@@ -423,6 +434,18 @@ export function sampleNextToken(
               }
             }
           }
+        }
+        // Compact out any unfilled -Infinity slots when fewer than k finite logits exist
+        if (candCount < k) {
+          let write = 0;
+          for (let i = 0; i < k; i++) {
+            if (Number.isFinite(samplerTopkVals[i])) {
+              samplerTopkIds[write] = samplerTopkIds[i];
+              samplerTopkVals[write] = samplerTopkVals[i];
+              write += 1;
+            }
+          }
+          candCount = write;
         }
       }
 
@@ -451,6 +474,7 @@ export function sampleNextToken(
       let minVal = -Infinity;
       for (let i = 0; i < vocabSize; i++) {
         const v = logits[i];
+        if (!Number.isFinite(v)) continue;
         if (v > minVal) {
           topIds[minSlot] = i;
           topVals[minSlot] = v;
@@ -464,20 +488,45 @@ export function sampleNextToken(
           }
         }
       }
-      const sorted = Array.from(topIds).sort((a, b) => logits[b] - logits[a] || a - b);
-      candIds = Int32Array.from(sorted);
-      candCount = sorted.length;
+      const finiteIds: number[] = [];
+      for (let i = 0; i < k; i++) {
+        if (Number.isFinite(topVals[i])) finiteIds.push(topIds[i]);
+      }
+      finiteIds.sort((a, b) => logits[b] - logits[a] || a - b);
+      candIds = Int32Array.from(finiteIds);
+      candCount = finiteIds.length;
+    }
+
+    // Finite-logit fallback: if every logit was non-finite (e.g. numerical spike), pick deterministic argmax/0
+    if (candCount === 0) {
+      let bestId = 0;
+      let bestVal = -Infinity;
+      for (let i = 0; i < vocabSize; i++) {
+        const v = logits[i];
+        if (Number.isFinite(v) && v > bestVal) {
+          bestVal = v;
+          bestId = i;
+        }
+      }
+      return bestId;
     }
 
     const invTemp = 1.0 / config.temperature;
     const maxLogit = logits[candIds[0]] * invTemp;
+    if (!Number.isFinite(maxLogit)) {
+      return candIds[0];
+    }
 
     const probs = candCount <= 1024 ? samplerTopkProbs : new Float64Array(candCount);
     let sumExp = 0;
     for (let i = 0; i < candCount; i++) {
       const p = Math.exp(logits[candIds[i]] * invTemp - maxLogit);
-      probs[i] = p;
-      sumExp += p;
+      const safeP = Number.isFinite(p) ? p : 0;
+      probs[i] = safeP;
+      sumExp += safeP;
+    }
+    if (!(sumExp > 0) || !Number.isFinite(sumExp)) {
+      return candIds[0];
     }
     const invSum = 1.0 / sumExp;
     for (let i = 0; i < candCount; i++) {
@@ -498,6 +547,9 @@ export function sampleNextToken(
 
     let renorm = 0;
     for (let i = 0; i < cutoff; i++) renorm += probs[i];
+    if (!(renorm > 0) || !Number.isFinite(renorm)) {
+      return candIds[0];
+    }
 
     const r = rng() * renorm;
     let running = 0;
@@ -5574,6 +5626,7 @@ export class LlamaVTensorRuntime {
       Math.min(16, Math.max(1, Math.floor(Math.min(truncatedPrompt.length, Math.max(64, commonPrefix)) / 16))),
     );
     this.kvPager.setPinnedPrefixPages(anchorPages);
+    this.unifiedStore?.setPinnedPrefixPages(anchorPages);
     const estMsPerPrefillToken =
       this.performanceContract && this.performanceContract.rooflinePrefillTokSec > 0
         ? 1000 / this.performanceContract.rooflinePrefillTokSec

@@ -212,7 +212,33 @@ export function trimToStableSpeculativePrefix(draftText: string, allowFinalWord:
 
 const UNIFIED_KV_MAGIC = 0x31564b55; // "UKV1" (legacy raw blocks)
 const UNIFIED_KV_MAGIC_V2 = 0x32564b55; // "UKV2" (Theorem T7 exact lossless factored blocks)
+const UNIFIED_KV_MAGIC_V3 = 0x33564b55; // "UKV3" (Theorem T7 factored blocks + 64-bit integrity trailer)
+const UNIFIED_KV_TRAILER_BYTES = 8;
 const MAX_PERSISTED_OPFS_BLOCKS = 16;
+
+/**
+ * Zero-allocation dual-lane 64-bit integrity digest (extrapolated from verdant-engine's
+ * `WorldSnapshot` wire checksum verification) so partial or corrupted OPFS `.unified.kv`
+ * writes are rejected cleanly before hydrating any KV pages.
+ */
+function computeUnifiedKvDigest(bytes: Uint8Array, length: number): readonly [number, number] {
+  let h1 = 0x811c9dc5 | 0; // FNV-1a lane A
+  let h2 = 0x9e3779b1 | 0; // Golden-ratio avalanche lane B
+  for (let i = 0; i < length; i++) {
+    const b = bytes[i];
+    h1 = Math.imul(h1 ^ b, 0x01000193);
+    h2 = Math.imul(h2 ^ ((b + i) & 0xff), 0x85ebca6b);
+    h2 = (h2 << 13) | (h2 >>> 19);
+  }
+  // Final avalanche mix
+  h1 ^= h1 >>> 16;
+  h1 = Math.imul(h1, 0x7feb352d);
+  h1 ^= h1 >>> 15;
+  h2 ^= h2 >>> 16;
+  h2 = Math.imul(h2, 0xc2b2ae35);
+  h2 ^= h2 >>> 16;
+  return [h1 >>> 0, h2 >>> 0];
+}
 
 function sanitizeUnifiedKvFileName(modelId: string): string {
   return `${sanitizeOpfsModelFileName(modelId).replace(/\.gguf$/i, '')}.unified.kv`;
@@ -243,6 +269,7 @@ export class VramUnifiedStore {
   private clock = 0;
   private dirtyForOpfs = false;
   private persistedOpfs = false;
+  private pinnedPrefixPages = 1;
 
   // Content-addressed KV prefix metrics
   private kvPrefixHits = 0;
@@ -286,6 +313,24 @@ export class VramUnifiedStore {
   }
 
   /**
+   * Pins leading prefix pages `[0 .. pinnedPrefixPages - 1]` (System Prompt, Tool Manifest,
+   * and frozen Lossless Episodic Epoch Index) so multi-page shared prefixes receive eviction
+   * & OPFS persistence priority alongside page 0.
+   */
+  setPinnedPrefixPages(pages: number): void {
+    const clamped = Math.max(1, Math.min(Math.max(1, this.maxBlocks - 1), Math.floor(pages)));
+    this.pinnedPrefixPages = clamped;
+  }
+
+  getPinnedPrefixPages(): number {
+    return this.pinnedPrefixPages;
+  }
+
+  private isPinnedPrefixPage(pageIndex: number): boolean {
+    return pageIndex < this.pinnedPrefixPages;
+  }
+
+  /**
    * Commits a full 16-token Q8 KV page block into the content-addressed unified store.
    * Identical prefixes across threads deduplicate automatically to 1 physical block.
    */
@@ -320,7 +365,7 @@ export class VramUnifiedStore {
       tokenIds: [...tokenIds],
       data,
       byteLength,
-      isSystemSink: pageIndex === 0,
+      isSystemSink: this.isPinnedPrefixPage(pageIndex),
       lastTouch: ++this.clock,
       hitCount: 0,
     };
@@ -393,8 +438,11 @@ export class VramUnifiedStore {
     let victimScore = Infinity;
 
     for (const [key, entry] of this.blocks) {
-      // System sink blocks (page 0) get a strong priority boost so shared system prompts stay hot
-      const utilityScore = entry.lastTouch + entry.hitCount * 4 + (entry.isSystemSink ? 10_000 : 0);
+      // Pinned prefix blocks [0 .. pinnedPrefixPages - 1] get a strong priority boost so shared
+      // system prompts and episodic epoch indexes stay hot ahead of tail turn pages
+      const isPinned = entry.isSystemSink || this.isPinnedPrefixPage(entry.pageIndex);
+      const pinBoost = isPinned ? 10_000 + Math.max(0, this.pinnedPrefixPages - entry.pageIndex) : 0;
+      const utilityScore = entry.lastTouch + entry.hitCount * 4 + pinBoost;
       if (utilityScore < victimScore) {
         victimScore = utilityScore;
         victimKey = key;
@@ -439,23 +487,53 @@ export class VramUnifiedStore {
   }
 
   /**
-   * Serializes the hottest embedded KV prefix blocks into a compact binary payload (`UKV1`)
-   * and persists it atomically into OPFS (`<modelId>.unified.kv`) so system prompts and
-   * recent prefixes survive page reloads!
+   * Serializes the hottest embedded KV prefix blocks into an integrity-checked binary `UKV3`
+   * snapshot (Theorem T7 factored blocks + 64-bit integrity trailer).
+   */
+  serializeSnapshotBytes(maxBlocks: number = MAX_PERSISTED_OPFS_BLOCKS): Uint8Array {
+    const ranked = this.selectTopBlocksForPersistence(maxBlocks);
+    return this.serializeBlocks(ranked);
+  }
+
+  /**
+   * Hydrates embedded KV prefix blocks from a raw binary snapshot (`UKV3` integrity-checked,
+   * or backward-compatible `UKV2`/`UKV1`). Rejects corrupted or truncated `UKV3` payloads cleanly
+   * with `0` hydrated blocks and zero thrown exceptions.
+   */
+  hydrateFromBytes(raw: Uint8Array, rekeyToIdentity = false): number {
+    try {
+      return this.deserializeBlocks(raw, rekeyToIdentity);
+    } catch {
+      return 0;
+    }
+  }
+
+  private selectTopBlocksForPersistence(maxBlocks: number): UnifiedKvBlockEntry[] {
+    return Array.from(this.blocks.values())
+      .sort((a, b) => {
+        const pinA = a.isSystemSink || this.isPinnedPrefixPage(a.pageIndex);
+        const pinB = b.isSystemSink || this.isPinnedPrefixPage(b.pageIndex);
+        const boostA = pinA ? 10_000 + Math.max(0, this.pinnedPrefixPages - a.pageIndex) : 0;
+        const boostB = pinB ? 10_000 + Math.max(0, this.pinnedPrefixPages - b.pageIndex) : 0;
+        const sa = a.lastTouch + a.hitCount * 4 + boostA;
+        const sb = b.lastTouch + b.hitCount * 4 + boostB;
+        return sb - sa;
+      })
+      .slice(0, maxBlocks);
+  }
+
+  /**
+   * Serializes the hottest embedded KV prefix blocks into an integrity-checked `UKV3` binary payload
+   * and persists it into OPFS (`<identityKey>.unified.kv`) so system prompts and recent prefixes
+   * survive page reloads without risk of partial-write corruption.
    */
   async persistToOpfs(opfsDirectoryOverride?: FileSystemDirectoryHandle): Promise<number> {
     if (!this.dirtyForOpfs || this.blocks.size === 0) return 0;
     const dir = opfsDirectoryOverride ?? (await getOpfsDir(true));
     if (!dir) return 0;
 
-    // Pick top MAX_PERSISTED_OPFS_BLOCKS by utility (always prioritizing system sink blocks)
-    const ranked = Array.from(this.blocks.values())
-      .sort((a, b) => {
-        const sa = a.lastTouch + a.hitCount * 4 + (a.isSystemSink ? 10_000 : 0);
-        const sb = b.lastTouch + b.hitCount * 4 + (b.isSystemSink ? 10_000 : 0);
-        return sb - sa;
-      })
-      .slice(0, MAX_PERSISTED_OPFS_BLOCKS);
+    // Pick top MAX_PERSISTED_OPFS_BLOCKS by utility (always prioritizing pinned prefix blocks)
+    const ranked = this.selectTopBlocksForPersistence(MAX_PERSISTED_OPFS_BLOCKS);
 
     const payload = this.serializeBlocks(ranked);
     const fileName = sanitizeUnifiedKvFileName(this.identityKey);
@@ -530,9 +608,13 @@ export class VramUnifiedStore {
           sync.close();
         }
 
+        const isLegacyCodec =
+          raw.byteLength >= 4 &&
+          new DataView(raw.buffer, raw.byteOffset, raw.byteLength).getUint32(0, true) !==
+            UNIFIED_KV_MAGIC_V3;
         const hydrated = this.deserializeBlocks(raw, isLegacyFallback);
         if (hydrated > 0) {
-          this.dirtyForOpfs = isLegacyFallback;
+          this.dirtyForOpfs = isLegacyFallback || isLegacyCodec;
           this.persistedOpfs = true;
           return hydrated;
         }
@@ -592,9 +674,10 @@ export class VramUnifiedStore {
     this.factoredSavedBytes = savedTotal;
 
     const headerBytes = 28;
-    const out = new Uint8Array(headerBytes + totalBodyBytes);
+    const bodyEnd = headerBytes + totalBodyBytes;
+    const out = new Uint8Array(bodyEnd + UNIFIED_KV_TRAILER_BYTES);
     const dv = new DataView(out.buffer);
-    dv.setUint32(0, UNIFIED_KV_MAGIC_V2, true);
+    dv.setUint32(0, UNIFIED_KV_MAGIC_V3, true);
     dv.setUint32(4, numLayers, true);
     dv.setUint32(8, nHeadsKv, true);
     dv.setUint32(12, headDim, true);
@@ -621,6 +704,9 @@ export class VramUnifiedStore {
       out.set(payload, off);
       off += payload.byteLength;
     }
+    const [digestLo, digestHi] = computeUnifiedKvDigest(out, bodyEnd);
+    dv.setUint32(bodyEnd, digestLo, true);
+    dv.setUint32(bodyEnd + 4, digestHi, true);
     return out;
   }
 
@@ -628,7 +714,24 @@ export class VramUnifiedStore {
     if (raw.byteLength < 28) return 0;
     const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
     const magic = dv.getUint32(0, true);
-    if (magic !== UNIFIED_KV_MAGIC && magic !== UNIFIED_KV_MAGIC_V2) return 0;
+    if (
+      magic !== UNIFIED_KV_MAGIC &&
+      magic !== UNIFIED_KV_MAGIC_V2 &&
+      magic !== UNIFIED_KV_MAGIC_V3
+    ) {
+      return 0;
+    }
+    let bodyEnd = raw.byteLength;
+    if (magic === UNIFIED_KV_MAGIC_V3) {
+      if (raw.byteLength < 28 + UNIFIED_KV_TRAILER_BYTES) return 0;
+      bodyEnd = raw.byteLength - UNIFIED_KV_TRAILER_BYTES;
+      const expectedLo = dv.getUint32(bodyEnd, true);
+      const expectedHi = dv.getUint32(bodyEnd + 4, true);
+      const [actualLo, actualHi] = computeUnifiedKvDigest(raw, bodyEnd);
+      if (actualLo !== expectedLo || actualHi !== expectedHi) {
+        return 0;
+      }
+    }
     const { numLayers, nHeadsKv, headDim, pageTokens, q8BytesPerHalfPage, scaleFloatsPerHalfPage } =
       this.geometry;
     if (
@@ -655,7 +758,7 @@ export class VramUnifiedStore {
       return nextKey;
     };
 
-    if (magic === UNIFIED_KV_MAGIC_V2) {
+    if (magic === UNIFIED_KV_MAGIC_V2 || magic === UNIFIED_KV_MAGIC_V3) {
       if (sizeField !== rawBlockBytes) return 0;
       let off = 28;
       let loaded = 0;
@@ -669,7 +772,7 @@ export class VramUnifiedStore {
         data: CompressedKvPageBlock;
       }> = [];
       for (let idx = 0; idx < count; idx++) {
-        if (off + metaBytes > raw.byteLength) return loaded;
+        if (off + metaBytes > bodyEnd) return magic === UNIFIED_KV_MAGIC_V3 ? 0 : loaded;
         let key = '';
         for (let i = 0; i < 16; i++) {
           key += String.fromCharCode(raw[off + i]);
@@ -684,7 +787,7 @@ export class VramUnifiedStore {
         off += pageTokens * 4;
         const compressedLen = dv.getUint32(off, true);
         off += 4;
-        if (off + compressedLen > raw.byteLength) return loaded;
+        if (off + compressedLen > bodyEnd) return magic === UNIFIED_KV_MAGIC_V3 ? 0 : loaded;
 
         const payload = raw.subarray(off, off + compressedLen);
         off += compressedLen;
@@ -693,7 +796,7 @@ export class VramUnifiedStore {
           savedTotal += rawBlockBytes - compressedLen;
         }
         const unpacked = decompressUnifiedKvBytes(payload, rawBlockBytes);
-        if (unpacked.byteLength !== rawBlockBytes) return loaded;
+        if (unpacked.byteLength !== rawBlockBytes) return magic === UNIFIED_KV_MAGIC_V3 ? 0 : loaded;
 
         let uOff = 0;
         const kQ8 = new Int8Array(q8BytesPerHalfPage);
@@ -712,6 +815,9 @@ export class VramUnifiedStore {
         new Uint8Array(vScales.buffer).set(unpacked.subarray(uOff, uOff + scaleBytes));
 
         pending.push({ key, pageIndex, tokenIds, data: { kQ8, vQ8, kScales, vScales } });
+      }
+      if (magic === UNIFIED_KV_MAGIC_V3 && off !== bodyEnd) {
+        return 0;
       }
       if (rekeyedByPage) {
         pending.sort((a, b) => a.pageIndex - b.pageIndex);
