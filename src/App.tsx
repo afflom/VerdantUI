@@ -37,7 +37,6 @@ import { isInternalBootstrapModel } from './engine/modelCatalog';
 import { ObserverStreamBus } from './engine/observerStreamBus';
 import { PrismBuildWorkerClient } from './engine/prismBuildClient';
 import { PrismHostPool } from './engine/prismHostPool';
-import { resolveOrCreatePrismForToolCall } from './engine/prismToolResolver';
 import {
   PrismStore,
   type PublishedPrismSummary,
@@ -169,8 +168,9 @@ export default function App() {
         onOpenPrism: (prismId) => {
           setActiveView({ kind: 'prism', prismId, mode: 'app' });
         },
-        resolveOrCreatePrismForToolCall: (toolName, args, meta) =>
-          resolveOrCreatePrismForToolCall({
+        resolveOrCreatePrismForToolCall: async (toolName, args, meta) => {
+          const { resolveOrCreatePrismForToolCall } = await import('./engine/prismToolResolver');
+          return resolveOrCreatePrismForToolCall({
             toolName,
             args,
             latestUserText: meta.latestUserText,
@@ -179,7 +179,8 @@ export default function App() {
             pool: prismPool,
             observer: workerClient.cognitiveObserver,
             signal: meta.signal,
-          }),
+          });
+        },
       }),
     [workerClient, observerBus, prismStore, prismPool],
   );
@@ -361,11 +362,6 @@ export default function App() {
     ) => {
       workerClient.scheduleSpeculativePrefill(messages, draft, system, threadId);
     },
-    [workerClient],
-  );
-
-  const handleCountTokens = useCallback(
-    (prompt: string) => workerClient.countTokens(prompt),
     [workerClient],
   );
 
@@ -667,7 +663,6 @@ export default function App() {
                 onEditPrism={handleEditPrismStudio}
                 publishedPrisms={visiblePublishedPrisms}
                 onSpeculativeDraftChange={handleSpeculativeDraftChange}
-                onCountTokens={handleCountTokens}
                 onPerceiveImage={handlePerceiveImage}
                 onClearPendingImage={handleClearPendingImage}
                 onPerceiveAudio={handlePerceiveAudio}

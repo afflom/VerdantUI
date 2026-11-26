@@ -66,7 +66,6 @@ interface ThreadViewProps {
     systemMessage?: string,
     threadId?: string,
   ) => void;
-  onCountTokens?: (prompt: string) => Promise<{ tokenCount: number; maxContextWindow: number }>;
   onPerceiveImage?: (name: string, width: number, height: number, rgba: Uint8Array) => Promise<PerceivedImageReport>;
   onClearPendingImage?: () => void;
   onPerceiveAudio?: (pcm16k: Float32Array) => Promise<PerceivedAudioReport>;

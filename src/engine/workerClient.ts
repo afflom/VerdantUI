@@ -491,7 +491,7 @@ export class LlamaVTensorWorkerClient {
         modelStreamEnabled: false,
         status: this.state.model ? 'ready' : 'idle',
         progressPercent: 0,
-        statusDetail: 'Model stream off',
+        statusDetail: 'Local AI off',
         errorMessage: null,
       });
     }
@@ -903,7 +903,7 @@ export class LlamaVTensorWorkerClient {
         status: 'ready',
         progressPercent: 100,
         statusDetail: isInternalBootstrap
-          ? 'LOD0 instant actions ready (Model Stream off)'
+          ? 'Ready on your device'
           : `${msg.summary.displayName} ready`,
         errorMessage: null,
         prefillProgress: null,
@@ -933,17 +933,9 @@ export class LlamaVTensorWorkerClient {
 
     if (msg.type === 'prefill') {
       const p = msg.progress;
-      const prefixNote = p.reusedPrefixTokens > 0 ? ` (reused ${p.reusedPrefixTokens} KV)` : '';
-      const detailSuffix = p.detail ? ` · ${p.detail}` : '';
-      const statusDetail =
-        p.totalTokens > 0 && p.completedTokens < p.totalTokens
-          ? `Prefilling prompt ${p.completedTokens}/${p.totalTokens}${prefixNote}${detailSuffix}`
-          : p.detail
-            ? p.detail
-            : `Prefilling prompt ${p.completedTokens}/${p.totalTokens}${prefixNote}`;
       this.patchState({
         prefillProgress: p,
-        statusDetail,
+        statusDetail: 'Preparing response…',
       });
       return;
     }
@@ -1014,6 +1006,13 @@ export class LlamaVTensorWorkerClient {
         multimodalTelemetry: msg.multimodalTelemetry,
       });
       entry.resolve(msg.report);
+      return;
+    }
+
+    if (msg.type === 'audio_synthesized') {
+      this.pending.delete(msg.requestId);
+      this.patchState({ multimodalTelemetry: msg.multimodalTelemetry });
+      entry.resolve({ wavBytes: new Uint8Array(msg.wavBuffer), sampleRate: msg.sampleRate, durationSec: msg.durationSec });
       return;
     }
 
@@ -1387,6 +1386,32 @@ export class LlamaVTensorWorkerClient {
     if (this.state.pendingAudioContext !== null) {
       this.patchState({ pendingAudioContext: null });
     }
+  }
+
+  /**
+   * Synthesizes a multi-track stereo modal audio clip directly inside the shared Web Worker
+   * and returns the zero-copy transferred 16-bit stereo RIFF/WAVE bytes.
+   */
+  async synthesizeAudioClip(params: {
+    readonly title: string;
+    readonly style: 'ambient-pad' | 'melodic-arpeggio' | 'rhythm-pulse' | 'sound-effects';
+    readonly bpm: number;
+    readonly rootMidi: number;
+    readonly scale: 'pentatonic' | 'major' | 'minor' | 'dorian';
+    readonly durationSec: number;
+  }): Promise<{ readonly wavBytes: Uint8Array; readonly sampleRate: number; readonly durationSec: number }> {
+    const requestId = this.nextRequestId('syn');
+    return new Promise((resolve, reject) => {
+      this.pending.set(requestId, {
+        resolve: resolve as (v: unknown) => void,
+        reject,
+      });
+      this.worker.postMessage({
+        type: 'synthesize_audio',
+        requestId,
+        ...params,
+      } satisfies WorkerRequest);
+    });
   }
 
   /**

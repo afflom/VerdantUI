@@ -2,6 +2,11 @@
 
 import { computeLogMelSpectrogram } from './audioFrontend';
 import {
+  composeMultiTrackArrangement,
+  encodeStereoWav,
+  synthesizeCompositionStereoPcm,
+} from './audioSynthesisEngine';
+import {
   LlamaVTensorRuntime,
   type LoadedModelSummary,
   type PrefillProgressEvent,
@@ -137,6 +142,16 @@ export type WorkerRequest =
       allowAutoLoad?: boolean;
     }
   | {
+      type: 'synthesize_audio';
+      requestId: string;
+      title: string;
+      style: 'ambient-pad' | 'melodic-arpeggio' | 'rhythm-pulse' | 'sound-effects';
+      bpm: number;
+      rootMidi: number;
+      scale: 'pentatonic' | 'major' | 'minor' | 'dorian';
+      durationSec: number;
+    }
+  | {
       type: 'shutdown';
     };
 
@@ -201,6 +216,14 @@ export type WorkerResponse =
       type: 'audio_perceived';
       requestId: string;
       report: PerceivedAudioReport;
+      multimodalTelemetry: MultimodalCoherenceTelemetry;
+    }
+  | {
+      type: 'audio_synthesized';
+      requestId: string;
+      wavBuffer: ArrayBuffer;
+      sampleRate: number;
+      durationSec: number;
       multimodalTelemetry: MultimodalCoherenceTelemetry;
     }
   | {
@@ -925,6 +948,40 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         },
         multimodalTelemetry: multimodalCoordinator.getTelemetry(),
       });
+      return;
+    }
+
+    if (req.type === 'synthesize_audio') {
+      const comp = composeMultiTrackArrangement({
+        title: req.title,
+        style: req.style,
+        bpm: req.bpm,
+        rootMidi: req.rootMidi,
+        scale: req.scale,
+        durationSec: req.durationSec,
+      });
+      const pcm = synthesizeCompositionStereoPcm(comp, 22_050);
+      const wav = encodeStereoWav(pcm.left, pcm.right, pcm.sampleRate);
+      multimodalCoordinator.activateModality({
+        modality: 'audio',
+        modelId: 'verdant-modal-audio-synth',
+        residentBytes: wav.byteLength,
+        evict: () => {},
+      });
+      const transferCopy = new Uint8Array(wav.byteLength);
+      transferCopy.set(wav);
+      const transferBuf = transferCopy.buffer;
+      workerScope.postMessage(
+        {
+          type: 'audio_synthesized',
+          requestId: req.requestId,
+          wavBuffer: transferBuf,
+          sampleRate: pcm.sampleRate,
+          durationSec: comp.durationSec,
+          multimodalTelemetry: multimodalCoordinator.getTelemetry(),
+        } satisfies WorkerResponse,
+        [transferBuf],
+      );
       return;
     }
 
