@@ -103,19 +103,21 @@ const FORBIDDEN_TRACKING_URLS_RE =
   /https?:\/\/(?:www\.)?(?:googletagmanager\.com|google-analytics\.com|cdn\.segment\.com|app\.posthog\.com|api\.mixpanel\.com)/i;
 
 /**
- * Primary user-facing UI surfaces audited for zero internal Verdant construct leakage (DEC-011 / VUI-UX-JARGON-01).
- * Technical diagnostics live exclusively in the opt-in developer inspector drawer, never primary user surfaces.
+ * Universal Zero-Jargon Ratchet (DEC-011 / DEC-012 / VUI-UX-JARGON-01):
+ * Scans ALL user-facing TSX files under `src/App.tsx` and `src/components/*.tsx`
+ * (excluding only the `?debug=1`-gated `VTensorInspector.tsx`) to guarantee zero internal
+ * engineering jargon ("Verdant Engine", "vTensor", "routing", "weights", "WASM", "OPFS",
+ * "GGUF", "Observer", "Model Stream", "Blueprint", "Holon", ".holo", etc.) ever leaks to users.
  */
-const USER_FACING_UI_FILES: readonly string[] = [
-  'src/components/StudioGuidedWizard.tsx',
-  'src/components/ModelBlueprintCanvas.tsx',
-  'src/components/ThreadSidebar.tsx',
-  'src/components/ThreadView.tsx',
-  'src/App.tsx',
-];
+const DEBUG_ONLY_UI_FILES = new Set<string>(['src/components/VTensorInspector.tsx']);
 
-const USER_FACING_JARGON_JSX_RE =
-  /(?:>[^<{}]*\b(Observer|OpenTelemetry|vTensor|LexLean|Holon|FK-07|REQ-D\d+)\b[^<{}]*<|(?:title|placeholder|aria-label)=["'][^"']*\b(Observer|OpenTelemetry|vTensor|LexLean|Holon|FK-07|REQ-D\d+)\b[^"']*["'])/;
+const USER_FACING_JARGON_TERMS =
+  'Verdant Engine|vTensor|OpenTelemetry|OTel|LexLean|Holon|\\.holo|FK-07|REQ-D\\d+|LOD0|Model Stream|SharedArrayBuffer|WASM|OPFS|GGUF|Safetensors|ggml|vRAM|Belady|SIMD|PROV-O|ISO\\/PAS|STRIDE|Traceability|Roofline|Blueprint|Observer|routing|routed|weights|weight|tok\\/s|prefill';
+
+const USER_FACING_JARGON_JSX_RE = new RegExp(
+  `(?:>[^<{}]*\\b(${USER_FACING_JARGON_TERMS})\\b[^<{}]*<|(?:title|placeholder|aria-label)=["'][^"']*\\b(${USER_FACING_JARGON_TERMS})\\b[^"']*["'])`,
+  'i',
+);
 
 const REQUIRED_DISABLED_GGML_PROVIDERS = [
   'GGML_CPU',
@@ -459,8 +461,10 @@ export function evaluateVerdantRatchet(snapshot: RatchetSnapshot): RatchetReport
     }
   }
 
-  // 11. Zero internal Verdant construct jargon in primary user-facing JSX surfaces (DEC-011 / VUI-UX-JARGON-01)
-  for (const uiPath of USER_FACING_UI_FILES) {
+  // 11. Universal zero internal jargon across ALL user-facing TSX surfaces (DEC-011 / DEC-012 / VUI-UX-JARGON-01)
+  for (const uiPath of srcPaths) {
+    if (uiPath !== 'src/App.tsx' && !uiPath.startsWith('src/components/')) continue;
+    if (!uiPath.endsWith('.tsx') || DEBUG_ONLY_UI_FILES.has(uiPath)) continue;
     const content = snapshot.srcFiles[uiPath];
     if (!content) continue;
     const match = content.match(USER_FACING_JARGON_JSX_RE);
@@ -470,7 +474,7 @@ export function evaluateVerdantRatchet(snapshot: RatchetSnapshot): RatchetReport
         category: 'user-facing-jargon',
         path: uiPath,
         line: findLineNumber(content, USER_FACING_JARGON_JSX_RE),
-        detail: `User-facing JSX exposes internal Verdant construct "${term}" — violates DEC-011 / VUI-UX-JARGON-01`,
+        detail: `User-facing JSX exposes technical jargon "${term}" — violates DEC-011 / VUI-UX-JARGON-01`,
       });
     }
   }
@@ -599,6 +603,17 @@ export function verifyPlantedDefects(cleanSnapshot: RatchetSnapshot): {
         srcFiles: {
           ...s.srcFiles,
           'src/components/StudioGuidedWizard.tsx': `${s.srcFiles['src/components/StudioGuidedWizard.tsx'] ?? ''}\nexport const _bad = () => <span>Observer Stream Active</span>;`,
+        },
+      }),
+    },
+    {
+      name: 'planted-user-facing-routing-weights-jargon',
+      expectedCategory: 'user-facing-jargon',
+      mutate: (s) => ({
+        ...s,
+        srcFiles: {
+          ...s.srcFiles,
+          'src/components/SettingsDrawer.tsx': `${s.srcFiles['src/components/SettingsDrawer.tsx'] ?? ''}\nexport const _bad2 = () => <span>Verdant Engine routing weights</span>;`,
         },
       }),
     },

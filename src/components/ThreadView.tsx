@@ -33,19 +33,15 @@ import {
   Paperclip,
   Pencil,
   RefreshCw,
-  SlidersHorizontal,
   Sparkles,
   Square,
   Wrench,
   X,
 } from 'lucide-react';
-import { formatMessagesForLlama } from '../engine/assistantAdapter';
 import {
   UNIFIED_VERDANT_SUGGESTIONS,
   UNIFIED_VERDANT_SYSTEM_PROMPT,
-  type CognitiveRouteCertificate,
 } from '../engine/cognitiveObserver';
-import { isInternalBootstrapModel } from '../engine/modelCatalog';
 import { shortPrismDigest, type PublishedPrismSummary } from '../engine/prismStudio';
 import type { EngineState } from '../engine/workerClient';
 
@@ -100,107 +96,6 @@ const SpeculativePrefillDriver: FC<{
   ]);
 
   return null;
-};
-
-const ComposerContextMeter: FC<{
-  engineState: EngineState;
-  modelReady: boolean;
-  onCountTokens?: (prompt: string) => Promise<{ tokenCount: number; maxContextWindow: number }>;
-}> = ({ engineState, modelReady, onCountTokens }) => {
-  const composerText = useAuiState((s) => s.composer.text);
-  const messages = useAuiState((s) => s.thread.messages);
-  const [tokenCount, setTokenCount] = useState<number>(0);
-
-  const model = engineState.model;
-  const maxCtx = model?.maxContextWindow ?? 0;
-  const isBootstrapUnbound = isInternalBootstrapModel(model?.id);
-  const systemMessage = engineState.importedHarness?.system ?? UNIFIED_VERDANT_SYSTEM_PROMPT;
-  const effectivePromptMode = engineState.importedHarness?.promptMode ?? engineState.promptMode;
-
-  useEffect(() => {
-    if (!modelReady || !model || isBootstrapUnbound || !onCountTokens) {
-      setTokenCount(0);
-      return;
-    }
-    const trimmedDraft = composerText.trim();
-    if (messages.length === 0 && trimmedDraft.length === 0) {
-      setTokenCount(0);
-      return;
-    }
-    let cancelled = false;
-    const timer = setTimeout(() => {
-      const syntheticMessages: ThreadMessage[] =
-        trimmedDraft.length > 0
-          ? [
-              ...messages,
-              {
-                id: 'draft-preview',
-                role: 'user',
-                createdAt: new Date(),
-                content: [{ type: 'text', text: composerText }],
-                attachments: [],
-                metadata: { custom: {} },
-              } as ThreadMessage,
-            ]
-          : [...messages];
-      const formatted = formatMessagesForLlama(
-        syntheticMessages,
-        model,
-        effectivePromptMode,
-        systemMessage,
-      );
-      void onCountTokens(formatted)
-        .then((res) => {
-          if (!cancelled) setTokenCount(res.tokenCount);
-        })
-        .catch(() => {
-          // Ignore transient count errors while switching models
-        });
-    }, 120);
-
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, [
-    composerText,
-    messages,
-    model,
-    modelReady,
-    isBootstrapUnbound,
-    effectivePromptMode,
-    systemMessage,
-    onCountTokens,
-  ]);
-
-  if (!model || isBootstrapUnbound || maxCtx <= 0) return null;
-
-  const isOverContext = tokenCount > maxCtx;
-  const displayTokens =
-    tokenCount > 0
-      ? `${tokenCount.toLocaleString()} / ${maxCtx.toLocaleString()} ctx`
-      : `${maxCtx.toLocaleString()} ctx`;
-
-  return (
-    <>
-      <span aria-hidden="true">·</span>
-      <span
-        data-testid="composer-context-meter"
-        title={
-          isOverContext
-            ? `Prompt is ${tokenCount.toLocaleString()} tokens; oldest ${(tokenCount - maxCtx).toLocaleString()} tokens will slide outside the ${maxCtx.toLocaleString()}-token window.`
-            : `Full native context supported: input & output up to ${maxCtx.toLocaleString()} tokens.`
-        }
-        className={`whitespace-nowrap shrink-0 font-mono text-[11px] tabular-nums ${
-          isOverContext
-            ? 'font-medium text-amber-700 dark:text-amber-400'
-            : 'text-slate-500 dark:text-slate-400'
-        }`}
-      >
-        {displayTokens}
-      </span>
-    </>
-  );
 };
 
 const ComposerPrismMentionPicker: FC<{
@@ -663,32 +558,12 @@ const AssistantMessageContext = createContext<AssistantMessageContextValue>({
 });
 
 const AssistantMessage: FC = () => {
-  const { statusDetail, onInspectRoute } = useContext(AssistantMessageContext);
-  const prismRoute = useAuiState(
-    (s) =>
-      (
-        s.message.metadata.custom as
-          | { readonly prismRoute?: CognitiveRouteCertificate }
-          | undefined
-      )?.prismRoute,
-  );
+  const { statusDetail } = useContext(AssistantMessageContext);
   return (
     <MessagePrimitive.Root className="group mx-auto w-full max-w-3xl px-4 py-3 sm:px-6">
       <div className="flex flex-col gap-2">
         <div className="flex items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
           <span className="font-semibold text-slate-800 dark:text-slate-200">VerdantUI</span>
-          {prismRoute && (
-            <button
-              type="button"
-              onClick={onInspectRoute}
-              title={prismRoute.rationale}
-              className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-mono text-[10px] text-slate-500 hover:bg-slate-100 hover:text-emerald-800 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-emerald-400 transition-colors"
-            >
-              <span>{prismRoute.label}</span>
-              <span aria-hidden="true">·</span>
-              <span>#{prismRoute.digest}</span>
-            </button>
-          )}
         </div>
 
         <div className="rounded-xl border border-slate-200/90 bg-white px-4 py-3.5 text-slate-800 dark:border-slate-800 dark:bg-[#121821] dark:text-slate-100">
@@ -765,7 +640,6 @@ export const ThreadView: FC<ThreadViewProps> = ({
   const isDownloading = engineState.status === 'downloading';
   const isModelLoading = isDownloading || engineState.status === 'loading';
   const modelReady = engineState.model !== null && !isModelLoading;
-  const isBootstrapUnbound = isInternalBootstrapModel(engineState.model?.id);
   const importedHarness = engineState.importedHarness;
   const effectiveSystemMessage = importedHarness?.system ?? UNIFIED_VERDANT_SYSTEM_PROMPT;
 
@@ -789,7 +663,7 @@ export const ThreadView: FC<ThreadViewProps> = ({
       <ThreadPrimitive.Root className="relative flex h-full flex-col overflow-hidden bg-[#F8F9FA] dark:bg-[#0B0F14]">
       <SpeculativePrefillDriver
         modelId={engineState.model?.id ?? null}
-        modelReady={modelReady && !isBootstrapUnbound}
+        modelReady={modelReady}
         promptMode={importedHarness?.promptMode ?? engineState.promptMode}
         systemMessage={effectiveSystemMessage}
         onSpeculativeDraftChange={onSpeculativeDraftChange}
@@ -807,53 +681,8 @@ export const ThreadView: FC<ThreadViewProps> = ({
                 </h1>
                 <p className="mt-2.5 max-w-2xl text-[15px] leading-relaxed text-slate-600 dark:text-slate-400">
                   A free, private, 100% on-device AI workspace running directly in your browser.
-                  Every prompt adapts automatically across built-in tools, deeper reasoning, and
-                  your own Prisms — zero accounts, zero tracking, zero servers.
+                  Zero accounts, zero tracking, zero servers.
                 </p>
-
-                <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-                  <span>
-                    Model Stream:{' '}
-                    <strong className="font-medium text-slate-800 dark:text-slate-200">
-                      {!engineState.modelStreamEnabled && isBootstrapUnbound
-                        ? 'Off (instant built-in tools active)'
-                        : isModelLoading
-                          ? `${engineState.statusDetail} (${engineState.progressPercent}%)`
-                          : isBootstrapUnbound
-                            ? 'Ready'
-                            : (engineState.model?.displayName ?? 'VerdantUI')}
-                    </strong>
-                  </span>
-                  {!isBootstrapUnbound && engineState.model && (
-                    <>
-                      <span aria-hidden="true">·</span>
-                      <span>
-                        Format:{' '}
-                        <span className="font-mono">
-                          {engineState.model.hparams.primaryQuantization}
-                        </span>
-                      </span>
-                      <span aria-hidden="true">·</span>
-                      <span>
-                        Context:{' '}
-                        <span className="font-mono">
-                          {engineState.model.maxContextWindow.toLocaleString()} tok
-                        </span>
-                      </span>
-                    </>
-                  )}
-                  {importedHarness && (
-                    <>
-                      <span aria-hidden="true">·</span>
-                      <span>
-                        Override:{' '}
-                        <strong className="font-medium text-slate-800 dark:text-slate-200">
-                          {importedHarness.name}
-                        </strong>
-                      </span>
-                    </>
-                  )}
-                </div>
               </div>
 
               {isModelLoading && (
@@ -1046,60 +875,15 @@ export const ThreadView: FC<ThreadViewProps> = ({
                       type="button"
                       onClick={() => setPrismPickerOpen((prev) => !prev)}
                       className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-medium text-emerald-800 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/50 transition-colors"
-                      title="Address a Published Prism with @"
+                      title="Use one of your published creations with @"
                     >
                       <Sparkles className="h-3 w-3" />
                       <span>
-                        {publishedPrisms.length} Prism{publishedPrisms.length === 1 ? '' : 's'}
+                        {publishedPrisms.length} App{publishedPrisms.length === 1 ? '' : 's'}
                       </span>
                     </button>
                   </>
                 )}
-                <ComposerContextMeter
-                  engineState={engineState}
-                  modelReady={modelReady}
-                  onCountTokens={onCountTokens}
-                />
-                {engineState.lastRouteCertificate && (
-                  <>
-                    <span className="hidden sm:inline" aria-hidden="true">
-                      ·
-                    </span>
-                    <button
-                      type="button"
-                      onClick={onToggleInspector}
-                      title={engineState.lastRouteCertificate.rationale}
-                      className="hidden shrink-0 items-center gap-1 whitespace-nowrap font-mono text-[11px] hover:text-emerald-800 sm:inline-flex dark:hover:text-emerald-400 transition-colors"
-                    >
-                      <SlidersHorizontal className="h-3 w-3" />
-                      <span>#{engineState.lastRouteCertificate.digest}</span>
-                    </button>
-                  </>
-                )}
-                {engineState.prefillProgress ? (
-                  <>
-                    <span className="hidden sm:inline" aria-hidden="true">
-                      ·
-                    </span>
-                    <span className="hidden truncate font-mono text-[11px] tabular-nums text-emerald-800 dark:text-emerald-400 sm:inline">
-                      {engineState.prefillProgress.totalTokens > 0 &&
-                      engineState.prefillProgress.completedTokens <
-                        engineState.prefillProgress.totalTokens
-                        ? `prefill ${engineState.prefillProgress.completedTokens}/${engineState.prefillProgress.totalTokens}${engineState.prefillProgress.detail ? ` · ${engineState.prefillProgress.detail}` : ''}`
-                        : (engineState.prefillProgress.detail ??
-                          `prefill ${engineState.prefillProgress.completedTokens}/${engineState.prefillProgress.totalTokens}`)}
-                    </span>
-                  </>
-                ) : engineState.lastTokensPerSec > 0 ? (
-                  <>
-                    <span className="hidden sm:inline" aria-hidden="true">
-                      ·
-                    </span>
-                    <span className="hidden font-mono tabular-nums sm:inline">
-                      {engineState.lastTokensPerSec.toFixed(1)} tok/s
-                    </span>
-                  </>
-                ) : null}
               </div>
 
               <div className="flex shrink-0 items-center gap-2">

@@ -12,6 +12,7 @@ import {
   useRemoteThreadListRuntime,
 } from '@assistant-ui/react';
 import { Menu, Moon, Shield, ShieldOff, SlidersHorizontal, Sun } from 'lucide-react';
+import { SettingsDrawer } from './components/SettingsDrawer';
 import { ThreadSidebar } from './components/ThreadSidebar';
 import { ThreadView } from './components/ThreadView';
 import { createLlamaVTensorAdapter } from './engine/assistantAdapter';
@@ -189,7 +190,12 @@ export default function App() {
   const [prisms, setPrisms] = useState<readonly VerdantPrismProject[]>(() => prismStore.list());
   const [activeView, setActiveView] = useState<ActiveWorkspaceView>({ kind: 'thread' });
   const [prismToast, setPrismToast] = useState<{ title: string; body: string } | null>(null);
-  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [debugPanelOpen, setDebugPanelOpen] = useState(false);
+  const debugMode = useMemo(() => {
+    if (typeof window === 'undefined') return false;
+    return new URLSearchParams(window.location.search).get('debug') === '1';
+  }, []);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [darkMode, setDarkMode] = useState<boolean>(readInitialDarkMode);
   const [activeSpace, setActiveSpace] = useState<ContextCompartmentId>('personal');
@@ -256,7 +262,10 @@ export default function App() {
     if (typeof window === 'undefined') return;
     const mq = window.matchMedia('(max-width: 1279px)');
     const sync = (matches: boolean) => {
-      if (matches) setInspectorOpen(false);
+      if (matches) {
+        setSettingsOpen(false);
+        setDebugPanelOpen(false);
+      }
     };
     sync(mq.matches);
     const handler = (e: MediaQueryListEvent) => sync(e.matches);
@@ -285,13 +294,14 @@ export default function App() {
         setMobileSidebarOpen(false);
         return;
       }
-      if (inspectorOpen && typeof window !== 'undefined' && window.innerWidth < 1280) {
-        setInspectorOpen(false);
+      if ((settingsOpen || debugPanelOpen) && typeof window !== 'undefined' && window.innerWidth < 1280) {
+        setSettingsOpen(false);
+        setDebugPanelOpen(false);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [mobileSidebarOpen, inspectorOpen]);
+  }, [mobileSidebarOpen, settingsOpen, debugPanelOpen]);
 
   const handleClearHarness = useCallback(() => {
     workerClient.setImportedHarness(null);
@@ -315,7 +325,7 @@ export default function App() {
   }, [workerClient]);
 
   const handleToggleInspector = useCallback(() => {
-    setInspectorOpen((prev) => !prev);
+    setSettingsOpen((prev) => !prev);
   }, []);
 
   const handleSpeculativeDraftChange = useCallback(
@@ -513,8 +523,8 @@ export default function App() {
                   data-testid="model-stream-toggle"
                   title={
                     streamOn
-                      ? `Model Stream enabled (${engineState.statusDetail}). Click to pause/disable.`
-                      : 'Model Stream disabled (remembers setting across reloads). Click to stream local neural weights.'
+                      ? 'Local AI is active on your device. Click to pause.'
+                      : 'Local AI is off. Click to enable private on-device AI.'
                   }
                   onClick={handleToggleModelStream}
                   className={`inline-flex h-9 items-center gap-2 rounded-lg border px-2.5 sm:px-3 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
@@ -534,7 +544,7 @@ export default function App() {
                             : 'bg-emerald-600 dark:bg-emerald-400'
                     }`}
                   />
-                  <span>Model Stream</span>
+                  <span>Local AI</span>
                   <span className="font-mono text-[11px] tabular-nums opacity-80">
                     {statusLabel}
                   </span>
@@ -545,9 +555,9 @@ export default function App() {
             <button
               type="button"
               onClick={handleToggleInspector}
-              aria-pressed={inspectorOpen}
+              aria-pressed={settingsOpen}
               className={`inline-flex h-9 items-center gap-1.5 rounded-lg px-2.5 sm:px-3 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                inspectorOpen
+                settingsOpen
                   ? 'bg-[#0F5132] text-white hover:bg-[#0B3D25]'
                   : 'border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800'
               }`}
@@ -573,7 +583,7 @@ export default function App() {
             engineState={engineState}
             mobileOpen={mobileSidebarOpen}
             onCloseMobile={() => setMobileSidebarOpen(false)}
-            onOpenInspector={() => setInspectorOpen(true)}
+            onOpenInspector={() => setSettingsOpen(true)}
             activeView={activeView}
             onSelectThreadView={() => setActiveView({ kind: 'thread' })}
             prisms={prisms}
@@ -619,11 +629,29 @@ export default function App() {
             )}
           </main>
 
-          {inspectorOpen && (
+          <SettingsDrawer
+            open={settingsOpen && !debugPanelOpen}
+            onClose={() => setSettingsOpen(false)}
+            darkMode={darkMode}
+            onToggleDarkMode={() => setDarkMode((d) => !d)}
+            activeSpace={activeSpace}
+            onSelectSpace={setActiveSpace}
+            sharingPaused={sharingPaused}
+            onToggleSharingPaused={() => setSharingPaused((p) => !p)}
+            cachedBytes={engineState.opfsStorage?.usageBytes ?? 0}
+            onClearCache={handleClearCache}
+            debugMode={debugMode}
+            onOpenDebugPanel={() => {
+              setSettingsOpen(false);
+              setDebugPanelOpen(true);
+            }}
+          />
+
+          {debugMode && debugPanelOpen && (
             <Suspense fallback={null}>
               <VTensorInspector
-                open={inspectorOpen}
-                onClose={() => setInspectorOpen(false)}
+                open={debugPanelOpen}
+                onClose={() => setDebugPanelOpen(false)}
                 engineState={engineState}
                 publishedPrisms={publishedPrisms}
                 observerBus={observerBus}

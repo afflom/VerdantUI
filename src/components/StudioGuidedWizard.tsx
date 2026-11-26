@@ -1,13 +1,11 @@
 /**
- * Conversational Verdant Studio Weight-Routing Wizard (`src/components/StudioGuidedWizard.tsx`)
+ * Conversational Verdant Studio Creator (`src/components/StudioGuidedWizard.tsx`)
  *
- * Implements DEC-009 (Zero LLM-Written JavaScript) & DEC-011 (Plain Human Language):
- * - Classifies the user's idea across the 7 MediaTypes (Picture, Audio, Written Work, Video,
- *   Game, Research Program, Tool) and activates ONLY the relevant Studio features.
- * - Routes structured declarative weights (`route-prism-weights`) — NEVER generates raw JS.
- * - Supports importing & attaching local media weight files (.gguf / .safetensors) onto
- *   compatible Picture, Audio, Video, Game, or Written-Work Prisms.
- * - Works smoothly both with the on-device local model AND instantaneously out of the box.
+ * Implements DEC-011 (Zero Technical Jargon) & DEC-012 (Zero User Tunables / Zero Manual Uploads):
+ * - Plain human language only — no "routing", "weights", "models", "WASM", or engineering terms.
+ * - Clean creation types: Game, Picture, Audio, Writing, Video, Research, Tool.
+ * - Per-creation Space selector (Personal, Work, Health, Research) and Privacy Shield switch
+ *   ("Share busy times only — never details").
  */
 
 import {
@@ -16,23 +14,17 @@ import {
   useMemo,
   useRef,
   useState,
-  type ChangeEvent,
   type FC,
   type FormEvent,
 } from 'react';
 import {
   Check,
-  Cpu,
   Globe,
   Loader2,
   Send,
   Shield,
-  ShieldCheck,
-  SlidersHorizontal,
   Sparkles,
   Square,
-  Upload,
-  X,
 } from 'lucide-react';
 import {
   dispatchStudioOp,
@@ -44,7 +36,6 @@ import type { VerdantRoutingReport } from '../engine/verdantStandardsRouter';
 import type { StudioChatMessage } from '../engine/prismStudio';
 import {
   buildStudioPromptForStep,
-  computeGuidedWizardState,
   parseIdeaSentence,
   reconcileWizardTurn,
   type ExtractedPrismIntent,
@@ -59,17 +50,9 @@ import {
   parseDiscoveryAgentResponse,
   type AgentChatTurn,
 } from '../engine/prismStudioAgent';
-import {
-  compatibleModalitiesForMediaType,
-  createImportedWeightBinding,
-  MULTIMODAL_WEIGHT_PRESETS,
-  PRISM_MEDIA_CATALOG,
-  type MediaModelWeightBinding,
-  type PrismMediaType,
-} from '../engine/prismMediaOrgans';
+import { PRISM_MEDIA_CATALOG, type PrismMediaType } from '../engine/prismMediaOrgans';
 import { DEFAULT_USER_SPACES, type ContextCompartmentId } from '../engine/unifiedPossessionModel';
 import type { EngineStatus } from '../engine/workerClient';
-import type { PrismRuntimeError } from './PrismSandboxFrame';
 
 interface StudioGuidedWizardProps {
   declaration: PrismDeclaration;
@@ -80,7 +63,6 @@ interface StudioGuidedWizardProps {
     readonly role: 'user' | 'assistant';
     readonly content: string;
     readonly badges?: readonly string[];
-    readonly needsLocalModel?: boolean;
   }) => Promise<void>;
   activeStep: GuidedStepId;
   onSelectStep: (step: GuidedStepId) => void;
@@ -96,22 +78,15 @@ interface StudioGuidedWizardProps {
   hasLocalModelReady: boolean;
   engineStatus: EngineStatus;
   engineProgressPercent: number;
-  engineStatusDetail: string;
-  loadedModelName: string | null;
-  onEnableModelStream: () => void;
-  runtimeError: PrismRuntimeError | null;
-  onClearRuntimeError: () => void;
   onOpenPreview: () => void;
-  onCheckAndBuild: () => void;
   onPublish: () => void;
-  building: boolean;
-  onSwitchToAdvanced: () => void;
+  publishing: boolean;
 }
 
 const STARTER_SUGGESTIONS: readonly string[] = [
-  'This Prism will be the video game "Minesweeper"',
+  'Make the game "Minesweeper"',
   'Create an emerald geometric sunburst picture',
-  'Create a calm ambient synth soundscape',
+  'Compose a calm ambient soundscape',
   'Healthy Habits: protect 5pm to 6pm daily for exercise',
 ];
 
@@ -147,27 +122,19 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
   hasLocalModelReady,
   engineStatus,
   engineProgressPercent,
-  loadedModelName,
   onOpenPreview,
-  onCheckAndBuild,
   onPublish,
-  building,
-  onSwitchToAdvanced,
+  publishing,
 }) => {
   const [inputText, setInputText] = useState('');
   const [thinking, setThinking] = useState(false);
-  const [agentPhaseLabel, setAgentPhaseLabel] = useState('Routing Prism weights…');
+  const [phaseLabel, setPhaseLabel] = useState('Designing…');
   const [agentQuickReplies, setAgentQuickReplies] = useState<readonly string[] | null>(null);
   const [selectedMediaType, setSelectedMediaType] = useState<PrismMediaType | null>(
     () => declaration.view?.proceduralOrgan?.mediaType ?? declaration.concept.mediaType ?? null,
   );
-  const [attachedWeights, setAttachedWeights] = useState<readonly MediaModelWeightBinding[]>(
-    () => declaration.view?.proceduralOrgan?.attachedWeights ?? [],
-  );
-  const [weightsPanelOpen, setWeightsPanelOpen] = useState(false);
 
   const scrollEndRef = useRef<HTMLDivElement | null>(null);
-  const weightFileInputRef = useRef<HTMLInputElement | null>(null);
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
   const runTokenRef = useRef(0);
@@ -175,15 +142,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
   useEffect(() => {
     const declMedia = declaration.view?.proceduralOrgan?.mediaType ?? declaration.concept.mediaType ?? null;
     if (declMedia) setSelectedMediaType(declMedia);
-    if (declaration.view?.proceduralOrgan?.attachedWeights) {
-      setAttachedWeights(declaration.view.proceduralOrgan.attachedWeights);
-    }
   }, [declaration.concept.mediaType, declaration.view?.proceduralOrgan]);
-
-  const guided = useMemo(
-    () => computeGuidedWizardState(declaration, routing, checkReport),
-    [declaration, routing, checkReport],
-  );
 
   const currentPrompt = useMemo(
     () => buildStudioPromptForStep(declaration, routing, checkReport, activeStep),
@@ -194,7 +153,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
     scrollEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }, [messages.length, activeStep, thinking]);
 
-  const isModelLoading = engineStatus === 'downloading' || engineStatus === 'loading';
+  const isLoadingAi = engineStatus === 'downloading' || engineStatus === 'loading';
 
   const handleStopAgent = useCallback(() => {
     runTokenRef.current += 1;
@@ -202,67 +161,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
     setThinking(false);
   }, [onCancelStudioAgent]);
 
-  const dispatchWeightBindings = useCallback(
-    async (nextBindings: readonly MediaModelWeightBinding[]) => {
-      setAttachedWeights(nextBindings);
-      if (declaration.view?.proceduralOrgan) {
-        const primaryReq = declaration.requirements[0]?.id ?? 'REQ-01';
-        await onDispatchOp({
-          op: 'route-prism-weights',
-          mediaType: declaration.view.proceduralOrgan.mediaType,
-          activeOrgans: declaration.view.proceduralOrgan.activeOrgans,
-          weights: declaration.view.proceduralOrgan.weights,
-          attachedWeights: nextBindings,
-          compartmentId: declaration.concept.compartmentId,
-          citation: { kind: 'req', requirementId: primaryReq },
-        });
-      }
-    },
-    [declaration, onDispatchOp],
-  );
-
-  const handleAttachWeightFile = useCallback(
-    async (e: ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      e.target.value = '';
-      if (!file) return;
-      const activeMedia: PrismMediaType = selectedMediaType ?? 'picture';
-      const modality = compatibleModalitiesForMediaType(activeMedia)[0] ?? 'text';
-      // Read only the leading 64 KiB header slice so multi-GB checkpoints inspect in <5ms
-      const headerSlice = new Uint8Array(await file.slice(0, 65536).arrayBuffer());
-      const binding = createImportedWeightBinding({
-        fileName: file.name,
-        byteLength: file.size,
-        modality,
-        headerBytes: headerSlice,
-      });
-      const nextBindings = [
-        ...attachedWeights.filter((b) => b.id !== binding.id),
-        binding,
-      ];
-      await dispatchWeightBindings(nextBindings);
-
-      await onAppendMessage({
-        role: 'assistant',
-        content: `Attached local ${modality} model weights "${file.name}" (${binding.headerSummary ?? `${(file.size / (1024 * 1024)).toFixed(1)} MB`}) and routed its signature onto this ${PRISM_MEDIA_CATALOG[activeMedia].label} Prism.`,
-        badges: [`Routed ${modality} weights`],
-      });
-    },
-    [attachedWeights, dispatchWeightBindings, onAppendMessage, selectedMediaType],
-  );
-
-  const handleTogglePresetWeight = useCallback(
-    async (preset: MediaModelWeightBinding) => {
-      const exists = attachedWeights.some((b) => b.id === preset.id);
-      const nextBindings = exists
-        ? attachedWeights.filter((b) => b.id !== preset.id)
-        : [...attachedWeights, preset];
-      await dispatchWeightBindings(nextBindings);
-    },
-    [attachedWeights, dispatchWeightBindings],
-  );
-
-  const handleChangePrismSpace = useCallback(
+  const handleChangeSpace = useCallback(
     async (nextSpace: ContextCompartmentId) => {
       if (declaration.view?.proceduralOrgan) {
         const primaryReq = declaration.requirements[0]?.id ?? 'REQ-01';
@@ -276,7 +175,6 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
           mediaType: declaration.view.proceduralOrgan.mediaType,
           activeOrgans: declaration.view.proceduralOrgan.activeOrgans,
           weights: nextWeights,
-          attachedWeights: declaration.view.proceduralOrgan.attachedWeights,
           compartmentId: nextSpace,
           citation: { kind: 'req', requirementId: primaryReq },
         });
@@ -300,7 +198,6 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
       mediaType: organ.mediaType,
       activeOrgans: organ.activeOrgans,
       weights: { ...organ.weights, emitsOpaqueConstraints: nextShare },
-      attachedWeights: organ.attachedWeights,
       compartmentId: declaration.concept.compartmentId,
       citation: { kind: 'req', requirementId: primaryReq },
     });
@@ -343,35 +240,28 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
         let rawModelJson = '';
         if (hasLocalModelReady && onRunStudioAgentPrompt) {
           setThinking(true);
-          setAgentPhaseLabel(
+          setPhaseLabel(
             isRefining
-              ? `Routing updated ${PRISM_MEDIA_CATALOG[activeMediaType].label} weights…`
-              : `Routing ${PRISM_MEDIA_CATALOG[activeMediaType].label} features…`,
+              ? `Updating your ${PRISM_MEDIA_CATALOG[activeMediaType].label.toLowerCase()}…`
+              : `Creating your ${PRISM_MEDIA_CATALOG[activeMediaType].label.toLowerCase()}…`,
           );
           try {
             const prompt = isRefining
               ? buildWeightRefinementPrompt(nextHistory, declaration, message)
               : buildWeightRoutingDiscoveryPrompt(nextHistory, declaration, userTurns, activeMediaType);
-            rawModelJson = await onRunStudioAgentPrompt(prompt, message, 768, (chars) => {
-              if (runTokenRef.current === runToken) {
-                setAgentPhaseLabel(`Routing Prism weights… (${chars.toLocaleString()} chars)`);
-              }
-            });
+            rawModelJson = await onRunStudioAgentPrompt(prompt, message, 768);
           } catch (err) {
             if (isAbortError(err) || runTokenRef.current !== runToken) {
               setThinking(false);
               await onAppendMessage({
                 role: 'assistant',
-                content: 'Stopped routing. Send another message whenever you are ready.',
+                content: 'Stopped. Send another message whenever you are ready.',
               });
               return;
             }
-            // Fall through cleanly to deterministic weight routing if local inference errored
             rawModelJson = '';
           } finally {
-            if (runTokenRef.current === runToken) {
-              setThinking(false);
-            }
+            if (runTokenRef.current === runToken) setThinking(false);
           }
           if (runTokenRef.current !== runToken) return;
         }
@@ -386,27 +276,20 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
 
         if (spec.readyToBuild || isRefining) {
           const assembled = assembleProceduralPrismOps(declaration, spec, message);
-          const finalOps =
-            attachedWeights.length > 0
-              ? assembled.ops.map((op) =>
-                  op.op === 'route-prism-weights' ? { ...op, attachedWeights } : op,
-                )
-              : assembled.ops;
-          if (finalOps.length > 0) {
-            await onDispatchOp({ op: 'batch', ops: finalOps });
+          if (assembled.ops.length > 0) {
+            await onDispatchOp({ op: 'batch', ops: assembled.ops });
           }
           await onAppendMessage({
             role: 'assistant',
             content: isRefining
-              ? `Updated your ${PRISM_MEDIA_CATALOG[spec.mediaType].label} Prism "${spec.name}" and refreshed Preview.`
-              : `Your ${PRISM_MEDIA_CATALOG[spec.mediaType].label} Prism "${spec.name}" is synthesized and live in Preview! Ask me in plain English to adjust any settings, rules, or style.`,
-            badges: assembled.badges,
+              ? `Updated "${spec.name}" and refreshed the preview.`
+              : `"${spec.name}" is ready in Preview! Tell me in plain English if you want to change anything.`,
+            badges: [PRISM_MEDIA_CATALOG[spec.mediaType].label],
           });
           setAgentQuickReplies(spec.quickReplies);
           onSelectStep('ready-to-seal');
           onOpenPreview();
         } else {
-          // Anchor Core Models right away so the live Blueprint updates immediately while asking 1–2 quick questions
           const coreOps = buildAgentCoreModelOps(declaration, spec, message);
           if (coreOps.length > 0) {
             let working = declaration;
@@ -419,10 +302,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
           await onAppendMessage({
             role: 'assistant',
             content: spec.reply,
-            badges: [
-              PRISM_MEDIA_CATALOG[spec.mediaType].label,
-              `${spec.activeOrgans.length} active feature(s)`,
-            ],
+            badges: [PRISM_MEDIA_CATALOG[spec.mediaType].label],
           });
           setAgentQuickReplies(spec.quickReplies);
           onSelectStep('confirm-context');
@@ -430,7 +310,6 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
         return;
       }
 
-      // Structured numeric policy / calculator flow
       let preParsedIntent: ExtractedPrismIntent | undefined;
       if (
         (routing.isUndefined || activeStep === 'anchor-idea') &&
@@ -439,7 +318,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
       ) {
         const runToken = ++runTokenRef.current;
         setThinking(true);
-        setAgentPhaseLabel('Extracting your Prism rules…');
+        setPhaseLabel('Understanding your idea…');
         try {
           const deterministic = parseIdeaSentence(message);
           preParsedIntent = await onSynthesizeWithLocalModel(message, deterministic);
@@ -457,7 +336,6 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
       await onAppendMessage({
         role: 'assistant',
         content: result.assistantReply,
-        badges: result.reconciledBadges,
       });
       setAgentQuickReplies(null);
       onSelectStep(result.nextStep);
@@ -465,7 +343,6 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
     },
     [
       activeStep,
-      attachedWeights,
       declaration,
       hasLocalModelReady,
       onAppendMessage,
@@ -496,57 +373,8 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col bg-white dark:bg-[#0E131B]">
-      {/* Compact Plain-Language Progress Rail */}
-      <div className="flex shrink-0 flex-wrap items-center justify-between gap-1 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
-        <div className="flex flex-wrap items-center gap-1">
-          {guided.steps
-            .filter((s) => s.visible)
-            .map((st) => {
-              const active = activeStep === st.id;
-              return (
-                <button
-                  key={st.id}
-                  type="button"
-                  onClick={() => onSelectStep(st.id)}
-                  className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors ${
-                    active
-                      ? 'bg-emerald-700 text-white'
-                      : st.complete
-                        ? 'bg-emerald-50 text-emerald-800 hover:bg-emerald-100 dark:bg-emerald-950/40 dark:text-emerald-300'
-                        : 'bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-zinc-800/80 dark:text-zinc-400'
-                  }`}
-                >
-                  {st.complete && <Check className="h-3 w-3" />}
-                  <span>{st.label}</span>
-                </button>
-              );
-            })}
-        </div>
-        <span
-          className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${
-            hasLocalModelReady
-              ? 'bg-emerald-50 text-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-300'
-              : 'bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400'
-          }`}
-          title={
-            hasLocalModelReady
-              ? `Local assistant active (${loadedModelName ?? 'on-device model'})`
-              : 'Instant procedural studio ready (turn on a local model for richer weight routing)'
-          }
-        >
-          <Cpu className="h-2.5 w-2.5" />
-          <span>
-            {hasLocalModelReady
-              ? 'Local AI Ready'
-              : isModelLoading
-                ? `Loading ${Math.round(engineProgressPercent)}%`
-                : 'Instant Studio'}
-          </span>
-        </span>
-      </div>
-
-      {/* Sparse Artifact Type Selector Rail */}
-      <div className="flex shrink-0 flex-wrap items-center justify-between gap-1.5 border-b border-zinc-100 bg-zinc-50/70 px-3 py-1.5 dark:border-zinc-800/80 dark:bg-[#0B0F14]">
+      {/* Creation Type Rail */}
+      <div className="flex shrink-0 flex-wrap items-center justify-between gap-1.5 border-b border-zinc-100 bg-zinc-50/70 px-3 py-2 dark:border-zinc-800/80 dark:bg-[#0B0F14]">
         <div className="flex flex-wrap items-center gap-1">
           {MEDIA_PILL_ORDER.map((mt) => {
             const selected = activeMediaForUi === mt;
@@ -555,7 +383,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
                 key={mt}
                 type="button"
                 onClick={() => setSelectedMediaType(selected ? null : mt)}
-                className={`rounded-full px-2 py-0.5 text-[10px] font-medium transition-colors ${
+                className={`rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors ${
                   selected
                     ? 'bg-emerald-700 text-white'
                     : 'border border-zinc-200 bg-white text-zinc-600 hover:border-emerald-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300'
@@ -566,38 +394,16 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
             );
           })}
         </div>
-        <div className="flex items-center gap-1">
-          <input
-            ref={weightFileInputRef}
-            type="file"
-            accept=".gguf,.safetensors,.bin"
-            className="hidden"
-            onChange={(e) => void handleAttachWeightFile(e)}
-          />
-          <button
-            type="button"
-            aria-expanded={weightsPanelOpen}
-            onClick={() => setWeightsPanelOpen((v) => !v)}
-            className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[10px] font-medium transition-colors ${
-              weightsPanelOpen || attachedWeights.length > 0
-                ? 'border-emerald-600/50 bg-emerald-50 text-emerald-900 dark:border-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-200'
-                : 'border-zinc-200 bg-white text-zinc-700 hover:border-emerald-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300'
-            }`}
-            title="Import local audio, image, or video weights or pick a compatible model preset"
-          >
-            <Upload className="h-2.5 w-2.5" />
-            <span>
-              {attachedWeights.length > 0
-                ? `${attachedWeights.length} Model Weight${attachedWeights.length === 1 ? '' : 's'}`
-                : 'Attach Weights'}
-            </span>
-          </button>
-        </div>
+        {isLoadingAi && (
+          <span className="text-[10px] font-medium text-zinc-500 tabular-nums">
+            Preparing AI {Math.round(engineProgressPercent)}%
+          </span>
+        )}
       </div>
 
-      {/* Per-Prism Space & Privacy Shield Controls (plain language) */}
+      {/* Space & Privacy Bar */}
       {(activeMediaForUi !== null || declaration.concept.compartmentId) && (
-        <div className="flex shrink-0 flex-wrap items-center justify-between gap-1.5 border-b border-zinc-100 bg-white px-3 py-1.5 text-[10px] dark:border-zinc-800/80 dark:bg-[#0E131B]">
+        <div className="flex shrink-0 flex-wrap items-center justify-between gap-1.5 border-b border-zinc-100 bg-white px-3 py-1.5 text-[11px] dark:border-zinc-800/80 dark:bg-[#0E131B]">
           <div className="flex items-center gap-1">
             <span className="font-medium text-zinc-500 dark:text-zinc-400">Space:</span>
             {DEFAULT_USER_SPACES.map((sp) => {
@@ -607,8 +413,8 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
                 <button
                   key={sp.id}
                   type="button"
-                  onClick={() => void handleChangePrismSpace(sp.id)}
-                  className={`rounded px-1.5 py-0.5 font-medium transition-colors ${
+                  onClick={() => void handleChangeSpace(sp.id)}
+                  className={`rounded px-2 py-0.5 font-medium transition-colors ${
                     isSelected
                       ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
                       : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
@@ -625,7 +431,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
               role="switch"
               aria-checked={declaration.view.proceduralOrgan.weights.emitsOpaqueConstraints}
               onClick={() => void handleToggleOpaqueSharing()}
-              className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-medium transition-colors ${
+              className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors ${
                 declaration.view.proceduralOrgan.weights.emitsOpaqueConstraints
                   ? 'border-emerald-500/50 bg-emerald-50 text-emerald-800 dark:border-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300'
                   : 'border-zinc-200 bg-zinc-50 text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400'
@@ -635,7 +441,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
               <Shield className="h-2.5 w-2.5" />
               <span>
                 {declaration.view.proceduralOrgan.weights.emitsOpaqueConstraints
-                  ? 'Share availability only (never details)'
+                  ? 'Share busy times only (never details)'
                   : 'Private to this space only'}
               </span>
             </button>
@@ -643,80 +449,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
         </div>
       )}
 
-      {/* Multi-Modal Model Weights Drawer */}
-      {weightsPanelOpen && (
-        <div className="shrink-0 space-y-2 border-b border-zinc-200 bg-zinc-50 px-3 py-2 text-[11px] dark:border-zinc-800 dark:bg-[#0B0F14]">
-          <div className="flex items-center justify-between gap-2">
-            <span className="font-semibold text-zinc-800 dark:text-zinc-200">
-              Route Audio, Image &amp; Video Model Weights
-            </span>
-            <div className="flex items-center gap-1.5">
-              <button
-                type="button"
-                onClick={() => weightFileInputRef.current?.click()}
-                className="inline-flex items-center gap-1 rounded-md bg-emerald-700 px-2 py-0.5 text-[10px] font-medium text-white hover:bg-emerald-800"
-              >
-                <Upload className="h-2.5 w-2.5" />
-                Import Local File
-              </button>
-              <button
-                type="button"
-                onClick={() => setWeightsPanelOpen(false)}
-                className="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-800"
-                aria-label="Close weights drawer"
-              >
-                <X className="h-3 w-3" />
-              </button>
-            </div>
-          </div>
-          <div className="flex flex-wrap gap-1.5">
-            {MULTIMODAL_WEIGHT_PRESETS.filter((p) => {
-              if (!activeMediaForUi) return true;
-              return compatibleModalitiesForMediaType(activeMediaForUi).includes(p.modality);
-            }).map((preset) => {
-              const active = attachedWeights.some((b) => b.id === preset.id);
-              return (
-                <button
-                  key={preset.id}
-                  type="button"
-                  onClick={() => void handleTogglePresetWeight(preset)}
-                  className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[10px] font-medium transition-colors ${
-                    active
-                      ? 'border-emerald-600 bg-emerald-50 text-emerald-900 dark:border-emerald-600 dark:bg-emerald-950/60 dark:text-emerald-200'
-                      : 'border-zinc-200 bg-white text-zinc-700 hover:border-emerald-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300'
-                  }`}
-                >
-                  {active && <Check className="h-2.5 w-2.5 text-emerald-600" />}
-                  <span>{preset.label}</span>
-                </button>
-              );
-            })}
-          </div>
-          {attachedWeights.length > 0 && (
-            <div className="flex flex-wrap gap-1 pt-0.5">
-              {attachedWeights.map((b) => (
-                <span
-                  key={b.id}
-                  className="inline-flex items-center gap-1 rounded-full bg-emerald-100/80 px-2 py-0.5 text-[10px] text-emerald-900 dark:bg-emerald-950/70 dark:text-emerald-200"
-                >
-                  <span>{b.label}</span>
-                  {b.headerSummary && <span className="opacity-75">· {b.headerSummary}</span>}
-                  <button
-                    type="button"
-                    onClick={() => void dispatchWeightBindings(attachedWeights.filter((x) => x.id !== b.id))}
-                    className="rounded-full p-0.5 hover:bg-black/10"
-                    aria-label={`Remove ${b.label}`}
-                  >
-                    <X className="h-2.5 w-2.5" />
-                  </button>
-                </span>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Persistent Unified Conversational Transcript */}
+      {/* Conversational Transcript */}
       <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3.5 text-xs">
         {messages.map((entry) => (
           <div
@@ -748,7 +481,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
           </div>
         ))}
 
-        {(messages.length === 0 || routing.readyToSeal) && (
+        {(messages.length === 0 || routing.readyToPreview) && (
           <div className="flex flex-col items-start">
             <div className="max-w-[96%] space-y-2.5 rounded-2xl border border-emerald-200/90 bg-emerald-50/45 px-3.5 py-3 text-zinc-800 dark:border-emerald-900/60 dark:bg-emerald-950/20 dark:text-zinc-200">
               <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-700 dark:text-emerald-400">
@@ -757,33 +490,24 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
               </div>
               <p className="leading-relaxed">
                 {messages.length === 0
-                  ? 'What would you like to create? Pick an artifact type above or describe a game, picture, audio track, novel, video, research program, or personal tool in plain English.'
-                  : currentPrompt.promptText}
+                  ? 'What would you like to make? Describe a game, picture, audio track, story, video, research space, or everyday tool in plain English.'
+                  : 'Your creation is ready. Ask for any adjustments, or publish it to use alongside your conversations.'}
               </p>
 
-              {routing.readyToSeal && (
+              {routing.readyToPreview && (
                 <div className="flex flex-wrap gap-2 pt-1">
                   <button
                     type="button"
-                    disabled={building}
-                    onClick={onCheckAndBuild}
+                    disabled={publishing}
+                    onClick={onPublish}
                     className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-700 px-3.5 py-1.5 text-xs font-medium text-white hover:bg-emerald-800 disabled:opacity-50"
                   >
-                    {building ? (
+                    {publishing ? (
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
                     ) : (
-                      <ShieldCheck className="h-3.5 w-3.5" />
+                      <Globe className="h-3.5 w-3.5" />
                     )}
-                    Verify &amp; Seal
-                  </button>
-                  <button
-                    type="button"
-                    disabled={building}
-                    onClick={onPublish}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-600 bg-white px-3.5 py-1.5 text-xs font-medium text-emerald-800 hover:bg-emerald-50 disabled:opacity-50 dark:border-emerald-700 dark:bg-transparent dark:text-emerald-200 dark:hover:bg-emerald-950/40"
-                  >
-                    <Globe className="h-3.5 w-3.5" />
-                    Publish to App
+                    Publish
                   </button>
                 </div>
               )}
@@ -795,7 +519,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
           <div className="flex items-center justify-between gap-2 rounded-xl border border-emerald-200/70 bg-emerald-50/40 px-3 py-2 text-[11px] text-emerald-900 dark:border-emerald-900/50 dark:bg-emerald-950/20 dark:text-emerald-200">
             <div className="flex min-w-0 items-center gap-2">
               <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-emerald-600" />
-              <span className="truncate">{agentPhaseLabel}</span>
+              <span className="truncate">{phaseLabel}</span>
             </div>
             {onCancelStudioAgent && (
               <button
@@ -812,7 +536,7 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
         <div ref={scrollEndRef} />
       </div>
 
-      {/* Natural-Language Quick Replies + Persistent Chat Input */}
+      {/* Quick Suggestions + Input */}
       <div className="shrink-0 space-y-2 border-t border-zinc-200 bg-zinc-50/70 p-3 dark:border-zinc-800 dark:bg-[#0B0F14]">
         {quickReplyList.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
@@ -843,8 +567,8 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
             }}
             placeholder={
               declaration.view?.proceduralOrgan
-                ? 'Ask to change difficulty, board size, style, schedule window, or rules…'
-                : currentPrompt.placeholder
+                ? 'Ask to change difficulty, size, style, schedule, or rules…'
+                : 'Describe what you want to make…'
             }
             className="min-w-0 flex-1 resize-none rounded-xl border border-zinc-300 bg-white px-3 py-2 text-xs leading-relaxed text-zinc-900 placeholder:text-zinc-400 focus:border-emerald-600 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
           />
@@ -852,23 +576,11 @@ export const StudioGuidedWizard: FC<StudioGuidedWizardProps> = ({
             type="submit"
             disabled={!inputText.trim() || thinking}
             className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-emerald-700 text-white hover:bg-emerald-800 disabled:opacity-45"
-            title="Send response"
+            title="Send"
           >
             {thinking ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
           </button>
         </form>
-
-        <div className="flex items-center justify-between text-[10px] text-zinc-500">
-          <span>Describe any idea or tweak in plain English</span>
-          <button
-            type="button"
-            onClick={onSwitchToAdvanced}
-            className="inline-flex items-center gap-1 font-medium text-zinc-600 hover:text-emerald-700 dark:text-zinc-400 dark:hover:text-emerald-400"
-          >
-            <SlidersHorizontal className="h-3 w-3" />
-            Advanced Model
-          </button>
-        </div>
       </div>
     </div>
   );

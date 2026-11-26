@@ -9,7 +9,6 @@ import {
   ArchiveRestore,
   ChevronDown,
   ChevronRight,
-  FileJson,
   Plus,
   ShieldCheck,
   SlidersHorizontal,
@@ -103,8 +102,6 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
   };
   const archivedCount = useAuiState((s) => s.threads.archivedThreadIds.length);
   const isBootstrapUnbound = isInternalBootstrapModel(engineState.model?.id);
-  const importedHarness = engineState.importedHarness;
-  const lastCert = engineState.lastRouteCertificate;
 
   const sidebarContent = (
     <div className="flex h-full w-full flex-col bg-white dark:bg-[#0F141C]">
@@ -252,8 +249,8 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
                 <button
                   type="button"
                   onClick={() => holoFileRef.current?.click()}
-                  title="Import & verify a binary .holo archive"
-                  aria-label="Import .holo archive"
+                  title="Import a saved creation"
+                  aria-label="Import creation"
                   className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-[#F8F9FA] text-slate-700 hover:border-slate-300 hover:bg-slate-100 dark:border-slate-800 dark:bg-[#141B26] dark:text-slate-300 dark:hover:bg-slate-800 transition-colors"
                 >
                   <Upload className="h-3.5 w-3.5" />
@@ -306,7 +303,7 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
                         {(p.publishedHolo?.proved || p.sealedDraft?.proved) && (
                           <ShieldCheck
                             className="h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400"
-                            aria-label="Proved .holo"
+                            aria-label="Verified"
                           />
                         )}
                       </button>
@@ -337,32 +334,10 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
         <div className="mt-0.5 truncate text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
           {isBootstrapUnbound
             ? engineState.modelStreamEnabled
-              ? `Streaming · ${engineState.progressPercent}%`
-              : 'Model Stream off · LOD0 ready'
-            : `Unified model ready · ${
-                engineState.model
-                  ? `${Math.round(engineState.model.maxContextWindow / 1024)}K ctx`
-                  : ''
-              }`}
+              ? `Preparing AI · ${engineState.progressPercent}%`
+              : 'On-device · Private'
+            : 'Local AI ready · Private'}
         </div>
-
-        <button
-          type="button"
-          onClick={() => {
-            onCloseMobile();
-            onOpenInspector();
-          }}
-          className="mt-2 flex w-full items-center gap-1.5 truncate text-left text-[11px] text-slate-600 hover:text-emerald-800 dark:text-slate-400 dark:hover:text-emerald-400 transition-colors"
-        >
-          <FileJson className="h-3.5 w-3.5 shrink-0" />
-          <span className="truncate">
-            {importedHarness
-              ? `Profile: ${importedHarness.name}`
-              : lastCert
-                ? `Verified · #${lastCert.digest}`
-                : 'On-Device AI · Ready'}
-          </span>
-        </button>
 
         <div className="mt-3">
           <button

@@ -5,12 +5,9 @@ import path from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { loadArchive } from 'prism-code';
 import {
-  compatibleModalitiesForMediaType,
-  createImportedWeightBinding,
   deriveActiveStudioOrgans,
-  inspectLocalWeightHeader,
-  MULTIMODAL_WEIGHT_PRESETS,
   normalizeOrganWeights,
+  requiredCapabilitiesForMediaType,
   synthesizeProceduralOrganView,
   type PrismMediaType,
 } from './prismMediaOrgans';
@@ -179,22 +176,11 @@ test('Minesweeper end-to-end procedural synthesis routes JSON weights, refines b
   assert.equal(loaded.identities.verified, true);
 });
 
-test('Multi-modal weight bindings attach imported audio/image/video weights cleanly onto procedural organs', () => {
-  assert.ok(MULTIMODAL_WEIGHT_PRESETS.some((p) => p.modality === 'image'));
-  assert.ok(MULTIMODAL_WEIGHT_PRESETS.some((p) => p.modality === 'audio'));
-  assert.ok(MULTIMODAL_WEIGHT_PRESETS.some((p) => p.modality === 'video'));
-
-  assert.deepEqual(compatibleModalitiesForMediaType('picture'), ['image']);
-  assert.deepEqual(compatibleModalitiesForMediaType('audio'), ['audio']);
-  assert.ok(compatibleModalitiesForMediaType('video').includes('video'));
-
-  const binding = createImportedWeightBinding({
-    fileName: 'musicgen-small-q8_0.gguf',
-    byteLength: 420_000_000,
-    modality: 'audio',
-  });
-  assert.equal(binding.format, 'gguf');
-  assert.equal(binding.targetOrgan, 'audio-synth');
+test('All 7 MediaTypes declare real capability requirements and synthesize cleanly without LLM JS', () => {
+  assert.deepEqual(requiredCapabilitiesForMediaType('picture'), ['image-creation', 'vision']);
+  assert.deepEqual(requiredCapabilitiesForMediaType('audio'), ['audio', 'language']);
+  assert.deepEqual(requiredCapabilitiesForMediaType('video'), ['image-creation', 'vision', 'audio']);
+  assert.deepEqual(requiredCapabilitiesForMediaType('interactive-game'), ['language', 'vision']);
 
   const mediaTypes: readonly PrismMediaType[] = [
     'picture',
@@ -215,71 +201,11 @@ test('Multi-modal weight bindings attach imported audio/image/video weights clea
       op: 'route-prism-weights',
       mediaType: mt,
       weights,
-      attachedWeights: mt === 'audio' ? [binding] : undefined,
       citation: { kind: 'req', requirementId: primaryReq },
     });
     assert.equal(routed.ok, true, `Failed routing ${mt}: ${routed.ok ? '' : routed.message}`);
     const synth = synthesizeProceduralOrganView(routed.declaration, routed.declaration.view!.proceduralOrgan!);
     assert.ok(synth.indexHtml.includes('id="organ-root"'));
     assert.ok(synth.appJs.includes('zero LLM JS'));
-    if (mt === 'audio') {
-      assert.ok(synth.indexHtml.includes('musicgen-small-q8_0.gguf'));
-      assert.ok(synth.appJs.includes('AUD_SIG'));
-    }
-    if (mt === 'picture') {
-      assert.ok(synth.appJs.includes('activeWeightSignature'));
-    }
-    if (mt === 'video') {
-      assert.ok(synth.appJs.includes('VID_SIG'));
-    }
   }
-});
-
-test('inspectLocalWeightHeader parses real GGUF v3 and Safetensors headers and derives 8D Q10 routing signatures', () => {
-  // 1. Construct a real minimal GGUF v3 header (magic 'GGUF', version=3, tensor_count=312, kv_count=24)
-  const ggufBuf = new Uint8Array(64);
-  ggufBuf.set([0x47, 0x47, 0x55, 0x46], 0);
-  const gdv = new DataView(ggufBuf.buffer);
-  gdv.setUint32(4, 3, true);
-  gdv.setUint32(8, 312, true);
-  gdv.setUint32(16, 24, true);
-
-  const ggufInfo = inspectLocalWeightHeader(ggufBuf, 'musicgen-small-q8_0.gguf', 420_000_000);
-  assert.equal(ggufInfo.format, 'gguf');
-  assert.equal(ggufInfo.validMagic, true);
-  assert.equal(ggufInfo.tensorCount, 312);
-  assert.ok(ggufInfo.headerSummary.includes('GGUF v3'));
-  assert.ok(ggufInfo.headerSummary.includes('312 tensors'));
-  assert.equal(ggufInfo.routingSignature.length, 8);
-  for (const lane of ggufInfo.routingSignature) {
-    assert.ok(lane >= 128 && lane <= 1024);
-  }
-
-  // 2. Construct a real minimal Safetensors header (u64 LE JSON length + UTF-8 JSON header)
-  const stJson = JSON.stringify({
-    __metadata__: { format: 'pt' },
-    'unet.conv_in.weight': { dtype: 'F16', shape: [320, 4, 3, 3], data_offsets: [0, 23040] },
-    'unet.conv_out.weight': { dtype: 'F16', shape: [4, 320, 3, 3], data_offsets: [23040, 46080] },
-  });
-  const stPayload = new TextEncoder().encode(stJson);
-  const stBuf = new Uint8Array(8 + stPayload.byteLength);
-  new DataView(stBuf.buffer).setUint32(0, stPayload.byteLength, true);
-  stBuf.set(stPayload, 8);
-
-  const stInfo = inspectLocalWeightHeader(stBuf, 'flux-schnell-fp16.safetensors', 1_900_000_000);
-  assert.equal(stInfo.format, 'safetensors');
-  assert.equal(stInfo.validMagic, true);
-  assert.equal(stInfo.tensorCount, 2);
-  assert.ok(stInfo.headerSummary.includes('2 tensors'));
-  assert.equal(stInfo.routingSignature.length, 8);
-
-  // 3. Binding carries real inspected metadata and signature into procedural synthesis
-  const binding = createImportedWeightBinding({
-    fileName: 'flux-schnell-fp16.safetensors',
-    byteLength: 1_900_000_000,
-    modality: 'image',
-    headerBytes: stBuf,
-  });
-  assert.equal(binding.tensorCount, 2);
-  assert.equal(binding.routingSignature?.length, 8);
 });

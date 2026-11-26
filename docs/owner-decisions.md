@@ -56,3 +56,8 @@
 
 - **Requirements:** `REQ-ZERO-USER-JARGON`
 - **Decision:** "We do not expose verdant constructs such as the Observer or other technical jargon to the user of VerdantUI."
+
+## DEC-012 (2026-11-26)
+
+- **Requirements:** `REQ-ZERO-USER-TUNABLES`, `REQ-COHERENT-MULTIMODAL-SENSES`
+- **Decision:** "Take all jargon and bloat out of VerdantUI. Do not introduce a bunch of tunables to the user. Users are not going to be uploading their own weights or models. Coherent multi-modal models enabled by verdant-engine improve the performance of VerdantUI."

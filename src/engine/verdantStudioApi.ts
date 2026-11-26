@@ -19,7 +19,6 @@ import type { JsonSchema2020Object, PrismGrants } from './prismStudio';
 import {
   deriveActiveStudioOrgans,
   PRISM_MEDIA_CATALOG,
-  type MediaModelWeightBinding,
   type PrismMediaType,
   type ProceduralOrganSpec,
   type ProceduralOrganWeights,
@@ -527,7 +526,6 @@ export type StudioApiOp =
       readonly mediaType: PrismMediaType;
       readonly activeOrgans?: readonly StudioFeatureOrgan[];
       readonly weights: ProceduralOrganWeights;
-      readonly attachedWeights?: readonly MediaModelWeightBinding[];
       readonly compartmentId?: string;
       readonly title?: string;
       readonly eyebrow?: string;
@@ -2884,7 +2882,6 @@ export function dispatchStudioOp(decl: PrismDeclaration, op: StudioApiOp): Studi
           mediaType: op.mediaType,
           activeOrgans,
           weights: op.weights,
-          attachedWeights: op.attachedWeights ?? decl.view?.proceduralOrgan?.attachedWeights,
           summary: op.summary,
         },
         authoredView: null,

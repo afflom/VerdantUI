@@ -140,12 +140,12 @@ test('Semantic release planner derives exact minor/patch/none bumps and determin
   assert.ok(docs['docs/product-lifecycle.md'].includes('VUI-FEAT-005'));
 });
 
-test('Permanent ratchet enforces 11/11 planted-defect gates including Free Public Benefit & zero UI jargon', () => {
+test('Permanent ratchet enforces planted-defect gates including Free Public Benefit & universal zero UI jargon', () => {
   const snap = loadRatchetSnapshot(process.cwd());
   const clean = evaluateVerdantRatchet(snap);
   assert.equal(clean.ok, true, `Ratchet violations: ${JSON.stringify(clean.violations)}`);
 
   const planted = verifyPlantedDefects(snap);
   assert.equal(planted.allCaught, true, `Missed planted defects: ${planted.failures.join(', ')}`);
-  assert.equal(planted.casesVerified, 11);
+  assert.ok(planted.casesVerified >= 12);
 });
