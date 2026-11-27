@@ -1679,7 +1679,10 @@ export class PrismStore {
     const nextDraft = snapshotFromDeclaration(res.declaration);
     const pushRev = opts?.pushRevision !== false;
     const declarationRevisions = pushRev
-      ? [...(existing.declarationRevisions ?? []), existing.declaration].slice(-MAX_REVISIONS)
+      ? [
+          ...(existing.declarationRevisions ?? []),
+          stripHeavyRevisionFields(existing.declaration),
+        ].slice(-MAX_REVISIONS)
       : (existing.declarationRevisions ?? []);
 
     // Invalidate sealedDraft whenever declaration mutates (except lock-registers / resolve-error)
@@ -1819,6 +1822,24 @@ export class PrismStore {
     await this.persistProject(project);
     return project;
   }
+}
+
+function stripHeavyRevisionFields(decl: PrismDeclaration): PrismDeclaration {
+  const organ = decl.view?.proceduralOrgan;
+  if (!organ || organ.weights.mediaType !== 'picture' || !organ.weights.reconciledImageDataUrl) {
+    return decl;
+  }
+  const { reconciledImageDataUrl: _stripped, ...leanWeights } = organ.weights;
+  return {
+    ...decl,
+    view: {
+      ...decl.view,
+      proceduralOrgan: {
+        ...organ,
+        weights: leanWeights,
+      },
+    },
+  };
 }
 
 export function snapshotFromDeclaration(decl: PrismDeclaration): VerdantPrismSnapshot {

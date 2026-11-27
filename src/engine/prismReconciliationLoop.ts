@@ -38,6 +38,7 @@ import {
   type SemanticVisualQaReport,
   type SemanticVisualQaTarget,
 } from './visionCritiqueLoop';
+import { createCooperativeYielder } from './vramSwapPolicy';
 
 export interface LodTierSpec {
   readonly rank: PrismLodRank;
@@ -133,10 +134,10 @@ export interface ReconciliationDeps {
   readonly syncSpacesForArtifact?: (prismId: string) => Promise<void>;
 }
 
+const reconciliationYielder = createCooperativeYielder();
+
 function yieldCooperativeFrame(): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, 0);
-  });
+  return reconciliationYielder.yieldNow();
 }
 
 function extractCanonicalSubject(prompt: string): string {
@@ -442,7 +443,7 @@ export async function runProgressivePrismReconciliation(params: {
         );
         currentRev = revision;
         nextWeights = {
-          ...pw,
+          ...rendered.weights,
           density: Math.min(92, (pw.density ?? 60) + 12),
           ...(!pinned.has('lighting') && qaReport.meanLuminance < 0.16 ? { lighting: 'golden-hour' } : {}),
         };

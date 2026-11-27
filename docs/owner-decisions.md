@@ -91,3 +91,8 @@
 
 - **Requirements:** `REQ-SELF-SIMILAR-PRISM-UI`, `REQ-OBSERVER-PROCEDURAL-SYNTHESIS`, `REQ-PRISM-GENERATION`
 - **Decision:** "VerdantUI needs to be a Verdant Prism itself — one Verdant Prism runtime instance rendered by the Observer and maintained by Verdant Studio so navigating between parts never interrupts inference, with cross-modal associative weights and progressive full-fidelity reconciliation."
+
+## DEC-019 (2026-11-27)
+
+- **Requirements:** `REQ-PERF-STABILITY-OPTIMIZATION`, `REQ-PRISM-GENERATION`, `REQ-OBSERVER-PROCEDURAL-SYNTHESIS`
+- **Decision:** "Post-v0.11.0 refinement and cleanup: eliminate 120ms root re-render storms and redundant Tropical layout solves, add 64-token KV page-boundary checkpointing and MessageChannel yields, promote SDXS-512 neural renders to 100% primary display with lean IndexedDB revisions and live VLM Vision QA, and execute the exact verified 610-tensor SDXS-512 UNet and 19-layer residual TAESD on native F16/Q8_0 WASM SIMD with zero-bloat OPFS/GGUF CLIP BPE."

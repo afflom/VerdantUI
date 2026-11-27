@@ -176,6 +176,17 @@
       "invariantId": "VUI-OPFS-01",
       "citation": { "kind": "req", "decisionId": "DEC-018" },
       "publicBenefitImpact": "Streams multi-layer CLIP text transformer, sinusoidal timestep conditioning, multi-head spatial cross-attention UNet refinement, and progressive 3-stage TAESD decoding (128px Lod0 through 512px Lod3) layer-by-layer from OPFS with cooperative frame yields and bounded <64 MB scratch memory."
+    },
+    {
+      "id": "VUI-FEAT-017",
+      "title": "Zero-Churn Scoped UI Subscriptions, 64-Token KV Checkpoint/Resume, 100% Neural Picture Sandbox, Live VLM QA & Native F16/Q8_0 SIMD SDXS-512 Graph",
+      "stage": "active",
+      "introducedIn": "0.11.0",
+      "ownerFile": "src/engine/verdantWasmSimd.ts",
+      "testFile": "src/engine/multimodalSynthesis.test.ts",
+      "invariantId": "VUI-SIMD-01",
+      "citation": { "kind": "req", "decisionId": "DEC-019" },
+      "publicBenefitImpact": "Eliminates root App 120ms decode re-renders and redundant Tropical layout solves, adds 64-token KV page-boundary checkpoint/auto-resume and MessageChannel yields, promotes SDXS-512 images to 100% primary display with lean IndexedDB revisions and live VLM Vision QA, and executes the exact 610-tensor SDXS-512 UNet and 19-layer residual TAESD on native F16/Q8_0 WASM SIMD with zero-bloat OPFS/GGUF CLIP BPE."
     }
   ]
 }

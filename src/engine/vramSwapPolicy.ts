@@ -519,6 +519,33 @@ export interface CooperativeYielder {
   dispose(): void;
 }
 
+export interface KvCheckpointDecisionInput {
+  readonly checkpointRequested: boolean;
+  readonly jobPartId: string;
+  readonly focusedPartId: string;
+  readonly hasWaitingFocusedJob: boolean;
+  readonly emittedTokensInSlice: number;
+  readonly totalEmittedTokens: number;
+  readonly remainingMaxTokens: number;
+}
+
+/**
+ * Pure 64-token KV page-boundary checkpoint predicate:
+ * yields a long-running background part cleanly at an exact 64-token KV page boundary
+ * when the user's focused foreground part is waiting, preserving all committed KV pages.
+ */
+export function shouldCheckpointAtKvPageBoundary(input: KvCheckpointDecisionInput): boolean {
+  return (
+    input.checkpointRequested &&
+    input.hasWaitingFocusedJob &&
+    input.jobPartId !== input.focusedPartId &&
+    input.emittedTokensInSlice >= 64 &&
+    input.totalEmittedTokens >= 128 &&
+    input.totalEmittedTokens % 64 === 0 &&
+    input.remainingMaxTokens >= 32
+  );
+}
+
 /**
  * Creates a zero-clamp macrotask yielder using `MessageChannel`.
  *

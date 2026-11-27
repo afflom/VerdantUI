@@ -30,10 +30,13 @@ import {
 } from '../engine/contentGalleryStore';
 import { isInternalBootstrapModel } from '../engine/modelCatalog';
 import type { VerdantPrismProject } from '../engine/prismStudio';
-import type { EngineState } from '../engine/workerClient';
+import type { EngineState, HeaderEngineSummary } from '../engine/workerClient';
 
 interface ThreadSidebarProps {
-  engineState: EngineState;
+  engineState?: EngineState;
+  headerSummary?: HeaderEngineSummary;
+  busyPartIds?: readonly string[];
+  busyMediaTypes?: ReadonlySet<GalleryMediaType>;
   mobileOpen: boolean;
   onCloseMobile: () => void;
   onOpenInspector: () => void;
@@ -94,6 +97,9 @@ const ArchivedThreadListItem: FC = () => (
 
 export const ThreadSidebar: FC<ThreadSidebarProps> = ({
   engineState,
+  headerSummary,
+  busyPartIds,
+  busyMediaTypes,
   mobileOpen,
   onCloseMobile,
   onOpenInspector,
@@ -121,7 +127,15 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
     }
   };
   const archivedCount = useAuiState((s) => s.threads.archivedThreadIds.length);
-  const isBootstrapUnbound = isInternalBootstrapModel(engineState.model?.id);
+  const activeModelId = headerSummary ? headerSummary.modelId : (engineState?.model?.id ?? null);
+  const modelStreamEnabled = headerSummary
+    ? headerSummary.modelStreamEnabled
+    : Boolean(engineState?.modelStreamEnabled);
+  const progressPercent = headerSummary
+    ? headerSummary.progressPercent
+    : (engineState?.progressPercent ?? 0);
+  const isBootstrapUnbound = isInternalBootstrapModel(activeModelId);
+  const busyPartSet = busyPartIds && busyPartIds.length > 0 ? new Set(busyPartIds) : null;
 
   const sidebarContent = (
     <div className="flex h-full w-full flex-col bg-white dark:bg-[#0F141C]">
@@ -309,6 +323,13 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
                       >
                         <Layers className="h-3.5 w-3.5 shrink-0 text-emerald-700 dark:text-emerald-400" />
                         <span className="truncate">{p.draft.name}</span>
+                        {busyPartSet?.has(p.id) && (
+                          <span
+                            className="inline-block h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-emerald-500"
+                            aria-label="Updating in background"
+                            title="Updating in background"
+                          />
+                        )}
                         {(p.publishedHolo?.proved || p.sealedDraft?.proved) && (
                           <ShieldCheck
                             className="h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400"
@@ -392,6 +413,13 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
                     <span className="inline-flex items-center gap-2 truncate">
                       <Icon className="h-3.5 w-3.5 shrink-0 text-slate-500 dark:text-slate-400" />
                       <span className="truncate">{g.label}</span>
+                      {busyMediaTypes?.has(g.mediaType) && (
+                        <span
+                          className="inline-block h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-emerald-500"
+                          aria-label="Refining in background"
+                          title="Refining in background"
+                        />
+                      )}
                     </span>
                     {count > 0 && (
                       <span className="font-mono text-[10px] text-slate-400 tabular-nums">
@@ -412,8 +440,8 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
         </div>
         <div className="mt-0.5 truncate text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
           {isBootstrapUnbound
-            ? engineState.modelStreamEnabled
-              ? `Preparing AI · ${engineState.progressPercent}%`
+            ? modelStreamEnabled
+              ? `Preparing AI · ${progressPercent}%`
               : 'On-device · Private'
             : 'Local AI ready · Private'}
         </div>

@@ -25,13 +25,16 @@ import {
 import { isInternalBootstrapModel } from './modelCatalog';
 import { ObserverStreamBus } from './observerStreamBus';
 import {
+  buildCanonicalWorkspaceUiTree,
   buildSystemPartPrisms,
   descriptorForUserPrism,
   galleryPrismId,
+  solveAndVerifyUiTree,
   synthesizeObserverPrismFrame,
   VERDANT_HOME_PRISM_ID,
   VERDANT_SETTINGS_PRISM_ID,
   type PrismSurfaceMode,
+  type SolvedUiLayout,
   type SynthesizedPrismFrame,
   type VerdantSystemPrismDescriptor,
 } from './observerUiSynthesizer';
@@ -166,6 +169,9 @@ export class VerdantRootPrismRuntime {
   // 2-tier Observer Frame structural cache (0 Tropical solves during token/LOD ticks)
   private cachedFrameKey = '';
   private cachedFrame: SynthesizedPrismFrame | null = null;
+  private cachedLayoutKey = '';
+  private cachedLayout: SolvedUiLayout | null = null;
+  private layoutSolveCount = 0;
 
   // Fine-grained subscriber sets for zero-churn React `useSyncExternalStore`
   private readonly focusListeners = new Set<() => void>();
@@ -398,6 +404,27 @@ export class VerdantRootPrismRuntime {
             : this.systemPartPrisms.find((p) => p.id === VERDANT_HOME_PRISM_ID) ??
               this.systemPartPrisms[0]!;
 
+    const includeSidebar = params.viewportWidthPx >= 1024;
+    const layoutKey = [
+      activePrismDescriptor.id,
+      params.surfaceMode,
+      params.viewportWidthPx,
+      params.viewportHeightPx,
+      includeSidebar ? 1 : 0,
+    ].join('|');
+    let solvedLayout = this.cachedLayout;
+    if (!solvedLayout || this.cachedLayoutKey !== layoutKey) {
+      const uiTree = buildCanonicalWorkspaceUiTree(
+        activePrismDescriptor.id,
+        params.surfaceMode,
+        includeSidebar,
+      );
+      solvedLayout = solveAndVerifyUiTree(uiTree, params.viewportWidthPx, params.viewportHeightPx);
+      this.cachedLayoutKey = layoutKey;
+      this.cachedLayout = solvedLayout;
+      this.layoutSolveCount += 1;
+    }
+
     const frame = synthesizeObserverPrismFrame({
       activePrism: activePrismDescriptor,
       partPrisms: this.systemPartPrisms,
@@ -407,10 +434,15 @@ export class VerdantRootPrismRuntime {
       viewportHeightPx: params.viewportHeightPx,
       darkMode: params.darkMode,
       userTyping: params.userTyping,
+      cachedLayout: solvedLayout,
     });
     this.cachedFrameKey = key;
     this.cachedFrame = frame;
     return frame;
+  }
+
+  getLayoutSolveCount(): number {
+    return this.layoutSolveCount;
   }
 
   // ---- Fine-grained subscriptions (zero full-tree React re-render storms) ----

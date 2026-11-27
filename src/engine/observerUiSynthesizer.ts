@@ -943,11 +943,17 @@ export function synthesizeObserverPrismFrame(opts: {
   readonly darkMode: boolean;
   readonly userTyping?: boolean;
   readonly dwellMillis?: number;
+  readonly cachedLayout?: SolvedUiLayout;
 }): SynthesizedPrismFrame {
   const rootPrism = buildRootWorkspacePrism(opts.partPrisms, opts.userPrisms);
   const includeSidebar = opts.viewportWidthPx >= 1024;
-  const uiTree = buildCanonicalWorkspaceUiTree(opts.activePrism.id, opts.surfaceMode, includeSidebar);
-  const layout = solveAndVerifyUiTree(uiTree, opts.viewportWidthPx, opts.viewportHeightPx);
+  const layout =
+    opts.cachedLayout ??
+    solveAndVerifyUiTree(
+      buildCanonicalWorkspaceUiTree(opts.activePrism.id, opts.surfaceMode, includeSidebar),
+      opts.viewportWidthPx,
+      opts.viewportHeightPx,
+    );
   const directive = stepObserverSurfaceAttention({
     activePrismId: opts.activePrism.id,
     surfaceMode: opts.surfaceMode,

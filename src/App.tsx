@@ -3,7 +3,18 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { Suspense, lazy, useCallback, useEffect, useMemo, useState, useSyncExternalStore, type FC } from 'react';
+import {
+  Suspense,
+  lazy,
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+  type ComponentProps,
+  type FC,
+} from 'react';
 import {
   AssistantRuntimeProvider,
   SimpleTextAttachmentAdapter,
@@ -54,7 +65,112 @@ import type { StudioChatBridge } from './engine/studioChatBridge';
 import { createVTensorThreadListAdapter } from './engine/threadStorage';
 import type { UnifiedExpertRegistry } from './engine/unifiedModelBasis';
 import { getVerdantRootPrismRuntime } from './engine/verdantRootPrism';
-import type { EngineState, LlamaVTensorWorkerClient } from './engine/workerClient';
+import type { LlamaVTensorWorkerClient } from './engine/workerClient';
+
+const LocalAiStatusPill: FC<{
+  readonly workerClient: LlamaVTensorWorkerClient;
+  readonly onToggle: () => void;
+}> = memo(({ workerClient, onToggle }) => {
+  const summary = useSyncExternalStore(
+    useCallback((cb) => workerClient.subscribeHeaderSummary(cb), [workerClient]),
+    useCallback(() => workerClient.getHeaderSummary(), [workerClient]),
+  );
+  const streamOn = summary.modelStreamEnabled;
+  const isStreaming = summary.status === 'downloading' || summary.status === 'loading';
+  const hasRealModel = summary.modelId !== null && !isInternalBootstrapModel(summary.modelId);
+  const hasError = streamOn && summary.errorMessage !== null;
+  const statusLabel = !streamOn
+    ? 'Off'
+    : isStreaming
+      ? `${summary.progressPercent}%`
+      : hasError
+        ? 'Error'
+        : hasRealModel
+          ? 'Ready'
+          : 'On';
+
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={streamOn}
+      data-testid="model-stream-toggle"
+      title={
+        streamOn
+          ? 'Local AI is active on your device. Click to pause.'
+          : 'Local AI is off. Click to enable private on-device AI.'
+      }
+      onClick={onToggle}
+      className={`inline-flex h-9 items-center gap-2 rounded-lg border px-2.5 sm:px-3 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+        streamOn
+          ? 'border-emerald-700/40 bg-emerald-50 text-emerald-950 hover:bg-emerald-100/80 dark:border-emerald-500/40 dark:bg-emerald-950/50 dark:text-emerald-200 dark:hover:bg-emerald-950/80'
+          : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-300 dark:hover:bg-slate-800'
+      }`}
+    >
+      <span
+        className={`inline-block h-2 w-2 rounded-full ${
+          !streamOn
+            ? 'bg-slate-400 dark:bg-slate-500'
+            : hasError
+              ? 'bg-red-500'
+              : isStreaming
+                ? 'animate-pulse bg-emerald-500'
+                : 'bg-emerald-600 dark:bg-emerald-400'
+        }`}
+      />
+      <span>Local AI</span>
+      <span className="font-mono text-[11px] tabular-nums opacity-80">{statusLabel}</span>
+    </button>
+  );
+});
+
+const SubscribedThreadSidebar: FC<
+  Omit<ComponentProps<typeof ThreadSidebar>, 'engineState' | 'headerSummary'> & {
+    readonly workerClient: LlamaVTensorWorkerClient;
+  }
+> = memo(({ workerClient, ...rest }) => {
+  const headerSummary = useSyncExternalStore(
+    useCallback((cb) => workerClient.subscribeHeaderSummary(cb), [workerClient]),
+    useCallback(() => workerClient.getHeaderSummary(), [workerClient]),
+  );
+  return <ThreadSidebar {...rest} headerSummary={headerSummary} />;
+});
+
+const SubscribedThreadView: FC<
+  Omit<ComponentProps<typeof ThreadView>, 'engineState'> & {
+    readonly workerClient: LlamaVTensorWorkerClient;
+  }
+> = ({ workerClient, ...rest }) => {
+  const engineState = useSyncExternalStore(
+    useCallback((cb) => workerClient.subscribeStore(cb), [workerClient]),
+    useCallback(() => workerClient.getState(), [workerClient]),
+  );
+  return <ThreadView {...rest} engineState={engineState} />;
+};
+
+const SubscribedStudioView: FC<
+  Omit<ComponentProps<typeof VerdantStudioView>, 'engineState'> & {
+    readonly workerClient: LlamaVTensorWorkerClient;
+  }
+> = ({ workerClient, ...rest }) => {
+  const engineState = useSyncExternalStore(
+    useCallback((cb) => workerClient.subscribeStore(cb), [workerClient]),
+    useCallback(() => workerClient.getState(), [workerClient]),
+  );
+  return <VerdantStudioView {...rest} workerClient={workerClient} engineState={engineState} />;
+};
+
+const SubscribedVTensorInspector: FC<
+  Omit<ComponentProps<typeof VTensorInspector>, 'engineState'> & {
+    readonly workerClient: LlamaVTensorWorkerClient;
+  }
+> = ({ workerClient, ...rest }) => {
+  const engineState = useSyncExternalStore(
+    useCallback((cb) => workerClient.subscribeStore(cb), [workerClient]),
+    useCallback(() => workerClient.getState(), [workerClient]),
+  );
+  return <VTensorInspector {...rest} engineState={engineState} />;
+};
 
 const THEME_STORAGE_KEY = 'vtensor-assistant:theme:v1';
 
@@ -232,7 +348,10 @@ export default function App() {
     adapter: threadListAdapter,
   });
 
-  const [engineState, setEngineState] = useState<EngineState>(() => workerClient.getState());
+  const appShellSummary = useSyncExternalStore(
+    useCallback((cb) => workerClient.subscribeAppShellSummary(cb), [workerClient]),
+    useCallback(() => workerClient.getAppShellSummary(), [workerClient]),
+  );
   const [prisms, setPrisms] = useState<readonly VerdantPrismProject[]>(() => prismStore.list());
   const [galleryArtifacts, setGalleryArtifacts] = useState<readonly ContentArtifactRecord[]>(() =>
     galleryStore.listAll(),
@@ -322,55 +441,21 @@ export default function App() {
     };
   }, [workerClient, expertRegistry]);
 
-  // Auto-generate missing Gallery preview thumbnails for Pictures created/edited in Studio directly
-  useEffect(() => {
-    const missingPic = prisms.find((p) => {
-      const w = p.declaration?.view?.proceduralOrgan?.weights;
-      if (!w || w.mediaType !== 'picture') return false;
-      const rec = galleryStore.get(p.id);
-      return !rec?.previewDataUrl;
-    });
-    if (!missingPic) return;
-    const weights = missingPic.declaration?.view?.proceduralOrgan?.weights;
-    if (!weights || weights.mediaType !== 'picture') return;
-    let cancelled = false;
-    void import('./engine/proceduralPictureRenderer').then(async ({ renderPictureWithCoherenceCheck }) => {
-      const rendered = await renderPictureWithCoherenceCheck(weights, { maxPreviewDim: 480 });
-      if (cancelled) return;
-      galleryStore.setArtifactMeta(missingPic.id, { previewDataUrl: rendered.pngDataUrl });
-      const rec = galleryStore.get(missingPic.id);
-      if (rec && rec.spaceIds.length > 0) {
-        const { syncSpacePrismView } = await import('./engine/studioChatBridge');
-        for (const sid of rec.spaceIds) {
-          await syncSpacePrismView(sid, {
-            store: prismStore,
-            galleries: galleryStore,
-            observer: workerClient.cognitiveObserver,
-            registry: expertRegistry,
-          });
-        }
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [prisms, galleryStore, prismStore, workerClient, expertRegistry]);
-
   // Register downloaded/resident neural weight experts into the unified VerdantUI model
   useEffect(() => {
-    if (engineState.model && !isInternalBootstrapModel(engineState.model.id)) {
-      const storedEntry = engineState.opfsStorage?.storedModels.find(
-        (m) => m.modelId === engineState.model!.id,
+    if (appShellSummary.model && !isInternalBootstrapModel(appShellSummary.model.id)) {
+      const storedEntry = appShellSummary.opfsStorage?.storedModels.find(
+        (m) => m.modelId === appShellSummary.model!.id,
       );
       expertRegistry.registerNeuralWeightExpert({
         modality: 'language',
-        modelId: engineState.model.id,
-        label: engineState.model.displayName,
+        modelId: appShellSummary.model.id,
+        label: appShellSummary.model.displayName,
         residency: 'hot-vtensor',
         residentBytes: storedEntry?.byteLength ?? 0,
       });
     }
-    for (const stored of engineState.opfsStorage?.storedModels ?? []) {
+    for (const stored of appShellSummary.opfsStorage?.storedModels ?? []) {
       const mod = /whisper/i.test(stored.modelId)
         ? 'speech'
         : /vision|mmproj|siglip|vlm/i.test(stored.modelId)
@@ -382,11 +467,11 @@ export default function App() {
         modality: mod,
         modelId: stored.modelId,
         label: stored.modelId,
-        residency: engineState.model?.id === stored.modelId ? 'hot-vtensor' : 'warm-opfs',
+        residency: appShellSummary.model?.id === stored.modelId ? 'hot-vtensor' : 'warm-opfs',
         residentBytes: stored.byteLength,
       });
     }
-  }, [engineState.model, engineState.opfsStorage, expertRegistry]);
+  }, [appShellSummary.model, appShellSummary.opfsStorage, expertRegistry]);
 
   useEffect(() => {
     let toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -443,17 +528,11 @@ export default function App() {
   }, [workerClient, expertRegistry]);
 
   useEffect(() => {
-    const unsubscribe = workerClient.subscribe(setEngineState);
-
     if (!workerClient.getState().model) {
       void workerClient.bootInitialModel().catch(() => {
-        // Error state is surfaced via engineState.errorMessage
+        // Error state is surfaced via scoped header/thread subscriptions
       });
     }
-
-    return () => {
-      unsubscribe();
-    };
   }, [workerClient]);
 
   useEffect(() => {
@@ -624,6 +703,23 @@ export default function App() {
     useCallback(() => rootPrism.getActiveBusyPartIds(), [rootPrism]),
   );
 
+  const busyMediaTypes = useMemo(() => {
+    const set = new Set<GalleryMediaType>();
+    for (const partId of busyBackgroundParts) {
+      const rec = galleryStore.get(partId);
+      if (rec) {
+        set.add(rec.mediaType);
+        continue;
+      }
+      const p = prisms.find((item) => item.id === partId);
+      const mt = p?.declaration?.view?.proceduralOrgan?.mediaType ?? p?.declaration?.concept.mediaType;
+      if (mt && mt !== 'space') {
+        set.add(mt);
+      }
+    }
+    return set;
+  }, [busyBackgroundParts, galleryStore, prisms]);
+
   const handleSelectSystemPrism = useCallback(
     (prismId: string) => {
       if (prismId === VERDANT_HOME_PRISM_ID) {
@@ -757,9 +853,9 @@ export default function App() {
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <VerdantModelContextBridge
-        importedHarness={engineState.importedHarness}
-        sampling={engineState.sampling}
-        samplingCustomized={engineState.samplingCustomized}
+        importedHarness={appShellSummary.importedHarness}
+        sampling={appShellSummary.sampling}
+        samplingCustomized={appShellSummary.samplingCustomized}
         workerClient={workerClient}
         publishedPrisms={visiblePublishedPrisms}
         prismPool={prismPool}
@@ -794,58 +890,10 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
-            {(() => {
-              const streamOn = engineState.modelStreamEnabled;
-              const isStreaming =
-                engineState.status === 'downloading' || engineState.status === 'loading';
-              const hasRealModel =
-                engineState.model !== null && !isInternalBootstrapModel(engineState.model.id);
-              const hasError = streamOn && engineState.errorMessage !== null;
-              const statusLabel = !streamOn
-                ? 'Off'
-                : isStreaming
-                  ? `${engineState.progressPercent}%`
-                  : hasError
-                    ? 'Error'
-                    : hasRealModel
-                      ? 'Ready'
-                      : 'On';
-              return (
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={streamOn}
-                  data-testid="model-stream-toggle"
-                  title={
-                    streamOn
-                      ? 'Local AI is active on your device. Click to pause.'
-                      : 'Local AI is off. Click to enable private on-device AI.'
-                  }
-                  onClick={handleToggleModelStream}
-                  className={`inline-flex h-9 items-center gap-2 rounded-lg border px-2.5 sm:px-3 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                    streamOn
-                      ? 'border-emerald-700/40 bg-emerald-50 text-emerald-950 hover:bg-emerald-100/80 dark:border-emerald-500/40 dark:bg-emerald-950/50 dark:text-emerald-200 dark:hover:bg-emerald-950/80'
-                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-300 dark:hover:bg-slate-800'
-                  }`}
-                >
-                  <span
-                    className={`inline-block h-2 w-2 rounded-full ${
-                      !streamOn
-                        ? 'bg-slate-400 dark:bg-slate-500'
-                        : hasError
-                          ? 'bg-red-500'
-                          : isStreaming
-                            ? 'animate-pulse bg-emerald-500'
-                            : 'bg-emerald-600 dark:bg-emerald-400'
-                    }`}
-                  />
-                  <span>Local AI</span>
-                  <span className="font-mono text-[11px] tabular-nums opacity-80">
-                    {statusLabel}
-                  </span>
-                </button>
-              );
-            })()}
+            <LocalAiStatusPill
+              workerClient={workerClient}
+              onToggle={handleToggleModelStream}
+            />
 
             <button
               type="button"
@@ -874,8 +922,10 @@ export default function App() {
 
         {/* Main 3-zone workbench: every zone is a procedurally synthesized Verdant Prism */}
         <div className="flex min-h-0 flex-1 overflow-hidden">
-          <ThreadSidebar
-            engineState={engineState}
+          <SubscribedThreadSidebar
+            workerClient={workerClient}
+            busyPartIds={busyBackgroundParts}
+            busyMediaTypes={busyMediaTypes}
             mobileOpen={mobileSidebarOpen}
             onCloseMobile={() => setMobileSidebarOpen(false)}
             onOpenInspector={() => setActiveView({ kind: 'settings' })}
@@ -906,8 +956,8 @@ export default function App() {
                 onChangeMode={setSurfaceMode}
                 onSelectChildPrism={handleSelectSystemPrism}
                 previewContent={
-                  <ThreadView
-                    engineState={engineState}
+                  <SubscribedThreadView
+                    workerClient={workerClient}
                     onCancelDownload={handleCancelDownload}
                     onRetryLoad={handleRetryLoad}
                     onDismissError={handleDismissError}
@@ -941,7 +991,7 @@ export default function App() {
                 darkMode={darkMode}
                 onToggleDarkMode={() => setDarkMode((d) => !d)}
                 onSetDarkMode={setDarkMode}
-                cachedBytes={engineState.opfsStorage?.usageBytes ?? 0}
+                cachedBytes={appShellSummary.opfsStorage?.usageBytes ?? 0}
                 onClearCache={handleClearCache}
                 debugMode={debugMode}
                 onOpenDebugPanel={() => setDebugPanelOpen(true)}
@@ -972,7 +1022,7 @@ export default function App() {
 
             {activeView.kind === 'prism' && focusedPrism && (
               <Suspense fallback={null}>
-                <VerdantStudioView
+                <SubscribedStudioView
                   project={focusedPrism}
                   mode={activeView.mode}
                   frame={observerFrame}
@@ -988,7 +1038,6 @@ export default function App() {
                   bridgeRuntime={prismPool}
                   getBuildClient={getPrismBuildClient}
                   workerClient={workerClient}
-                  engineState={engineState}
                   darkMode={darkMode}
                   getStudioChatBridge={getStudioChatBridge}
                   rootPrism={rootPrism}
@@ -1000,10 +1049,10 @@ export default function App() {
 
           {debugMode && debugPanelOpen && (
             <Suspense fallback={null}>
-              <VTensorInspector
+              <SubscribedVTensorInspector
                 open={debugPanelOpen}
                 onClose={() => setDebugPanelOpen(false)}
-                engineState={engineState}
+                workerClient={workerClient}
                 publishedPrisms={publishedPrisms}
                 unifiedModelTelemetry={expertRegistry.telemetry()}
                 observerBus={observerBus}

@@ -25,6 +25,8 @@ let generator = W.generator === 'botanical-fractal' ? 'botanical-garden'
   : W.generator || 'landscape-vista';
 let lighting = W.lighting || 'golden-hour';
 let curW = W.width || 800, curH = W.height || 500, hiDpi = 1;
+let useReconciledImage = typeof W.reconciledImageDataUrl === 'string' && W.reconciledImageDataUrl.startsWith('data:image/');
+let drawGeneration = 0;
 
 function mulberry32(a) {
   return function() {
@@ -57,7 +59,29 @@ function drawArtwork(canvas) {
   const w = canvas.width, h = canvas.height;
   const rng = mulberry32(seed);
   const [cBg, cMid, cAcc, cHi] = W.palette;
+  const genToken = ++drawGeneration;
   ctx.clearRect(0, 0, w, h);
+
+  if (useReconciledImage && generator !== 'logo-mark' && W.reconciledImageDataUrl) {
+    ctx.fillStyle = cBg;
+    ctx.fillRect(0, 0, w, h);
+    const img = new Image();
+    img.onload = () => {
+      if (genToken !== drawGeneration || !useReconciledImage) return;
+      ctx.clearRect(0, 0, w, h);
+      ctx.drawImage(img, 0, 0, w, h);
+      if (window.verdant?.sense?.inspectCanvas) {
+        try { window.verdant.sense.inspectCanvas(canvas); } catch (_) {}
+      }
+    };
+    img.onerror = () => {
+      if (genToken !== drawGeneration) return;
+      useReconciledImage = false;
+      drawArtwork(canvas);
+    };
+    img.src = W.reconciledImageDataUrl;
+    return;
+  }
 
   if (generator === 'landscape-vista') {
     const horizon = h * 0.62, sunX = w * (0.28 + rng() * 0.44), sunY = h * (0.22 + rng() * 0.2), sunR = Math.min(w, h) * 0.085;
@@ -378,7 +402,7 @@ function render() {
   meta.textContent = curW + '×' + curH + ' · ' + lighting.replace('-', ' ');
   const actions = document.createElement('div'); actions.className = 'organ-row';
   const genBtn = document.createElement('button'); genBtn.className = 'organ-btn ghost'; genBtn.textContent = 'New Variation';
-  genBtn.onclick = () => { seed = (seed * 1664525 + 1013904223) % 999999; drawArtwork(canvas); };
+  genBtn.onclick = () => { useReconciledImage = false; seed = (seed * 1664525 + 1013904223) % 999999; drawArtwork(canvas); };
   const expPng = document.createElement('button'); expPng.className = 'organ-btn primary'; expPng.textContent = 'Download PNG';
   expPng.onclick = () => { const a = document.createElement('a'); a.href = canvas.toDataURL('image/png'); a.download = (W.caption || 'artwork').toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.png'; a.click(); };
   actions.append(genBtn, expPng);
@@ -393,7 +417,7 @@ function render() {
 if (window.verdant?.onInput) {
   window.verdant.onInput((input) => {
     const text = (typeof input === 'string' ? input : String((input && (input.prompt || input.text)) || '')).toLowerCase();
-    if (/\\b(variation|remix|regenerate)\\b/.test(text)) seed = (seed * 1664525 + 1013904223) % 999999;
+    if (/\\b(variation|remix|regenerate)\\b/.test(text)) { useReconciledImage = false; seed = (seed * 1664525 + 1013904223) % 999999; }
     if (/\\b(golden|sunset|warm)\\b/.test(text)) lighting = 'golden-hour';
     else if (/\\b(twilight|dusk|evening)\\b/.test(text)) lighting = 'twilight';
     else if (/\\b(midnight|night|dark|noir)\\b/.test(text)) lighting = 'midnight';

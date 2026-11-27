@@ -13,6 +13,7 @@ import { VerdantRootPrismRuntime } from './verdantRootPrism';
 import { VERDANT_HOME_PRISM_ID } from './observerUiSynthesizer';
 import type { LlamaVTensorWorkerClient } from './workerClient';
 import { VerdantCognitiveObserver } from './cognitiveObserver';
+import { shouldCheckpointAtKvPageBoundary } from './vramSwapPolicy';
 
 function createStubWorkerClient(): {
   client: LlamaVTensorWorkerClient;
@@ -206,4 +207,110 @@ test('UnifiedSemanticAssociator binds cross-modal concepts with parent-linked ka
   const matchVec = encodeSemanticVector32(['dog', 'golden fur', 'alert ears', 'expressive eyes']);
   const res = registry.semantics.computeSemanticResidual(w2.revision.conceptId, matchVec);
   assert.ok(Number.isFinite(res.residualNorm) && res.cosineSimilarity > 0.2);
+});
+
+test('Observer Tropical layout geometry cache executes 0 solves across focusedPrism draft.digest LOD ticks', async () => {
+  const { client } = createStubWorkerClient();
+  const root = new VerdantRootPrismRuntime({ workerClient: client });
+  const bridge = await root.getStudioChatBridge();
+  const created = await bridge.createArtifactFromPrompt({
+    prompt: 'Create a picture of a golden dog',
+    forcedMediaType: 'picture',
+  });
+
+  const proj0 = root.prismStore.get(created.prismId)!;
+  const f0 = root.getObserverFrame({
+    activeView: { kind: 'prism', prismId: created.prismId, mode: 'studio' },
+    focusedPrism: proj0,
+    prisms: root.prismStore.list(),
+    surfaceMode: 'preview',
+    viewportWidthPx: 1440,
+    viewportHeightPx: 900,
+    darkMode: false,
+    userTyping: false,
+  });
+  const solvesAfterFirst = root.getLayoutSolveCount();
+  assert.equal(solvesAfterFirst, 1);
+
+  // Mutate focusedPrism draft digest (simulating Lod0 -> Lod1 -> Lod2 -> Lod3 reconciliation commits)
+  await root.prismStore.applyStudioOp(
+    created.prismId,
+    { op: 'set-metadata', description: 'Refined Lod2 golden dog' },
+    { pushRevision: false },
+  );
+  const proj1 = root.prismStore.get(created.prismId)!;
+  assert.notEqual(proj1.draft.digest, proj0.draft.digest);
+
+  const f1 = root.getObserverFrame({
+    activeView: { kind: 'prism', prismId: created.prismId, mode: 'studio' },
+    focusedPrism: proj1,
+    prisms: root.prismStore.list(),
+    surfaceMode: 'preview',
+    viewportWidthPx: 1440,
+    viewportHeightPx: 900,
+    darkMode: true,
+    userTyping: true,
+  });
+  assert.equal(
+    root.getLayoutSolveCount(),
+    solvesAfterFirst,
+    'Digest/theme/typing updates must reuse cached SolvedUiLayout with 0 Tropical solves',
+  );
+  assert.equal(f1.layout.layoutDigest, f0.layout.layoutDigest);
+
+  // Changing viewport or surfaceMode must cleanly trigger a new Tropical layout solve
+  root.getObserverFrame({
+    activeView: { kind: 'prism', prismId: created.prismId, mode: 'studio' },
+    focusedPrism: proj1,
+    prisms: root.prismStore.list(),
+    surfaceMode: 'details',
+    viewportWidthPx: 1440,
+    viewportHeightPx: 900,
+    darkMode: true,
+    userTyping: false,
+  });
+  assert.equal(root.getLayoutSolveCount(), solvesAfterFirst + 1);
+  root.dispose();
+});
+
+test('64-token KV page-boundary checkpoint yields long background part cleanly for waiting focused part', () => {
+  assert.equal(
+    shouldCheckpointAtKvPageBoundary({
+      checkpointRequested: true,
+      jobPartId: 'bg-thread',
+      focusedPartId: 'fg-studio',
+      hasWaitingFocusedJob: true,
+      emittedTokensInSlice: 64,
+      totalEmittedTokens: 128,
+      remainingMaxTokens: 128,
+    }),
+    true,
+    'Background part at exact 64-token page boundary (>=128 total, >=32 left) must checkpoint cleanly',
+  );
+
+  // Must NOT checkpoint off-boundary (e.g. token 129) or when the job IS the focused part
+  assert.equal(
+    shouldCheckpointAtKvPageBoundary({
+      checkpointRequested: true,
+      jobPartId: 'bg-thread',
+      focusedPartId: 'fg-studio',
+      hasWaitingFocusedJob: true,
+      emittedTokensInSlice: 65,
+      totalEmittedTokens: 129,
+      remainingMaxTokens: 127,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldCheckpointAtKvPageBoundary({
+      checkpointRequested: true,
+      jobPartId: 'fg-studio',
+      focusedPartId: 'fg-studio',
+      hasWaitingFocusedJob: true,
+      emittedTokensInSlice: 64,
+      totalEmittedTokens: 128,
+      remainingMaxTokens: 128,
+    }),
+    false,
+  );
 });

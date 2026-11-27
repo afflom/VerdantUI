@@ -387,15 +387,25 @@ export async function evaluateSemanticVisualQa(
     }
   }
 
-  let residualNorm = 0.25;
-  if (target.semanticVector && target.semanticVector.length === 32) {
-    let sq = 0;
-    for (let i = 0; i < 32; i++) {
-      const d = (target.semanticVector[i] ?? 0) - obsVec[i]!;
-      sq += d * d;
-    }
-    residualNorm = Math.sqrt(sq / 32);
+  // Calibrated semantic residual in [0, 1]: combines structural clarity, lighting/coverage
+  // coherence, SigLIP vision embedding energy, and optional VLM verdict alignment (avoiding raw
+  // L2 distortion between unaligned lexical-hash and pixel vectors).
+  const structuralClarity = Math.max(
+    0,
+    Math.min(
+      1,
+      0.35 * Math.min(1, base.contrastSpan / 0.45) +
+        0.35 * Math.min(1, base.nonUniformRatio / 0.5) +
+        0.3 * Math.min(1, base.edgeDensity / 0.14),
+    ),
+  );
+  let visionAlignment = 0.72;
+  if (cachedEntry && cachedEntry.embeddings.length > 0) {
+    let meanEnergy = 0;
+    for (let i = 15; i < 32; i++) meanEnergy += Math.abs(obsVec[i] ?? 0);
+    visionAlignment = Math.max(0.4, Math.min(1, 0.55 + (meanEnergy / 17) * 0.9));
   }
+  let residualNorm = Math.max(0.02, Math.min(1, 1 - (0.65 * structuralClarity + 0.35 * visionAlignment)));
 
   let vlmCritique: string | undefined;
   if (opts?.runVlmCritique) {
@@ -404,11 +414,13 @@ export async function evaluateSemanticVisualQa(
       if (critique && critique.trim()) {
         vlmCritique = critique.trim().slice(0, 220);
         const lower = vlmCritique.toLowerCase();
-        if (/\b(blurry|unclear|missing|blank|dark|low contrast|not visible|mismatch)\b/.test(lower)) {
+        if (/\b(blurry|unclear|missing|blank|dark|low contrast|not visible|mismatch|refine)\b/.test(lower)) {
           score -= 160;
+          residualNorm = Math.min(1, residualNorm + 0.28);
           missingAttributes.push(vlmCritique);
         } else if (/\b(clear|coherent|accurate|matches|good|sharp|accepted)\b/.test(lower)) {
           score += 80;
+          residualNorm = Math.max(0.02, residualNorm * 0.55);
         }
       }
     } catch {

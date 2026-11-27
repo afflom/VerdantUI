@@ -751,11 +751,26 @@ export class StudioChatBridge {
       return createdCompanion;
     }
 
+    // Advance UnifiedSemanticAssociator (vN -> vN+1, parentKappa-chained) so refinements
+    // propagate across adjacent modalities and trigger progressive Lod1->Lod3 reconciliation.
+    const { revision: refinedSemanticRev } = await contextualizePromptToUnifiedWeights({
+      prompt: `${proj.draft.name}: ${params.instruction}`,
+      mediaType,
+      prismId: proj.id,
+      activePrismId: proj.id,
+      deps: {
+        registry,
+        runLocalLanguagePrompt: this.deps.runLocalStudioPrompt
+          ? (sys, usr, max) => this.deps.runLocalStudioPrompt!(sys, usr, max, proj.id)
+          : undefined,
+      },
+    });
+
     let rawModelJson = '';
     if (this.deps.runLocalStudioPrompt) {
       try {
         const prompt = buildWeightRefinementPrompt([], decl, params.instruction);
-        rawModelJson = await this.deps.runLocalStudioPrompt(prompt, params.instruction, 512);
+        rawModelJson = await this.deps.runLocalStudioPrompt(prompt, params.instruction, 512, proj.id);
       } catch {
         rawModelJson = '';
       }
@@ -937,7 +952,13 @@ export class StudioChatBridge {
         op: 'batch',
         ops: [
           ...assembled.ops,
-          { op: 'set-concept-profile', pinnedFields: mergedPins },
+          {
+            op: 'set-concept-profile',
+            pinnedFields: mergedPins,
+            semanticConceptId: refinedSemanticRev.conceptId,
+            semanticKappa: refinedSemanticRev.kappa,
+            semanticVersion: refinedSemanticRev.version,
+          },
         ],
       },
       { pushRevision: true },
@@ -961,6 +982,16 @@ export class StudioChatBridge {
       for (const sid of rec?.spaceIds ?? []) {
         await syncSpacePrismView(sid, this.deps);
       }
+    }
+
+    if (mediaType !== 'space' && this.deps.scheduleProgressiveReconciliation) {
+      this.deps.scheduleProgressiveReconciliation({
+        prismId: updatedProj.id,
+        prompt: `${updatedProj.draft.name}: ${params.instruction}`,
+        initialRevision: refinedSemanticRev,
+        startRank: 1,
+        maxRank: 3,
+      });
     }
 
     registry.basis.recordAdaptation({

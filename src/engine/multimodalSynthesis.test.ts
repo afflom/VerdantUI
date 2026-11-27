@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  encodeClipBpeTokens,
   encodePromptToClipTokens,
   loadImageWeightsFromBacking,
   loadImageWeightsFromGguf,
+  parseClipBpeFromJsonAndMerges,
   sinusoidalTimestepEmbedding,
   synthesizeDistilledImageAsync,
   synthesizeImageOneStep,
@@ -12,6 +14,8 @@ import {
   type ImageSynthesisScratch,
   type TaesdDecoderWeights,
 } from './imageSynthesisEngine';
+import { verdantConv2d } from './verdantKernels';
+import { getSharedComputeWasmArena, verdantConv2dSimd } from './verdantWasmSimd';
 import {
   composeMultiTrackArrangement,
   encodeStereoWav,
@@ -412,4 +416,280 @@ test('synthesizeDistilledImageAsync streams multi-layer CLIP, cross-attention UN
   assert.equal(lod3.height, 512);
   assert.equal(lod3.rgba.length, 512 * 512 * 4);
   assert.ok(lod3.peakScratchBytes < 64 * 1024 * 1024, 'Lod3 512x512 scratch must stay strictly under 64 MB');
+});
+
+function floatToF16Bits(val: number): number {
+  const f32 = new Float32Array(1);
+  const u32 = new Uint32Array(f32.buffer);
+  f32[0] = val;
+  const x = u32[0]!;
+  const sign = (x >>> 16) & 0x8000;
+  let exp = ((x >>> 23) & 0xff) - 127 + 15;
+  let frac = (x >>> 13) & 0x03ff;
+  if (exp <= 0) return sign;
+  if (exp >= 31) return sign | 0x7c00;
+  return sign | (exp << 10) | frac;
+}
+
+test('verdantConv2dSimd matches scalar verdantConv2d for F32 and native F16 weights with 0 WASM arena leak', () => {
+  const inC = 4;
+  const outC = 8;
+  const H = 6;
+  const W = 6;
+  const kH = 3;
+  const kW = 3;
+  const input = new Float32Array(inC * H * W);
+  for (let i = 0; i < input.length; i++) input[i] = Math.sin(i * 0.37) * 0.5;
+  const wF32 = new Float32Array(outC * inC * kH * kW);
+  for (let i = 0; i < wF32.length; i++) wF32[i] = Math.cos(i * 0.19) * 0.25;
+  const bias = new Float32Array(outC);
+  for (let i = 0; i < outC; i++) bias[i] = (i - 3.5) * 0.05;
+
+  const expected = new Float32Array(outC * H * W);
+  verdantConv2d(input, wF32, bias, expected, inC, outC, H, W, kH, kW, 1, 1);
+
+  const arena = getSharedComputeWasmArena();
+  const usedBefore = arena?.usedBytes ?? 0;
+
+  const outF32 = new Float32Array(outC * H * W);
+  const resF32 = verdantConv2dSimd({
+    input,
+    weightRaw: new Uint8Array(wF32.buffer, wF32.byteOffset, wF32.byteLength),
+    weightType: GgmlType.F32,
+    bias,
+    out: outF32,
+    inC,
+    outC,
+    height: H,
+    width: W,
+    kH,
+    kW,
+    stride: 1,
+    padding: 1,
+    arena,
+  });
+  assert.equal(resF32.outH, H);
+  assert.equal(resF32.outW, W);
+  assert.equal(arena?.usedBytes ?? 0, usedBefore, 'withScratchScope must leak 0 bytes after F32 Conv2d');
+  for (let i = 0; i < expected.length; i++) {
+    assert.ok(Math.abs(outF32[i]! - expected[i]!) < 1e-4, `F32 mismatch at ${i}`);
+  }
+
+  // Native F16 weights (zero F16->F32 inflation)
+  const wF16 = new Uint16Array(wF32.length);
+  for (let i = 0; i < wF32.length; i++) wF16[i] = floatToF16Bits(wF32[i]!);
+  const outF16 = new Float32Array(outC * H * W);
+  verdantConv2dSimd({
+    input,
+    weightRaw: new Uint8Array(wF16.buffer, wF16.byteOffset, wF16.byteLength),
+    weightType: GgmlType.F16,
+    bias,
+    out: outF16,
+    inC,
+    outC,
+    height: H,
+    width: W,
+    kH,
+    kW,
+    stride: 1,
+    padding: 1,
+    arena,
+  });
+  assert.equal(arena?.usedBytes ?? 0, usedBefore, 'withScratchScope must leak 0 bytes after F16 Conv2d');
+  for (let i = 0; i < expected.length; i++) {
+    assert.ok(Math.abs(outF16[i]! - expected[i]!) < 2e-3, `F16 mismatch at ${i}`);
+  }
+});
+
+test('encodeClipBpeTokens executes exact OpenAI CLIP byte-level BPE merges ("dog" -> 1929)', () => {
+  const vocabJson = JSON.stringify({
+    'a</w>': 320,
+    'd': 67,
+    'o': 78,
+    'g</w>': 326,
+    'do': 400,
+    'dog</w>': 1929,
+    'g': 70,
+    'l': 75,
+    'e': 68,
+    'n</w>': 333,
+    'go': 401,
+    'gol': 402,
+    'gold': 403,
+    'golde': 404,
+    'golden</w>': 3878,
+    '<|startoftext|>': 49406,
+    '<|endoftext|>': 49407,
+  });
+  const mergesText = [
+    '#version: 0.2',
+    'd o',
+    'do g</w>',
+    'g o',
+    'go l',
+    'gol d',
+    'gold e',
+    'golde n</w>',
+  ].join('\n');
+
+  const vocab = parseClipBpeFromJsonAndMerges(vocabJson, mergesText, 'custom');
+  const tokens = encodeClipBpeTokens('A Golden Dog', vocab, 77);
+  assert.deepEqual(tokens, [49406, 320, 3878, 1929, 49407]);
+});
+
+test('Exact verified SDXS-512 UNet topology (input_blocks {0,1,3,4,6,7} -> output_blocks {0..7} + up_blocks.0.attentions) + 10 TAESD residual blocks executes end-to-end', async () => {
+  const V = 32;
+  const D = 8;
+  const S = 16;
+  const C0 = 4; // scaled stand-in for 320
+  const C1 = 8; // scaled stand-in for 640
+  const C2 = 16; // scaled stand-in for 1280
+  const TE = 16; // scaled stand-in for time_embed 1280
+  const TC = 4; // scaled stand-in for TAESD 64
+  const fill = (len: number, seed: number) => {
+    const out = new Float32Array(len);
+    for (let i = 0; i < len; i++) out[i] = Math.sin(i * 0.29 + seed) * 0.04;
+    return out;
+  };
+  const ones = (len: number) => new Float32Array(len).fill(1);
+  const zeros = (len: number) => new Float32Array(len);
+
+  const resBlock = (prefix: string, inC: number, outC: number, s: number) => [
+    { name: `${prefix}.in_layers.0.weight`, dims: [inC], data: ones(inC) },
+    { name: `${prefix}.in_layers.0.bias`, dims: [inC], data: zeros(inC) },
+    { name: `${prefix}.in_layers.2.weight`, dims: [3, 3, inC, outC], data: fill(9 * inC * outC, s) },
+    { name: `${prefix}.in_layers.2.bias`, dims: [outC], data: zeros(outC) },
+    { name: `${prefix}.emb_layers.1.weight`, dims: [TE, outC], data: fill(TE * outC, s + 0.1) },
+    { name: `${prefix}.emb_layers.1.bias`, dims: [outC], data: zeros(outC) },
+    { name: `${prefix}.out_layers.0.weight`, dims: [outC], data: ones(outC) },
+    { name: `${prefix}.out_layers.0.bias`, dims: [outC], data: zeros(outC) },
+    { name: `${prefix}.out_layers.3.weight`, dims: [3, 3, outC, outC], data: fill(9 * outC * outC, s + 0.2) },
+    { name: `${prefix}.out_layers.3.bias`, dims: [outC], data: zeros(outC) },
+    ...(inC !== outC
+      ? [
+          { name: `${prefix}.skip_connection.weight`, dims: [1, 1, inC, outC], data: fill(inC * outC, s + 0.3) },
+          { name: `${prefix}.skip_connection.bias`, dims: [outC], data: zeros(outC) },
+        ]
+      : []),
+  ];
+
+  const spatialAttn = (prefix: string, ch: number, s: number) => {
+    const tb = `${prefix}.transformer_blocks.0`;
+    return [
+      { name: `${prefix}.norm.weight`, dims: [ch], data: ones(ch) },
+      { name: `${prefix}.norm.bias`, dims: [ch], data: zeros(ch) },
+      { name: `${prefix}.proj_in.weight`, dims: [1, 1, ch, ch], data: fill(ch * ch, s) },
+      { name: `${prefix}.proj_in.bias`, dims: [ch], data: zeros(ch) },
+      { name: `${tb}.norm1.weight`, dims: [ch], data: ones(ch) },
+      { name: `${tb}.norm1.bias`, dims: [ch], data: zeros(ch) },
+      { name: `${tb}.attn1.to_q.weight`, dims: [ch, ch], data: fill(ch * ch, s + 0.1) },
+      { name: `${tb}.attn1.to_k.weight`, dims: [ch, ch], data: fill(ch * ch, s + 0.2) },
+      { name: `${tb}.attn1.to_v.weight`, dims: [ch, ch], data: fill(ch * ch, s + 0.3) },
+      { name: `${tb}.attn1.to_out.0.weight`, dims: [ch, ch], data: fill(ch * ch, s + 0.4) },
+      { name: `${tb}.norm2.weight`, dims: [ch], data: ones(ch) },
+      { name: `${tb}.norm2.bias`, dims: [ch], data: zeros(ch) },
+      { name: `${tb}.attn2.to_q.weight`, dims: [ch, ch], data: fill(ch * ch, s + 0.5) },
+      { name: `${tb}.attn2.to_k.weight`, dims: [D, ch], data: fill(D * ch, s + 0.6) },
+      { name: `${tb}.attn2.to_v.weight`, dims: [D, ch], data: fill(D * ch, s + 0.7) },
+      { name: `${tb}.attn2.to_out.0.weight`, dims: [ch, ch], data: fill(ch * ch, s + 0.8) },
+      { name: `${tb}.norm3.weight`, dims: [ch], data: ones(ch) },
+      { name: `${tb}.norm3.bias`, dims: [ch], data: zeros(ch) },
+      { name: `${tb}.ff.net.0.proj.weight`, dims: [ch, ch * 2], data: fill(ch * ch * 2, s + 0.9) },
+      { name: `${tb}.ff.net.2.weight`, dims: [ch, ch], data: fill(ch * ch, s + 1.0) },
+      { name: `${prefix}.proj_out.weight`, dims: [1, 1, ch, ch], data: fill(ch * ch, s + 1.1) },
+      { name: `${prefix}.proj_out.bias`, dims: [ch], data: zeros(ch) },
+    ];
+  };
+
+  const taesdRes = (idx: number, s: number) => [
+    { name: `first_stage_model.decoder.layers.${idx}.conv.0.weight`, dims: [3, 3, TC, TC], data: fill(9 * TC * TC, s) },
+    { name: `first_stage_model.decoder.layers.${idx}.conv.0.bias`, dims: [TC], data: zeros(TC) },
+    { name: `first_stage_model.decoder.layers.${idx}.conv.2.weight`, dims: [3, 3, TC, TC], data: fill(9 * TC * TC, s + 0.1) },
+    { name: `first_stage_model.decoder.layers.${idx}.conv.2.bias`, dims: [TC], data: zeros(TC) },
+    { name: `first_stage_model.decoder.layers.${idx}.conv.4.weight`, dims: [3, 3, TC, TC], data: fill(9 * TC * TC, s + 0.2) },
+    { name: `first_stage_model.decoder.layers.${idx}.conv.4.bias`, dims: [TC], data: zeros(TC) },
+  ];
+
+  const gguf = buildSyntheticSdxsGguf([
+    { name: 'cond_stage_model.transformer.text_model.embeddings.token_embedding.weight', dims: [D, V], data: fill(D * V, 1) },
+    { name: 'cond_stage_model.transformer.text_model.embeddings.position_embedding.weight', dims: [D, S], data: fill(D * S, 2) },
+    { name: 'cond_stage_model.transformer.text_model.final_layer_norm.weight', dims: [D], data: ones(D) },
+    { name: 'cond_stage_model.transformer.text_model.final_layer_norm.bias', dims: [D], data: zeros(D) },
+    { name: 'model.diffusion_model.time_embed.0.weight', dims: [C0, TE], data: fill(C0 * TE, 3) },
+    { name: 'model.diffusion_model.time_embed.0.bias', dims: [TE], data: zeros(TE) },
+    { name: 'model.diffusion_model.time_embed.2.weight', dims: [TE, TE], data: fill(TE * TE, 4) },
+    { name: 'model.diffusion_model.time_embed.2.bias', dims: [TE], data: zeros(TE) },
+    // Exact live input_blocks: {0, 1, 3, 4, 6, 7} (NO blocks 2 or 5, NO middle_block!)
+    { name: 'model.diffusion_model.input_blocks.0.0.weight', dims: [3, 3, 4, C0], data: fill(36 * C0, 5) },
+    { name: 'model.diffusion_model.input_blocks.0.0.bias', dims: [C0], data: zeros(C0) },
+    ...resBlock('model.diffusion_model.input_blocks.1.0', C0, C0, 6),
+    { name: 'model.diffusion_model.input_blocks.3.0.op.weight', dims: [3, 3, C0, C0], data: fill(9 * C0 * C0, 7) },
+    { name: 'model.diffusion_model.input_blocks.3.0.op.bias', dims: [C0], data: zeros(C0) },
+    ...resBlock('model.diffusion_model.input_blocks.4.0', C0, C1, 8),
+    ...spatialAttn('model.diffusion_model.input_blocks.4.1', C1, 9),
+    { name: 'model.diffusion_model.input_blocks.6.0.op.weight', dims: [3, 3, C1, C1], data: fill(9 * C1 * C1, 10) },
+    { name: 'model.diffusion_model.input_blocks.6.0.op.bias', dims: [C1], data: zeros(C1) },
+    ...resBlock('model.diffusion_model.input_blocks.7.0', C1, C2, 11),
+    ...spatialAttn('model.diffusion_model.input_blocks.7.1', C2, 12),
+    // Exact live output_blocks: {0..7} + up_blocks.0.attentions.{0,1}
+    ...resBlock('model.diffusion_model.output_blocks.0.0', C2 + C2, C2, 13),
+    ...spatialAttn('model.diffusion_model.up_blocks.0.attentions.0', C2, 14),
+    ...resBlock('model.diffusion_model.output_blocks.1.0', C2 + C1, C2, 15),
+    ...spatialAttn('model.diffusion_model.up_blocks.0.attentions.1', C2, 16),
+    { name: 'model.diffusion_model.output_blocks.2.1.conv.weight', dims: [3, 3, C2, C2], data: fill(9 * C2 * C2, 17) },
+    { name: 'model.diffusion_model.output_blocks.2.1.conv.bias', dims: [C2], data: zeros(C2) },
+    ...resBlock('model.diffusion_model.output_blocks.3.0', C2 + C1, C1, 18),
+    ...spatialAttn('model.diffusion_model.output_blocks.3.1', C1, 19),
+    ...resBlock('model.diffusion_model.output_blocks.4.0', C1 + C0, C1, 20),
+    ...spatialAttn('model.diffusion_model.output_blocks.4.1', C1, 21),
+    { name: 'model.diffusion_model.output_blocks.5.2.conv.weight', dims: [3, 3, C1, C1], data: fill(9 * C1 * C1, 22) },
+    { name: 'model.diffusion_model.output_blocks.5.2.conv.bias', dims: [C1], data: zeros(C1) },
+    ...resBlock('model.diffusion_model.output_blocks.6.0', C1 + C0, C0, 23),
+    ...resBlock('model.diffusion_model.output_blocks.7.0', C0 + C0, C0, 24),
+    { name: 'model.diffusion_model.out.0.weight', dims: [C0], data: ones(C0) },
+    { name: 'model.diffusion_model.out.0.bias', dims: [C0], data: zeros(C0) },
+    { name: 'model.diffusion_model.out.2.weight', dims: [3, 3, C0, 4], data: fill(36 * C0, 25) },
+    { name: 'model.diffusion_model.out.2.bias', dims: [4], data: zeros(4) },
+    // Exact 19-layer TAESD decoder with all 10 residual blocks
+    { name: 'first_stage_model.decoder.layers.0.weight', dims: [3, 3, 4, TC], data: fill(36 * TC, 26) },
+    { name: 'first_stage_model.decoder.layers.0.bias', dims: [TC], data: zeros(TC) },
+    ...taesdRes(2, 27),
+    ...taesdRes(3, 28),
+    ...taesdRes(4, 29),
+    { name: 'first_stage_model.decoder.layers.6.weight', dims: [3, 3, TC, TC], data: fill(9 * TC * TC, 30) },
+    ...taesdRes(7, 31),
+    ...taesdRes(8, 32),
+    ...taesdRes(9, 33),
+    { name: 'first_stage_model.decoder.layers.11.weight', dims: [3, 3, TC, TC], data: fill(9 * TC * TC, 34) },
+    ...taesdRes(12, 35),
+    ...taesdRes(13, 36),
+    ...taesdRes(14, 37),
+    { name: 'first_stage_model.decoder.layers.16.weight', dims: [3, 3, TC, TC], data: fill(9 * TC * TC, 38) },
+    ...taesdRes(17, 39),
+    { name: 'first_stage_model.decoder.layers.18.weight', dims: [3, 3, TC, 3], data: fill(27 * TC, 40) },
+    { name: 'first_stage_model.decoder.layers.18.bias', dims: [3], data: new Float32Array([0.5, 0.5, 0.5]) },
+  ]);
+
+  const loaded = loadImageWeightsFromGguf(gguf);
+  assert.equal(loaded.streamGraph?.hasMiddleBlock, false);
+  assert.deepEqual(loaded.streamGraph?.inputBlockIndices, [0, 1, 3, 4, 6, 7]);
+  assert.deepEqual(loaded.streamGraph?.outputBlockIndices, [0, 1, 2, 3, 4, 5, 6, 7]);
+  assert.equal(loaded.streamGraph?.taesdResidualIndices.length, 10);
+
+  const tokens = encodePromptToClipTokens('a golden dog', V, S);
+  const res = await synthesizeDistilledImageAsync({
+    promptTokens: tokens,
+    latentH: 8,
+    latentW: 8,
+    seed: 7,
+    loaded,
+  });
+
+  assert.equal(res.width, 64);
+  assert.equal(res.height, 64);
+  assert.equal(res.crossAttnBlocksExecuted, 6, 'All 6 SpatialTransformer cross-attention blocks must execute');
+  assert.equal(res.taesdResidualBlocksExecuted, 10, 'All 10 TAESD residual blocks must execute');
+  assert.ok(res.unetBlocksExecuted >= 14, 'All encoder/decoder UNet blocks must execute');
+  assert.ok(res.peakScratchBytes < 64 * 1024 * 1024);
+  assert.equal(res.rgba.length, 64 * 64 * 4);
 });

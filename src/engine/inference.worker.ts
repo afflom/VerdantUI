@@ -9,6 +9,7 @@ import {
 } from './audioSynthesisEngine';
 import {
   encodePromptToClipTokens,
+  ensureClipBpeVocabularyCached,
   loadImageWeightsFromBacking,
   synthesizeDistilledImageAsync,
   type ImageSynthesisScratch,
@@ -48,6 +49,10 @@ import {
   type VramBackingKind,
   type VramBackingStore,
 } from './vramBackingStore';
+import {
+  createCooperativeYielder,
+  shouldCheckpointAtKvPageBoundary,
+} from './vramSwapPolicy';
 import type { WeightResidencyPolicy } from './vramWeightPager';
 import {
   type ConformanceSuiteReport,
@@ -452,12 +457,19 @@ let activeLoadPromise: Promise<void> | null = null;
 let activeGenerationController: AbortController | null = null;
 let activeGenerationPromise: Promise<void> | null = null;
 let activeGenerationCount = 0;
+let activeGenerationPartId: string | null = null;
+let checkpointRequested = false;
 let focusedPartId = 'verdant-part-home';
+const cooperativeYielder = createCooperativeYielder();
 
 interface QueuedGenerationJob {
   readonly req: Extract<WorkerRequest, { type: 'generate' }>;
   readonly controller: AbortController;
   readonly enqueuedSeq: number;
+  readonly continuationPrompt?: string;
+  readonly continuationAccumulatedText?: string;
+  readonly continuationTokensEmitted?: number;
+  readonly remainingMaxTokens?: number;
 }
 let generationEnqueueSeq = 0;
 const pendingGenerationQueue: QueuedGenerationJob[] = [];
@@ -673,7 +685,13 @@ async function executeSingleGenerationJob(job: QueuedGenerationJob): Promise<voi
 
   await preemptSpeculativePrefill();
   opfsPersistEpoch += 1;
+  const jobPartId = req.partId ?? req.threadId ?? 'verdant-part-home';
+  const sliceController = new AbortController();
+  const onParentAbort = () => sliceController.abort();
+  controller.signal.addEventListener('abort', onParentAbort, { once: true });
   activeGenerationController = controller;
+  activeGenerationPartId = jobPartId;
+  checkpointRequested = false;
   activeGenerationCount += 1;
 
   let finishGen!: () => void;
@@ -682,9 +700,19 @@ async function executeSingleGenerationJob(job: QueuedGenerationJob): Promise<voi
   });
   activeGenerationPromise = genDone;
   let shouldPersistAfterTurn = false;
+  let checkpointed = false;
 
   try {
-    let count = 0;
+    let sliceCount = 0;
+    const prevAccumText = job.continuationAccumulatedText ?? '';
+    const prevTokensEmitted = job.continuationTokensEmitted ?? 0;
+    const activePrompt = job.continuationPrompt ?? req.prompt;
+    const targetMaxTokens = job.remainingMaxTokens ?? req.sampling.maxTokens;
+    const sliceSampling: SamplingConfig =
+      targetMaxTokens === req.sampling.maxTokens
+        ? req.sampling
+        : { ...req.sampling, maxTokens: targetMaxTokens };
+    let lastSliceAccum = '';
     let lastPrefillPost = 0;
     let lastPrefillDetail: string | undefined;
     let lastTelemetryPost = 0;
@@ -702,9 +730,9 @@ async function executeSingleGenerationJob(job: QueuedGenerationJob): Promise<voi
         : undefined;
 
     for await (const tokenEvent of runtime.generate(
-      req.prompt,
-      req.sampling,
-      controller.signal,
+      activePrompt,
+      sliceSampling,
+      sliceController.signal,
       (progress) => {
         const now = performance.now();
         const detailChanged =
@@ -728,49 +756,104 @@ async function executeSingleGenerationJob(job: QueuedGenerationJob): Promise<voi
       req.threadId,
       prefixEmbeddings,
     )) {
-      count += 1;
+      sliceCount += 1;
+      lastSliceAccum = tokenEvent.accumulatedText;
+      const totalEmitted = prevTokensEmitted + sliceCount;
+      const remainingTokens = Math.max(0, targetMaxTokens - sliceCount);
+      const hasWaitingFocusedJob = pendingGenerationQueue.some(
+        (q) => (q.req.partId ?? q.req.threadId ?? '') === focusedPartId,
+      );
+      const willCheckpoint =
+        !tokenEvent.finished &&
+        !controller.signal.aborted &&
+        shouldCheckpointAtKvPageBoundary({
+          checkpointRequested,
+          jobPartId,
+          focusedPartId,
+          hasWaitingFocusedJob,
+          emittedTokensInSlice: sliceCount,
+          totalEmittedTokens: totalEmitted,
+          remainingMaxTokens: remainingTokens,
+        });
+
+      const mergedEvent: TokenStreamEvent =
+        prevAccumText.length > 0 || prevTokensEmitted > 0 || willCheckpoint
+          ? {
+              ...tokenEvent,
+              accumulatedText: prevAccumText + tokenEvent.accumulatedText,
+              generatedTokens: totalEmitted,
+              finished: willCheckpoint ? false : tokenEvent.finished,
+            }
+          : tokenEvent;
+
       const nowMs = performance.now();
       const includeTelemetry =
-        count === 1 || tokenEvent.finished || nowMs - lastTelemetryPost >= 150;
+        sliceCount === 1 || mergedEvent.finished || nowMs - lastTelemetryPost >= 150;
       if (includeTelemetry) {
         lastTelemetryPost = nowMs;
       }
       post({
         type: 'token',
         requestId: req.requestId,
-        event: tokenEvent,
+        event: mergedEvent,
         telemetry: includeTelemetry ? runtime.getTelemetry() : undefined,
       });
       const stepUs = (nowMs - lastStepMs) * 1000;
       lastStepMs = nowMs;
       multimodalCoordinator.frameOracle.recordFrame(stepUs);
+
+      if (willCheckpoint) {
+        checkpointed = true;
+        sliceController.abort();
+        pendingGenerationQueue.push({
+          req,
+          controller,
+          enqueuedSeq: job.enqueuedSeq,
+          continuationPrompt: activePrompt + lastSliceAccum,
+          continuationAccumulatedText: prevAccumText + lastSliceAccum,
+          continuationTokensEmitted: totalEmitted,
+          remainingMaxTokens: remainingTokens,
+        });
+        break;
+      }
+
       await runtime.maybeYieldGenerationStep(stepUs);
     }
 
-    shouldPersistAfterTurn = !controller.signal.aborted;
-    post({
-      type: 'done',
-      requestId: req.requestId,
-      telemetry: runtime.getTelemetry(),
-      multimodalTelemetry: multimodalCoordinator.getTelemetry(),
-    });
+    if (!checkpointed) {
+      shouldPersistAfterTurn = !controller.signal.aborted;
+      post({
+        type: 'done',
+        requestId: req.requestId,
+        telemetry: runtime.getTelemetry(),
+        multimodalTelemetry: multimodalCoordinator.getTelemetry(),
+      });
+    }
   } catch (err) {
-    post({
-      type: 'error',
-      requestId: req.requestId,
-      message: err instanceof Error ? err.message : String(err),
-    });
+    if (!checkpointed) {
+      post({
+        type: 'error',
+        requestId: req.requestId,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
   } finally {
+    controller.signal.removeEventListener('abort', onParentAbort);
     activeGenerationCount = Math.max(0, activeGenerationCount - 1);
-    activeControllers.delete(req.requestId);
+    if (!checkpointed) {
+      activeControllers.delete(req.requestId);
+    }
     if (activeGenerationController === controller) {
       activeGenerationController = null;
+      activeGenerationPartId = null;
     }
+    checkpointRequested = false;
     if (activeGenerationPromise === genDone) {
       activeGenerationPromise = null;
     }
     finishGen();
     if (
+      !checkpointed &&
       shouldPersistAfterTurn &&
       activeGenerationCount === 0 &&
       pendingGenerationQueue.length === 0 &&
@@ -1303,10 +1386,14 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         });
         return;
       }
+      const bpeVocab =
+        neuralWeights.streamGraph?.clipBpeVocab ??
+        (await ensureClipBpeVocabularyCached(Boolean(req.allowAutoLoad)));
       const promptTokens = encodePromptToClipTokens(
         req.prompt,
         neuralWeights.clip.vocabSize,
         neuralWeights.clip.maxSeqLen,
+        bpeVocab,
       );
       const synth = await synthesizeDistilledImageAsync({
         promptTokens,
@@ -1315,7 +1402,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         seed: req.seed,
         loaded: neuralWeights,
         scratch: imageSynthesisScratch,
-        yieldFrame: () => new Promise<void>((resolve) => setTimeout(resolve, 0)),
+        yieldFrame: () => cooperativeYielder.yieldNow(),
       });
       multimodalCoordinator.frameOracle.recordFrame((performance.now() - t0) * 1000);
       const copy = new Uint8Array(synth.rgba.byteLength);
@@ -1342,12 +1429,56 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       if (req.allowAutoLoad && !activeVisionEncoder && !visionLoadPromise) {
         void ensureVisionEncoderOnDemand();
       }
+      const runVlmCritique = async (
+        visionKappa: string,
+        target: SemanticVisualQaTarget,
+      ): Promise<string | null> => {
+        if (!activeVisionEncoder || !runtime.isLoaded || activeGenerationCount > 0) {
+          return null;
+        }
+        const cached = multimodalCoordinator.getCachedVisual(visionKappa);
+        const modelEmbDim = runtime.getModelSummary()?.hparams.embeddingLength ?? 0;
+        if (!cached || cached.embeddings.length === 0 || cached.embeddingDim !== modelEmbDim) {
+          return null;
+        }
+        const qaCtrl = new AbortController();
+        const qaTimer = setTimeout(() => qaCtrl.abort(), 4500);
+        let text = '';
+        activeGenerationCount += 1;
+        try {
+          const prompt = `<|im_start|>system\nYou are a concise visual QA critic. Reply ONLY with "ACCEPTED" if the image clearly depicts the target subject and attributes, or "REFINE: <short missing visual attribute>".<|im_end|>\n<|im_start|>user\nTarget subject: ${target.canonicalSubject}. Attributes: ${target.attributes.slice(0, 4).join(', ')}. Lighting: ${target.lighting ?? 'balanced'}. Evaluate the attached visual embeddings.<|im_end|>\n<|im_start|>assistant\n`;
+          for await (const ev of runtime.generate(
+            prompt,
+            {
+              temperature: 0.1,
+              topP: 0.9,
+              topK: 20,
+              repeatPenalty: 1.05,
+              maxTokens: 32,
+              fullContextOutput: false,
+            },
+            qaCtrl.signal,
+            undefined,
+            'qa:vision',
+            cached.embeddings,
+          )) {
+            text = ev.accumulatedText;
+          }
+        } catch {
+          return null;
+        } finally {
+          clearTimeout(qaTimer);
+          activeGenerationCount = Math.max(0, activeGenerationCount - 1);
+        }
+        return text.trim() || null;
+      };
       const report = await evaluateSemanticVisualQa(
         { rgba, width: req.width, height: req.height },
         req.target,
         {
           visionEncoder: activeVisionEncoder,
           coordinator: multimodalCoordinator,
+          runVlmCritique,
           minAcceptScoreQ10: req.minAcceptScoreQ10,
         },
       );
@@ -1537,9 +1668,19 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
 
     if (req.type === 'generate') {
       // Non-preemptive salience-ordered scheduling: NEVER abort another part's active generation!
-      // Single-writer kvPager guarantees 0% KV thrashing while every part completes cleanly.
+      // If a focused foreground part arrives while a background part is running, request a clean
+      // 64-token KV page-boundary checkpoint so foreground responds rapidly with zero lost tokens.
       const controller = new AbortController();
       activeControllers.set(req.requestId, controller);
+      const incomingPartId = req.partId ?? req.threadId ?? 'verdant-part-home';
+      if (
+        activeGenerationCount > 0 &&
+        incomingPartId === focusedPartId &&
+        activeGenerationPartId !== null &&
+        activeGenerationPartId !== focusedPartId
+      ) {
+        checkpointRequested = true;
+      }
       pendingGenerationQueue.push({
         req,
         controller,

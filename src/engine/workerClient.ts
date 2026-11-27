@@ -157,7 +157,26 @@ const INITIAL_TELEMETRY: VTensorTelemetrySnapshot = {
   lastGraphNodeCount: 0,
 };
 
+export interface HeaderEngineSummary {
+  readonly modelStreamEnabled: boolean;
+  readonly status: EngineStatus;
+  readonly progressPercent: number;
+  readonly modelId: string | null;
+  readonly modelDisplayName: string | null;
+  readonly errorMessage: string | null;
+  readonly activePartTaskCount: number;
+}
+
+export interface AppShellEngineSummary {
+  readonly model: LoadedModelSummary | null;
+  readonly opfsStorage: OpfsQuotaSnapshot;
+  readonly sampling: SamplingConfig;
+  readonly samplingCustomized: boolean;
+  readonly importedHarness: ImportedHarnessSpec | null;
+}
+
 type Listener = (state: EngineState) => void;
+type VoidListener = () => void;
 
 function loadSavedPrefs(): {
   sampling: SamplingConfig;
@@ -301,6 +320,11 @@ export class LlamaVTensorWorkerClient {
     this.activeToolRegistry = tools;
   }
   private readonly listeners = new Set<Listener>();
+  private readonly voidListeners = new Set<VoidListener>();
+  private readonly headerSummaryListeners = new Set<VoidListener>();
+  private readonly appShellSummaryListeners = new Set<VoidListener>();
+  private headerSummary: HeaderEngineSummary;
+  private appShellSummary: AppShellEngineSummary;
   private readonly pending = new Map<
     string,
     {
@@ -367,6 +391,22 @@ export class LlamaVTensorWorkerClient {
       pendingImageContext: null,
       pendingAudioContext: null,
       activePartTaskIds: [],
+    };
+    this.headerSummary = {
+      modelStreamEnabled: savedStreamEnabled,
+      status: 'idle',
+      progressPercent: 0,
+      modelId: null,
+      modelDisplayName: null,
+      errorMessage: null,
+      activePartTaskCount: 0,
+    };
+    this.appShellSummary = {
+      model: null,
+      opfsStorage: INITIAL_OPFS_STORAGE,
+      sampling: saved.sampling,
+      samplingCustomized: false,
+      importedHarness: savedHarness,
     };
 
     this.worker = this.spawnWorker();
@@ -496,11 +536,49 @@ export class LlamaVTensorWorkerClient {
     return this.state;
   }
 
+  getHeaderSummary(): HeaderEngineSummary {
+    return this.headerSummary;
+  }
+
+  getAppShellSummary(): AppShellEngineSummary {
+    return this.appShellSummary;
+  }
+
   subscribe(listener: Listener): () => void {
     this.listeners.add(listener);
     listener(this.state);
     return () => {
       this.listeners.delete(listener);
+    };
+  }
+
+  subscribeStore(listener: VoidListener): () => void {
+    this.voidListeners.add(listener);
+    return () => {
+      this.voidListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Fine-grained subscription for top-bar & sidebar status UI: fires ONLY when
+   * `modelStreamEnabled`, `status`, `progressPercent`, `model.id`, `errorMessage`, or
+   * `activePartTaskIds.length` changes — NEVER on 120 ms decode telemetry ticks.
+   */
+  subscribeHeaderSummary(listener: VoidListener): () => void {
+    this.headerSummaryListeners.add(listener);
+    return () => {
+      this.headerSummaryListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Fine-grained subscription for root App shell state (`model`, `opfsStorage`, `sampling`,
+   * `importedHarness`) — 0 root re-renders during token streaming or prefill telemetry ticks.
+   */
+  subscribeAppShellSummary(listener: VoidListener): () => void {
+    this.appShellSummaryListeners.add(listener);
+    return () => {
+      this.appShellSummaryListeners.delete(listener);
     };
   }
 
@@ -779,6 +857,56 @@ export class LlamaVTensorWorkerClient {
     this.state = { ...this.state, ...patch };
     for (const listener of this.listeners) {
       listener(this.state);
+    }
+    for (const listener of this.voidListeners) {
+      listener();
+    }
+
+    const prevH = this.headerSummary;
+    const nextModelId = this.state.model?.id ?? null;
+    const nextModelName = this.state.model?.displayName ?? null;
+    const nextActiveCount = this.state.activePartTaskIds.length;
+    if (
+      prevH.modelStreamEnabled !== this.state.modelStreamEnabled ||
+      prevH.status !== this.state.status ||
+      prevH.progressPercent !== this.state.progressPercent ||
+      prevH.modelId !== nextModelId ||
+      prevH.modelDisplayName !== nextModelName ||
+      prevH.errorMessage !== this.state.errorMessage ||
+      prevH.activePartTaskCount !== nextActiveCount
+    ) {
+      this.headerSummary = {
+        modelStreamEnabled: this.state.modelStreamEnabled,
+        status: this.state.status,
+        progressPercent: this.state.progressPercent,
+        modelId: nextModelId,
+        modelDisplayName: nextModelName,
+        errorMessage: this.state.errorMessage,
+        activePartTaskCount: nextActiveCount,
+      };
+      for (const listener of this.headerSummaryListeners) {
+        listener();
+      }
+    }
+
+    const prevS = this.appShellSummary;
+    if (
+      prevS.model !== this.state.model ||
+      prevS.opfsStorage !== this.state.opfsStorage ||
+      prevS.sampling !== this.state.sampling ||
+      prevS.samplingCustomized !== this.state.samplingCustomized ||
+      prevS.importedHarness !== this.state.importedHarness
+    ) {
+      this.appShellSummary = {
+        model: this.state.model,
+        opfsStorage: this.state.opfsStorage,
+        sampling: this.state.sampling,
+        samplingCustomized: this.state.samplingCustomized,
+        importedHarness: this.state.importedHarness,
+      };
+      for (const listener of this.appShellSummaryListeners) {
+        listener();
+      }
     }
   }
 
@@ -1627,6 +1755,9 @@ export class LlamaVTensorWorkerClient {
     }
     this.worker.terminate();
     this.listeners.clear();
+    this.voidListeners.clear();
+    this.headerSummaryListeners.clear();
+    this.appShellSummaryListeners.clear();
     this.pending.clear();
   }
 }

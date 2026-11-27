@@ -8160,6 +8160,19 @@ export class VerdantWasmArena {
   }
 
   /**
+   * Runs `fn` with temporary WASM linear-memory scratch allocations and restores `cursor`
+   * immediately in `finally` — guaranteeing 0 leaked bytes across Conv2d / Linear calls.
+   */
+  withScratchScope<T>(fn: (arena: VerdantWasmArena) => T): T {
+    const saved = this.cursor;
+    try {
+      return fn(this);
+    } finally {
+      this.cursor = saved;
+    }
+  }
+
+  /**
    * Live Hardware Calibration Probe (< 8 ms):
    * Empirically measures sustained quantized weight-read bandwidth (B_mem, GB/s) on a cache-spanning
    * ~11.25 MiB matrix and peak VNNI/Int8 vector throughput (F_peak, GOPS/s) on an L1-resident batch-4 tile.
@@ -9097,4 +9110,252 @@ export class VerdantWasmArena {
       this.mulMatBatchQ8K(e.weightType, e.wPtr, q8kBatchPtr, xF32BatchPtr, e.outPtr, cols, e.rows, 4);
     }
   }
+}
+
+let sharedComputeArena: VerdantWasmArena | null = null;
+
+/** Lazily acquires a reusable WASM SIMD arena for standalone Conv2d / Linear compute. */
+export function getSharedComputeWasmArena(): VerdantWasmArena | null {
+  if (!isVerdantWasmSimdSupported()) return null;
+  if (!sharedComputeArena) {
+    try {
+      sharedComputeArena = new VerdantWasmArena({ initialPages: 64, shared: false, maxPages: 1024 });
+    } catch {
+      return null;
+    }
+  }
+  return sharedComputeArena;
+}
+
+/**
+ * Native `GgmlType.F16` / `GgmlType.F32` WASM SIMD `Conv2d` via tiled `im2col` +
+ * `VerdantWasmArena.mulMatBatch` with reversible `withScratchScope` (0 leaked bytes,
+ * 2x less weight RAM for native `F16` SDXS/TAESD tensors). Falls back cleanly to scalar F64
+ * when WASM SIMD is unavailable or row width is not 4-aligned.
+ */
+export function verdantConv2dSimd(params: {
+  readonly input: Float32Array;
+  readonly weightRaw: Uint8Array;
+  readonly weightType: GgmlType.F16 | GgmlType.F32;
+  readonly bias: Float32Array | null;
+  readonly out: Float32Array;
+  readonly inC: number;
+  readonly outC: number;
+  readonly height: number;
+  readonly width: number;
+  readonly kH: number;
+  readonly kW: number;
+  readonly stride?: number;
+  readonly padding?: number;
+  readonly arena?: VerdantWasmArena | null;
+}): { readonly outH: number; readonly outW: number; readonly usedSimd: boolean } {
+  const {
+    input,
+    weightRaw,
+    weightType,
+    bias,
+    out,
+    inC,
+    outC,
+    height,
+    width,
+    kH,
+    kW,
+    stride = 1,
+    padding = 0,
+  } = params;
+  const outH = Math.floor((height + 2 * padding - kH) / stride) + 1;
+  const outW = Math.floor((width + 2 * padding - kW) / stride) + 1;
+  const outPlane = outH * outW;
+  const inPlane = height * width;
+  const kPlane = kH * kW;
+  const cols = inC * kPlane;
+
+  const arena = params.arena ?? getSharedComputeWasmArena();
+  const canSimd =
+    arena !== null &&
+    outC >= 1 &&
+    outPlane >= 1 &&
+    cols >= 4 &&
+    (cols & 3) === 0 &&
+    (weightType === GgmlType.F16 || weightType === GgmlType.F32);
+
+  if (!canSimd) {
+    const wF32 =
+      weightType === GgmlType.F32 && (weightRaw.byteOffset & 3) === 0
+        ? new Float32Array(weightRaw.buffer, weightRaw.byteOffset, outC * cols)
+        : (() => {
+            const tmp = new Float32Array(outC * cols);
+            const dv = new DataView(weightRaw.buffer, weightRaw.byteOffset, weightRaw.byteLength);
+            if (weightType === GgmlType.F32) {
+              for (let i = 0; i < tmp.length; i++) tmp[i] = dv.getFloat32(i * 4, true);
+            } else {
+              for (let i = 0; i < tmp.length; i++) tmp[i] = f16ToF32(dv.getUint16(i * 2, true));
+            }
+            return tmp;
+          })();
+    for (let oc = 0; oc < outC; oc++) {
+      const wBaseOc = oc * cols;
+      const oBase = oc * outPlane;
+      const bVal = bias ? bias[oc]! : 0.0;
+      for (let oy = 0; oy < outH; oy++) {
+        const iyStart = oy * stride - padding;
+        const oRow = oBase + oy * outW;
+        for (let ox = 0; ox < outW; ox++) {
+          const ixStart = ox * stride - padding;
+          let acc = bVal;
+          for (let ic = 0; ic < inC; ic++) {
+            const inBase = ic * inPlane;
+            const wBase = wBaseOc + ic * kPlane;
+            for (let ky = 0; ky < kH; ky++) {
+              const iy = iyStart + ky;
+              if (iy < 0 || iy >= height) continue;
+              const inRow = inBase + iy * width;
+              const wRow = wBase + ky * kW;
+              for (let kx = 0; kx < kW; kx++) {
+                const ix = ixStart + kx;
+                if (ix >= 0 && ix < width) {
+                  acc += input[inRow + ix]! * wF32[wRow + kx]!;
+                }
+              }
+            }
+          }
+          out[oRow + ox] = Math.fround(acc);
+        }
+      }
+    }
+    return { outH, outW, usedSimd: false };
+  }
+
+  const TILE_PIXELS = Math.min(outPlane, 64);
+  const wByteLen = weightType === GgmlType.F16 ? outC * cols * 2 : outC * cols * 4;
+  arena.withScratchScope((a) => {
+    const wPtr = a.allocRegion(wByteLen);
+    const xBatchPtr = a.allocRegion(TILE_PIXELS * cols * 4);
+    const outBatchPtr = a.allocRegion(TILE_PIXELS * outC * 4);
+    a.bytes().set(weightRaw.subarray(0, wByteLen), wPtr);
+
+    const xView = new Float32Array(a.memory.buffer, xBatchPtr, TILE_PIXELS * cols);
+    const outView = new Float32Array(a.memory.buffer, outBatchPtr, TILE_PIXELS * outC);
+
+    for (let pStart = 0; pStart < outPlane; pStart += TILE_PIXELS) {
+      const batch = Math.min(TILE_PIXELS, outPlane - pStart);
+      for (let b = 0; b < batch; b++) {
+        const p = pStart + b;
+        const oy = Math.floor(p / outW);
+        const ox = p - oy * outW;
+        const iyStart = oy * stride - padding;
+        const ixStart = ox * stride - padding;
+        const xOff = b * cols;
+        if (kH === 1 && kW === 1 && padding === 0) {
+          const inIdx = iyStart * width + ixStart;
+          for (let ic = 0; ic < inC; ic++) {
+            xView[xOff + ic] = input[ic * inPlane + inIdx]!;
+          }
+        } else {
+          let dst = xOff;
+          for (let ic = 0; ic < inC; ic++) {
+            const inBase = ic * inPlane;
+            for (let ky = 0; ky < kH; ky++) {
+              const iy = iyStart + ky;
+              if (iy < 0 || iy >= height) {
+                for (let kx = 0; kx < kW; kx++) xView[dst++] = 0;
+                continue;
+              }
+              const inRow = inBase + iy * width;
+              for (let kx = 0; kx < kW; kx++) {
+                const ix = ixStart + kx;
+                xView[dst++] = ix >= 0 && ix < width ? input[inRow + ix]! : 0;
+              }
+            }
+          }
+        }
+      }
+
+      a.mulMatBatch(weightType, wPtr, xBatchPtr, outBatchPtr, cols, outC, batch);
+
+      for (let b = 0; b < batch; b++) {
+        const p = pStart + b;
+        const oOff = b * outC;
+        if (bias) {
+          for (let oc = 0; oc < outC; oc++) {
+            out[oc * outPlane + p] = Math.fround(outView[oOff + oc]! + bias[oc]!);
+          }
+        } else {
+          for (let oc = 0; oc < outC; oc++) {
+            out[oc * outPlane + p] = outView[oOff + oc]!;
+          }
+        }
+      }
+    }
+  });
+
+  return { outH, outW, usedSimd: true };
+}
+
+/**
+ * Native `Q8_0` / `F16` / `F32` batched matrix multiply (`[batchSize, inDim] -> [batchSize, outDim]`)
+ * via `VerdantWasmArena` with reversible `withScratchScope` (0 leaked bytes, zero weight inflation).
+ */
+export function verdantLinearBatchSimd(params: {
+  readonly input: Float32Array;
+  readonly weightRaw: Uint8Array;
+  readonly weightType: GgmlType;
+  readonly bias: Float32Array | null;
+  readonly out: Float32Array;
+  readonly inDim: number;
+  readonly outDim: number;
+  readonly batchSize: number;
+  readonly arena?: VerdantWasmArena | null;
+}): boolean {
+  const { input, weightRaw, weightType, bias, out, inDim, outDim, batchSize } = params;
+  const arena = params.arena ?? getSharedComputeWasmArena();
+  const isNativeSupported =
+    arena !== null &&
+    batchSize >= 1 &&
+    outDim >= 1 &&
+    ((weightType === GgmlType.Q8_0 && (inDim & 31) === 0 && inDim >= 32) ||
+      ((weightType === GgmlType.F16 || weightType === GgmlType.F32) && (inDim & 3) === 0 && inDim >= 4));
+  if (!isNativeSupported) return false;
+
+  const TILE = Math.min(batchSize, 64);
+  const wByteLen = weightRowByteSize(weightType, inDim) * outDim;
+  arena.withScratchScope((a) => {
+    const wPtr = a.allocRegion(wByteLen);
+    const xPtr = a.allocRegion(TILE * inDim * 4);
+    const outPtr = a.allocRegion(TILE * outDim * 4);
+    const useQ8Act = weightType === GgmlType.Q8_0;
+    const qStride = useQ8Act ? (inDim >> 5) * Q8_0_ACT_BLOCK_BYTES : 0;
+    const q8Ptr = useQ8Act ? a.allocRegion(TILE * qStride) : 0;
+    a.bytes().set(weightRaw.subarray(0, wByteLen), wPtr);
+
+    const xView = new Float32Array(a.memory.buffer, xPtr, TILE * inDim);
+    const outView = new Float32Array(a.memory.buffer, outPtr, TILE * outDim);
+
+    for (let t0 = 0; t0 < batchSize; t0 += TILE) {
+      const bCount = Math.min(TILE, batchSize - t0);
+      xView.set(input.subarray(t0 * inDim, (t0 + bCount) * inDim), 0);
+      if (useQ8Act) {
+        for (let b = 0; b < bCount; b++) {
+          a.quantizeActivation(xPtr + b * inDim * 4, q8Ptr + b * qStride, inDim);
+        }
+        a.mulMatBatchQ8(weightType, wPtr, q8Ptr, xPtr, outPtr, inDim, outDim, bCount);
+      } else {
+        a.mulMatBatch(weightType, wPtr, xPtr, outPtr, inDim, outDim, bCount);
+      }
+
+      for (let b = 0; b < bCount; b++) {
+        const srcBase = b * outDim;
+        const dstBase = (t0 + b) * outDim;
+        if (bias) {
+          for (let r = 0; r < outDim; r++) {
+            out[dstBase + r] = Math.fround(outView[srcBase + r]! + bias[r]!);
+          }
+        } else {
+          out.set(outView.subarray(srcBase, srcBase + outDim), dstBase);
+        }
+      }
+    }
+  });
+  return true;
 }

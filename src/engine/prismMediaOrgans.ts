@@ -189,6 +189,8 @@ export interface PictureWeights {
   readonly subtitle?: string;
   readonly coverFormat?: 'book' | 'album' | 'game';
   readonly svgMarkup?: string;
+  /** Compact (`<= 512px`) Vision-QA-accepted neural render persisted for 1:1 live sandbox display. */
+  readonly reconciledImageDataUrl?: string;
 }
 
 export interface AudioWeights {

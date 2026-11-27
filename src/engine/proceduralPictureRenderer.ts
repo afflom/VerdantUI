@@ -1247,36 +1247,113 @@ export async function renderPictureWithCoherenceCheck(
   const w = Math.max(160, Math.round(weights.width * scale));
   const h = Math.max(120, Math.round(weights.height * scale));
 
-  const blendNeuralLayer = (dst: Uint8ClampedArray, dw: number, dh: number) => {
-    const nl = opts?.neuralLayer;
-    if (!nl || nl.width <= 0 || nl.height <= 0 || nl.rgba.length < nl.width * nl.height * 4) return;
-    const blendAlpha = weights.generator === 'logo-mark' ? 0.08 : 0.24;
+  const hasNeuralLayer = Boolean(
+    opts?.neuralLayer &&
+      opts.neuralLayer.width > 0 &&
+      opts.neuralLayer.height > 0 &&
+      opts.neuralLayer.rgba.length >= opts.neuralLayer.width * opts.neuralLayer.height * 4,
+  );
+
+  const upscaleNeuralBilinear = (
+    nl: { readonly width: number; readonly height: number; readonly rgba: Uint8ClampedArray },
+    dw: number,
+    dh: number,
+  ): Uint8ClampedArray => {
+    const out = new Uint8ClampedArray(dw * dh * 4);
+    const sw = nl.width;
+    const sh = nl.height;
+    const scaleX = sw > 1 && dw > 1 ? (sw - 1) / (dw - 1) : 0;
+    const scaleY = sh > 1 && dh > 1 ? (sh - 1) / (dh - 1) : 0;
     for (let y = 0; y < dh; y++) {
-      const sy = Math.min(nl.height - 1, Math.floor((y / dh) * nl.height));
+      const fy = y * scaleY;
+      const y0 = Math.floor(fy);
+      const y1 = Math.min(sh - 1, y0 + 1);
+      const ty = fy - y0;
       for (let x = 0; x < dw; x++) {
-        const sx = Math.min(nl.width - 1, Math.floor((x / dw) * nl.width));
-        const si = (sy * nl.width + sx) * 4;
+        const fx = x * scaleX;
+        const x0 = Math.floor(fx);
+        const x1 = Math.min(sw - 1, x0 + 1);
+        const tx = fx - x0;
+        const i00 = (y0 * sw + x0) * 4;
+        const i10 = (y0 * sw + x1) * 4;
+        const i01 = (y1 * sw + x0) * 4;
+        const i11 = (y1 * sw + x1) * 4;
         const di = (y * dw + x) * 4;
-        dst[di] = clamp255(lerp(dst[di]!, nl.rgba[si]!, blendAlpha));
-        dst[di + 1] = clamp255(lerp(dst[di + 1]!, nl.rgba[si + 1]!, blendAlpha));
-        dst[di + 2] = clamp255(lerp(dst[di + 2]!, nl.rgba[si + 2]!, blendAlpha));
+        for (let c = 0; c < 3; c++) {
+          const top = lerp(nl.rgba[i00 + c]!, nl.rgba[i10 + c]!, tx);
+          const bot = lerp(nl.rgba[i01 + c]!, nl.rgba[i11 + c]!, tx);
+          out[di + c] = clamp255(lerp(top, bot, ty));
+        }
+        out[di + 3] = 255;
       }
     }
+    return out;
+  };
+
+  const applyNeuralLayer = (dst: Uint8ClampedArray, dw: number, dh: number): boolean => {
+    const nl = opts?.neuralLayer;
+    if (!nl || nl.width <= 0 || nl.height <= 0 || nl.rgba.length < nl.width * nl.height * 4) {
+      return false;
+    }
+    const upscaled = upscaleNeuralBilinear(nl, dw, dh);
+    if (weights.generator === 'logo-mark') {
+      // Preserve crisp vector logo-mark geometry with subtle tonal harmonization
+      const blendAlpha = 0.08;
+      for (let i = 0; i < dst.length; i += 4) {
+        dst[i] = clamp255(lerp(dst[i]!, upscaled[i]!, blendAlpha));
+        dst[i + 1] = clamp255(lerp(dst[i + 1]!, upscaled[i + 1]!, blendAlpha));
+        dst[i + 2] = clamp255(lerp(dst[i + 2]!, upscaled[i + 2]!, blendAlpha));
+      }
+      return true;
+    }
+    if (weights.generator === 'cover-art') {
+      // 100% primary neural backdrop with legible cover-art footer band preserved
+      const footerStartY = Math.floor(dh * 0.72);
+      for (let y = 0; y < dh; y++) {
+        for (let x = 0; x < dw; x++) {
+          const di = (y * dw + x) * 4;
+          if (y < footerStartY) {
+            dst[di] = upscaled[di]!;
+            dst[di + 1] = upscaled[di + 1]!;
+            dst[di + 2] = upscaled[di + 2]!;
+            dst[di + 3] = 255;
+          } else {
+            // Subtle dark gradient scrim over neural bottom band for readable cover typography
+            const t = (y - footerStartY) / Math.max(1, dh - footerStartY);
+            const scrim = 0.25 + 0.45 * t;
+            dst[di] = clamp255(lerp(upscaled[di]!, dst[di]!, scrim));
+            dst[di + 1] = clamp255(lerp(upscaled[di + 1]!, dst[di + 1]!, scrim));
+            dst[di + 2] = clamp255(lerp(upscaled[di + 2]!, dst[di + 2]!, scrim));
+            dst[di + 3] = 255;
+          }
+        }
+      }
+      return true;
+    }
+    // 100% primary neural fidelity for open-world Picture subjects ("a dog", scenes, portraits)
+    dst.set(upscaled);
+    return true;
   };
 
   let activeWeights: PictureWeights =
     weights.generator === 'logo-mark' && !weights.svgMarkup
       ? { ...weights, svgMarkup: synthesizeLogoSvg(weights) }
       : weights;
-  let rendered = renderPictureToRgba(activeWeights, w, h);
-  blendNeuralLayer(rendered.rgba, rendered.width, rendered.height);
+  let rendered =
+    hasNeuralLayer && weights.generator !== 'logo-mark' && weights.generator !== 'cover-art'
+      ? { width: w, height: h, rgba: upscaleNeuralBilinear(opts!.neuralLayer!, w, h) }
+      : renderPictureToRgba(activeWeights, w, h);
+  let neuralApplied =
+    hasNeuralLayer && weights.generator !== 'logo-mark' && weights.generator !== 'cover-art'
+      ? true
+      : applyNeuralLayer(rendered.rgba, rendered.width, rendered.height);
   let coherence = await evaluateRenderedFrameCoherence({
     rgba: rendered.rgba,
     width: rendered.width,
     height: rendered.height,
   });
 
-  if (!coherence.coherent) {
+  if (!coherence.coherent && !neuralApplied) {
     activeWeights = {
       ...activeWeights,
       seed: ((activeWeights.seed * 1664525 + 1013904223) >>> 0) % 990_000 + 1000,
@@ -1289,12 +1366,24 @@ export async function renderPictureWithCoherenceCheck(
       ],
     };
     rendered = renderPictureToRgba(activeWeights, w, h);
-    blendNeuralLayer(rendered.rgba, rendered.width, rendered.height);
+    neuralApplied = applyNeuralLayer(rendered.rgba, rendered.width, rendered.height);
     coherence = await evaluateRenderedFrameCoherence({
       rgba: rendered.rgba,
       width: rendered.width,
       height: rendered.height,
     });
+  }
+
+  if (neuralApplied && weights.generator !== 'logo-mark') {
+    activeWeights = {
+      ...activeWeights,
+      reconciledImageDataUrl: encodeCompactThumbnailDataUrl(
+        rendered.rgba,
+        rendered.width,
+        rendered.height,
+        Math.min(512, maxDim),
+      ),
+    };
   }
 
   return {
