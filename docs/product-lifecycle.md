@@ -4,7 +4,7 @@
 
 - **Active Features:** 13
 - **Proposed / Planned Features:** 0
-- **Recorded Releases:** 7
+- **Recorded Releases:** 8
 
 ## Feature Register
 
@@ -35,3 +35,4 @@
 | `v0.5.0` | `v2.22.4` | `da5083b5ee` | 10 | Autonomous Prism-Backed Chat Tool-Calls & Natural-Language MediaType Selection |
 | `v0.6.0` | `v2.22.4` | `da5083b5ee` | 11 | Unified Expert Basis, Global MediaType Galleries, Spaces-as-Prisms & Feature-Complete Media Synthesis |
 | `v0.7.0` | `v2.22.4` | `da5083b5ee` | 12 | Self-Similar Prism UI & Observer Procedural Surface Synthesis |
+| `v0.8.0` | `v2.22.4` | `8a1f0ae8f7` | 13 | Coherent Multi-Facet Synthesis, SVG Logo/Cover Art, Mastered WAV+MIDI & Decluttered Media Prisms |

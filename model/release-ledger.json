@@ -137,6 +137,30 @@
         "VUI-FEAT-012"
       ],
       "summary": "Self-Similar Prism UI & Observer Procedural Surface Synthesis"
+    },
+    {
+      "version": "0.8.0",
+      "tag": "v0.8.0",
+      "releasedAt": "2026-11-27T11:17:17.357Z",
+      "commit": "a7bc6aaa8dfa6052b179bf10d304625cc48bef71",
+      "engineTag": "v2.22.4",
+      "studioCommit": "8a1f0ae8f7b0e1da35bff239a05db5f2fdc44df7",
+      "activeFeatureIds": [
+        "VUI-FEAT-001",
+        "VUI-FEAT-002",
+        "VUI-FEAT-003",
+        "VUI-FEAT-004",
+        "VUI-FEAT-005",
+        "VUI-FEAT-006",
+        "VUI-FEAT-007",
+        "VUI-FEAT-008",
+        "VUI-FEAT-009",
+        "VUI-FEAT-010",
+        "VUI-FEAT-011",
+        "VUI-FEAT-012",
+        "VUI-FEAT-013"
+      ],
+      "summary": "Coherent Multi-Facet Synthesis, SVG Logo/Cover Art, Mastered WAV+MIDI & Decluttered Media Prisms"
     }
   ]
 }

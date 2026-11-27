@@ -2,6 +2,14 @@
 
 > Generated mechanically by `npm run studio:publish` from `model/release-ledger.json` and `model/features.json`.
 
+## v0.8.0 (2026-11-27)
+
+Coherent Multi-Facet Synthesis, SVG Logo/Cover Art, Mastered WAV+MIDI & Decluttered Media Prisms
+
+- **Engine Pin:** `afflom/verdant-engine@v2.22.4`
+- **Studio Pin:** `afflom/verdant-studio@8a1f0ae8f7b0`
+- **Active Features:** `VUI-FEAT-001`, `VUI-FEAT-002`, `VUI-FEAT-003`, `VUI-FEAT-004`, `VUI-FEAT-005`, `VUI-FEAT-006`, `VUI-FEAT-007`, `VUI-FEAT-008`, `VUI-FEAT-009`, `VUI-FEAT-010`, `VUI-FEAT-011`, `VUI-FEAT-012`, `VUI-FEAT-013`
+
 ## v0.7.0 (2026-11-27)
 
 Self-Similar Prism UI & Observer Procedural Surface Synthesis
