@@ -51,7 +51,7 @@ interface RawFetchedItem {
   readonly attributes?: readonly string[];
 }
 
-const STREAM_FETCH_TIMEOUT_MS = 4_500;
+const STREAM_FETCH_TIMEOUT_MS = 2_800;
 const MAX_CHUNK_CHARS = 1_100;
 
 /** Strips HTML scripts, styles, tags, and noisy whitespace into compact canonical text. */

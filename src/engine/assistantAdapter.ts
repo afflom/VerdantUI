@@ -1124,6 +1124,41 @@ export function createLlamaVTensorAdapter(
         }
       }
 
+      // Overlap zero-cutoff realtime Content Stream ingestion CONCURRENTLY with model mount/upgrade
+      // so Content Stream network I/O adds 0 serial wait when a capability is warming/switching!
+      const shouldStartLiveStreams =
+        !isToolContinuationStep &&
+        initialState.streamingConsent === 'accepted' &&
+        client.cognitiveObserver.grants.isAllowed('network-weights') &&
+        certificate.qualityBudget.shouldConsultContentStreams &&
+        Boolean(studioBridge?.contentStreams?.hasEnabledStreams()) &&
+        Boolean(studioBridge?.expertRegistry) &&
+        !abortSignal.aborted;
+
+      const liveStreamPromise: Promise<{
+        readonly promptContextBlock: string | null;
+        readonly titles: ReadonlySet<string>;
+      }> | null = shouldStartLiveStreams
+        ? import('./realtimeWeightStreamer')
+            .then(({ streamRealtimeWeightsToPrism }) =>
+              streamRealtimeWeightsToPrism({
+                query: latestUserText,
+                catalogStore: studioBridge!.contentStreams!,
+                registry: studioBridge!.expertRegistry!,
+                maxStreams: certificate.qualityBudget.featureRichness === 'full' ? 3 : 2,
+                signal: abortSignal,
+              }),
+            )
+            .then((streamed) => ({
+              promptContextBlock:
+                streamed.promptContextBlock && streamed.promptContextBlock.trim().length > 0
+                  ? streamed.promptContextBlock
+                  : null,
+              titles: new Set(streamed.chunks.map((c) => c.title.toLowerCase())),
+            }))
+            .catch(() => ({ promptContextBlock: null, titles: new Set<string>() }))
+        : null;
+
       // ---------------------------------------------------------------------
       // Path B: Hidden Unmanaged System Stream Gate (`FK-07` ContainerGrantMatrix + streaming consent)
       // NEVER start a network download while streaming consent is pending or Offline-Only Mode is active.
@@ -1241,37 +1276,25 @@ export function createLlamaVTensorAdapter(
         systemTokensEstimate: estimateTextTokens(systemMessage) + (activeTools ? 380 : 0),
       });
 
-      // Zero-cutoff realtime Content Stream ingestion (opt-in user streams only; tail-injected -> 0 KV prefix wipe!)
-      let liveStreamContextBlock: string | null = null;
-      if (
-        !isToolContinuationStep &&
-        state.streamingConsent === 'accepted' &&
-        client.cognitiveObserver.grants.isAllowed('network-weights') &&
-        certificate.qualityBudget.shouldConsultContentStreams &&
-        studioBridge?.contentStreams?.hasEnabledStreams() &&
-        studioBridge?.expertRegistry &&
-        !abortSignal.aborted
-      ) {
-        try {
-          const { streamRealtimeWeightsToPrism } = await import('./realtimeWeightStreamer');
-          const streamed = await streamRealtimeWeightsToPrism({
-            query: latestUserText,
-            catalogStore: studioBridge.contentStreams,
-            registry: studioBridge.expertRegistry,
-            maxStreams: certificate.qualityBudget.featureRichness === 'full' ? 3 : 2,
-            signal: abortSignal,
-          });
-          if (streamed.promptContextBlock && streamed.promptContextBlock.trim().length > 0) {
-            liveStreamContextBlock = streamed.promptContextBlock;
-          }
-        } catch {
-          // Live stream failure never interrupts local generation
-        }
-      }
+      // Await any already-in-flight parallel realtime Content Stream lookup + cross-session Basis recall
+      // (both tail-injected -> 0 KV prefix wipes and < 0.5 ms local associative grounding!)
+      const liveStreamRes = liveStreamPromise
+        ? await liveStreamPromise
+        : { promptContextBlock: null, titles: new Set<string>() };
+      const liveStreamContextBlock = liveStreamRes.promptContextBlock;
+      const basisRecallBlock =
+        !isToolContinuationStep && studioBridge?.expertRegistry
+          ? studioBridge.expertRegistry.basis.formatBasisRecallBlock(
+              latestUserText,
+              3,
+              liveStreamRes.titles,
+            )
+          : null;
 
       const sensory = client.consumePendingSensory();
       const combinedTailRecall = [
         projected.foveatedRecallBlock,
+        basisRecallBlock,
         liveStreamContextBlock,
         sensory.textBlock,
       ]

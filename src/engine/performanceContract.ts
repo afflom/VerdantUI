@@ -151,6 +151,8 @@ export interface PerformanceContract {
   readonly weightLayerFrameSlots: number;
   readonly streamEmbeddings: boolean;
   readonly streamLmHead: boolean;
+  /** True when `streamLmHead` caches stripes lazily into a full-vocab WASM buffer (0 OPFS reads on tokens 2..N). */
+  readonly lazyPinLmHead: boolean;
   readonly lmHeadTileTargetBytes: number;
   readonly projectedResidentWeightBytes: number;
   readonly vramLogicalCapacityCeilingBytes: number;
@@ -502,6 +504,7 @@ export function derivePerformanceContract(
   let weightLayerFrameSlots = hp.blockCount;
   let streamEmbeddings = false;
   let streamLmHead = false;
+  let lazyPinLmHead = false;
   let lmHeadTileTargetBytes = VRAM_LM_HEAD_TILE_TARGET_BYTES;
   let projectedResidentWeightBytes = model.totalWeightBufferBytes;
   let opfsIoTimeSec = 0;
@@ -600,8 +603,20 @@ export function derivePerformanceContract(
         1,
         Math.min(maxSlotsForMode, maxSlotsByBudget, forcedCap, hardCap),
       );
+      // If full-vocab LM-head fits comfortably in remaining WASM weight budget on `opfs-demand`
+      // (`auto`), enable lazy-pin LM-head: 0 mount latency, 0 OPFS reads on tokens 2..N!
+      const layersPlusNormsBytes = hotNormsEstimate + weightLayerFrameSlots * avgLayerBytes + 64 * 1024;
+      if (
+        allowFullDemandPinning &&
+        streamLmHead &&
+        model.lmHeadWeightBytes > 0 &&
+        layersPlusNormsBytes + model.lmHeadWeightBytes <= physicalWeightBudgetBytes
+      ) {
+        lazyPinLmHead = true;
+      }
+      const effectiveLmHeadResidentBytes = lazyPinLmHead ? model.lmHeadWeightBytes : lmTileEstimate;
       projectedResidentWeightBytes = Math.round(
-        hotNormsEstimate + weightLayerFrameSlots * avgLayerBytes + lmTileEstimate + 64 * 1024,
+        hotNormsEstimate + weightLayerFrameSlots * avgLayerBytes + effectiveLmHeadResidentBytes + 64 * 1024,
       );
 
       // Belady-Optimal Cyclic Pinning: layers [0 .. K-2] stay permanently pinned (0 OPFS faults);
@@ -612,7 +627,7 @@ export function derivePerformanceContract(
         hp.blockCount > 0 ? Math.max(0, hp.blockCount - beladyPinnedLayers) / hp.blockCount : 0;
       const faultedBytesPerToken =
         bodyWeightBytes * faultedLayerFraction +
-        (streamLmHead ? model.lmHeadWeightBytes : 0);
+        (streamLmHead && !lazyPinLmHead ? model.lmHeadWeightBytes : 0);
       opfsIoTimeSec = faultedBytesPerToken / Math.max(1e6, backingBandwidthMBs * 1e6);
     }
   }
@@ -795,6 +810,7 @@ export function derivePerformanceContract(
     weightLayerFrameSlots,
     streamEmbeddings,
     streamLmHead,
+    lazyPinLmHead,
     lmHeadTileTargetBytes,
     projectedResidentWeightBytes,
     vramLogicalCapacityCeilingBytes,

@@ -93,4 +93,16 @@ test('UnifiedExpertRegistry unifies neural weights, procedural organs, user basi
     hasImportedHarness: false,
   });
   assert.notDeepEqual(rBase.snapshot.belief, rAdapt.snapshot.belief);
+
+  // Cross-session Basis associative recall filters stop-words, formats compact tail block, and excludes duplicates
+  const recallBlock = basis.formatBasisRecallBlock('Tell me about the emerald mountain lake sunset');
+  assert.ok(recallBlock && recallBlock.includes('Emerald Mountain Lake'));
+  const excludedBlock = basis.formatBasisRecallBlock(
+    'Tell me about the emerald mountain lake sunset',
+    3,
+    new Set(['emerald mountain lake']),
+  );
+  assert.equal(excludedBlock, null);
+  const unrelatedBlock = basis.formatBasisRecallBlock('What is the weather in Tokyo?');
+  assert.equal(unrelatedBlock, null);
 });

@@ -83,6 +83,8 @@ export interface VramWeightPagerConfig {
   readonly layerFrameSlots: number;
   readonly streamEmbeddings: boolean;
   readonly streamLmHead: boolean;
+  /** When true alongside `streamLmHead`, caches every LM-head stripe in full-vocab WASM RAM on first pass. */
+  readonly lazyPinLmHead?: boolean;
   readonly lmHeadStripeRows?: number;
   /** Number of hot token embedding rows cached inside WASM linear memory when `streamEmbeddings` is active. */
   readonly hotEmbeddingCacheSlots?: number;
@@ -308,6 +310,11 @@ export class VramWeightPager {
   private readonly lmHeadRowBytes: number;
   private readonly lmHeadFullStripeView: VTensorHandle | null;
   private readonly lmHeadTailStripeView: VTensorHandle | null;
+  private readonly lmHeadLazyPinned: boolean;
+  private readonly lmHeadFullCachedView: VTensorHandle | null;
+  private readonly lmHeadStripeCached: Uint8Array;
+  private readonly lmHeadCachedStripeViews: Array<VTensorHandle | null>;
+  private lmHeadCachedStripeCount = 0;
 
   // Sparse Mixture-of-Experts (qwen3moe / qwen2moe / mixtral) O(1) Frequency-Protected WASM Expert Cache
   readonly isMoe: boolean;
@@ -654,6 +661,10 @@ export class VramWeightPager {
       this.lmHeadStripeRows = outWeightInfo.dims[1] ?? 1;
       this.lmHeadFullStripeView = null;
       this.lmHeadTailStripeView = null;
+      this.lmHeadLazyPinned = false;
+      this.lmHeadFullCachedView = null;
+      this.lmHeadStripeCached = new Uint8Array(0);
+      this.lmHeadCachedStripeViews = [];
       this.residentWeightBytes = weightsBuf.capacityBytes;
       this.pinnedLayerCount = layerInfos.length;
       this.cachedStreamingPublications = [];
@@ -765,32 +776,59 @@ export class VramWeightPager {
       this.embdNext = new Int32Array(0);
     }
 
-    // 4. Row-striped LM-head streaming tile buffer if LM head is streamed from OPFS
+    // 4. Row-striped LM-head streaming tile buffer (or full-vocab lazy WASM cache on `opfs-demand`)
     if (this.streamLmHead) {
       const cols = outWeightInfo.dims[0] ?? 1;
       const vocabRows = outWeightInfo.dims[1] ?? 1;
       this.lmHeadStripeRows =
         config.lmHeadStripeRows ?? computeLmHeadStripeRows(outWeightInfo);
-      const tileBytes = alignUp32(this.lmHeadStripeRows * this.lmHeadRowBytes) + 32;
-      const tileBuf = allocBuffer('vtensor.vram_lmhead_tile', 'weights', tileBytes);
-      this.lmHeadTileBuffer = tileBuf;
-      this.lmHeadFullStripeView = tileBuf.createViewTensor(
-        'vram.lmhead_stripe',
-        outWeightInfo.type,
-        [cols, this.lmHeadStripeRows],
-        0,
-      );
-      const tailRows = vocabRows % this.lmHeadStripeRows;
-      this.lmHeadTailStripeView =
-        tailRows > 0
-          ? tileBuf.createViewTensor('vram.lmhead_tail', outWeightInfo.type, [cols, tailRows], 0)
-          : null;
-      totalResident += tileBuf.capacityBytes;
+      const numStripes = Math.max(1, Math.ceil(vocabRows / this.lmHeadStripeRows));
+      if (config.lazyPinLmHead) {
+        this.lmHeadLazyPinned = true;
+        const fullBytes = alignUp32(vocabRows * this.lmHeadRowBytes) + 32;
+        const tileBuf = allocBuffer('vtensor.vram_lmhead_tile', 'weights', fullBytes);
+        this.lmHeadTileBuffer = tileBuf;
+        this.lmHeadFullCachedView = tileBuf.createViewTensor(
+          'vram.lmhead_cached_full',
+          outWeightInfo.type,
+          [cols, vocabRows],
+          0,
+        );
+        this.lmHeadFullStripeView = null;
+        this.lmHeadTailStripeView = null;
+        this.lmHeadStripeCached = new Uint8Array(numStripes);
+        this.lmHeadCachedStripeViews = new Array<VTensorHandle | null>(numStripes).fill(null);
+        totalResident += tileBuf.capacityBytes;
+      } else {
+        this.lmHeadLazyPinned = false;
+        const tileBytes = alignUp32(this.lmHeadStripeRows * this.lmHeadRowBytes) + 32;
+        const tileBuf = allocBuffer('vtensor.vram_lmhead_tile', 'weights', tileBytes);
+        this.lmHeadTileBuffer = tileBuf;
+        this.lmHeadFullCachedView = null;
+        this.lmHeadFullStripeView = tileBuf.createViewTensor(
+          'vram.lmhead_stripe',
+          outWeightInfo.type,
+          [cols, this.lmHeadStripeRows],
+          0,
+        );
+        const tailRows = vocabRows % this.lmHeadStripeRows;
+        this.lmHeadTailStripeView =
+          tailRows > 0
+            ? tileBuf.createViewTensor('vram.lmhead_tail', outWeightInfo.type, [cols, tailRows], 0)
+            : null;
+        this.lmHeadStripeCached = new Uint8Array(0);
+        this.lmHeadCachedStripeViews = [];
+        totalResident += tileBuf.capacityBytes;
+      }
     } else {
       this.lmHeadTileBuffer = null;
       this.lmHeadStripeRows = outWeightInfo.dims[1] ?? 1;
       this.lmHeadFullStripeView = null;
       this.lmHeadTailStripeView = null;
+      this.lmHeadLazyPinned = false;
+      this.lmHeadFullCachedView = null;
+      this.lmHeadStripeCached = new Uint8Array(0);
+      this.lmHeadCachedStripeViews = [];
     }
 
     // 5. Bounded WASM LRU Sparse Expert Cache (`vtensor.vram_moe_experts`) for 30B-A3B MoE!
@@ -1286,55 +1324,46 @@ export class VramWeightPager {
   }
 
   /**
+   * Returns a single full-vocab WASM LM-head handle once all lazy-pinned stripes have been cached
+   * in WASM RAM (enabling 0 OPFS reads and 1× thread-pool dispatch per decode token!).
+   */
+  getCachedFullLmHead(): VTensorHandle | null {
+    if (this.pinnedOutputWeight) return this.pinnedOutputWeight;
+    if (
+      this.lmHeadLazyPinned &&
+      this.lmHeadFullCachedView &&
+      this.lmHeadStripeCached.length > 0 &&
+      this.lmHeadCachedStripeCount >= this.lmHeadStripeCached.length
+    ) {
+      return this.lmHeadFullCachedView;
+    }
+    return null;
+  }
+
+  /**
    * Streams the LM-head output projection weight matrix in bounded row-stripes (or invokes once
-   * directly against the pinned LM head when `!streamLmHead`).
+   * directly against the pinned / fully lazy-cached LM head with 0 OPFS reads!).
    */
   forEachLmHeadStripe(
     callback: (weightStripe: VTensorHandle, rowStart: number, rowCount: number) => void,
   ): void {
     const vocabSize = this.outWeightInfo.dims[1] ?? 1;
-    if (this.pinnedOutputWeight) {
-      callback(this.pinnedOutputWeight, 0, vocabSize);
+    const fullCached = this.getCachedFullLmHead();
+    if (fullCached) {
+      callback(fullCached, 0, vocabSize);
       return;
     }
 
-    const tileBuf = this.lmHeadTileBuffer!;
-    const raw = tileBuf.rawBytes();
-    const cols = this.outWeightInfo.dims[0] ?? 1;
-    const baseFileOffset = this.parsed.dataOffset + this.outWeightInfo.offset;
-
     for (let rowStart = 0; rowStart < vocabSize; rowStart += this.lmHeadStripeRows) {
       const rowCount = Math.min(this.lmHeadStripeRows, vocabSize - rowStart);
-      const stripeBytes = rowCount * this.lmHeadRowBytes;
-      const fileOffset = baseFileOffset + rowStart * this.lmHeadRowBytes;
-
-      const t0 = performance.now();
-      const read = this.backing.readRange(fileOffset, raw, 0, stripeBytes);
-      this.backingReadMs += performance.now() - t0;
-      if (read !== stripeBytes) {
-        throw new Error(`vRAM LM-head stripe [${rowStart}, ${rowStart + rowCount}) short read.`);
-      }
-      this.coalescedReads += 1;
-      this.bytesRestoredFromBacking += stripeBytes;
-
-      const view =
-        rowCount === this.lmHeadStripeRows && this.lmHeadFullStripeView
-          ? this.lmHeadFullStripeView
-          : this.lmHeadTailStripeView && this.lmHeadTailStripeView.dims[1] === rowCount
-            ? this.lmHeadTailStripeView
-            : tileBuf.createViewTensor(
-                `vram.lmhead_${rowStart}`,
-                this.outWeightInfo.type,
-                [cols, rowCount],
-                0,
-              );
+      const view = this.acquireLmHeadStripe(rowStart, rowCount);
       callback(view, rowStart, rowCount);
     }
   }
 
   /**
    * Loads a single LM-head row stripe `[rowStart, rowStart + rowCount)` from backing into the
-   * bounded LM-head tile buffer (used by async demand-paged LM-head streaming).
+   * bounded LM-head tile buffer (or caches it permanently in WASM RAM when `lazyPinLmHead` is active).
    */
   acquireLmHeadStripe(rowStart: number, rowCount: number): VTensorHandle {
     if (this.pinnedOutputWeight) {
@@ -1346,6 +1375,34 @@ export class VramWeightPager {
     const baseFileOffset = this.parsed.dataOffset + this.outWeightInfo.offset;
     const stripeBytes = rowCount * this.lmHeadRowBytes;
     const fileOffset = baseFileOffset + rowStart * this.lmHeadRowBytes;
+
+    if (this.lmHeadLazyPinned) {
+      const stripeIdx = Math.floor(rowStart / this.lmHeadStripeRows);
+      const dstOffset = rowStart * this.lmHeadRowBytes;
+      if (this.lmHeadStripeCached[stripeIdx] === 0) {
+        const t0 = performance.now();
+        const read = this.backing.readRange(fileOffset, raw, dstOffset, stripeBytes);
+        this.backingReadMs += performance.now() - t0;
+        if (read !== stripeBytes) {
+          throw new Error(`vRAM LM-head stripe [${rowStart}, ${rowStart + rowCount}) short read.`);
+        }
+        this.coalescedReads += 1;
+        this.bytesRestoredFromBacking += stripeBytes;
+        this.lmHeadStripeCached[stripeIdx] = 1;
+        this.lmHeadCachedStripeCount += 1;
+      }
+      let cachedView = this.lmHeadCachedStripeViews[stripeIdx];
+      if (!cachedView) {
+        cachedView = tileBuf.createViewTensor(
+          `vram.lmhead_cached_${stripeIdx}`,
+          this.outWeightInfo.type,
+          [cols, rowCount],
+          dstOffset,
+        );
+        this.lmHeadCachedStripeViews[stripeIdx] = cachedView;
+      }
+      return cachedView;
+    }
 
     const t0 = performance.now();
     const read = this.backing.readRange(fileOffset, raw, 0, stripeBytes);

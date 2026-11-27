@@ -518,3 +518,76 @@ test('Observer continuously senses user quality budget from Immediate + Global C
   assert.equal(proofRoute.certificate.modelId, 'qwen3-30b-a3b-q4_k_m');
   assert.equal(proofRoute.certificate.thinkingPolicy, 'on');
 });
+
+test('Observer settles unit & radix conversions at LOD0 (<1 ms), suppresses <think> on brief queries, and engages calibrated analytical thinking on subtle puzzles', async () => {
+  const observer = new VerdantCognitiveObserver();
+
+  // 1. Exact deterministic LOD0 unit & radix conversions
+  const tempRoute = observer.selectRoute({
+    threadId: 'lod0-conv-temp',
+    messages: [makeUserMsg('Convert 212 F to C')],
+    latestUserText: 'Convert 212 F to C',
+    hasAttachment: false,
+    activeModel: QWEN3_4B_SUMMARY,
+    cachedModelIds: ['qwen3-4b-q4_k_m'],
+    isToolContinuationStep: false,
+    hasImportedHarness: false,
+  });
+  assert.equal(tempRoute.certificate.kind, 'lod0-verified');
+  assert.equal(tempRoute.certificate.directMatch?.toolName, 'calculate');
+
+  const hexRoute = observer.selectRoute({
+    threadId: 'lod0-conv-hex',
+    messages: [makeUserMsg('0xff to decimal')],
+    latestUserText: '0xff to decimal',
+    hasAttachment: false,
+    activeModel: QWEN3_4B_SUMMARY,
+    cachedModelIds: ['qwen3-4b-q4_k_m'],
+    isToolContinuationStep: false,
+    hasImportedHarness: false,
+  });
+  assert.equal(hexRoute.certificate.kind, 'lod0-verified');
+
+  const tools = createVerdantClientTools(() => ({
+    model: QWEN3_4B_SUMMARY,
+    telemetry: { activeProvider: 'vTensor', verdantVersion: '2.22.4', kernelAcceleration: 'wasm-simd' } as never,
+    opfsStorage: { supported: true, usageBytes: 0, quotaBytes: 0, storedModels: [], partialModels: [] } as never,
+    lastTokensPerSec: 25,
+  }));
+  const tempRes = await tools.calculate.execute!({ expression: 'Convert 212 F to C' }, {} as never);
+  assert.equal(tempRes.result, 100);
+  assert.equal(tempRes.formatted, '100 °C');
+  const hexRes = await tools.calculate.execute!({ expression: '0xff to decimal' }, {} as never);
+  assert.equal(hexRes.result, 255);
+  const binRes = await tools.calculate.execute!({ expression: '42 to binary' }, {} as never);
+  assert.equal(binRes.formatted, '0b101010');
+  const dataRes = await tools.calculate.execute!({ expression: '2 GiB to MiB' }, {} as never);
+  assert.equal(dataRes.result, 2048);
+
+  // 2. Explicit brief query suppresses hidden <think> chain for instant visible first token
+  const briefRoute = observer.selectRoute({
+    threadId: 'brief-fast-path',
+    messages: [makeUserMsg('Give me a quick brief summary of photosynthesis')],
+    latestUserText: 'Give me a quick brief summary of photosynthesis',
+    hasAttachment: false,
+    activeModel: QWEN3_4B_SUMMARY,
+    cachedModelIds: ['qwen3-4b-q4_k_m'],
+    isToolContinuationStep: false,
+    hasImportedHarness: false,
+  });
+  assert.equal(briefRoute.certificate.thinkingPolicy, 'off');
+
+  // 3. Subtle analytical/bug/counting prompt engages <think> + sharp analytical temperature (<= 0.35)
+  const puzzleRoute = observer.selectRoute({
+    threadId: 'analytical-puzzle',
+    messages: [makeUserMsg("How many r's in strawberry? Check edge cases step by step.")],
+    latestUserText: "How many r's in strawberry? Check edge cases step by step.",
+    hasAttachment: false,
+    activeModel: QWEN3_4B_SUMMARY,
+    cachedModelIds: ['qwen3-4b-q4_k_m'],
+    isToolContinuationStep: false,
+    hasImportedHarness: false,
+  });
+  assert.equal(puzzleRoute.certificate.thinkingPolicy, 'on');
+  assert.ok(puzzleRoute.certificate.recommendedSampling.temperature <= 0.35);
+});

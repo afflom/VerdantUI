@@ -1646,6 +1646,7 @@ export class LlamaVTensorRuntime {
         layerFrameSlots: contract.weightLayerFrameSlots,
         streamEmbeddings: contract.streamEmbeddings,
         streamLmHead: contract.streamLmHead,
+        lazyPinLmHead: contract.lazyPinLmHead,
         lmHeadStripeRows: computeLmHeadStripeRows(outWeightInfo, contract.lmHeadTileTargetBytes),
         hotEmbeddingCacheSlots: unifiedPlan.hotEmbeddingCacheSlots,
         moeExpertCacheSlots: contract.moeExpertCacheSlots,
@@ -5491,54 +5492,60 @@ export class LlamaVTensorRuntime {
       if (plan.pinnedLmHeadNode) {
         plan.pinnedLmHeadNode.execute();
       } else if (plan.executeLmHeadStripe) {
-        const stripes = wp.getLmHeadStripeSpecs();
-        const stripeBytesEst = stripes[0]?.byteLength ?? 0;
-        const stripeLookahead =
-          !demandStats || poolBytes >= stripeBytesEst * 3 ? 2 : 0;
-        const inflightStripes = new Map<number, Promise<void>>();
-        const scheduleStripes = (startIdx: number) => {
-          if (stripeLookahead <= 0) return;
-          for (let s = startIdx; s < Math.min(stripes.length, startIdx + stripeLookahead); s++) {
-            if (inflightStripes.has(s)) continue;
-            const p = backing.prefetchRanges!([stripes[s]], { signal });
-            p.catch(() => {});
-            inflightStripes.set(s, p);
+        const cachedFullLmHead = wp.getCachedFullLmHead();
+        if (cachedFullLmHead) {
+          // Zero-OPFS fast path: full-vocab LM-head is already cached in WASM RAM -> 1 single multi-core pass!
+          plan.executeLmHeadStripe(cachedFullLmHead, 0, this.hparams!.vocabSize);
+        } else {
+          const stripes = wp.getLmHeadStripeSpecs();
+          const stripeBytesEst = stripes[0]?.byteLength ?? 0;
+          const stripeLookahead =
+            !demandStats || poolBytes >= stripeBytesEst * 3 ? 2 : 0;
+          const inflightStripes = new Map<number, Promise<void>>();
+          const scheduleStripes = (startIdx: number) => {
+            if (stripeLookahead <= 0) return;
+            for (let s = startIdx; s < Math.min(stripes.length, startIdx + stripeLookahead); s++) {
+              if (inflightStripes.has(s)) continue;
+              const p = backing.prefetchRanges!([stripes[s]], { signal });
+              p.catch(() => {});
+              inflightStripes.set(s, p);
+            }
+          };
+          try {
+            for (let sIdx = 0; sIdx < stripes.length; sIdx++) {
+              LlamaVTensorRuntime.throwIfAborted(signal);
+              const tStripe0 = performance.now();
+              const spec = stripes[sIdx];
+              const pct = Math.min(99, Math.max(1, Math.round(((sIdx + 1) / stripes.length) * 100)));
+              onDetail?.(`Computing logits (${pct}%)`);
+              const pendingStripe = inflightStripes.get(sIdx);
+              if (pendingStripe) {
+                inflightStripes.delete(sIdx);
+                await pendingStripe;
+              }
+              if (
+                !(backing instanceof OpfsDemandVramBackingStore) ||
+                !backing.isRangeCached(spec.fileOffset, spec.byteLength)
+              ) {
+                await backing.prefetchRanges([spec], { signal });
+              }
+              LlamaVTensorRuntime.throwIfAborted(signal);
+              const weightStripe = wp.acquireLmHeadStripe(spec.rowStart, spec.rowCount);
+              // Keep upcoming LM-head stripes prefetching concurrently with WASM SIMD projection
+              if (sIdx + 1 < stripes.length) {
+                scheduleStripes(sIdx + 1);
+              }
+              plan.executeLmHeadStripe(weightStripe, spec.rowStart, spec.rowCount);
+              if (performance.now() - tStripe0 >= 12) {
+                await this.yielder.yieldNow();
+              }
+            }
+          } finally {
+            for (const p of inflightStripes.values()) {
+              p.catch(() => {});
+            }
+            inflightStripes.clear();
           }
-        };
-        try {
-          for (let sIdx = 0; sIdx < stripes.length; sIdx++) {
-            LlamaVTensorRuntime.throwIfAborted(signal);
-            const tStripe0 = performance.now();
-            const spec = stripes[sIdx];
-            const pct = Math.min(99, Math.max(1, Math.round(((sIdx + 1) / stripes.length) * 100)));
-            onDetail?.(`Computing logits (${pct}%)`);
-            const pendingStripe = inflightStripes.get(sIdx);
-            if (pendingStripe) {
-              inflightStripes.delete(sIdx);
-              await pendingStripe;
-            }
-            if (
-              !(backing instanceof OpfsDemandVramBackingStore) ||
-              !backing.isRangeCached(spec.fileOffset, spec.byteLength)
-            ) {
-              await backing.prefetchRanges([spec], { signal });
-            }
-            LlamaVTensorRuntime.throwIfAborted(signal);
-            const weightStripe = wp.acquireLmHeadStripe(spec.rowStart, spec.rowCount);
-            // Keep upcoming LM-head stripes prefetching concurrently with WASM SIMD projection
-            if (sIdx + 1 < stripes.length) {
-              scheduleStripes(sIdx + 1);
-            }
-            plan.executeLmHeadStripe(weightStripe, spec.rowStart, spec.rowCount);
-            if (performance.now() - tStripe0 >= 12) {
-              await this.yielder.yieldNow();
-            }
-          }
-        } finally {
-          for (const p of inflightStripes.values()) {
-            p.catch(() => {});
-          }
-          inflightStripes.clear();
         }
       }
     }

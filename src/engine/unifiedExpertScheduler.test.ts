@@ -193,6 +193,16 @@ test('derivePerformanceContract enforces opfs-paged + streamed embeddings/LM-hea
   assert.equal(contract.streamEmbeddings, true);
   assert.equal(contract.streamLmHead, true);
   assert.equal(
+    contract.lazyPinLmHead,
+    true,
+    'opfs-demand auto residency must enable lazyPinLmHead when full-vocab LM-head fits in WASM budget (0 OPFS reads on tokens 2..N)',
+  );
+  assert.equal(
+    contract.opfsIoOverheadMsPerToken,
+    0,
+    'When all layers and lazy-pinned LM-head fit in WASM RAM, steady-state per-token OPFS I/O overhead must be 0 ms',
+  );
+  assert.equal(
     contract.weightLayerFrameSlots,
     36,
     'opfs-demand auto residency must pin all 36 layers when they fit in WASM budget (0 OPFS layer reads per decode token)',
