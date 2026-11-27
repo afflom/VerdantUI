@@ -177,4 +177,19 @@ test('1-word seeds, feature-derived companion generation, and pin-preserving tun
   const logoIntent = detectStudioChatIntent('Create a minimalist emerald geometric logo for Meridian');
   assert.equal(logoIntent?.toolName, 'studio_create_artifact');
   assert.equal(logoIntent?.args.spaceName, undefined);
+
+  // Observer active modality residency reporting
+  const obs = new VerdantCognitiveObserver();
+  obs.setModalityResidencyProvider(() => ({
+    language: true,
+    image: true,
+    vision: false,
+    audio: true,
+    basis: true,
+  }));
+  const residency = obs.getActiveModalityResidency();
+  assert.equal(residency.language, true);
+  assert.equal(residency.image, true);
+  assert.equal(residency.audio, true);
+  assert.equal(residency.basis, true);
 });

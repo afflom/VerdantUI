@@ -75,6 +75,7 @@ import {
 } from '../engine/prismStudioAgent';
 import { PRISM_MEDIA_CATALOG, type PrismMediaType } from '../engine/prismMediaOrgans';
 import { isInternalBootstrapModel } from '../engine/modelCatalog';
+import type { StudioChatBridge } from '../engine/studioChatBridge';
 import type { EngineState, LlamaVTensorWorkerClient } from '../engine/workerClient';
 import {
   PrismSandboxFrame,
@@ -99,6 +100,7 @@ interface VerdantStudioViewProps {
   workerClient: LlamaVTensorWorkerClient;
   engineState: EngineState;
   darkMode: boolean;
+  getStudioChatBridge?: () => Promise<StudioChatBridge>;
   onSelectProject: (prismId: string, mode: 'studio' | 'app') => void;
 }
 
@@ -125,6 +127,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   workerClient,
   engineState,
   darkMode,
+  getStudioChatBridge,
   onSelectProject,
 }) => {
   const [guidedStep, setGuidedStep] = useState<GuidedStepId>('anchor-idea');
@@ -550,24 +553,83 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       const activeMediaType =
         declaration?.view?.proceduralOrgan?.mediaType ?? declaration?.concept.mediaType;
 
-      // Live in-place Document commands (read/write toggle, add section, continue drafting)
+      // Companion media derived directly from this Prism's features ("Generate cover art for this", "Make a soundtrack for this")
+      const companionMatch = message.match(
+        /\b(?:generate|create|make|compose|design|add)\s+(?:a\s+|an\s+)?(cover\s+art|book\s+cover|album\s+cover|game\s+cover|logo|brand\s*mark|soundtrack|theme\s+song)\b/i,
+      );
+      if (companionMatch && getStudioChatBridge) {
+        const requestedKind = companionMatch[1]!.toLowerCase();
+        const isAudio = /soundtrack|theme\s+song/.test(requestedKind);
+        const isLogo = /logo|brand\s*mark/.test(requestedKind);
+        setNlBusy(true);
+        setNlBusyLabel(isAudio ? 'Composing soundtrack…' : isLogo ? 'Designing logo…' : 'Creating cover art…');
+        try {
+          const bridge = await getStudioChatBridge();
+          const companion = await bridge.refinePrismFromPrompt({
+            target: project.id,
+            instruction: message,
+          });
+          await store.appendMessage(project.id, {
+            role: 'assistant',
+            content: `Created **${companion.prismName}** from this Prism's features and saved it to ${companion.galleryLabel}.`,
+          });
+          onSelectProject(companion.prismId, 'app');
+          return;
+        } finally {
+          setNlBusy(false);
+        }
+      }
+
+      // Live in-place organ commands (Document read/write/draft; Audio/Video playback; Picture new variation)
       if (
-        activeMediaType === 'written-work' &&
         project.published !== null &&
-        /\b(read|reading|write|edit|add\s+(?:a\s+)?(?:chapter|section)|new\s+(?:chapter|section)|continue|draft|expand|tighten|rewrite|paragraph)\b/.test(lower)
+        ((activeMediaType === 'written-work' &&
+          /\b(read|reading|write|edit|add\s+(?:a\s+)?(?:chapter|section)|new\s+(?:chapter|section)|continue|draft|expand|tighten|rewrite|paragraph)\b/.test(lower)) ||
+          ((activeMediaType === 'audio' || activeMediaType === 'video') &&
+            /^(?:play|pause|stop|resume|scene\s+\d+)$/i.test(message)) ||
+          (activeMediaType === 'picture' && /^(?:new\s+variation|another\s+variation|shuffle|re-?roll)\b/i.test(message)))
       ) {
         setNlBusy(true);
-        setNlBusyLabel('Updating document…');
+        setNlBusyLabel(activeMediaType === 'written-work' ? 'Updating document…' : 'Updating live preview…');
         try {
           await bridgeRuntime.dispatchPublishedPrism(project.id, { prompt: message });
           onChangeSurfaceMode('preview');
           await store.appendMessage(project.id, {
             role: 'assistant',
-            content: 'Updated your document live in Preview.',
+            content:
+              activeMediaType === 'written-work'
+                ? 'Updated your document live in Preview.'
+                : 'Updated live Preview.',
           });
           return;
         } catch {
           // Fall through to declarative refinement if sandbox isn't accepting input
+        } finally {
+          setNlBusy(false);
+        }
+      }
+
+      // Pin-preserving natural-language refinement for any existing procedural Prism via StudioChatBridge
+      if (
+        declaration?.view?.proceduralOrgan &&
+        declaration.view.proceduralOrgan.mediaType !== 'space' &&
+        getStudioChatBridge
+      ) {
+        setNlBusy(true);
+        setNlBusyLabel(`Refining ${PRISM_MEDIA_CATALOG[declaration.view.proceduralOrgan.mediaType].label.toLowerCase()}…`);
+        try {
+          const bridge = await getStudioChatBridge();
+          const refined = await bridge.refinePrismFromPrompt({
+            target: project.id,
+            instruction: message,
+          });
+          await store.appendMessage(project.id, {
+            role: 'assistant',
+            content: `Updated "${refined.prismName}" while preserving your pinned parameters.`,
+          });
+          setGuidedStep('ready-to-seal');
+          onChangeSurfaceMode('preview');
+          return;
         } finally {
           setNlBusy(false);
         }
@@ -706,6 +768,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       bridgeRuntime,
       checkReport,
       declaration,
+      getStudioChatBridge,
       guidedStep,
       handleDispatchOp,
       handlePublish,
@@ -716,6 +779,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       nlBusy,
       onChangeMode,
       onChangeSurfaceMode,
+      onSelectProject,
       project.draft.name,
       project.id,
       project.messages,

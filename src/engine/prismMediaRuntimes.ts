@@ -849,6 +849,38 @@ function drawFrame(sec) {
 }
 
 renderChrome();
+if (window.verdant?.onInput) {
+  window.verdant.onInput((input) => {
+    const prompt = String(input?.prompt || input?.text || input || '').trim();
+    const low = prompt.toLowerCase();
+    if (/\\bpause\\b|\\bstop\\b/.test(low)) { playing = false; renderChrome(); return { playing, scenes: scenes.length }; }
+    if (/\\bplay\\b|\\bresume\\b/.test(low)) { playing = true; renderChrome(); return { playing, scenes: scenes.length }; }
+    const scMatch = low.match(/\\bscene\\s+(\\d+)\\b/);
+    if (scMatch) {
+      const idx = Math.max(0, Math.min(scenes.length - 1, Number(scMatch[1]) - 1));
+      selectedIdx = idx;
+      let startAt = 0;
+      for (let i = 0; i < idx; i++) startAt += scenes[i].durationSec;
+      tSec = startAt + 0.05;
+      renderChrome();
+      return { playing, selectedScene: idx + 1 };
+    }
+    if (/\\badd\\s+scene\\b/.test(low)) {
+      const title = prompt.replace(/^.*\\badd\\s+scene\\b[:\\s-]*/i, '').trim() || ('Scene ' + (scenes.length + 1));
+      scenes.push({ title: title.slice(0, 42), subtitle: 'Added via natural language', durationSec: 4, accent: W.palette[2] || '#34d399', motion: 'rise' });
+      selectedIdx = scenes.length - 1;
+      renderChrome();
+      return { playing, scenes: scenes.length };
+    }
+    if (/\\bmidnight\\b|\\bdark\\b|\\bnocturnal\\b/.test(low)) { W.palette = ['#020617', '#0f172a', '#60a5fa']; }
+    else if (/\\bgolden\\b|\\bwarm\\b|\\bsunset\\b/.test(low)) { W.palette = ['#1c1917', '#451a03', '#f59e0b']; }
+    else if (/\\bemerald\\b|\\bforest\\b|\\bverdant\\b/.test(low)) { W.palette = ['#022c22', '#064e3b', '#34d399']; }
+    if (/\\bslower\\b|\\bcalm\\b/.test(low)) { scenes = scenes.map((s) => ({ ...s, durationSec: Math.min(10, s.durationSec + 1.5) })); }
+    else if (/\\bfaster\\b|\\benergetic\\b/.test(low)) { scenes = scenes.map((s) => ({ ...s, durationSec: Math.max(2, s.durationSec - 1) })); }
+    renderChrome();
+    return { playing, scenes: scenes.length, palette: W.palette };
+  });
+}
 function loop(ts) {
   if (!lastTs) lastTs = ts;
   const dt = Math.min(0.1, (ts - lastTs) / 1000); lastTs = ts;

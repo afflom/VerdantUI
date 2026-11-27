@@ -483,6 +483,25 @@ export default function App() {
   }, [prismStore, galleryStore, expertRegistry, observerBus, workerClient, prismPool, prismBuildClient]);
 
   useEffect(() => {
+    workerClient.cognitiveObserver.setModalityResidencyProvider(() => {
+      const st = workerClient.getState();
+      const loadedModel = st.model !== null && !isInternalBootstrapModel(st.model.id);
+      const mm = st.multimodalTelemetry;
+      const activeMods = mm?.activeModalities ?? [];
+      return {
+        language: loadedModel,
+        image: activeMods.includes('image-synthesis') || st.cachedModelIds.includes('sdxs-512-q8-taesd'),
+        vision: activeMods.includes('vision') || st.cachedModelIds.includes('smolvlm2-256m-mmproj'),
+        audio: activeMods.includes('audio') || st.cachedModelIds.includes('whisper-tiny-en-q8'),
+        basis: expertRegistry.basis.snapshot().adaptationSteps > 0,
+      };
+    });
+    return () => {
+      workerClient.cognitiveObserver.setModalityResidencyProvider(null);
+    };
+  }, [workerClient, expertRegistry]);
+
+  useEffect(() => {
     const unsubscribe = workerClient.subscribe(setEngineState);
 
     if (!workerClient.getState().model) {
@@ -978,6 +997,7 @@ export default function App() {
                   workerClient={workerClient}
                   engineState={engineState}
                   darkMode={darkMode}
+                  getStudioChatBridge={getStudioChatBridge}
                   onSelectProject={handleSelectPrism}
                 />
               </Suspense>

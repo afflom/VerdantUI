@@ -966,16 +966,44 @@ export interface RouteDecisionContext {
  * Maintains strictly isolated cognitive state per `threadId` so threads never conflate
  * semantically or mechanically.
  */
+export interface ActiveModalityResidency {
+  readonly language: boolean;
+  readonly image: boolean;
+  readonly vision: boolean;
+  readonly audio: boolean;
+  readonly basis: boolean;
+}
+
 export class VerdantCognitiveObserver {
   private readonly threads = new Map<string, InternalThreadMemory>();
   readonly grants = new ContainerGrantMatrix();
   /** Unified possession hierarchy (`Observer ⊇ User ⊇ {Threads, Prisms, ContextCompartments}`) & non-leaking boundary. */
   readonly possession = new ObserverPossessionStore('personal');
   private userBasisFacetsProvider: (() => CognitiveVector) | null = null;
+  private modalityResidencyProvider: (() => ActiveModalityResidency) | null = null;
 
   /** Connects the non-static `LivingTrainingBasis` Q10 vector into active inference routing. */
   setUserBasisFacetsProvider(provider: (() => CognitiveVector) | null): void {
     this.userBasisFacetsProvider = provider;
+  }
+
+  /** Connects live on-device modality residency (`language`, `image`, `vision`, `audio`, `basis`). */
+  setModalityResidencyProvider(provider: (() => ActiveModalityResidency) | null): void {
+    this.modalityResidencyProvider = provider;
+  }
+
+  /** Reports which neural/basis modalities are currently resident on-device for Studio weight routing. */
+  getActiveModalityResidency(): ActiveModalityResidency {
+    if (this.modalityResidencyProvider) {
+      return this.modalityResidencyProvider();
+    }
+    return {
+      language: false,
+      image: false,
+      vision: false,
+      audio: false,
+      basis: this.userBasisFacetsProvider !== null,
+    };
   }
 
   /**

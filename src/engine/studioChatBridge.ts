@@ -259,8 +259,9 @@ async function materializeInlineArtifact(
 
   if (weights.mediaType === 'picture') {
     const pw = weights as PictureWeights;
+    const residency = deps.observer.getActiveModalityResidency();
     let neuralLayer: { readonly width: number; readonly height: number; readonly rgba: Uint8ClampedArray } | null = null;
-    if (deps.synthesizeImageLayer) {
+    if (deps.synthesizeImageLayer && (residency.image || !residency.language)) {
       try {
         const res = await deps.synthesizeImageLayer({ prompt: pw.caption || proj.draft.name, seed: pw.seed });
         if (res.neuralAvailable && res.rgba && res.width > 0 && res.height > 0) {
@@ -643,7 +644,7 @@ export class StudioChatBridge {
 
     // Handle feature-derived companion creation ("generate cover art", "generate a logo", "generate a soundtrack")
     const compMatch = params.instruction.match(
-      /\b(?:generate|create|make|compose|add)\s+(?:a\s+|an\s+)?(cover\s+art|book\s+cover|album\s+cover|logo|brand\s*mark|soundtrack|theme\s+song)\b/i,
+      /\b(?:generate|create|make|compose|design|add)\s+(?:a\s+|an\s+)?(cover\s+art|book\s+cover|album\s+cover|game\s+cover|logo|brand\s*mark|soundtrack|theme\s+song)\b/i,
     );
     if (compMatch) {
       const token = compMatch[1]!.toLowerCase();
@@ -711,6 +712,43 @@ export class StudioChatBridge {
         patchWeights.scale = scMatch[1]!.toLowerCase();
       } else if (!existingPins.has('scale') && /\b(dark|darker|nocturnal|moody|twilight)\b/i.test(params.instruction)) {
         patchWeights.scale = 'minor';
+      }
+    } else if (mediaType === 'video') {
+      const existingScenes = Array.isArray(patchWeights.scenes)
+        ? (patchWeights.scenes as Array<Record<string, unknown>>).map((s) => ({ ...s }))
+        : [];
+      const addSceneMatch = params.instruction.match(/\badd\s+scene\b[:\s-]*(.+)$/i);
+      if (addSceneMatch) {
+        const title = addSceneMatch[1]!.trim().slice(0, 48) || `Scene ${existingScenes.length + 1}`;
+        const palette = Array.isArray(patchWeights.palette) ? (patchWeights.palette as string[]) : ['#0f172a', '#1e293b', '#34d399'];
+        existingScenes.push({
+          title,
+          subtitle: 'Added via natural language',
+          durationSec: 4,
+          accent: palette[2] ?? '#34d399',
+          motion: 'rise',
+        });
+        patchWeights.scenes = existingScenes;
+      }
+      if (!existingPins.has('palette')) {
+        if (/\b(midnight|dark|nocturnal)\b/i.test(params.instruction)) {
+          patchWeights.palette = ['#020617', '#0f172a', '#60a5fa'];
+        } else if (/\b(golden|warm|sunset)\b/i.test(params.instruction)) {
+          patchWeights.palette = ['#1c1917', '#451a03', '#f59e0b'];
+        } else if (/\b(emerald|forest|verdant)\b/i.test(params.instruction)) {
+          patchWeights.palette = ['#022c22', '#064e3b', '#34d399'];
+        }
+      }
+      if (/\b(slower|calm|relaxed)\b/i.test(params.instruction) && existingScenes.length > 0) {
+        patchWeights.scenes = existingScenes.map((s) => ({
+          ...s,
+          durationSec: Math.min(10, Number(s.durationSec || 4) + 1.5),
+        }));
+      } else if (/\b(faster|energetic|snappy)\b/i.test(params.instruction) && existingScenes.length > 0) {
+        patchWeights.scenes = existingScenes.map((s) => ({
+          ...s,
+          durationSec: Math.max(2, Number(s.durationSec || 4) - 1),
+        }));
       }
     }
 
