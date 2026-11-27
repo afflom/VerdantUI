@@ -1016,6 +1016,18 @@ export class LlamaVTensorWorkerClient {
       return;
     }
 
+    if (msg.type === 'image_synthesized') {
+      this.pending.delete(msg.requestId);
+      this.patchState({ multimodalTelemetry: msg.multimodalTelemetry });
+      entry.resolve({
+        neuralAvailable: msg.neuralAvailable,
+        width: msg.width,
+        height: msg.height,
+        rgba: msg.rgbaBuffer ? new Uint8ClampedArray(msg.rgbaBuffer) : null,
+      });
+      return;
+    }
+
     if (msg.type === 'token_count') {
       this.pending.delete(msg.requestId);
       entry.resolve({ tokenCount: msg.tokenCount, maxContextWindow: msg.maxContextWindow });
@@ -1408,6 +1420,35 @@ export class LlamaVTensorWorkerClient {
       });
       this.worker.postMessage({
         type: 'synthesize_audio',
+        requestId,
+        ...params,
+      } satisfies WorkerRequest);
+    });
+  }
+
+  /**
+   * Routes resident SDXS/TAESD neural image weights inside the shared Web Worker
+   * when cached locally, returning `{ neuralAvailable: false }` in <1ms otherwise.
+   */
+  async synthesizeImageLayer(params: {
+    readonly prompt: string;
+    readonly seed: number;
+    readonly latentH?: number;
+    readonly latentW?: number;
+  }): Promise<{
+    readonly neuralAvailable: boolean;
+    readonly width: number;
+    readonly height: number;
+    readonly rgba: Uint8ClampedArray | null;
+  }> {
+    const requestId = this.nextRequestId('img');
+    return new Promise((resolve, reject) => {
+      this.pending.set(requestId, {
+        resolve: resolve as (v: unknown) => void,
+        reject,
+      });
+      this.worker.postMessage({
+        type: 'synthesize_image',
         requestId,
         ...params,
       } satisfies WorkerRequest);

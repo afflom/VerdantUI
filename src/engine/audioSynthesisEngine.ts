@@ -353,3 +353,169 @@ export function encodeStereoWavDataUrl(wavBytes: Uint8Array): string {
   }
   return `data:audio/wav;base64,${btoa(bin)}`;
 }
+
+export interface AudioFidelityReport {
+  readonly rmsDbfs: number;
+  readonly peakDbfs: number;
+  readonly clippedSamples: number;
+  readonly hasNaN: boolean;
+  readonly nonSilent: boolean;
+}
+
+/** Measures stereo PCM RMS, peak headroom, NaN safety, and digital clipping. */
+export function analyzeAudioFidelity(left: Float32Array, right: Float32Array): AudioFidelityReport {
+  const n = Math.min(left.length, right.length);
+  if (n === 0) {
+    return { rmsDbfs: -120, peakDbfs: -120, clippedSamples: 0, hasNaN: false, nonSilent: false };
+  }
+  let sumSq = 0;
+  let peak = 0;
+  let clippedSamples = 0;
+  let hasNaN = false;
+  for (let i = 0; i < n; i++) {
+    const l = left[i]!;
+    const r = right[i]!;
+    if (!Number.isFinite(l) || !Number.isFinite(r)) {
+      hasNaN = true;
+      continue;
+    }
+    const al = Math.abs(l);
+    const ar = Math.abs(r);
+    if (al >= 0.9995 || ar >= 0.9995) clippedSamples += 1;
+    if (al > peak) peak = al;
+    if (ar > peak) peak = ar;
+    sumSq += l * l + r * r;
+  }
+  const rms = Math.sqrt(sumSq / (2 * n));
+  const toDb = (x: number) => (x <= 1e-6 ? -120 : 20 * Math.log10(x));
+  const rmsDbfs = toDb(rms);
+  const peakDbfs = toDb(peak);
+  return {
+    rmsDbfs,
+    peakDbfs,
+    clippedSamples,
+    hasNaN,
+    nonSilent: rmsDbfs > -48 && peak > 0.01,
+  };
+}
+
+/**
+ * Clean stereo mastering pass: removes DC bias, normalizes RMS toward `-16 dBFS`,
+ * and limits true peaks strictly below `-1.0 dBFS` (`0.891`) with zero clipping or NaNs.
+ */
+export function masterStereoPcm(
+  left: Float32Array,
+  right: Float32Array,
+  sampleRate: number,
+): { readonly left: Float32Array; readonly right: Float32Array; readonly sampleRate: number } {
+  const n = Math.min(left.length, right.length);
+  const outL = new Float32Array(n);
+  const outR = new Float32Array(n);
+  if (n === 0) return { left: outL, right: outR, sampleRate };
+
+  let meanL = 0;
+  let meanR = 0;
+  for (let i = 0; i < n; i++) {
+    meanL += Number.isFinite(left[i]!) ? left[i]! : 0;
+    meanR += Number.isFinite(right[i]!) ? right[i]! : 0;
+  }
+  meanL /= n;
+  meanR /= n;
+
+  let sumSq = 0;
+  let peak = 0;
+  for (let i = 0; i < n; i++) {
+    const l = (Number.isFinite(left[i]!) ? left[i]! : 0) - meanL;
+    const r = (Number.isFinite(right[i]!) ? right[i]! : 0) - meanR;
+    outL[i] = l;
+    outR[i] = r;
+    sumSq += l * l + r * r;
+    const m = Math.max(Math.abs(l), Math.abs(r));
+    if (m > peak) peak = m;
+  }
+
+  const rms = Math.sqrt(sumSq / (2 * n));
+  const targetRms = 0.16; // ~ -16 dBFS
+  const maxPeak = 0.89; // ~ -1.0 dBFS ceiling
+  let gain = rms > 1e-5 ? Math.min(2.5, targetRms / rms) : 1;
+  if (peak * gain > maxPeak && peak > 1e-6) {
+    gain = maxPeak / peak;
+  }
+
+  for (let i = 0; i < n; i++) {
+    outL[i] = Math.max(-maxPeak, Math.min(maxPeak, outL[i]! * gain));
+    outR[i] = Math.max(-maxPeak, Math.min(maxPeak, outR[i]! * gain));
+  }
+  return { left: outL, right: outR, sampleRate };
+}
+
+function writeMidiVarLen(value: number, out: number[]): void {
+  let v = Math.max(0, Math.floor(value));
+  const stack = [v & 0x7f];
+  v >>>= 7;
+  while (v > 0) {
+    stack.push((v & 0x7f) | 0x80);
+    v >>>= 7;
+  }
+  for (let i = stack.length - 1; i >= 0; i--) out.push(stack[i]!);
+}
+
+/**
+ * Encodes a `MusicalComposition` into a valid Standard MIDI 1.0 binary file (`audio/midi`, SMF Type 1).
+ */
+export function encodeCompositionToMidi(comp: MusicalComposition): Uint8Array {
+  const ppqn = 480;
+  const usPerBeat = Math.max(200_000, Math.min(1_500_000, Math.round(60_000_000 / Math.max(40, comp.bpm))));
+
+  interface RawMidiMsg {
+    readonly tick: number;
+    readonly bytes: readonly number[];
+  }
+  const msgs: RawMidiMsg[] = [
+    // Tempo meta event
+    { tick: 0, bytes: [0xff, 0x51, 0x03, (usPerBeat >>> 16) & 0xff, (usPerBeat >>> 8) & 0xff, usPerBeat & 0xff] },
+  ];
+
+  const channelForTimbre = (timbre: MusicalNoteEvent['timbre']): number => {
+    if (timbre === 'warm-pad') return 0;
+    if (timbre === 'plucked-bass') return 1;
+    if (timbre === 'modal-bell' || timbre === 'sfx-chime') return 2;
+    return 9; // GM percussion channel
+  };
+
+  for (const ev of comp.events) {
+    const ch = channelForTimbre(ev.timbre);
+    const note = Math.max(0, Math.min(127, Math.round(ev.midi)));
+    const vel = Math.max(1, Math.min(127, Math.round(ev.velocity * 115)));
+    const tOn = Math.max(0, Math.round(ev.startBeat * ppqn));
+    const tOff = Math.max(tOn + 24, Math.round((ev.startBeat + ev.durationBeats) * ppqn));
+    msgs.push({ tick: tOn, bytes: [0x90 | ch, note, vel] });
+    msgs.push({ tick: tOff, bytes: [0x80 | ch, note, 0] });
+  }
+
+  msgs.sort((a, b) => a.tick - b.tick);
+
+  const trackData: number[] = [];
+  let prevTick = 0;
+  for (const m of msgs) {
+    writeMidiVarLen(m.tick - prevTick, trackData);
+    for (const b of m.bytes) trackData.push(b);
+    prevTick = m.tick;
+  }
+  // End of track
+  trackData.push(0x00, 0xff, 0x2f, 0x00);
+
+  const out = new Uint8Array(14 + 8 + trackData.length);
+  const dv = new DataView(out.buffer);
+  // MThd header (format 1, 1 track, 480 ppqn)
+  out.set([0x4d, 0x54, 0x68, 0x64], 0);
+  dv.setUint32(4, 6, false);
+  dv.setUint16(8, 1, false);
+  dv.setUint16(10, 1, false);
+  dv.setUint16(12, ppqn, false);
+  // MTrk chunk
+  out.set([0x4d, 0x54, 0x72, 0x6b], 14);
+  dv.setUint32(18, trackData.length, false);
+  out.set(trackData, 22);
+  return out;
+}

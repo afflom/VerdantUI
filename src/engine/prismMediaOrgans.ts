@@ -14,7 +14,11 @@
  */
 
 import type { PrismDeclaration } from './verdantStudioApi';
-import { inferPictureWeightsFromPrompt, type PictureLightingMood } from './proceduralPictureRenderer';
+import {
+  inferPictureWeightsFromPrompt,
+  synthesizeLogoSvg,
+  type PictureLightingMood,
+} from './proceduralPictureRenderer';
 import {
   buildArcadeCanvasRuntimeJs,
   buildCellularSimRuntimeJs,
@@ -164,6 +168,8 @@ export type PictureGeneratorKind =
   | 'constellation-atlas'
   | 'poster-editorial'
   | 'pixel-scene'
+  | 'logo-mark'
+  | 'cover-art'
   | 'botanical-fractal'
   | 'wave-field'
   | 'constellation'
@@ -180,6 +186,9 @@ export interface PictureWeights {
   readonly density: number;
   readonly palette: readonly [string, string, string, string];
   readonly caption: string;
+  readonly subtitle?: string;
+  readonly coverFormat?: 'book' | 'album' | 'game';
+  readonly svgMarkup?: string;
 }
 
 export interface AudioWeights {
@@ -508,6 +517,8 @@ export function normalizeOrganWeights(
       'constellation-atlas',
       'poster-editorial',
       'pixel-scene',
+      'logo-mark',
+      'cover-art',
       'botanical-fractal',
       'wave-field',
       'constellation',
@@ -534,7 +545,11 @@ export function normalizeOrganWeights(
       safeHex(rawPal[2], inferredPic.palette[2]),
       safeHex(rawPal[3], inferredPic.palette[3]),
     ];
-    return {
+    const coverFormat =
+      p.coverFormat === 'book' || p.coverFormat === 'album' || p.coverFormat === 'game'
+        ? p.coverFormat
+        : inferredPic.coverFormat;
+    const picWeights: PictureWeights = {
       mediaType: 'picture',
       generator: gen,
       lighting,
@@ -545,7 +560,12 @@ export function normalizeOrganWeights(
       density: clampInt(p.density, 8, 120, inferredPic.density),
       palette,
       caption: safeStr(p.caption, titleHint, 140),
+      ...(typeof p.subtitle === 'string' && p.subtitle.trim() ? { subtitle: safeStr(p.subtitle, '', 160) } : {}),
+      ...(coverFormat ? { coverFormat } : {}),
     };
+    return gen === 'logo-mark'
+      ? { ...picWeights, svgMarkup: typeof p.svgMarkup === 'string' && p.svgMarkup.includes('<svg') ? p.svgMarkup : synthesizeLogoSvg(picWeights) }
+      : picWeights;
   }
 
   if (mediaType === 'audio') {
@@ -565,13 +585,25 @@ export function normalizeOrganWeights(
     const allowedScales: readonly AudioWeights['scale'][] = ['pentatonic', 'major', 'minor', 'dorian'];
     const scale = allowedScales.includes(p.scale as AudioWeights['scale'])
       ? (p.scale as AudioWeights['scale'])
-      : /\b(dark|minor|moody|noir)\b/.test(lowerHint)
+      : /\b(dark|minor|moody|noir|nocturnal|melanchol)\b/.test(lowerHint)
         ? 'minor'
-        : 'pentatonic';
+        : /\b(dorian|mystic|twilight|alpine)\b/.test(lowerHint)
+          ? 'dorian'
+          : /\b(major|bright|sunny|uplifting|happy)\b/.test(lowerHint)
+            ? 'major'
+            : 'pentatonic';
+    const bpmMatch = lowerHint.match(/\b(\d{2,3})\s*bpm\b/);
+    const inferredBpm = bpmMatch
+      ? Number(bpmMatch[1])
+      : style === 'ambient-pad'
+        ? 76
+        : style === 'rhythm-pulse'
+          ? 118
+          : 104;
     return {
       mediaType: 'audio',
       style,
-      bpm: clampInt(p.bpm, 45, 200, style === 'ambient-pad' ? 76 : style === 'rhythm-pulse' ? 118 : 104),
+      bpm: clampInt(p.bpm, 45, 200, inferredBpm),
       rootMidi: clampInt(p.rootMidi, 36, 72, 60),
       scale,
       durationSec: clampInt(p.durationSec, 4, 30, 8),

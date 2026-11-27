@@ -454,10 +454,36 @@ interface ExtractedTurn {
   readonly emptyThinkAssistant?: boolean;
 }
 
+function sanitizeToolResultForPrompt(value: unknown, depth = 0): unknown {
+  if (depth > 6 || value === null || value === undefined) return value;
+  if (typeof value === 'string') {
+    const dataUrlMatch = value.match(/^data:([^;,\s]{1,64});base64,/i);
+    if (dataUrlMatch && value.length > 256) {
+      return `[inline ${dataUrlMatch[1]} artifact rendered in UI (${Math.round((value.length * 3) / 4 / 1024)} KB)]`;
+    }
+    if (value.length > 4_000) {
+      return `${value.slice(0, 3_600)}… [truncated ${value.length - 3_600} chars]`;
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeToolResultForPrompt(item, depth + 1));
+  }
+  if (typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = sanitizeToolResultForPrompt(v, depth + 1);
+    }
+    return out;
+  }
+  return value;
+}
+
 function serializeToolResultPayload(part: ToolCallMessagePart): string {
+  const sanitized = sanitizeToolResultForPrompt(part.result ?? null);
   const payload = part.isError
-    ? { name: part.toolName, error: part.result ?? 'Tool execution failed.' }
-    : { name: part.toolName, result: part.result ?? null };
+    ? { name: part.toolName, error: sanitized ?? 'Tool execution failed.' }
+    : { name: part.toolName, result: sanitized };
   return `<tool_response>\n${JSON.stringify(payload)}\n</tool_response>`;
 }
 

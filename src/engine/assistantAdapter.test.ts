@@ -256,3 +256,43 @@ test('formatSpeculativePrefixForLlama maintains strict byte-prefix parity with f
     }
   }
 });
+
+test('formatMessagesForLlama and formatSpeculativePrefixForLlama redact large base64 data URLs from tool results', () => {
+  const fakePng = `data:image/png;base64,${'A'.repeat(64_000)}`;
+  const fakeWav = `data:audio/wav;base64,${'B'.repeat(120_000)}`;
+  const msgs: ThreadMessage[] = [
+    makeMsg('user', 'Create a logo'),
+    {
+      id: 'a-tool-1',
+      role: 'assistant',
+      createdAt: new Date(),
+      status: { type: 'complete', reason: 'stop' },
+      content: [
+        {
+          type: 'tool-call',
+          toolCallId: 'tc_1',
+          toolName: 'studio_create_artifact',
+          args: { prompt: 'Create a logo' },
+          argsText: '{"prompt":"Create a logo"}',
+          result: {
+            prismName: 'Meridian Logo',
+            previewImageDataUrl: fakePng,
+            audioWavDataUrl: fakeWav,
+          },
+        },
+        { type: 'text', text: 'Created Meridian Logo.' },
+      ],
+      metadata: { unstable_state: null, unstable_annotations: [], unstable_data: [], steps: [], custom: {} },
+    },
+    makeMsg('user', 'Now make cover art'),
+  ];
+  const model = 'qwen3-0.6b-q4_0';
+  const prompt = formatMessagesForLlama(msgs, model, 'auto');
+  const spec = formatSpeculativePrefixForLlama(msgs.slice(0, 2), 'Now make', model, 'auto');
+  assert.ok(prompt.length < 2000, `Prompt bloated to ${prompt.length} chars`);
+  assert.ok(spec.length < 2000, `Speculative prompt bloated to ${spec.length} chars`);
+  assert.ok(!prompt.includes('AAAA'), 'Raw PNG base64 must never leak into prompt');
+  assert.ok(!prompt.includes('BBBB'), 'Raw WAV base64 must never leak into prompt');
+  assert.ok(prompt.includes('inline image/png artifact rendered in UI'));
+  assert.ok(prompt.includes('inline audio/wav artifact rendered in UI'));
+});

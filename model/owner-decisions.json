@@ -90,6 +90,12 @@
       "at": "2026-11-26",
       "requirements": ["REQ-SELF-SIMILAR-PRISM-UI", "REQ-OBSERVER-PROCEDURAL-SYNTHESIS"],
       "quote": "Every part of VerdantUI is a natural language interface with a rendering (preview) panel, and a toggle to switch from the preview to the details of the Prism. VerdantUI itself must be a Verdant Prism and all of its parts must also be Verdant Prisms. VerdantUI and all of its parts must be rendered by the Observer using procedural synthesis."
+    },
+    {
+      "id": "DEC-016",
+      "at": "2026-11-27",
+      "requirements": ["REQ-PRISM-GENERATION"],
+      "quote": "We dont need more UI options. VerdantUI is a natural language interface that renders content to its user. The Observer must make use of Verdant Studio to generate its output. We have these language, audio, image, and video models in VerdantUI, so that their weights can be routed into a Verdant Prism in its procedural synthesis."
     }
   ]
 }

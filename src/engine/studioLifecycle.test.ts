@@ -118,7 +118,14 @@ test('Semantic release planner derives exact minor/patch/none bumps and determin
     ...model,
     releaseLedger: {
       schema: 'verdant-ui/release-ledger/1',
-      releases: [{ ...latest, activeFeatureIds: allActiveIds }],
+      releases: [
+        {
+          ...latest,
+          engineTag: model.enginePin.tag,
+          studioCommit: model.studioPin.commit,
+          activeFeatureIds: allActiveIds,
+        },
+      ],
     },
   };
   assert.equal(planSemanticRelease(syncedLedger, 'auto').bump, 'none');

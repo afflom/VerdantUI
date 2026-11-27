@@ -228,6 +228,7 @@ export default function App() {
                 return out;
               },
               synthesizeAudioWav: (params) => workerClient.synthesizeAudioClip(params),
+              synthesizeImageLayer: (params) => workerClient.synthesizeImageLayer(params),
               onOpenPrism: (prismId) => {
                 setActiveView({ kind: 'prism', prismId, mode: 'app' });
               },

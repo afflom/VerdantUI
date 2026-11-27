@@ -83,6 +83,12 @@ export interface StudioConceptModel {
   readonly activeOrgans?: readonly StudioFeatureOrgan[];
   /** Owner context compartment (e.g. personal, work, health, research) for zero-leak isolation (DEC-010). */
   readonly compartmentId?: string;
+  /** Original natural-language seed word or sentence that generated this Prism. */
+  readonly seedText?: string;
+  /** Feature keys explicitly pinned by the user (preserved across iterative tuning). */
+  readonly pinnedFields?: readonly string[];
+  /** Linked companion Prism IDs generated coherently from this Prism's features (e.g., cover art, logo, soundtrack). */
+  readonly linkedPrismIds?: readonly string[];
   readonly stakeholders: readonly StakeholderDecl[];
   readonly opmObjects: readonly OpmObjectDecl[];
   readonly opmProcesses: readonly OpmProcessDecl[];
@@ -401,6 +407,9 @@ export type StudioApiOp =
       readonly usesLocalAi?: boolean;
       readonly involvesPayments?: boolean;
       readonly compartmentId?: string;
+      readonly seedText?: string;
+      readonly pinnedFields?: readonly string[];
+      readonly linkedPrismIds?: readonly string[];
     }
   | {
       readonly op: 'admit-stakeholder';
@@ -1874,6 +1883,9 @@ export function dispatchStudioOp(decl: PrismDeclaration, op: StudioApiOp): Studi
           op.involvesPayments !== undefined ? op.involvesPayments : decl.concept.involvesPayments,
         compartmentId:
           op.compartmentId !== undefined ? op.compartmentId.trim() || 'personal' : decl.concept.compartmentId,
+        ...(op.seedText !== undefined ? { seedText: op.seedText } : {}),
+        ...(op.pinnedFields !== undefined ? { pinnedFields: [...op.pinnedFields] } : {}),
+        ...(op.linkedPrismIds !== undefined ? { linkedPrismIds: [...op.linkedPrismIds] } : {}),
       };
       const nextAssurance = decl.security.reviewedAt
         ? decl.security.assuranceLevel

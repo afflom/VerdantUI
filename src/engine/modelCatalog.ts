@@ -507,11 +507,11 @@ export const MULTIMODAL_CORE_MODELS: readonly MultimodalCoreModelSpec[] = [
     url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en-q8_0.bin',
   },
   {
-    id: 'sdxs-512-q4-taesd',
+    id: 'sdxs-512-q8-taesd',
     modality: 'image-synthesis',
-    name: 'SDXS-512 1-Step Distilled Diffusion + TAESD',
+    name: 'SDXS-512 1-Step Distilled Diffusion (Q8_0) + TAESD',
     approximateBytes: 640_000_000,
-    url: 'https://huggingface.co/concedo/sdxs-512-tinySDdistilled-GGUF/resolve/main/sdxs-512-0.9-q4_0.gguf',
+    url: 'https://huggingface.co/concedo/sdxs-512-tinySDdistilled-GGUF/resolve/3144d898d61492f8382ffcabec055733fc5b2a0e/sdxs-512-tinySDdistilled_Q8_0.gguf',
   },
 ];
 

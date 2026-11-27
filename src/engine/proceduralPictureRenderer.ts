@@ -232,7 +232,17 @@ export function inferPictureWeightsFromPrompt(
   const lower = `${titleHint} ${prompt}`.toLowerCase();
 
   let generator: PictureGeneratorKind = 'landscape-vista';
-  if (/\b(nebula|galaxy|planet|saturn|cosmos|deep\s+space|supernova|black\s+hole)\b/.test(lower)) {
+  let coverFormat: 'book' | 'album' | 'game' | undefined;
+  if (/\b(logo|brand\s*mark|emblem|monogram|wordmark|app\s+icon|crest)\b/.test(lower)) {
+    generator = 'logo-mark';
+  } else if (/\b(book\s+cover|album\s+cover|album\s+art|cover\s+art|box\s+art|game\s+cover|magazine\s+cover)\b/.test(lower)) {
+    generator = 'cover-art';
+    coverFormat = /\b(album|record|vinyl|ep|single|soundtrack)\b/.test(lower)
+      ? 'album'
+      : /\b(game|app|arcade|software)\b/.test(lower)
+        ? 'game'
+        : 'book';
+  } else if (/\b(nebula|galaxy|planet|saturn|cosmos|deep\s+space|supernova|black\s+hole)\b/.test(lower)) {
     generator = 'cosmic-nebula';
   } else if (/\b(constellation|star\s*map|celestial|astrology|night\s+sky\s+chart|zodiac)\b/.test(lower)) {
     generator = 'constellation-atlas';
@@ -298,10 +308,10 @@ export function inferPictureWeightsFromPrompt(
   // Aspect ratio inference
   let width = 800;
   let height = 500;
-  if (/\b(square|1:1|avatar|icon|album\s+cover)\b/.test(lower)) {
+  if (generator === 'logo-mark' || coverFormat === 'album' || /\b(square|1:1|avatar|icon|album\s+cover)\b/.test(lower)) {
     width = 640;
     height = 640;
-  } else if (/\b(portrait|vertical|9:16|phone|poster|tall)\b/.test(lower)) {
+  } else if (coverFormat === 'book' || /\b(portrait|vertical|9:16|phone|poster|tall|book\s+cover)\b/.test(lower)) {
     width = 512;
     height = 768;
   } else if (/\b(4:3|classic)\b/.test(lower)) {
@@ -326,7 +336,7 @@ export function inferPictureWeightsFromPrompt(
       ? 32
       : 58;
 
-  return {
+  const baseWeights: PictureWeights = {
     mediaType: 'picture',
     generator,
     lighting,
@@ -337,7 +347,67 @@ export function inferPictureWeightsFromPrompt(
     density,
     palette,
     caption: titleHint.slice(0, 120),
+    ...(coverFormat ? { coverFormat } : {}),
   };
+  return generator === 'logo-mark'
+    ? { ...baseWeights, svgMarkup: synthesizeLogoSvg(baseWeights) }
+    : baseWeights;
+}
+
+function escapeXml(s: string): string {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/**
+ * Synthesizes a clean, standalone SVG 2 vector brand mark (`image/svg+xml`) deterministically
+ * from `PictureWeights` (zero external URLs, zero scripts, crisp geometric balance).
+ */
+export function synthesizeLogoSvg(weights: PictureWeights): string {
+  const [cBg, cMid, cAcc, cHi] = weights.palette;
+  const variant = Math.abs(weights.seed) % 5;
+  const title = escapeXml((weights.caption || 'Verdant').slice(0, 32));
+  const initial = escapeXml((weights.caption || 'V').trim().charAt(0).toUpperCase() || 'V');
+
+  let markSvg = '';
+  if (variant === 0) {
+    markSvg = `
+    <polygon points="256,88 392,166 392,322 256,400 120,322 120,166" fill="none" stroke="${cAcc}" stroke-width="14" stroke-linejoin="round"/>
+    <polygon points="256,88 392,166 256,244 120,166" fill="${cAcc}" fill-opacity="0.28"/>
+    <polygon points="256,244 392,166 392,322 256,400" fill="${cMid}" fill-opacity="0.55"/>
+    <polygon points="256,244 120,166 120,322 256,400" fill="${cHi}" fill-opacity="0.16"/>
+    <circle cx="256" cy="244" r="30" fill="${cHi}"/>`;
+  } else if (variant === 1) {
+    markSvg = `
+    <circle cx="256" cy="244" r="126" fill="none" stroke="${cMid}" stroke-width="14"/>
+    <ellipse cx="256" cy="244" rx="142" ry="62" transform="rotate(-32 256 244)" fill="none" stroke="${cAcc}" stroke-width="12"/>
+    <ellipse cx="256" cy="244" rx="142" ry="62" transform="rotate(32 256 244)" fill="none" stroke="${cHi}" stroke-width="8" stroke-opacity="0.85"/>
+    <circle cx="256" cy="244" r="34" fill="${cAcc}"/>`;
+  } else if (variant === 2) {
+    markSvg = `
+    <circle cx="256" cy="244" r="144" fill="${cMid}" fill-opacity="0.22" stroke="${cAcc}" stroke-width="10"/>
+    <path d="M256,120 C332,162 344,274 256,364 C168,274 180,162 256,120 Z" fill="${cAcc}" fill-opacity="0.82"/>
+    <path d="M256,144 L256,356 M256,214 L302,184 M256,258 L210,228 M256,298 L296,272" stroke="${cBg}" stroke-width="10" stroke-linecap="round"/>`;
+  } else if (variant === 3) {
+    markSvg = `
+    <rect x="148" y="136" width="216" height="216" rx="28" transform="rotate(45 256 244)" fill="${cMid}" fill-opacity="0.35" stroke="${cAcc}" stroke-width="14"/>
+    <rect x="184" y="172" width="144" height="144" rx="18" transform="rotate(45 256 244)" fill="none" stroke="${cHi}" stroke-width="8" stroke-opacity="0.8"/>
+    <text x="256" y="274" text-anchor="middle" fill="${cHi}" font-family="Inter, system-ui, sans-serif" font-size="96" font-weight="800">${initial}</text>`;
+  } else {
+    markSvg = `
+    <circle cx="220" cy="244" r="110" fill="${cMid}" fill-opacity="0.9"/>
+    <circle cx="292" cy="244" r="110" fill="${cAcc}" fill-opacity="0.78"/>
+    <path d="M256,154 A110,110 0 0,1 256,334 A110,110 0 0,1 256,154 Z" fill="${cHi}" fill-opacity="0.92"/>`;
+  }
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="${title} logo">
+  <rect width="512" height="512" rx="64" fill="${cBg}"/>
+  ${markSvg}
+  <text x="256" y="458" text-anchor="middle" fill="${cHi}" font-family="Inter, system-ui, sans-serif" font-size="28" font-weight="700" letter-spacing="4">${title.toUpperCase()}</text>
+</svg>`;
 }
 
 /**
@@ -756,6 +826,116 @@ export function renderPictureToRgba(
       drawDisc(rgba, w, h, sx, sy, sr * 2.4, i % 4 === 0 ? cAcc : cMid, 0.25, 0.85);
       drawDisc(rgba, w, h, sx, sy, sr, i % 4 === 0 ? cAcc : cHi, 0.95, 0.35);
     }
+  } else if (gen === 'logo-mark') {
+    // Crisp high-contrast geometric brand mark raster matching synthesizeLogoSvg
+    for (let y = 0; y < h; y++) {
+      const grad = y / h;
+      const col = mixRgb(cBg, cMid, grad * 0.14);
+      for (let x = 0; x < w; x++) {
+        const idx = (y * w + x) * 4;
+        rgba[idx] = clamp255(col[0]);
+        rgba[idx + 1] = clamp255(col[1]);
+        rgba[idx + 2] = clamp255(col[2]);
+        rgba[idx + 3] = 255;
+      }
+    }
+    const cx = w * 0.5;
+    const cy = h * 0.46;
+    const r = Math.min(w, h) * 0.28;
+    const variant = Math.abs(seed) % 5;
+    if (variant === 0) {
+      // Faceted Prism Hexagon
+      const pts: Array<[number, number]> = [];
+      for (let i = 0; i < 6; i++) {
+        const a = -Math.PI / 2 + (i * Math.PI) / 3;
+        pts.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]);
+      }
+      for (let i = 0; i < 6; i++) {
+        const [x0, y0] = pts[i]!;
+        const [x1, y1] = pts[(i + 1) % 6]!;
+        drawLine(rgba, w, h, x0, y0, x1, y1, cAcc, 0.96, Math.max(4, r * 0.08));
+        drawLine(rgba, w, h, cx, cy, x0, y0, i % 2 === 0 ? cMid : cHi, 0.62, Math.max(2, r * 0.045));
+      }
+      drawDisc(rgba, w, h, cx, cy, r * 0.24, cHi, 0.96, 0.06);
+    } else if (variant === 1) {
+      // Interlocking orbital emblem
+      for (let a = 0; a < 360; a++) {
+        const rad = (a * Math.PI) / 180;
+        drawDisc(rgba, w, h, cx + Math.cos(rad) * r, cy + Math.sin(rad) * r, r * 0.05, cMid, 0.9, 0.15);
+        const ox = Math.cos(rad) * r * 1.08;
+        const oy = Math.sin(rad) * r * 0.44;
+        const rx1 = ox * 0.85 - oy * 0.52;
+        const ry1 = ox * 0.52 + oy * 0.85;
+        drawDisc(rgba, w, h, cx + rx1, cy + ry1, r * 0.042, cAcc, 0.92, 0.15);
+        drawDisc(rgba, w, h, cx + rx1, cy - ry1, r * 0.032, cHi, 0.78, 0.15);
+      }
+      drawDisc(rgba, w, h, cx, cy, r * 0.28, cAcc, 0.98, 0.05);
+    } else if (variant === 2) {
+      // Botanical crest
+      drawDisc(rgba, w, h, cx, cy, r * 1.05, cMid, 0.28, 0.04);
+      for (let a = 0; a < 360; a++) {
+        const rad = (a * Math.PI) / 180;
+        drawDisc(rgba, w, h, cx + Math.cos(rad) * r * 1.05, cy + Math.sin(rad) * r * 1.05, r * 0.04, cAcc, 0.92, 0.12);
+      }
+      drawDisc(rgba, w, h, cx, cy, r * 0.66, cAcc, 0.88, 0.08);
+      drawLine(rgba, w, h, cx, cy - r * 0.75, cx, cy + r * 0.78, cBg, 0.95, Math.max(4, r * 0.07));
+      drawLine(rgba, w, h, cx, cy - r * 0.18, cx + r * 0.36, cy - r * 0.42, cBg, 0.9, Math.max(3, r * 0.055));
+      drawLine(rgba, w, h, cx, cy + r * 0.12, cx - r * 0.36, cy - r * 0.12, cBg, 0.9, Math.max(3, r * 0.055));
+    } else if (variant === 3) {
+      // Architectural diamond
+      const pts: Array<[number, number]> = [
+        [cx, cy - r * 1.08],
+        [cx + r * 1.08, cy],
+        [cx, cy + r * 1.08],
+        [cx - r * 1.08, cy],
+      ];
+      for (let i = 0; i < 4; i++) {
+        drawLine(rgba, w, h, pts[i]![0], pts[i]![1], pts[(i + 1) % 4]![0], pts[(i + 1) % 4]![1], cAcc, 0.96, Math.max(5, r * 0.09));
+      }
+      for (let i = 0; i < 4; i++) {
+        const p0 = [lerp(cx, pts[i]![0], 0.66), lerp(cy, pts[i]![1], 0.66)] as const;
+        const p1 = [lerp(cx, pts[(i + 1) % 4]![0], 0.66), lerp(cy, pts[(i + 1) % 4]![1], 0.66)] as const;
+        drawLine(rgba, w, h, p0[0], p0[1], p1[0], p1[1], cHi, 0.86, Math.max(3, r * 0.05));
+      }
+      drawDisc(rgba, w, h, cx, cy, r * 0.24, cMid, 0.94, 0.05);
+    } else {
+      // Split modernist emblem
+      drawDisc(rgba, w, h, cx - r * 0.3, cy, r * 0.82, cMid, 0.92, 0.03);
+      drawDisc(rgba, w, h, cx + r * 0.3, cy, r * 0.82, cAcc, 0.84, 0.03);
+      drawDisc(rgba, w, h, cx, cy, r * 0.34, cHi, 0.94, 0.04);
+    }
+    // Crisp clearspace frame rule at bottom
+    const m = Math.round(Math.min(w, h) * 0.14);
+    drawLine(rgba, w, h, m, h - m * 0.85, w - m, h - m * 0.85, cHi, 0.72, 2.5);
+  } else if (gen === 'cover-art') {
+    // Editorial Book / Album / Game Cover Art: layered focal backdrop + contrast scrim + framing
+    const backdropGen: PictureGeneratorKind =
+      Math.abs(seed) % 3 === 0 ? 'landscape-vista' : Math.abs(seed) % 3 === 1 ? 'cosmic-nebula' : 'ocean-seascape';
+    const base = renderPictureToRgba({ ...weights, generator: backdropGen }, w, h);
+    rgba.set(base.rgba);
+    // Atmospheric top & bottom editorial scrims for high-contrast typography readability
+    for (let y = 0; y < h; y++) {
+      const v = y / h;
+      const topScrim = v < 0.28 ? smoothstep(1 - v / 0.28) * 0.58 : 0;
+      const botScrim = v > 0.72 ? smoothstep((v - 0.72) / 0.28) * 0.64 : 0;
+      const sAmt = Math.max(topScrim, botScrim);
+      if (sAmt <= 0) continue;
+      for (let x = 0; x < w; x++) {
+        const idx = (y * w + x) * 4;
+        rgba[idx] = clamp255(lerp(rgba[idx]!, cBg[0], sAmt));
+        rgba[idx + 1] = clamp255(lerp(rgba[idx + 1]!, cBg[1], sAmt));
+        rgba[idx + 2] = clamp255(lerp(rgba[idx + 2]!, cBg[2], sAmt));
+      }
+    }
+    const m = Math.round(Math.min(w, h) * 0.075);
+    // Refined cover border + editorial accent rules
+    drawLine(rgba, w, h, m, m, w - m, m, cHi, 0.75, 2);
+    drawLine(rgba, w, h, m, h - m, w - m, h - m, cAcc, 0.92, 3.5);
+    drawLine(rgba, w, h, m, m, m, h - m, cHi, 0.32, 1.5);
+    drawLine(rgba, w, h, w - m, m, w - m, h - m, cHi, 0.32, 1.5);
+    // Focal crest badge near upper center
+    drawDisc(rgba, w, h, w * 0.5, m + Math.min(w, h) * 0.08, Math.min(w, h) * 0.032, cAcc, 0.94, 0.12);
+    drawDisc(rgba, w, h, w * 0.5, m + Math.min(w, h) * 0.08, Math.min(w, h) * 0.014, cHi, 0.95, 0.1);
   } else if (gen === 'poster-editorial') {
     for (let y = 0; y < h; y++) {
       const col = mixRgb(cHi, cBg, 0.08 + (y / h) * 0.12);
@@ -1005,15 +1185,39 @@ export function encodeRgbaToPngDataUrl(
  */
 export async function renderPictureWithCoherenceCheck(
   weights: PictureWeights,
-  opts?: { readonly maxPreviewDim?: number },
+  opts?: {
+    readonly maxPreviewDim?: number;
+    readonly neuralLayer?: { readonly width: number; readonly height: number; readonly rgba: Uint8ClampedArray } | null;
+  },
 ): Promise<RenderedPictureResult> {
   const maxDim = opts?.maxPreviewDim ?? 640;
   const scale = Math.min(1, maxDim / Math.max(weights.width, weights.height));
   const w = Math.max(160, Math.round(weights.width * scale));
   const h = Math.max(120, Math.round(weights.height * scale));
 
-  let activeWeights = weights;
+  const blendNeuralLayer = (dst: Uint8ClampedArray, dw: number, dh: number) => {
+    const nl = opts?.neuralLayer;
+    if (!nl || nl.width <= 0 || nl.height <= 0 || nl.rgba.length < nl.width * nl.height * 4) return;
+    const blendAlpha = weights.generator === 'logo-mark' ? 0.08 : 0.24;
+    for (let y = 0; y < dh; y++) {
+      const sy = Math.min(nl.height - 1, Math.floor((y / dh) * nl.height));
+      for (let x = 0; x < dw; x++) {
+        const sx = Math.min(nl.width - 1, Math.floor((x / dw) * nl.width));
+        const si = (sy * nl.width + sx) * 4;
+        const di = (y * dw + x) * 4;
+        dst[di] = clamp255(lerp(dst[di]!, nl.rgba[si]!, blendAlpha));
+        dst[di + 1] = clamp255(lerp(dst[di + 1]!, nl.rgba[si + 1]!, blendAlpha));
+        dst[di + 2] = clamp255(lerp(dst[di + 2]!, nl.rgba[si + 2]!, blendAlpha));
+      }
+    }
+  };
+
+  let activeWeights: PictureWeights =
+    weights.generator === 'logo-mark' && !weights.svgMarkup
+      ? { ...weights, svgMarkup: synthesizeLogoSvg(weights) }
+      : weights;
   let rendered = renderPictureToRgba(activeWeights, w, h);
+  blendNeuralLayer(rendered.rgba, rendered.width, rendered.height);
   let coherence = await evaluateRenderedFrameCoherence({
     rgba: rendered.rgba,
     width: rendered.width,
@@ -1025,8 +1229,15 @@ export async function renderPictureWithCoherenceCheck(
       ...activeWeights,
       seed: ((activeWeights.seed * 1664525 + 1013904223) >>> 0) % 990_000 + 1000,
       density: Math.min(100, activeWeights.density + 18),
+      palette: [
+        activeWeights.palette[0],
+        activeWeights.palette[1],
+        activeWeights.palette[2],
+        '#f8fafc',
+      ],
     };
     rendered = renderPictureToRgba(activeWeights, w, h);
+    blendNeuralLayer(rendered.rgba, rendered.width, rendered.height);
     coherence = await evaluateRenderedFrameCoherence({
       rgba: rendered.rgba,
       width: rendered.width,

@@ -16,6 +16,7 @@ import {
   composeMultiTrackArrangement,
   encodeStereoWav,
   encodeStereoWavDataUrl,
+  masterStereoPcm,
   synthesizeCompositionStereoPcm,
 } from './audioSynthesisEngine';
 import type { VerdantCognitiveObserver } from './cognitiveObserver';
@@ -98,12 +99,56 @@ export interface StudioChatBridgeDeps {
     readonly scale: AudioWeights['scale'];
     readonly durationSec: number;
   }) => Promise<{ readonly wavBytes: Uint8Array; readonly durationSec: number }>;
+  readonly synthesizeImageLayer?: (params: {
+    readonly prompt: string;
+    readonly seed: number;
+  }) => Promise<{
+    readonly neuralAvailable: boolean;
+    readonly width: number;
+    readonly height: number;
+    readonly rgba: Uint8ClampedArray | null;
+  }>;
   readonly onOpenPrism?: (prismId: string) => void;
   readonly onOpenGallery?: (mediaType: GalleryMediaType) => void;
 }
 
 function normKey(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+/** Extracts feature keys explicitly stated by the user so iterative tuning preserves user pins. */
+export function extractPinnedFieldsFromPrompt(prompt: string): readonly string[] {
+  const lower = prompt.toLowerCase();
+  const pins = new Set<string>();
+  if (/\b\d{2,3}\s*bpm\b/.test(lower)) pins.add('bpm');
+  if (/\b(pentatonic|major|minor|dorian)\b/.test(lower)) pins.add('scale');
+  if (/\b(golden\s*hour|twilight|midnight|daylight|neon|noir|sunset|sunrise|dark|bright)\b/.test(lower)) {
+    pins.add('lighting');
+  }
+  if (/\b(emerald|amber|crimson|cobalt|sapphire|violet|magenta|monochrome|terracotta|gold|pastel)\b/.test(lower)) {
+    pins.add('palette');
+  }
+  if (/\b(16:9|4:3|1:1|9:16|square|portrait|widescreen)\b/.test(lower)) pins.add('aspect');
+  if (/\b\d{1,2}\s*[x×]\s*\d{1,2}\b/.test(lower)) pins.add('dimensions');
+  return Array.from(pins);
+}
+
+type CompanionFacetRequest = 'cover-art' | 'logo' | 'soundtrack';
+
+function detectRequestedCompanions(prompt: string, primaryMediaType: PrismMediaType): readonly CompanionFacetRequest[] {
+  if (primaryMediaType === 'space') return [];
+  const lower = prompt.toLowerCase();
+  const out: CompanionFacetRequest[] = [];
+  if (primaryMediaType !== 'picture' && /\b(cover\s+art|book\s+cover|album\s+cover|box\s+art)\b/.test(lower)) {
+    out.push('cover-art');
+  }
+  if (primaryMediaType !== 'picture' && /\b(logo|brand\s*mark|emblem)\b/.test(lower)) {
+    out.push('logo');
+  }
+  if (primaryMediaType !== 'audio' && /\b(soundtrack|theme\s+song|background\s+music|ambient\s+music)\b/.test(lower)) {
+    out.push('soundtrack');
+  }
+  return out;
 }
 
 export function findPrismByNameOrId(
@@ -213,8 +258,21 @@ async function materializeInlineArtifact(
   if (!weights) return {};
 
   if (weights.mediaType === 'picture') {
-    const rendered = await renderPictureWithCoherenceCheck(weights as PictureWeights, {
+    const pw = weights as PictureWeights;
+    let neuralLayer: { readonly width: number; readonly height: number; readonly rgba: Uint8ClampedArray } | null = null;
+    if (deps.synthesizeImageLayer) {
+      try {
+        const res = await deps.synthesizeImageLayer({ prompt: pw.caption || proj.draft.name, seed: pw.seed });
+        if (res.neuralAvailable && res.rgba && res.width > 0 && res.height > 0) {
+          neuralLayer = { width: res.width, height: res.height, rgba: res.rgba };
+        }
+      } catch {
+        neuralLayer = null;
+      }
+    }
+    const rendered = await renderPictureWithCoherenceCheck(pw, {
       maxPreviewDim: 640,
+      neuralLayer,
     });
     return {
       previewImageDataUrl: rendered.pngDataUrl,
@@ -254,7 +312,8 @@ async function materializeInlineArtifact(
       scale: aw.scale,
       durationSec: Math.min(10, aw.durationSec),
     });
-    const pcm = synthesizeCompositionStereoPcm(comp, 22_050);
+    const rawPcm = synthesizeCompositionStereoPcm(comp, 22_050);
+    const pcm = masterStereoPcm(rawPcm.left, rawPcm.right, rawPcm.sampleRate);
     const wav = encodeStereoWav(pcm.left, pcm.right, pcm.sampleRate);
     return {
       audioWavDataUrl: encodeStereoWavDataUrl(wav),
@@ -332,8 +391,16 @@ export class StudioChatBridge {
           }
         : mediaType === 'audio'
           ? {
-              ...(affinities.preferredAudioScale ? { scale: affinities.preferredAudioScale } : {}),
-              ...(affinities.preferredAudioBpm ? { bpm: affinities.preferredAudioBpm } : {}),
+              ...(!/\b(pentatonic|major|minor|dorian|lydian|phrygian|mixolydian|dark|nocturnal|melancholy|bright|happy|upbeat|jazz|dreamy)\b/i.test(
+                promptText,
+              ) && affinities.preferredAudioScale
+                ? { scale: affinities.preferredAudioScale }
+                : {}),
+              ...(!/\b\d{2,3}\s*bpm\b|\b(fast|upbeat|energetic|synthwave|pulse|techno|calm|slow|ambient|chill|meditation|sleep|lofi)\b/i.test(
+                promptText,
+              ) && affinities.preferredAudioBpm
+                ? { bpm: affinities.preferredAudioBpm }
+                : {}),
               ...(params.weightOverrides ?? {}),
             }
           : { ...(params.weightOverrides ?? {}) };
@@ -373,7 +440,22 @@ export class StudioChatBridge {
     };
 
     const assembled = assembleProceduralPrismOps(baseDecl, mergedSpec, promptText);
-    await store.applyStudioOp(created.id, { op: 'batch', ops: assembled.ops }, { pushRevision: false });
+    const initialPins = extractPinnedFieldsFromPrompt(promptText);
+    await store.applyStudioOp(
+      created.id,
+      {
+        op: 'batch',
+        ops: [
+          ...assembled.ops,
+          {
+            op: 'set-concept-profile',
+            seedText: promptText,
+            pinnedFields: initialPins,
+          },
+        ],
+      },
+      { pushRevision: false },
+    );
     const published = await store.publish(created.id);
     const activeProj = published ?? store.get(created.id)!;
     this.lastTouchedPrismId = activeProj.id;
@@ -438,6 +520,27 @@ export class StudioChatBridge {
       newlyAcquiredSkill: true,
     });
 
+    // Generate any explicitly requested companion facets coherently from this Prism's features
+    const companionIds: string[] = [];
+    if (!params.weightOverrides?.__isCompanion) {
+      const requestedCompanions = detectRequestedCompanions(promptText, mediaType);
+      for (const cKind of requestedCompanions) {
+        const compRes = await this.generateCompanionFromPrism(activeProj, cKind, {
+          spaceId: resolvedSpaceId,
+        });
+        if (compRes) companionIds.push(compRes.prismId);
+      }
+      if (companionIds.length > 0) {
+        await store.applyStudioOp(
+          activeProj.id,
+          { op: 'set-concept-profile', linkedPrismIds: companionIds },
+          { pushRevision: false },
+        );
+        await store.publish(activeProj.id);
+        this.lastTouchedPrismId = activeProj.id;
+      }
+    }
+
     return {
       __prismInvocation: true,
       action: mediaType === 'space' ? 'space' : 'create',
@@ -450,16 +553,73 @@ export class StudioChatBridge {
       spaceId: resolvedSpaceId,
       spaceName: resolvedSpaceName,
       digest: (activeProj.published ?? activeProj.draft).digest,
-      summary: activeProj.draft.summary || promptText.slice(0, 160),
+      summary:
+        companionIds.length > 0
+          ? `${activeProj.draft.summary || promptText.slice(0, 140)} (+${companionIds.length} companion ${companionIds.length === 1 ? 'asset' : 'assets'} saved to Galleries)`
+          : activeProj.draft.summary || promptText.slice(0, 160),
       ...rendered,
       output: {
         status: 'synthesized',
         mediaType,
         gallery: mediaType === 'space' ? 'Spaces' : GALLERY_LABEL_BY_TYPE[mediaType],
         categories,
+        ...(companionIds.length > 0 ? { linkedPrismIds: companionIds } : {}),
         ...(resolvedSpaceName ? { space: resolvedSpaceName } : {}),
       },
     };
+  }
+
+  /**
+   * Derives a coherent companion Prism (`cover-art`, `logo`, or `soundtrack`) directly from
+   * an existing Prism's features (title, purpose, palette, mood, theme) and links them cleanly.
+   */
+  async generateCompanionFromPrism(
+    parent: VerdantPrismProject,
+    kind: CompanionFacetRequest,
+    opts?: { readonly spaceId?: string },
+  ): Promise<StudioChatArtifactResult> {
+    const parentName = parent.published?.name ?? parent.draft.name;
+    const parentPurpose = parent.declaration?.concept.purpose || parent.draft.summary || parentName;
+    const parentMedia =
+      parent.declaration?.view?.proceduralOrgan?.mediaType ??
+      parent.declaration?.concept.mediaType ??
+      'tool-organ';
+    const parentW = parent.declaration?.view?.proceduralOrgan?.weights as unknown as Record<string, unknown> | undefined;
+    const inheritedPalette = Array.isArray(parentW?.palette) ? parentW.palette : undefined;
+    const inheritedLighting = typeof parentW?.lighting === 'string' ? parentW.lighting : undefined;
+
+    if (kind === 'soundtrack') {
+      const prompt = `Compose a coherent soundtrack for "${parentName}": ${parentPurpose}`;
+      return this.createArtifactFromPrompt({
+        prompt,
+        title: `${parentName} Soundtrack`,
+        forcedMediaType: 'audio',
+        spaceId: opts?.spaceId,
+        weightOverrides: { __isCompanion: true, title: `${parentName} Soundtrack` },
+      });
+    }
+
+    const isLogo = kind === 'logo';
+    const coverFormat =
+      parentMedia === 'written-work' ? 'book' : parentMedia === 'audio' ? 'album' : 'game';
+    const prompt = isLogo
+      ? `Create a geometric logo for "${parentName}": ${parentPurpose}`
+      : `Create ${coverFormat} cover art for "${parentName}": ${parentPurpose}`;
+    return this.createArtifactFromPrompt({
+      prompt,
+      title: isLogo ? `${parentName} Logo` : `${parentName} Cover Art`,
+      forcedMediaType: 'picture',
+      spaceId: opts?.spaceId,
+      weightOverrides: {
+        __isCompanion: true,
+        generator: isLogo ? 'logo-mark' : 'cover-art',
+        caption: parentName,
+        subtitle: parentPurpose.slice(0, 64),
+        ...(isLogo ? {} : { coverFormat }),
+        ...(inheritedPalette ? { palette: inheritedPalette } : {}),
+        ...(inheritedLighting ? { lighting: inheritedLighting } : {}),
+      },
+    });
   }
 
   async refinePrismFromPrompt(params: {
@@ -481,6 +641,30 @@ export class StudioChatBridge {
     const mediaType: PrismMediaType =
       decl.view?.proceduralOrgan?.mediaType ?? decl.concept.mediaType ?? 'tool-organ';
 
+    // Handle feature-derived companion creation ("generate cover art", "generate a logo", "generate a soundtrack")
+    const compMatch = params.instruction.match(
+      /\b(?:generate|create|make|compose|add)\s+(?:a\s+|an\s+)?(cover\s+art|book\s+cover|album\s+cover|logo|brand\s*mark|soundtrack|theme\s+song)\b/i,
+    );
+    if (compMatch) {
+      const token = compMatch[1]!.toLowerCase();
+      const kind: CompanionFacetRequest = /soundtrack|song/.test(token)
+        ? 'soundtrack'
+        : /logo|brand/.test(token)
+          ? 'logo'
+          : 'cover-art';
+      const createdCompanion = await this.generateCompanionFromPrism(proj, kind);
+      const nextLinked = Array.from(
+        new Set([...(decl.concept.linkedPrismIds ?? []), createdCompanion.prismId]),
+      );
+      await store.applyStudioOp(
+        proj.id,
+        { op: 'set-concept-profile', linkedPrismIds: nextLinked },
+        { pushRevision: false },
+      );
+      await store.publish(proj.id);
+      return createdCompanion;
+    }
+
     let rawModelJson = '';
     if (this.deps.runLocalStudioPrompt) {
       try {
@@ -491,26 +675,43 @@ export class StudioChatBridge {
       }
     }
 
-    // Apply deterministic semantic overrides (e.g. "night with stars", "16x16 with 40 mines", "128 BPM")
+    // Apply deterministic semantic overrides while preserving previously user-pinned fields
+    const existingPins = new Set(decl.concept.pinnedFields ?? []);
+    const newPins = extractPinnedFieldsFromPrompt(params.instruction);
+    const mergedPins = Array.from(new Set([...existingPins, ...newPins]));
+
     const curW = decl.view?.proceduralOrgan?.weights as unknown as Record<string, unknown> | undefined;
     let patchWeights: Record<string, unknown> = { ...(curW ?? {}) };
     if (mediaType === 'picture') {
       const inferred = inferPictureWeightsFromPrompt(params.instruction, proj.draft.name);
+      const pinSet = new Set(newPins);
       patchWeights = {
         ...patchWeights,
-        lighting: inferred.lighting,
-        palette: inferred.palette,
+        ...((!existingPins.has('lighting') || pinSet.has('lighting')) ? { lighting: inferred.lighting } : {}),
+        ...((!existingPins.has('palette') || pinSet.has('palette')) ? { palette: inferred.palette } : {}),
         density: inferred.density,
         seed: ((Number(patchWeights.seed || 4219) * 1664525 + 1013904223) >>> 0) % 990_000 + 1000,
-        ...(/\b(landscape|nebula|cosmos|architecture|botanical|ocean|abstract|mosaic|constellation|poster|pixel)\b/i.test(params.instruction)
+        ...(/\b(landscape|nebula|cosmos|architecture|botanical|ocean|abstract|mosaic|constellation|poster|pixel|logo|cover\s+art)\b/i.test(params.instruction)
           ? { generator: inferred.generator }
           : {}),
       };
     } else if (mediaType === 'audio') {
       const bpmMatch = params.instruction.match(/\b(\d{2,3})\s*bpm\b/i);
-      if (bpmMatch) patchWeights.bpm = Number(bpmMatch[1]);
+      if (bpmMatch) {
+        patchWeights.bpm = Number(bpmMatch[1]);
+      } else if (!existingPins.has('bpm')) {
+        if (/\b(faster|energetic|upbeat)\b/i.test(params.instruction)) {
+          patchWeights.bpm = Math.min(170, Number(patchWeights.bpm || 96) + 18);
+        } else if (/\b(slower|calmer|ambient|nocturnal)\b/i.test(params.instruction)) {
+          patchWeights.bpm = Math.max(60, Number(patchWeights.bpm || 96) - 16);
+        }
+      }
       const scMatch = params.instruction.match(/\b(pentatonic|major|minor|dorian)\b/i);
-      if (scMatch) patchWeights.scale = scMatch[1]!.toLowerCase();
+      if (scMatch) {
+        patchWeights.scale = scMatch[1]!.toLowerCase();
+      } else if (!existingPins.has('scale') && /\b(dark|darker|nocturnal|moody|twilight)\b/i.test(params.instruction)) {
+        patchWeights.scale = 'minor';
+      }
     }
 
     const seedJson =
@@ -526,7 +727,17 @@ export class StudioChatBridge {
 
     const { spec } = parseDiscoveryAgentResponse(seedJson, params.instruction, decl, 2, mediaType);
     const assembled = assembleProceduralPrismOps(decl, { ...spec, name: proj.draft.name, readyToBuild: true }, params.instruction);
-    await store.applyStudioOp(proj.id, { op: 'batch', ops: assembled.ops }, { pushRevision: true });
+    await store.applyStudioOp(
+      proj.id,
+      {
+        op: 'batch',
+        ops: [
+          ...assembled.ops,
+          { op: 'set-concept-profile', pinnedFields: mergedPins },
+        ],
+      },
+      { pushRevision: true },
+    );
     pool.evictPrism(proj.id);
     const published = await store.publish(proj.id);
     const updatedProj = published ?? store.get(proj.id)!;

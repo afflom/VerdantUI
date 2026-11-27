@@ -253,6 +253,80 @@ function drawArtwork(canvas) {
       ctx.beginPath(); ctx.arc(pts[i][0], pts[i][1], pts[i][2], 0, Math.PI * 2); ctx.fill();
     }
     ctx.globalAlpha = 1;
+  } else if (generator === 'logo-mark') {
+    ctx.fillStyle = cBg; ctx.fillRect(0, 0, w, h);
+    const cx = w * 0.5, cy = h * 0.45, r = Math.min(w, h) * 0.28, variant = Math.abs(seed) % 5;
+    if (variant === 0) {
+      ctx.strokeStyle = cAcc; ctx.lineWidth = Math.max(5, r * 0.09); ctx.lineJoin = 'round';
+      ctx.beginPath();
+      for (let i = 0; i < 6; i++) {
+        const a = -Math.PI / 2 + (i * Math.PI) / 3, px = cx + Math.cos(a) * r, py = cy + Math.sin(a) * r;
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.closePath(); ctx.fillStyle = cMid; ctx.globalAlpha = 0.34; ctx.fill(); ctx.globalAlpha = 1; ctx.stroke();
+      ctx.fillStyle = cHi; ctx.beginPath(); ctx.arc(cx, cy, r * 0.22, 0, Math.PI * 2); ctx.fill();
+    } else if (variant === 1) {
+      ctx.strokeStyle = cMid; ctx.lineWidth = Math.max(5, r * 0.09);
+      ctx.beginPath(); ctx.arc(cx, cy, r * 0.9, 0, Math.PI * 2); ctx.stroke();
+      for (const ang of [-0.55, 0.55]) {
+        ctx.save(); ctx.translate(cx, cy); ctx.rotate(ang);
+        ctx.strokeStyle = ang < 0 ? cAcc : cHi; ctx.lineWidth = Math.max(4, r * 0.07);
+        ctx.beginPath(); ctx.ellipse(0, 0, r * 1.05, r * 0.44, 0, 0, Math.PI * 2); ctx.stroke();
+        ctx.restore();
+      }
+      ctx.fillStyle = cAcc; ctx.beginPath(); ctx.arc(cx, cy, r * 0.26, 0, Math.PI * 2); ctx.fill();
+    } else if (variant === 2) {
+      ctx.fillStyle = cMid; ctx.globalAlpha = 0.22; ctx.beginPath(); ctx.arc(cx, cy, r * 1.02, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1; ctx.strokeStyle = cAcc; ctx.lineWidth = Math.max(4, r * 0.07); ctx.stroke();
+      ctx.fillStyle = cAcc; ctx.beginPath(); ctx.moveTo(cx, cy - r * 0.85);
+      ctx.bezierCurveTo(cx + r * 0.65, cy - r * 0.4, cx + r * 0.65, cy + r * 0.45, cx, cy + r * 0.85);
+      ctx.bezierCurveTo(cx - r * 0.65, cy + r * 0.45, cx - r * 0.65, cy - r * 0.4, cx, cy - r * 0.85);
+      ctx.fill();
+      ctx.strokeStyle = cBg; ctx.lineWidth = Math.max(4, r * 0.06); ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(cx, cy - r * 0.62); ctx.lineTo(cx, cy + r * 0.72); ctx.stroke();
+    } else if (variant === 3) {
+      ctx.save(); ctx.translate(cx, cy); ctx.rotate(Math.PI / 4);
+      ctx.fillStyle = cMid; ctx.globalAlpha = 0.32; ctx.fillRect(-r * 0.76, -r * 0.76, r * 1.52, r * 1.52);
+      ctx.globalAlpha = 1; ctx.strokeStyle = cAcc; ctx.lineWidth = Math.max(5, r * 0.09);
+      ctx.strokeRect(-r * 0.76, -r * 0.76, r * 1.52, r * 1.52);
+      ctx.strokeStyle = cHi; ctx.lineWidth = Math.max(3, r * 0.05);
+      ctx.strokeRect(-r * 0.5, -r * 0.5, r, r);
+      ctx.restore();
+      ctx.fillStyle = cHi; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.font = '800 ' + Math.round(r * 0.68) + 'px Inter, sans-serif';
+      ctx.fillText((W.caption || 'V').trim().charAt(0).toUpperCase() || 'V', cx, cy + 2);
+    } else {
+      ctx.fillStyle = cMid; ctx.globalAlpha = 0.9; ctx.beginPath(); ctx.arc(cx - r * 0.28, cy, r * 0.78, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = cAcc; ctx.globalAlpha = 0.82; ctx.beginPath(); ctx.arc(cx + r * 0.28, cy, r * 0.78, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 0.94; ctx.fillStyle = cHi; ctx.beginPath(); ctx.arc(cx, cy, r * 0.3, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    ctx.fillStyle = cHi; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+    ctx.font = '700 ' + Math.round(Math.min(w, h) * 0.052) + 'px Inter, sans-serif';
+    ctx.fillText((W.caption || 'VERDANT').toUpperCase().slice(0, 28), cx, h * 0.88);
+  } else if (generator === 'cover-art') {
+    const prevGen = generator;
+    generator = Math.abs(seed) % 3 === 0 ? 'landscape-vista' : Math.abs(seed) % 3 === 1 ? 'cosmic-nebula' : 'ocean-seascape';
+    drawArtwork(canvas);
+    generator = prevGen;
+    const topG = ctx.createLinearGradient(0, 0, 0, h * 0.32);
+    topG.addColorStop(0, cBg); topG.addColorStop(1, 'transparent');
+    ctx.globalAlpha = 0.78; ctx.fillStyle = topG; ctx.fillRect(0, 0, w, h * 0.32);
+    const botG = ctx.createLinearGradient(0, h * 0.68, 0, h);
+    botG.addColorStop(0, 'transparent'); botG.addColorStop(1, cBg);
+    ctx.fillStyle = botG; ctx.fillRect(0, h * 0.68, w, h * 0.32);
+    ctx.globalAlpha = 1;
+    const m = Math.round(Math.min(w, h) * 0.07);
+    ctx.strokeStyle = cHi; ctx.globalAlpha = 0.45; ctx.lineWidth = 1.5; ctx.strokeRect(m, m, w - m * 2, h - m * 2);
+    ctx.globalAlpha = 1; ctx.fillStyle = cAcc; ctx.fillRect(m, h - m - 3, w - m * 2, 4);
+    ctx.fillStyle = cHi; ctx.textAlign = 'center';
+    ctx.font = '700 ' + Math.round(Math.min(w, h) * 0.068) + 'px Georgia, serif';
+    ctx.fillText((W.caption || 'Untitled').slice(0, 28), w * 0.5, m + Math.round(Math.min(w, h) * 0.13));
+    if (W.subtitle) {
+      ctx.globalAlpha = 0.82; ctx.font = '500 ' + Math.round(Math.min(w, h) * 0.028) + 'px Inter, sans-serif';
+      ctx.fillText(W.subtitle.slice(0, 48), w * 0.5, h - m - 22);
+      ctx.globalAlpha = 1;
+    }
   } else if (generator === 'poster-editorial') {
     ctx.fillStyle = cHi; ctx.fillRect(0, 0, w, h);
     const cx = w * 0.5, cy = h * 0.45, rad = Math.min(w, h) * 0.3;
@@ -320,43 +394,48 @@ function drawArtwork(canvas) {
 
 function render() {
   root.innerHTML = '';
-  const bar = document.createElement('div');
-  bar.className = 'organ-row'; bar.style.marginBottom = '10px'; bar.style.justifyContent = 'space-between';
-
-  const left = document.createElement('div'); left.className = 'organ-row';
-  const genBtn = document.createElement('button'); genBtn.className = 'organ-btn primary'; genBtn.textContent = 'New Variation';
-  genBtn.onclick = () => { seed = (seed * 1664525 + 1013904223) % 999999; drawArtwork(canvas); };
-  const sceneSel = document.createElement('select'); sceneSel.className = 'organ-input';
-  for (const [id, lbl] of SCENES) { const o = document.createElement('option'); o.value = id; o.textContent = lbl; if (id === generator) o.selected = true; sceneSel.appendChild(o); }
-  sceneSel.onchange = () => { generator = sceneSel.value; drawArtwork(canvas); };
-  const aspectSel = document.createElement('select'); aspectSel.className = 'organ-input';
-  for (const [lbl, aw, ah] of ASPECTS) { const o = document.createElement('option'); o.value = aw + 'x' + ah; o.textContent = lbl; if (Math.abs(curW / curH - aw / ah) < 0.15) o.selected = true; aspectSel.appendChild(o); }
-  aspectSel.onchange = () => { const [aw, ah] = aspectSel.value.split('x').map(Number); curW = aw; curH = ah; canvas.width = curW * hiDpi; canvas.height = curH * hiDpi; drawArtwork(canvas); };
-  const lightSel = document.createElement('select'); lightSel.className = 'organ-input';
-  for (const [id, lbl] of [['golden-hour','Golden Hour'],['twilight','Twilight'],['midnight','Midnight'],['daylight','Daylight'],['neon','Neon'],['studio','Studio']]) {
-    const o = document.createElement('option'); o.value = id; o.textContent = lbl; if (id === lighting) o.selected = true; lightSel.appendChild(o);
-  }
-  lightSel.onchange = () => { lighting = lightSel.value; drawArtwork(canvas); };
-  const detailBtn = document.createElement('button'); detailBtn.className = 'organ-btn';
-  detailBtn.textContent = density >= 76 ? 'Detail: High' : density <= 38 ? 'Detail: Low' : 'Detail: Med';
-  detailBtn.onclick = () => { density = density >= 76 ? 34 : density <= 38 ? 58 : 84; detailBtn.textContent = density >= 76 ? 'Detail: High' : density <= 38 ? 'Detail: Low' : 'Detail: Med'; drawArtwork(canvas); };
-  const dpiBtn = document.createElement('button'); dpiBtn.className = 'organ-btn'; dpiBtn.textContent = hiDpi === 2 ? '2× HiDPI' : '1× Standard';
-  dpiBtn.onclick = () => { hiDpi = hiDpi === 1 ? 2 : 1; dpiBtn.textContent = hiDpi === 2 ? '2× HiDPI' : '1× Standard'; canvas.width = Math.min(1600, curW * hiDpi); canvas.height = Math.min(1200, curH * hiDpi); drawArtwork(canvas); };
-  left.append(genBtn, sceneSel, aspectSel, lightSel, detailBtn, dpiBtn);
-
-  const right = document.createElement('div'); right.className = 'organ-row';
-  const expPng = document.createElement('button'); expPng.className = 'organ-btn'; expPng.textContent = 'Download PNG';
-  expPng.onclick = () => { const a = document.createElement('a'); a.href = canvas.toDataURL('image/png'); a.download = (W.caption || 'artwork').toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.png'; a.click(); };
-  const expSpec = document.createElement('button'); expSpec.className = 'organ-btn'; expSpec.textContent = 'Export JSON';
-  expSpec.onclick = () => { const dl = window.verdant?.browser?.downloadFile || window.verdant?.downloadFile; dl?.((W.caption || 'artwork').toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.json', JSON.stringify({ ...W, generator, seed, width: curW, height: curH, lighting, density }, null, 2), 'application/json'); };
-  right.append(expPng, expSpec);
-  bar.append(left, right); root.appendChild(bar);
-
   const canvas = document.createElement('canvas');
   canvas.className = 'organ-canvas';
   canvas.width = curW * hiDpi; canvas.height = curH * hiDpi;
   root.appendChild(canvas);
   drawArtwork(canvas);
+
+  const foot = document.createElement('div');
+  foot.className = 'doc-footer';
+  foot.style.marginTop = '12px';
+  const meta = document.createElement('span');
+  meta.textContent = curW + '×' + curH + ' · ' + lighting.replace('-', ' ');
+  const actions = document.createElement('div'); actions.className = 'organ-row';
+  const genBtn = document.createElement('button'); genBtn.className = 'organ-btn ghost'; genBtn.textContent = 'New Variation';
+  genBtn.onclick = () => { seed = (seed * 1664525 + 1013904223) % 999999; drawArtwork(canvas); };
+  const expPng = document.createElement('button'); expPng.className = 'organ-btn primary'; expPng.textContent = 'Download PNG';
+  expPng.onclick = () => { const a = document.createElement('a'); a.href = canvas.toDataURL('image/png'); a.download = (W.caption || 'artwork').toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.png'; a.click(); };
+  actions.append(genBtn, expPng);
+  if (generator === 'logo-mark' && W.svgMarkup) {
+    const expSvg = document.createElement('button'); expSvg.className = 'organ-btn'; expSvg.textContent = 'Download SVG';
+    expSvg.onclick = () => { (window.verdant?.browser?.downloadFile || window.verdant?.downloadFile)?.((W.caption || 'logo').toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.svg', W.svgMarkup, 'image/svg+xml'); };
+    actions.appendChild(expSvg);
+  }
+  foot.append(meta, actions);
+  root.appendChild(foot);
+}
+if (window.verdant?.onInput) {
+  window.verdant.onInput((input) => {
+    const text = (typeof input === 'string' ? input : String((input && (input.prompt || input.text)) || '')).toLowerCase();
+    if (/\\b(variation|remix|regenerate)\\b/.test(text)) seed = (seed * 1664525 + 1013904223) % 999999;
+    if (/\\b(golden|sunset|warm)\\b/.test(text)) lighting = 'golden-hour';
+    else if (/\\b(twilight|dusk|evening)\\b/.test(text)) lighting = 'twilight';
+    else if (/\\b(midnight|night|dark|noir)\\b/.test(text)) lighting = 'midnight';
+    else if (/\\b(daylight|bright|morning)\\b/.test(text)) lighting = 'daylight';
+    else if (/\\b(neon|cyber)\\b/.test(text)) lighting = 'neon';
+    if (/\\b(16:9|widescreen)\\b/.test(text)) { curW = 896; curH = 504; }
+    else if (/\\b(square|1:1)\\b/.test(text)) { curW = 640; curH = 640; }
+    else if (/\\b(portrait|9:16|vertical)\\b/.test(text)) { curW = 512; curH = 768; }
+    if (/\\b(high|rich|more)\\s+detail\\b/.test(text)) density = 84;
+    else if (/\\b(minimal|simple|less\\s+detail)\\b/.test(text)) density = 34;
+    render();
+    return { ok: true, generator, lighting, width: curW, height: curH };
+  });
 }
 render();
 `;
@@ -541,41 +620,73 @@ function exportWav() {
   const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([buf], { type: 'audio/wav' })); a.download = (W.title || 'verdant-audio').toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.wav'; a.click();
 }
 
+function exportMidi() {
+  const ppqn = 480, usPerBeat = Math.round(60000000 / Math.max(45, bpm));
+  const scale = SCALES[scaleName] || SCALES.pentatonic, durSec = Math.min(14, Math.max(4, W.durationSec));
+  const numSteps = Math.floor(durSec / ((60 / bpm) * 0.5)), msgs = [];
+  msgs.push([0, [0xff, 0x51, 0x03, (usPerBeat >>> 16) & 255, (usPerBeat >>> 8) & 255, usPerBeat & 255]]);
+  for (let st = 0; st < numSteps; st++) {
+    const t = st * (ppqn >> 1), chordDeg = PROG[Math.floor(st / 8) % PROG.length];
+    if (tracks.pad && st % 8 === 0) for (const off of [0, 2, 4]) {
+      const n = Math.max(0, Math.min(127, W.rootMidi - 12 + scale[(chordDeg + off) % scale.length]));
+      msgs.push([t, [0x90, n, 64]], [t + ppqn * 3, [0x80, n, 0]]);
+    }
+    if (tracks.lead && (W.style !== 'ambient-pad' || st % 2 === 0)) {
+      const n = Math.max(0, Math.min(127, W.rootMidi + scale[(chordDeg + (st % 5) * 2) % scale.length]));
+      msgs.push([t, [0x91, n, 82]], [t + (ppqn >> 1), [0x81, n, 0]]);
+    }
+  }
+  msgs.sort((a, b) => a[0] - b[0]);
+  const trk = []; let prev = 0;
+  const vlq = (v) => { const s = [v & 127]; v >>>= 7; while (v > 0) { s.push((v & 127) | 128); v >>>= 7; } for (let i = s.length - 1; i >= 0; i--) trk.push(s[i]); };
+  for (const [tk, bs] of msgs) { vlq(Math.max(0, tk - prev)); for (const b of bs) trk.push(b); prev = tk; }
+  trk.push(0, 0xff, 0x2f, 0);
+  const out = new Uint8Array(22 + trk.length), dv = new DataView(out.buffer);
+  out.set([0x4d, 0x54, 0x68, 0x64], 0); dv.setUint32(4, 6, false); dv.setUint16(8, 1, false); dv.setUint16(10, 1, false); dv.setUint16(12, ppqn, false);
+  out.set([0x4d, 0x54, 0x72, 0x6b], 14); dv.setUint32(18, trk.length, false); out.set(trk, 22);
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([out], { type: 'audio/midi' })); a.download = (W.title || 'verdant-audio').toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.mid'; a.click();
+}
+
 function render() {
   root.innerHTML = '';
-  const bar = document.createElement('div'); bar.className = 'organ-row'; bar.style.justifyContent = 'space-between'; bar.style.marginBottom = '10px';
-  const left = document.createElement('div'); left.className = 'organ-row';
-  const playBtn = document.createElement('button'); playBtn.className = 'organ-btn primary'; playBtn.textContent = playing ? 'Stop' : 'Play Stereo';
-  playBtn.onclick = () => (playing ? stopPlay() : startPlay());
-  const tempoBtn = document.createElement('button'); tempoBtn.className = 'organ-btn'; tempoBtn.textContent = bpm + ' BPM';
-  tempoBtn.onclick = () => { bpm = bpm >= 164 ? 68 : bpm + 12; if (playing) { stopPlay(); startPlay(); } else render(); };
-  const scaleSel = document.createElement('select'); scaleSel.className = 'organ-input';
-  for (const sc of ['pentatonic','major','minor','dorian']) { const o = document.createElement('option'); o.value = sc; o.textContent = sc[0].toUpperCase() + sc.slice(1); if (sc === scaleName) o.selected = true; scaleSel.appendChild(o); }
-  scaleSel.onchange = () => { scaleName = scaleSel.value; };
-  left.append(playBtn, tempoBtn, scaleSel);
-  const wavBtn = document.createElement('button'); wavBtn.className = 'organ-btn'; wavBtn.textContent = 'Download Stereo WAV'; wavBtn.onclick = exportWav;
-  bar.append(left, wavBtn); root.appendChild(bar);
-
-  const mixer = document.createElement('div'); mixer.className = 'organ-row'; mixer.style.marginBottom = '10px';
-  for (const [k, lbl] of [['pad','Pad'],['bass','Bass'],['lead','Melody'],['rhythm','Drums']]) {
-    const b = document.createElement('button'); b.className = 'organ-btn' + (tracks[k] ? ' primary' : '');
-    b.textContent = (tracks[k] ? '● ' : '○ ') + lbl;
-    b.onclick = () => { tracks[k] = !tracks[k]; render(); };
-    mixer.appendChild(b);
-  }
-  root.appendChild(mixer);
-
-  canvasEl = document.createElement('canvas'); canvasEl.className = 'organ-canvas'; canvasEl.width = 640; canvasEl.height = 150;
+  canvasEl = document.createElement('canvas'); canvasEl.className = 'organ-canvas'; canvasEl.width = 640; canvasEl.height = 170;
   root.appendChild(canvasEl);
   drawLiveAnalyser();
 
   const seq = document.createElement('div'); seq.style.display = 'grid'; seq.style.gridTemplateColumns = 'repeat(16, 1fr)'; seq.style.gap = '4px'; seq.style.marginTop = '10px';
   for (let i = 0; i < 16; i++) {
     const d = document.createElement('div'); d.id = 'aud-step-' + i;
-    d.style.height = '10px'; d.style.borderRadius = '4px'; d.style.border = '1px solid var(--v-border)'; d.style.background = 'var(--v-surface-alt)';
+    d.style.height = '6px'; d.style.borderRadius = '999px'; d.style.background = 'var(--v-surface-alt)';
     seq.appendChild(d);
   }
   root.appendChild(seq);
+
+  const foot = document.createElement('div'); foot.className = 'doc-footer'; foot.style.marginTop = '14px';
+  const left = document.createElement('div'); left.className = 'organ-row';
+  const playBtn = document.createElement('button'); playBtn.className = 'organ-btn primary'; playBtn.textContent = playing ? 'Stop' : 'Play Stereo';
+  playBtn.onclick = () => (playing ? stopPlay() : startPlay());
+  const meta = document.createElement('span'); meta.textContent = bpm + ' BPM · ' + scaleName[0].toUpperCase() + scaleName.slice(1);
+  left.append(playBtn, meta);
+  const right = document.createElement('div'); right.className = 'organ-row';
+  const wavBtn = document.createElement('button'); wavBtn.className = 'organ-btn'; wavBtn.textContent = 'Download Stereo WAV'; wavBtn.onclick = exportWav;
+  const midBtn = document.createElement('button'); midBtn.className = 'organ-btn ghost'; midBtn.textContent = 'MIDI'; midBtn.onclick = exportMidi;
+  right.append(wavBtn, midBtn);
+  foot.append(left, right); root.appendChild(foot);
+}
+if (window.verdant?.onInput) {
+  window.verdant.onInput((input) => {
+    const text = (typeof input === 'string' ? input : String((input && (input.prompt || input.text)) || '')).toLowerCase();
+    const bm = text.match(/\\b(\\d{2,3})\\s*bpm\\b/);
+    if (bm) bpm = Math.max(45, Math.min(200, Number(bm[1])));
+    else if (/\\b(faster|upbeat|energetic)\\b/.test(text)) bpm = Math.min(170, bpm + 16);
+    else if (/\\b(slower|calmer|ambient)\\b/.test(text)) bpm = Math.max(60, bpm - 14);
+    for (const sc of ['pentatonic','major','minor','dorian']) if (text.includes(sc)) scaleName = sc;
+    if (/\\b(drum|beat|rhythm|percussion)\\b/.test(text)) tracks.rhythm = !/\\b(no|remove|without)\\s+(drum|beat|rhythm)/.test(text);
+    if (/\\bplay\\b/.test(text) && !playing) startPlay();
+    else if (/\\bstop|pause\\b/.test(text) && playing) stopPlay();
+    else render();
+    return { ok: true, bpm, scale: scaleName };
+  });
 }
 render();
 `;
@@ -593,58 +704,41 @@ let recorder = null, recChunks = [], recording = false, recTimer = null;
 
 function renderChrome() {
   root.innerHTML = '';
-  const bar = document.createElement('div'); bar.className = 'organ-row'; bar.style.marginBottom = '10px'; bar.style.justifyContent = 'space-between';
-  const left = document.createElement('div'); left.className = 'organ-row';
-  const playBtn = document.createElement('button'); playBtn.className = 'organ-btn primary'; playBtn.textContent = playing ? 'Pause' : 'Play';
-  playBtn.onclick = () => { playing = !playing; playBtn.textContent = playing ? 'Pause' : 'Play'; };
-  const timeEl = document.createElement('span'); timeEl.id = 'vid-time'; timeEl.className = 'organ-pill'; timeEl.textContent = tSec.toFixed(1) + 's / ' + getTotalDur() + 's';
-  left.append(playBtn, timeEl);
-
-  const right = document.createElement('div'); right.className = 'organ-row';
-  const recBtn = document.createElement('button'); recBtn.id = 'vid-rec'; recBtn.className = 'organ-btn' + (recording ? ' primary' : '');
-  recBtn.textContent = recording ? 'Stop Recording…' : 'Record WebM (with Audio)';
-  const snapBtn = document.createElement('button'); snapBtn.className = 'organ-btn'; snapBtn.textContent = 'Save Frame PNG';
-  right.append(recBtn, snapBtn); bar.append(left, right); root.appendChild(bar);
-
   const canvas = document.createElement('canvas'); canvas.id = 'vid-canvas';
   canvas.className = 'organ-canvas'; canvas.width = dims[0]; canvas.height = dims[1];
   root.appendChild(canvas);
 
-  // Interactive timeline scrubber
   const scrub = document.createElement('input'); scrub.id = 'vid-scrub'; scrub.type = 'range';
   scrub.min = '0'; scrub.max = String(getTotalDur()); scrub.step = '0.05'; scrub.value = String(tSec);
-  scrub.style.width = '100%'; scrub.style.margin = '10px 0';
+  scrub.style.width = '100%'; scrub.style.margin = '12px 0 6px';
   scrub.oninput = () => { tSec = Number(scrub.value); drawFrame(tSec); };
   root.appendChild(scrub);
 
-  // Scene markers & inline editor
-  const sceneRow = document.createElement('div'); sceneRow.className = 'organ-row'; sceneRow.style.marginBottom = '10px';
+  const sceneRow = document.createElement('div'); sceneRow.className = 'doc-chapters'; sceneRow.style.marginBottom = '4px';
   let accStart = 0;
   scenes.forEach((sc, idx) => {
     const startAt = accStart; accStart += sc.durationSec;
-    const chip = document.createElement('button'); chip.className = 'organ-btn' + (idx === selectedIdx ? ' primary' : '');
-    chip.textContent = (idx + 1) + '. ' + sc.title + ' (' + sc.durationSec + 's)';
+    const chip = document.createElement('button'); chip.type = 'button';
+    chip.className = 'doc-ch-pill' + (idx === selectedIdx ? ' active' : '');
+    chip.textContent = (idx + 1) + '. ' + sc.title;
     chip.onclick = () => { selectedIdx = idx; tSec = startAt + 0.05; renderChrome(); };
     sceneRow.appendChild(chip);
   });
-  const addSceneBtn = document.createElement('button'); addSceneBtn.className = 'organ-btn'; addSceneBtn.textContent = '+ Scene';
-  addSceneBtn.onclick = () => {
-    scenes.push({ title: 'Scene ' + (scenes.length + 1), subtitle: 'New motion beat', durationSec: 4, motion: 'rise', accent: '#10b981' });
-    selectedIdx = scenes.length - 1; renderChrome();
-  };
-  sceneRow.appendChild(addSceneBtn);
   root.appendChild(sceneRow);
 
-  const curSc = scenes[selectedIdx] || scenes[0];
-  const ed = document.createElement('div'); ed.className = 'organ-row';
-  const tIn = document.createElement('input'); tIn.className = 'organ-input'; tIn.style.flex = '1'; tIn.value = curSc.title; tIn.placeholder = 'Scene title';
-  tIn.oninput = () => { curSc.title = tIn.value; };
-  const sIn = document.createElement('input'); sIn.className = 'organ-input'; sIn.style.flex = '1'; sIn.value = curSc.subtitle; sIn.placeholder = 'Scene subtitle';
-  sIn.oninput = () => { curSc.subtitle = sIn.value; };
-  const motSel = document.createElement('select'); motSel.className = 'organ-input';
-  for (const m of ['rise','pan','pulse','orbit']) { const o = document.createElement('option'); o.value = m; o.textContent = 'Motion: ' + m; if (curSc.motion === m) o.selected = true; motSel.appendChild(o); }
-  motSel.onchange = () => { curSc.motion = motSel.value; };
-  ed.append(tIn, sIn, motSel); root.appendChild(ed);
+  const foot = document.createElement('div'); foot.className = 'doc-footer'; foot.style.marginTop = '10px';
+  const left = document.createElement('div'); left.className = 'organ-row';
+  const playBtn = document.createElement('button'); playBtn.className = 'organ-btn primary'; playBtn.textContent = playing ? 'Pause' : 'Play';
+  playBtn.onclick = () => { playing = !playing; playBtn.textContent = playing ? 'Pause' : 'Play'; };
+  const timeEl = document.createElement('span'); timeEl.id = 'vid-time'; timeEl.textContent = tSec.toFixed(1) + 's / ' + getTotalDur() + 's';
+  left.append(playBtn, timeEl);
+
+  const right = document.createElement('div'); right.className = 'organ-row';
+  const snapBtn = document.createElement('button'); snapBtn.className = 'organ-btn ghost'; snapBtn.textContent = 'Save Frame PNG';
+  const recBtn = document.createElement('button'); recBtn.id = 'vid-rec'; recBtn.className = 'organ-btn' + (recording ? ' primary' : '');
+  recBtn.textContent = recording ? 'Stop Recording…' : 'Record WebM';
+  right.append(snapBtn, recBtn);
+  foot.append(left, right); root.appendChild(foot);
 
   snapBtn.onclick = () => { const a = document.createElement('a'); a.href = canvas.toDataURL('image/png'); a.download = 'verdant-frame.png'; a.click(); };
   recBtn.onclick = () => toggleRecord(canvas, recBtn);
@@ -654,7 +748,7 @@ function stopRecording(recBtn) {
   if (recTimer) { clearTimeout(recTimer); recTimer = null; }
   if (recorder && recorder.state !== 'inactive') { try { recorder.stop(); } catch (_) {} }
   recording = false;
-  if (recBtn) { recBtn.textContent = 'Record WebM (with Audio)'; recBtn.className = 'organ-btn'; }
+  if (recBtn) { recBtn.textContent = 'Record WebM'; recBtn.className = 'organ-btn'; }
 }
 
 function toggleRecord(canvas, recBtn) {
@@ -663,14 +757,28 @@ function toggleRecord(canvas, recBtn) {
   try {
     const vStream = canvas.captureStream(Math.max(15, Math.min(60, W.fps || 30)));
     const tracks = [...vStream.getVideoTracks()];
-    // Attach synchronized soft ambient soundtrack into MediaRecorder mux
+    // Synthesize a coherent harmonic modal chord & melody progression into MediaRecorder mux
     try {
       const AC = window.AudioContext || window.webkitAudioContext;
       if (AC) {
-        const ac = new AC(), dest = ac.createMediaStreamDestination(), osc = ac.createOscillator(), g = ac.createGain();
-        osc.type = 'sine'; osc.frequency.value = 220; g.gain.value = 0.04;
-        osc.connect(g); g.connect(dest); osc.start();
-        setTimeout(() => { try { osc.stop(); void ac.close(); } catch (_) {} }, Math.round(getTotalDur() * 1000) + 250);
+        const ac = new AC(), dest = ac.createMediaStreamDestination(), filter = ac.createBiquadFilter();
+        filter.type = 'lowpass'; filter.frequency.value = 2600; filter.connect(dest);
+        const totalDur = getTotalDur(), notes = [261.63, 293.66, 329.63, 392.0, 440.0, 523.25];
+        const t0 = ac.currentTime;
+        for (let step = 0; step < Math.ceil(totalDur * 2); step++) {
+          const at = t0 + step * 0.5, hz = notes[(step * 2 + Math.floor(step / 4)) % notes.length];
+          const osc = ac.createOscillator(), g = ac.createGain();
+          osc.type = 'sine'; osc.frequency.setValueAtTime(hz, at);
+          g.gain.setValueAtTime(0.0008, at); g.gain.exponentialRampToValueAtTime(0.045, at + 0.04); g.gain.exponentialRampToValueAtTime(0.0006, at + 0.48);
+          osc.connect(g); g.connect(filter); osc.start(at); osc.stop(at + 0.5);
+          if (step % 4 === 0) {
+            const pad = ac.createOscillator(), pg = ac.createGain();
+            pad.type = 'triangle'; pad.frequency.setValueAtTime(hz * 0.5, at);
+            pg.gain.setValueAtTime(0.0008, at); pg.gain.exponentialRampToValueAtTime(0.03, at + 0.2); pg.gain.exponentialRampToValueAtTime(0.0006, at + 1.9);
+            pad.connect(pg); pg.connect(filter); pad.start(at); pad.stop(at + 2.0);
+          }
+        }
+        setTimeout(() => { try { void ac.close(); } catch (_) {} }, Math.round(totalDur * 1000) + 350);
         tracks.push(...dest.stream.getAudioTracks());
       }
     } catch (_) {}

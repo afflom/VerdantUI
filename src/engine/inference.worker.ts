@@ -4,8 +4,15 @@ import { computeLogMelSpectrogram } from './audioFrontend';
 import {
   composeMultiTrackArrangement,
   encodeStereoWav,
+  masterStereoPcm,
   synthesizeCompositionStereoPcm,
 } from './audioSynthesisEngine';
+import {
+  synthesizeImageOneStep,
+  type ClipTextWeights,
+  type DistilledUnetWeights,
+  type TaesdDecoderWeights,
+} from './imageSynthesisEngine';
 import {
   LlamaVTensorRuntime,
   type LoadedModelSummary,
@@ -152,6 +159,14 @@ export type WorkerRequest =
       durationSec: number;
     }
   | {
+      type: 'synthesize_image';
+      requestId: string;
+      prompt: string;
+      seed: number;
+      latentH?: number;
+      latentW?: number;
+    }
+  | {
       type: 'shutdown';
     };
 
@@ -227,6 +242,15 @@ export type WorkerResponse =
       multimodalTelemetry: MultimodalCoherenceTelemetry;
     }
   | {
+      type: 'image_synthesized';
+      requestId: string;
+      neuralAvailable: boolean;
+      width: number;
+      height: number;
+      rgbaBuffer: ArrayBuffer | null;
+      multimodalTelemetry: MultimodalCoherenceTelemetry;
+    }
+  | {
       type: 'opfs_storage';
       requestId: string;
       storage: OpfsQuotaSnapshot;
@@ -263,6 +287,15 @@ const runtime = new LlamaVTensorRuntime();
 const multimodalCoordinator = new MultimodalCoherenceCoordinator();
 let activeVisionEncoder: SiglipVisionEncoder | null = null;
 let activeWhisperEngine: WhisperAudioEngine | null = null;
+interface ResidentNeuralImageWeights {
+  readonly clip: ClipTextWeights;
+  readonly unet: DistilledUnetWeights;
+  readonly taesd: TaesdDecoderWeights;
+}
+let residentNeuralImageWeights: ResidentNeuralImageWeights | null = null;
+function getResidentNeuralImageWeights(): ResidentNeuralImageWeights | null {
+  return residentNeuralImageWeights;
+}
 let visionLoadPromise: Promise<SiglipVisionEncoder | null> | null = null;
 let whisperLoadPromise: Promise<WhisperAudioEngine | null> | null = null;
 const threadPoolReadyPromise = runtime.initThreadPool().catch(() => undefined);
@@ -960,7 +993,8 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         scale: req.scale,
         durationSec: req.durationSec,
       });
-      const pcm = synthesizeCompositionStereoPcm(comp, 22_050);
+      const rawPcm = synthesizeCompositionStereoPcm(comp, 22_050);
+      const pcm = masterStereoPcm(rawPcm.left, rawPcm.right, rawPcm.sampleRate);
       const wav = encodeStereoWav(pcm.left, pcm.right, pcm.sampleRate);
       multimodalCoordinator.activateModality({
         modality: 'audio',
@@ -978,6 +1012,50 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           wavBuffer: transferBuf,
           sampleRate: pcm.sampleRate,
           durationSec: comp.durationSec,
+          multimodalTelemetry: multimodalCoordinator.getTelemetry(),
+        } satisfies WorkerResponse,
+        [transferBuf],
+      );
+      return;
+    }
+
+    if (req.type === 'synthesize_image') {
+      const neuralWeights = getResidentNeuralImageWeights();
+      if (!neuralWeights) {
+        post({
+          type: 'image_synthesized',
+          requestId: req.requestId,
+          neuralAvailable: false,
+          width: 0,
+          height: 0,
+          rgbaBuffer: null,
+          multimodalTelemetry: multimodalCoordinator.getTelemetry(),
+        });
+        return;
+      }
+      const promptTokens = Array.from(new TextEncoder().encode(req.prompt.slice(0, 77))).map(
+        (b) => b % Math.max(1, neuralWeights.clip.vocabSize),
+      );
+      const synth = synthesizeImageOneStep({
+        promptTokens,
+        latentH: Math.max(4, Math.min(32, req.latentH ?? 8)),
+        latentW: Math.max(4, Math.min(32, req.latentW ?? 8)),
+        seed: req.seed,
+        clip: neuralWeights.clip,
+        unet: neuralWeights.unet,
+        taesd: neuralWeights.taesd,
+      });
+      const copy = new Uint8Array(synth.rgba.byteLength);
+      copy.set(synth.rgba);
+      const transferBuf = copy.buffer;
+      workerScope.postMessage(
+        {
+          type: 'image_synthesized',
+          requestId: req.requestId,
+          neuralAvailable: true,
+          width: synth.width,
+          height: synth.height,
+          rgbaBuffer: transferBuf,
           multimodalTelemetry: multimodalCoordinator.getTelemetry(),
         } satisfies WorkerResponse,
         [transferBuf],

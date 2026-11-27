@@ -109,8 +109,12 @@ export interface DiscoveryParseResult {
   readonly usedFallback: boolean;
 }
 
+const EXPLICIT_LOGO_OR_COVER_RE =
+  /\b(logo|brand\s*mark|emblem|monogram|wordmark|app\s+icon|crest|cover\s+art|book\s+cover|album\s+cover|album\s+art|box\s+art|game\s+cover|magazine\s+cover)\b/i;
+const COMPANION_WITH_ART_RE =
+  /\b(?:with|plus|including|and)\s+(?:a\s+|an\s+|its\s+own\s+)?(?:logo|brand\s*mark|cover\s+art|book\s+cover|album\s+cover|soundtrack)\b/i;
 const PICTURE_RE =
-  /\b(picture|image|artwork|poster|illustration|painting|portrait|wallpaper|fractal|mosaic|constellation|sprite|drawing|visual\s+art|svg\s+art|landscape|nebula|seascape|sunset|sunrise|scenery)\b/i;
+  /\b(picture|image|artwork|logo|brand\s*mark|emblem|monogram|cover\s+art|book\s+cover|album\s+cover|album\s+art|poster|illustration|painting|portrait|wallpaper|fractal|mosaic|constellation|sprite|drawing|visual\s+art|svg\s+art|landscape|nebula|seascape|sunset|sunrise|scenery)\b/i;
 const SPACE_RE =
   /\b(create\s+(?:a\s+)?(?:new\s+)?space|new\s+space|space\s+called|space\s+named|curated\s+space|project\s+space)\b/i;
 const AUDIO_RE =
@@ -150,6 +154,16 @@ export function classifyArtifactMediaType(sentence: string): ArtifactMediaClassi
       activeOrgans: deriveActiveStudioOrgans('space'),
       mode: 'procedural-organ',
       reason: 'Creates a Verdant Space Prism organizing curated content with a live custom view.',
+    };
+  }
+  // Explicit single-artifact Logo or Cover Art requests take precedence over "book"/"album"/"game" nouns
+  // unless phrased as a companion ("build a game WITH cover art").
+  if (EXPLICIT_LOGO_OR_COVER_RE.test(trimmed) && !COMPANION_WITH_ART_RE.test(trimmed)) {
+    return {
+      mediaType: 'picture',
+      activeOrgans: deriveActiveStudioOrgans('picture'),
+      mode: 'procedural-organ',
+      reason: 'Activates Visual Canvas and Palette organs for procedural logo or cover art synthesis.',
     };
   }
   if (GAME_RE.test(trimmed)) {

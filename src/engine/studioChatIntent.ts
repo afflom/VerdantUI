@@ -137,27 +137,46 @@ export function detectStudioChatIntent(
     };
   }
 
+  // 5b. Companion media generation from an existing Prism ("Generate cover art for this", "Make a soundtrack for my game")
+  const companionMatch = trimmed.match(
+    /^(?:please\s+)?(?:generate|create|make|compose|design)\s+(?:a\s+|an\s+)?(cover\s+art|book\s+cover|album\s+cover|logo|brand\s*mark|soundtrack|theme\s+song)\s+for\s+(?:(this(?:\s+\w+)?|that(?:\s+\w+)?|it|the\s+(?:last|latest)\s+\w+)|(?:my|the)\s+["'“]?([^"'”?!.]{2,56})["'”]?)[?.!]*$/i,
+  );
+  if (companionMatch) {
+    const kind = companionMatch[1]!.trim();
+    const target = companionMatch[2] ? 'latest' : (companionMatch[3] ?? 'latest').trim();
+    return {
+      toolName: 'studio_refine_prism',
+      args: { target, instruction: `generate ${kind}` },
+      confidenceQ10: 960,
+      reason: `Generate ${kind} from Prism "${target}" features.`,
+    };
+  }
+
   // 6. Direct natural-language multimedia creation via Verdant Studio
   const isCreationVerb =
     /^(?:please\s+)?(?:generate|create|make|draw|paint|render|design|compose|build|produce|synthesize|craft|write)\b/i.test(
       trimmed,
     );
-  if (!isCreationVerb) return null;
+  const isDirectMediaSeed =
+    /^(?:a\s+|an\s+)?(?:logo|brand\s*mark|emblem|cover\s+art|(?:book|album|game)\s+cover(?:\s+art)?|album\s+art|soundtrack|theme\s+song|video\s+reel|storyboard|poster|wallpaper|painting|illustration)\s+(?:for|of|with|in|about)\b/i.test(
+      trimmed,
+    );
+  if (!isCreationVerb && !isDirectMediaSeed) return null;
 
   const explicitMedia =
-    /\b(picture|image|artwork|painting|illustration|poster|wallpaper|portrait|landscape|nebula|seascape|pixel\s+art|mosaic|constellation|audio|music|song|soundtrack|soundscape|beat|lo-?fi|melody|synth|sound\s+effects?|video|animation|motion\s+graphic|storyboard|reel|trailer|game|minesweeper|breakout|pong|snake|2048|memory\s+match|lights?\s+out|connect\s*4|tic[\s-]?tac[\s-]?toe|gomoku|game\s+of\s+life|rule\s*30|novel|short\s+story|manuscript|chapter|research\s+program|study\s+plan|habit\s+tracker|habit\s+guardian|schedule\s+guard|workflow\s+checklist|calculator\s+app)\b/i.test(
+    /\b(picture|image|artwork|logo|brand\s*mark|emblem|cover\s+art|book\s+cover|album\s+cover|album\s+art|game\s+cover|painting|illustration|poster|wallpaper|portrait|landscape|nebula|seascape|pixel\s+art|mosaic|constellation|audio|music|song|soundtrack|soundscape|beat|lo-?fi|melody|synth|sound\s+effects?|video|animation|motion\s+graphic|storyboard|reel|trailer|game|minesweeper|breakout|pong|snake|2048|memory\s+match|lights?\s+out|connect\s*4|tic[\s-]?tac[\s-]?toe|gomoku|game\s+of\s+life|rule\s*30|novel|book|short\s+story|essay|manuscript|chapter|research\s+program|study\s+plan|habit\s+tracker|habit\s+guardian|schedule\s+guard|workflow\s+checklist|calculator\s+app)\b/i.test(
       trimmed,
     );
 
   if (
     /^write\b/i.test(trimmed) &&
-    !/\b(novel|book|short\s+story|manuscript|chapters?|screenplay|research\s+program)\b/i.test(trimmed)
+    !/\b(novel|book|short\s+story|essay|manuscript|chapters?|screenplay|research\s+program)\b/i.test(trimmed)
   ) {
     return null;
   }
 
   if (explicitMedia) {
-    const forSpace = trimmed.match(/\b(?:for|in|into)\s+(?:(?:my|the)\s+)?["'“]?([A-Z][a-zA-Z0-9\s-]{1,36})["'”]?(?:\s+space)?$/);
+    const forSpace = trimmed.match(/\b(?:in|into)\s+(?:(?:my|the)\s+)?["'“]?([A-Z][a-zA-Z0-9\s-]{1,36})["'”]?\s+space[?.!]*$/i);
     const spaceName = forSpace?.[1]?.trim();
     return {
       toolName: 'studio_create_artifact',
