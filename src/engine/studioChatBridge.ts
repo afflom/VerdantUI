@@ -51,7 +51,19 @@ import {
   inferPictureWeightsFromPrompt,
   renderPictureWithCoherenceCheck,
 } from './proceduralPictureRenderer';
-import type { UnifiedExpertRegistry } from './unifiedModelBasis';
+import {
+  contextualizePromptToUnifiedWeights,
+  VERDANT_LOD_LADDER,
+} from './prismReconciliationLoop';
+import type {
+  SemanticRevisionRecord,
+  UnifiedExpertRegistry,
+} from './unifiedModelBasis';
+import type { PrismLodRank } from './verdantStudioApi';
+import type {
+  SemanticVisualQaReport,
+  SemanticVisualQaTarget,
+} from './visionCritiqueLoop';
 export { detectStudioChatIntent, type DetectedStudioChatIntent } from './studioChatIntent';
 
 export interface StudioChatArtifactResult {
@@ -91,7 +103,12 @@ export interface StudioChatBridgeDeps {
   readonly observer: VerdantCognitiveObserver;
   readonly galleries: ContentGalleryStore;
   readonly registry: UnifiedExpertRegistry;
-  readonly runLocalStudioPrompt?: (systemPrompt: string, userPrompt: string, maxTokens: number) => Promise<string>;
+  readonly runLocalStudioPrompt?: (
+    systemPrompt: string,
+    userPrompt: string,
+    maxTokens: number,
+    partId?: string,
+  ) => Promise<string>;
   readonly synthesizeAudioWav?: (params: {
     readonly title: string;
     readonly style: AudioWeights['style'];
@@ -103,12 +120,29 @@ export interface StudioChatBridgeDeps {
   readonly synthesizeImageLayer?: (params: {
     readonly prompt: string;
     readonly seed: number;
+    readonly latentH?: number;
+    readonly latentW?: number;
   }) => Promise<{
     readonly neuralAvailable: boolean;
     readonly width: number;
     readonly height: number;
     readonly rgba: Uint8ClampedArray | null;
   }>;
+  readonly evaluateVisualQa?: (params: {
+    readonly width: number;
+    readonly height: number;
+    readonly rgba: Uint8Array | Uint8ClampedArray;
+    readonly target: SemanticVisualQaTarget;
+    readonly minAcceptScoreQ10?: number;
+  }) => Promise<SemanticVisualQaReport>;
+  readonly runWithDeterministicPrecision?: <T>(fn: () => Promise<T>) => Promise<T>;
+  readonly scheduleProgressiveReconciliation?: (job: {
+    readonly prismId: string;
+    readonly prompt: string;
+    readonly initialRevision: SemanticRevisionRecord;
+    readonly startRank?: PrismLodRank;
+    readonly maxRank?: PrismLodRank;
+  }) => void;
   readonly onOpenPrism?: (prismId: string) => void;
   readonly onOpenGallery?: (mediaType: GalleryMediaType) => void;
 }
@@ -387,11 +421,28 @@ export class StudioChatBridge {
     const baseDecl = created.declaration!;
     const affinities = registry.basis.getStyleAffinities();
 
-    // Seed picture weights using semantic prompt inference + learned living basis affinities
+    // Stage 1: Contextualize prompt into cross-modal Unified Semantic Associator (delta_rule.rs)
+    // so adjacent modalities ("a dog" -> "make a video of that dog") share the same semantic anchor.
+    const { revision: semanticRev, inheritedAnchor } = await contextualizePromptToUnifiedWeights({
+      prompt: promptText,
+      mediaType,
+      prismId: created.id,
+      activePrismId: this.lastTouchedPrismId ?? undefined,
+      deps: {
+        registry,
+        runLocalLanguagePrompt: this.deps.runLocalStudioPrompt
+          ? (sys, usr, maxTok) => this.deps.runLocalStudioPrompt!(sys, usr, maxTok, created.id)
+          : undefined,
+      },
+    });
+
+    // Seed picture weights using semantic prompt inference + associated cross-modal anchor + learned basis affinities
     const baseWeightsSeed: Record<string, unknown> =
       mediaType === 'picture'
         ? {
             ...inferPictureWeightsFromPrompt(promptText, title, affinities),
+            ...(inheritedAnchor && semanticRev.palette ? { palette: semanticRev.palette } : {}),
+            ...(inheritedAnchor && semanticRev.lighting ? { lighting: semanticRev.lighting } : {}),
             ...(params.weightOverrides ?? {}),
           }
         : mediaType === 'audio'
@@ -408,7 +459,14 @@ export class StudioChatBridge {
                 : {}),
               ...(params.weightOverrides ?? {}),
             }
-          : { ...(params.weightOverrides ?? {}) };
+          : mediaType === 'video'
+            ? {
+                ...(inheritedAnchor && semanticRev.palette
+                  ? { palette: [semanticRev.palette[0], semanticRev.palette[1], semanticRev.palette[2]] }
+                  : {}),
+                ...(params.weightOverrides ?? {}),
+              }
+            : { ...(params.weightOverrides ?? {}) };
 
     // Engage on-device LLM weight router when Local AI is active for richer custom specs
     let rawModelJson = '';
@@ -420,7 +478,7 @@ export class StudioChatBridge {
           2,
           mediaType,
         );
-        rawModelJson = await this.deps.runLocalStudioPrompt(sysPrompt, promptText, 512);
+        rawModelJson = await this.deps.runLocalStudioPrompt(sysPrompt, promptText, 512, created.id);
       } catch {
         rawModelJson = '';
       }
@@ -430,7 +488,7 @@ export class StudioChatBridge {
       rawModelJson ||
       JSON.stringify({
         name: title,
-        purpose: promptText.slice(0, 220),
+        purpose: semanticRev.contextualBrief || promptText.slice(0, 220),
         mediaType,
         readyToBuild: true,
         weights: { mediaType, ...baseWeightsSeed },
@@ -446,6 +504,7 @@ export class StudioChatBridge {
 
     const assembled = assembleProceduralPrismOps(baseDecl, mergedSpec, promptText);
     const initialPins = extractPinnedFieldsFromPrompt(promptText);
+    const initialLod = VERDANT_LOD_LADDER[0];
     await store.applyStudioOp(
       created.id,
       {
@@ -456,6 +515,17 @@ export class StudioChatBridge {
             op: 'set-concept-profile',
             seedText: promptText,
             pinnedFields: initialPins,
+            semanticConceptId: semanticRev.conceptId,
+            semanticKappa: semanticRev.kappa,
+            semanticVersion: semanticRev.version,
+            lodState: {
+              rank: initialLod.rank,
+              label: initialLod.label,
+              qaScoreQ10: 760,
+              qaPasses: 0,
+              qaSummary: initialLod.userStatusLabel,
+              updatedAt: Date.now(),
+            },
           },
         ],
       },
@@ -544,6 +614,17 @@ export class StudioChatBridge {
         await store.publish(activeProj.id);
         this.lastTouchedPrismId = activeProj.id;
       }
+    }
+
+    // Schedule non-interruptible background Lod1 -> Lod3 progressive QA reconciliation inside VerdantRootPrismRuntime
+    if (mediaType !== 'space' && this.deps.scheduleProgressiveReconciliation) {
+      this.deps.scheduleProgressiveReconciliation({
+        prismId: activeProj.id,
+        prompt: promptText,
+        initialRevision: semanticRev,
+        startRank: 1,
+        maxRank: 3,
+      });
     }
 
     return {

@@ -24,6 +24,60 @@ import {
 import { prismContentDigest } from './prismKernel';
 import type { PrismMediaType } from './prismMediaOrgans';
 import type { VerdantPrismProject } from './prismStudio';
+import { verdantGatedDeltaStepF32 } from './verdantKernels';
+
+export const SEMANTIC_ASSOC_DIM = 32 as const;
+const MAX_SEMANTIC_CONCEPTS = 64;
+
+/**
+ * Immutable parent-linked semantic revision (`observer_streams.rs::ModelRevisionRecord` parity)
+ * binding a concept (e.g. "dog") associatively across Language, Image, Vision QA, Audio, Video,
+ * and every Gallery MediaType inside the unified VerdantUI model.
+ */
+export interface SemanticRevisionRecord {
+  readonly conceptId: string;
+  readonly version: number;
+  readonly kappa: string;
+  readonly parentKappa: string | null;
+  readonly canonicalSubject: string;
+  readonly contextualBrief: string;
+  readonly attributes: readonly string[];
+  readonly composition: string;
+  readonly lighting: string;
+  readonly palette: readonly [string, string, string, string];
+  readonly motionCues: readonly string[];
+  readonly acousticCues: readonly string[];
+  readonly facetsQ10: CognitiveVector;
+  /** Compact `SEMANTIC_ASSOC_DIM`-dimensional normalized semantic vector for Gated Delta Rule. */
+  readonly semanticVector: readonly number[];
+  readonly clipSignatureDigest?: string;
+  readonly visionTargetKappa?: string;
+  readonly linkedPrismIds: readonly string[];
+  readonly residualNorm: number;
+  readonly updatedAt: number;
+}
+
+export interface UnifiedSemanticPacket {
+  readonly canonicalSubject: string;
+  readonly contextualBrief: string;
+  readonly attributes?: readonly string[];
+  readonly composition?: string;
+  readonly lighting?: string;
+  readonly palette?: readonly [string, string, string, string];
+  readonly motionCues?: readonly string[];
+  readonly acousticCues?: readonly string[];
+  readonly facetsQ10?: CognitiveVector;
+  readonly clipSignatureDigest?: string;
+  readonly visionTargetKappa?: string;
+  readonly linkedPrismId?: string;
+}
+
+export interface PersistedSemanticAssociatorState {
+  readonly dim: number;
+  /** Flat `dim * dim` associative state matrix `S` (`delta_rule.rs`). */
+  readonly stateMatrix: readonly number[];
+  readonly revisions: readonly SemanticRevisionRecord[];
+}
 
 export type UnifiedExpertKind =
   | 'neural-weights'
@@ -80,6 +134,7 @@ export interface LivingBasisSnapshot {
   readonly styleAffinities: UserStyleAffinities;
   readonly acquiredSkillIds: readonly string[];
   readonly knowledgeIndex: readonly BasisKnowledgeEntry[];
+  readonly semanticAssociator?: PersistedSemanticAssociatorState;
   readonly basisDigest: string;
 }
 
@@ -195,6 +250,15 @@ export class LivingTrainingBasis {
   private readonly knowledgeByKappa = new Map<string, BasisKnowledgeEntry>();
   private readonly listeners = new Set<(snap: LivingBasisSnapshot) => void>();
   private hydrated = false;
+  readonly semantics = new UnifiedSemanticAssociator();
+
+  constructor() {
+    this.semantics.setMutationHook(() => {
+      this.updatedAt = Date.now();
+      this.emit();
+      void this.persist();
+    });
+  }
 
   subscribe(listener: (snap: LivingBasisSnapshot) => void): () => void {
     this.listeners.add(listener);
@@ -217,6 +281,7 @@ export class LivingTrainingBasis {
       styleAffinities: this.styleAffinities,
       acquiredSkillIds: acquired,
       knowledgeIndex: knowledge,
+      semanticAssociator: this.semantics.serialize(),
       basisDigest: computeBasisDigest(this.adaptationSteps, this.userFacetsQ10, acquired, knowledge),
     };
   }
@@ -361,6 +426,9 @@ export class LivingTrainingBasis {
         for (const entry of loaded.knowledgeIndex ?? []) {
           this.knowledgeByKappa.set(entry.kappa, entry);
         }
+        if (loaded.semanticAssociator) {
+          this.semantics.hydrate(loaded.semanticAssociator);
+        }
         this.emit();
       }
     } catch {
@@ -385,8 +453,358 @@ export class LivingTrainingBasis {
   }
 }
 
+function normalizeConceptKey(raw: string): string {
+  const stop = new Set([
+    'a', 'an', 'the', 'of', 'for', 'to', 'in', 'on', 'with', 'about', 'create', 'make',
+    'generate', 'draw', 'paint', 'render', 'compose', 'build', 'write', 'picture', 'image',
+    'photo', 'video', 'audio', 'song', 'story', 'game', 'art', 'artwork', 'this', 'that',
+    'short', 'new', 'my',
+  ]);
+  const words = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]+/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 2 && !stop.has(w));
+  const canonical = words.slice(0, 4).join('-');
+  return canonical || 'concept';
+}
+
+/**
+ * Deterministic normalized `SEMANTIC_ASSOC_DIM`-dimensional feature projection for any semantic
+ * concept or text description so Language, Image, Vision QA, Audio, and Procedural Organs share
+ * one exact `Float32Array(32)` coordinate space for `verdantGatedDeltaStepF32`.
+ */
+export function encodeSemanticVector32(parts: readonly string[]): Float32Array {
+  const vec = new Float32Array(SEMANTIC_ASSOC_DIM);
+  const text = parts.join(' ').toLowerCase();
+  const tokens = text
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(/\s+/)
+    .filter((t) => t.length >= 2);
+  if (tokens.length === 0) {
+    vec[0] = 1.0;
+    return vec;
+  }
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i]!;
+    let h1 = 2166136261 >>> 0;
+    let h2 = 2654435761 >>> 0;
+    for (let j = 0; j < tok.length; j++) {
+      const ch = tok.charCodeAt(j);
+      h1 = Math.imul(h1 ^ ch, 16777619) >>> 0;
+      h2 = Math.imul(h2 ^ (ch + j * 31), 2246822519) >>> 0;
+    }
+    const idx1 = h1 % SEMANTIC_ASSOC_DIM;
+    const idx2 = h2 % SEMANTIC_ASSOC_DIM;
+    const sign1 = ((h1 >>> 16) & 1) === 0 ? 1 : -1;
+    const sign2 = ((h2 >>> 16) & 1) === 0 ? 1 : -1;
+    const weight = i < 4 ? 1.5 : 1.0;
+    vec[idx1] = Math.fround(vec[idx1]! + sign1 * weight);
+    vec[idx2] = Math.fround(vec[idx2]! + sign2 * weight * 0.65);
+  }
+  let normSq = 0.0;
+  for (let i = 0; i < SEMANTIC_ASSOC_DIM; i++) normSq += vec[i]! * vec[i]!;
+  const inv = normSq > 1e-8 ? 1.0 / Math.sqrt(normSq) : 1.0;
+  for (let i = 0; i < SEMANTIC_ASSOC_DIM; i++) vec[i] = Math.fround(vec[i]! * inv);
+  return vec;
+}
+
+/**
+ * Unified Cross-Modal Semantic Associator extrapolated directly from
+ * `verdant-tensor/src/linear/delta_rule.rs` (`gated_delta_step_f32`) and
+ * `verdant-core/src/observer_streams.rs` (immutable parent-linked `kappa` revisions).
+ *
+ * Maintains one `32 x 32` associative state matrix `S` (zero-GC preallocated scratch) and
+ * parent-linked `SemanticRevisionRecord`s so Language, Image, Vision QA, Audio, Video, and
+ * every Gallery MediaType share associative semantics (e.g. `"dog"`).
+ */
+export class UnifiedSemanticAssociator {
+  private readonly state = new Float32Array(SEMANTIC_ASSOC_DIM * SEMANTIC_ASSOC_DIM);
+  private readonly scratch = new Float32Array(
+    SEMANTIC_ASSOC_DIM * SEMANTIC_ASSOC_DIM + 2 * SEMANTIC_ASSOC_DIM,
+  );
+  private readonly scoresBuf = new Float32Array(SEMANTIC_ASSOC_DIM);
+  private readonly logDecayBuf = new Float32Array([-0.04]);
+  private readonly revisionsByConcept = new Map<string, SemanticRevisionRecord>();
+  private readonly conceptByPrismId = new Map<string, string>();
+  private onMutate?: () => void;
+
+  setMutationHook(hook: () => void): void {
+    this.onMutate = hook;
+  }
+
+  /**
+   * Writes a contextualized semantic observation into associative state matrix `S` via
+   * `verdantGatedDeltaStepF32` and commits an immutable parent-linked `kappa` revision (`vN+1`).
+   */
+  writeSemanticObservation(
+    conceptHint: string,
+    packet: UnifiedSemanticPacket,
+    opts?: { readonly gain?: number; readonly decay?: number },
+  ): { readonly revision: SemanticRevisionRecord; readonly residualNorm: number } {
+    const conceptId = normalizeConceptKey(packet.canonicalSubject || conceptHint);
+    const prev = this.revisionsByConcept.get(conceptId) ?? null;
+
+    const attributes = Array.from(
+      new Set([
+        ...(prev?.attributes ?? []),
+        ...(packet.attributes ?? []),
+      ]),
+    ).slice(0, 12);
+    const motionCues = Array.from(
+      new Set([...(prev?.motionCues ?? []), ...(packet.motionCues ?? [])]),
+    ).slice(0, 8);
+    const acousticCues = Array.from(
+      new Set([...(prev?.acousticCues ?? []), ...(packet.acousticCues ?? [])]),
+    ).slice(0, 8);
+    const linkedPrismIds = Array.from(
+      new Set([
+        ...(prev?.linkedPrismIds ?? []),
+        ...(packet.linkedPrismId ? [packet.linkedPrismId] : []),
+      ]),
+    );
+
+    const keyVec = encodeSemanticVector32([conceptId, packet.canonicalSubject]);
+    const valVec = encodeSemanticVector32([
+      packet.canonicalSubject,
+      packet.contextualBrief,
+      ...attributes,
+      packet.composition ?? prev?.composition ?? '',
+      packet.lighting ?? prev?.lighting ?? '',
+      ...motionCues,
+      ...acousticCues,
+    ]);
+
+    this.logDecayBuf[0] = Math.fround(opts?.decay ?? -0.04);
+    const gain = opts?.gain ?? 0.65;
+    const step = verdantGatedDeltaStepF32(
+      {
+        query: keyVec,
+        key: keyVec,
+        value: valVec,
+        logDecay: this.logDecayBuf,
+        gain,
+      },
+      this.state,
+      this.scoresBuf,
+      this.scratch,
+    );
+
+    const nextVersion = (prev?.version ?? 0) + 1;
+    const parentKappa = prev?.kappa ?? null;
+    const canonicalPayload = JSON.stringify({
+      conceptId,
+      version: nextVersion,
+      parentKappa,
+      canonicalSubject: packet.canonicalSubject.trim() || conceptId,
+      contextualBrief: packet.contextualBrief.trim().slice(0, 260),
+      attributes,
+      composition: packet.composition ?? prev?.composition ?? 'centered subject framing',
+      lighting: packet.lighting ?? prev?.lighting ?? 'daylight',
+      palette: packet.palette ?? prev?.palette ?? ['#0f172a', '#1e293b', '#10b981', '#f8fafc'],
+      motionCues,
+      acousticCues,
+      clipSignatureDigest: packet.clipSignatureDigest ?? prev?.clipSignatureDigest,
+      visionTargetKappa: packet.visionTargetKappa ?? prev?.visionTargetKappa,
+    });
+    const kappa = prismContentDigest(`verdant/kappa/v1:semantic:${conceptId}:${canonicalPayload}`);
+
+    const revision: SemanticRevisionRecord = {
+      conceptId,
+      version: nextVersion,
+      kappa,
+      parentKappa,
+      canonicalSubject: packet.canonicalSubject.trim() || conceptId,
+      contextualBrief: packet.contextualBrief.trim().slice(0, 260),
+      attributes,
+      composition: packet.composition ?? prev?.composition ?? 'centered subject framing',
+      lighting: packet.lighting ?? prev?.lighting ?? 'daylight',
+      palette: packet.palette ?? prev?.palette ?? ['#0f172a', '#1e293b', '#10b981', '#f8fafc'],
+      motionCues,
+      acousticCues,
+      facetsQ10: packet.facetsQ10 ?? prev?.facetsQ10 ?? INITIAL_USER_FACETS,
+      semanticVector: Array.from(valVec),
+      clipSignatureDigest: packet.clipSignatureDigest ?? prev?.clipSignatureDigest,
+      visionTargetKappa: packet.visionTargetKappa ?? prev?.visionTargetKappa,
+      linkedPrismIds,
+      residualNorm: step.residualNorm,
+      updatedAt: Date.now(),
+    };
+
+    this.revisionsByConcept.set(conceptId, revision);
+    for (const pid of linkedPrismIds) {
+      this.conceptByPrismId.set(pid, conceptId);
+    }
+    if (this.revisionsByConcept.size > MAX_SEMANTIC_CONCEPTS) {
+      const oldest = [...this.revisionsByConcept.values()].sort(
+        (a, b) => a.updatedAt - b.updatedAt,
+      )[0];
+      if (oldest) this.revisionsByConcept.delete(oldest.conceptId);
+    }
+    this.onMutate?.();
+    return { revision, residualNorm: step.residualNorm };
+  }
+
+  /** Associates a Prism ID with an existing semantic concept anchor without mutating weights. */
+  linkPrismToConcept(conceptId: string, prismId: string): SemanticRevisionRecord | null {
+    const prev = this.revisionsByConcept.get(conceptId);
+    if (!prev) return null;
+    if (prev.linkedPrismIds.includes(prismId)) return prev;
+    const next: SemanticRevisionRecord = {
+      ...prev,
+      linkedPrismIds: [...prev.linkedPrismIds, prismId],
+      updatedAt: Date.now(),
+    };
+    this.revisionsByConcept.set(conceptId, next);
+    this.conceptByPrismId.set(prismId, conceptId);
+    this.onMutate?.();
+    return next;
+  }
+
+  /** Records an accepted Vision QA `kappa` onto a semantic anchor so adjacent modalities reuse it. */
+  recordAcceptedVisionTarget(conceptId: string, visionTargetKappa: string): SemanticRevisionRecord | null {
+    const prev = this.revisionsByConcept.get(conceptId);
+    if (!prev) return null;
+    const next: SemanticRevisionRecord = {
+      ...prev,
+      visionTargetKappa,
+      updatedAt: Date.now(),
+    };
+    this.revisionsByConcept.set(conceptId, next);
+    this.onMutate?.();
+    return next;
+  }
+
+  getConcept(conceptId: string): SemanticRevisionRecord | null {
+    return this.revisionsByConcept.get(conceptId) ?? null;
+  }
+
+  getConceptForPrism(prismId: string): SemanticRevisionRecord | null {
+    const cid = this.conceptByPrismId.get(prismId);
+    return cid ? (this.revisionsByConcept.get(cid) ?? null) : null;
+  }
+
+  listConcepts(): readonly SemanticRevisionRecord[] {
+    return [...this.revisionsByConcept.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  /**
+   * Recalls an associated semantic revision across adjacent modalities (e.g. prompting
+   * `"make a video of that dog"` or `"write a story about it"` resolves the reconciled `"dog"`).
+   */
+  recallAssociatedSemantics(
+    query: string,
+    activePrismId?: string,
+  ): SemanticRevisionRecord | null {
+    const qLower = query.toLowerCase();
+    // 1. Direct pronoun/anaphora reference to active Prism or most recently updated concept
+    const isAnaphoric = /\b(that|this|it|same)\b/.test(qLower);
+    if (activePrismId) {
+      const activeConcept = this.getConceptForPrism(activePrismId);
+      if (activeConcept && (isAnaphoric || qLower.includes(activeConcept.canonicalSubject.toLowerCase()))) {
+        return activeConcept;
+      }
+    }
+
+    // 2. Exact concept key match
+    const candidateKey = normalizeConceptKey(query);
+    const exact = this.revisionsByConcept.get(candidateKey);
+    if (exact) return exact;
+
+    // 3. Cosine + lexical resonance across stored associative anchors + state matrix S readout
+    const qVec = encodeSemanticVector32([query]);
+    let best: SemanticRevisionRecord | null = null;
+    let bestScore = 0.28;
+    for (const rec of this.revisionsByConcept.values()) {
+      const subj = rec.canonicalSubject.toLowerCase();
+      let lexical = 0;
+      if (subj.length >= 2 && qLower.includes(subj)) lexical += 0.6;
+      let dot = 0;
+      for (let i = 0; i < SEMANTIC_ASSOC_DIM; i++) {
+        dot += qVec[i]! * (rec.semanticVector[i] ?? 0);
+      }
+      const total = lexical + Math.max(0, dot);
+      if (total > bestScore) {
+        bestScore = total;
+        best = rec;
+      }
+    }
+    if (best) return best;
+
+    // 4. Pure pronoun fallback ("make a video of it") -> most recent semantic concept
+    if (isAnaphoric && this.revisionsByConcept.size > 0) {
+      return this.listConcepts()[0] ?? null;
+    }
+    return null;
+  }
+
+  /**
+   * Evaluates the Gated Delta prediction residual `||v_target - S * k_observed||_2 / sqrt(d)`
+   * and cosine alignment between a target concept and an observed modality feature vector.
+   */
+  computeSemanticResidual(
+    conceptId: string,
+    observedVector: Float32Array,
+  ): { readonly residualNorm: number; readonly cosineSimilarity: number } {
+    const rec = this.revisionsByConcept.get(conceptId);
+    if (!rec) return { residualNorm: 1, cosineSimilarity: 0 };
+    const dim = SEMANTIC_ASSOC_DIM;
+    let sqDiff = 0.0;
+    let dot = 0.0;
+    let normObs = 0.0;
+    let normTgt = 0.0;
+    for (let r = 0; r < dim; r++) {
+      const rowOff = r * dim;
+      let pred = 0.0;
+      for (let c = 0; c < dim; c++) {
+        pred += this.state[rowOff + c]! * (observedVector[c] ?? 0);
+      }
+      const target = rec.semanticVector[r] ?? 0;
+      const diff = target - pred;
+      sqDiff += diff * diff;
+      const obs = observedVector[r] ?? 0;
+      dot += obs * target;
+      normObs += obs * obs;
+      normTgt += target * target;
+    }
+    const denom = Math.sqrt(Math.max(1e-8, normObs * normTgt));
+    return {
+      residualNorm: Math.sqrt(sqDiff / dim),
+      cosineSimilarity: Math.max(-1, Math.min(1, dot / denom)),
+    };
+  }
+
+  serialize(): PersistedSemanticAssociatorState {
+    return {
+      dim: SEMANTIC_ASSOC_DIM,
+      stateMatrix: Array.from(this.state),
+      revisions: this.listConcepts(),
+    };
+  }
+
+  hydrate(persisted?: PersistedSemanticAssociatorState): void {
+    if (!persisted || persisted.dim !== SEMANTIC_ASSOC_DIM) return;
+    if (Array.isArray(persisted.stateMatrix) && persisted.stateMatrix.length === this.state.length) {
+      for (let i = 0; i < this.state.length; i++) {
+        this.state[i] = Math.fround(persisted.stateMatrix[i] ?? 0);
+      }
+    }
+    this.revisionsByConcept.clear();
+    this.conceptByPrismId.clear();
+    for (const rec of persisted.revisions ?? []) {
+      this.revisionsByConcept.set(rec.conceptId, rec);
+      for (const pid of rec.linkedPrismIds) {
+        this.conceptByPrismId.set(pid, rec.conceptId);
+      }
+    }
+  }
+}
+
+let cachedBasisDbPromise: Promise<IDBDatabase> | null = null;
+
 function openBasisDb(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  if (cachedBasisDbPromise) return cachedBasisDbPromise;
+  cachedBasisDbPromise = new Promise<IDBDatabase>((resolve, reject) => {
     const req = indexedDB.open(BASIS_IDB_NAME, 1);
     req.onupgradeneeded = () => {
       const db = req.result;
@@ -394,9 +812,23 @@ function openBasisDb(): Promise<IDBDatabase> {
         db.createObjectStore(BASIS_IDB_STORE);
       }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onclose = () => {
+        cachedBasisDbPromise = null;
+      };
+      db.onversionchange = () => {
+        db.close();
+        cachedBasisDbPromise = null;
+      };
+      resolve(db);
+    };
+    req.onerror = () => {
+      cachedBasisDbPromise = null;
+      reject(req.error);
+    };
   });
+  return cachedBasisDbPromise;
 }
 
 /**
@@ -407,10 +839,12 @@ function openBasisDb(): Promise<IDBDatabase> {
 export class UnifiedExpertRegistry {
   private readonly experts = new Map<string, UnifiedExpertDescriptor>();
   readonly basis: LivingTrainingBasis;
+  readonly semantics: UnifiedSemanticAssociator;
   private readonly listeners = new Set<(snap: UnifiedModelTelemetrySnapshot) => void>();
 
   constructor(basis?: LivingTrainingBasis) {
     this.basis = basis ?? new LivingTrainingBasis();
+    this.semantics = this.basis.semantics;
     // Register all always-ready procedural experts on the shared verdant-engine substrate
     for (const pe of DEFAULT_PROCEDURAL_EXPERTS) {
       this.experts.set(pe.id, {

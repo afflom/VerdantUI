@@ -42,7 +42,11 @@ import {
 } from './modelCatalog';
 import type { MultimodalCoherenceTelemetry } from './multimodalCoordinator';
 import type { PrecisionContractMode } from './performanceContract';
-import type { PerceivedImageReport } from './visionCritiqueLoop';
+import type {
+  PerceivedImageReport,
+  SemanticVisualQaReport,
+  SemanticVisualQaTarget,
+} from './visionCritiqueLoop';
 import type { OpfsQuotaSnapshot } from './vramBackingStore';
 import { trimToStableSpeculativePrefix } from './vramUnifiedStore';
 import type { WeightResidencyPolicy } from './vramWeightPager';
@@ -116,6 +120,8 @@ export interface EngineState {
   readonly multimodalTelemetry: MultimodalCoherenceTelemetry | null;
   readonly pendingImageContext: PerceivedImageReport | null;
   readonly pendingAudioContext: PerceivedAudioReport | null;
+  /** Active non-preempted part IDs currently inferring or queued in the unified worker. */
+  readonly activePartTaskIds: readonly string[];
 }
 
 const INITIAL_OPFS_STORAGE: OpfsQuotaSnapshot = {
@@ -307,6 +313,8 @@ export class LlamaVTensorWorkerClient {
   private state: EngineState;
   private disposed = false;
   private lastRequestedCatalogModel: CatalogModel | null = null;
+  private readonly activeGenerationPartByReq = new Map<string, string>();
+  private focusedPartId = 'verdant-part-home';
   private readonly handlePageUnload = (): void => {
     if (this.disposed) return;
     this.disposed = true;
@@ -358,6 +366,7 @@ export class LlamaVTensorWorkerClient {
       multimodalTelemetry: null,
       pendingImageContext: null,
       pendingAudioContext: null,
+      activePartTaskIds: [],
     };
 
     this.worker = this.spawnWorker();
@@ -387,6 +396,7 @@ export class LlamaVTensorWorkerClient {
     };
     const handleWorkerFailure = (errorMsg: string) => {
       this.activeLoadRequestId = null;
+      this.activeGenerationPartByReq.clear();
       for (const [, pendingEntry] of this.pending) {
         pendingEntry.reject(new Error(errorMsg));
       }
@@ -397,6 +407,7 @@ export class LlamaVTensorWorkerClient {
         progressPercent: 0,
         prefillProgress: null,
         conformanceRunning: false,
+        activePartTaskIds: [],
         errorMessage: errorMsg,
         statusDetail: 'Worker restarting',
       });
@@ -1027,11 +1038,17 @@ export class LlamaVTensorWorkerClient {
 
     if (msg.type === 'done') {
       this.pending.delete(msg.requestId);
+      this.activeGenerationPartByReq.delete(msg.requestId);
+      const remainingParts = Array.from(new Set(this.activeGenerationPartByReq.values()));
       this.patchState({
-        status: 'ready',
+        status: remainingParts.length > 0 ? 'generating' : 'ready',
         prefillProgress: null,
-        statusDetail: `${this.state.model?.displayName ?? 'Model'} ready`,
+        statusDetail:
+          remainingParts.length > 0
+            ? 'Generating response'
+            : `${this.state.model?.displayName ?? 'Model'} ready`,
         telemetry: msg.telemetry,
+        activePartTaskIds: remainingParts,
         ...(msg.multimodalTelemetry ? { multimodalTelemetry: msg.multimodalTelemetry } : {}),
       });
       entry.resolve(undefined);
@@ -1084,6 +1101,13 @@ export class LlamaVTensorWorkerClient {
         height: msg.height,
         rgba: msg.rgbaBuffer ? new Uint8ClampedArray(msg.rgbaBuffer) : null,
       });
+      return;
+    }
+
+    if (msg.type === 'visual_qa_result') {
+      this.pending.delete(msg.requestId);
+      this.patchState({ multimodalTelemetry: msg.multimodalTelemetry });
+      entry.resolve(msg.report);
       return;
     }
 
@@ -1284,18 +1308,34 @@ export class LlamaVTensorWorkerClient {
     });
   }
 
+  /**
+   * Updates the Observer's focused part slot so the unified worker prioritizes the visible
+   * part's queued tasks without aborting or interrupting any sibling part's active inference.
+   */
+  setFocusedPart(partId: string): void {
+    if (!partId || partId === this.focusedPartId) return;
+    this.focusedPartId = partId;
+    try {
+      this.worker.postMessage({ type: 'set_focus_part', partId } satisfies WorkerRequest);
+    } catch {
+      // Ignore transient worker restart
+    }
+  }
+
   async *streamGenerate(
     prompt: string,
     signal?: AbortSignal,
     samplingOverride?: SamplingConfig,
     threadId?: string,
     visualKappa?: string,
+    opts?: { readonly partId?: string; readonly salience?: number },
   ): AsyncGenerator<TokenStreamEvent, void, unknown> {
     if (!this.state.model) {
       throw new Error('Wait for the model to finish loading before sending a message.');
     }
 
     const requestId = this.nextRequestId('gen');
+    const partId = opts?.partId ?? threadId ?? 'verdant-part-home';
     const queue: TokenStreamEvent[] = [];
     let notifyNext: (() => void) | null = null;
     let done = false;
@@ -1331,11 +1371,15 @@ export class LlamaVTensorWorkerClient {
     this.lastSpeculativePrompt = '';
     this.lastTokenStatePatchMs = 0;
 
+    this.activeGenerationPartByReq.set(requestId, partId);
+    const activeParts = Array.from(new Set(this.activeGenerationPartByReq.values()));
+
     this.patchState({
       status: 'generating',
       prefillProgress: null,
       speculativePrefill: { ...this.state.speculativePrefill, active: false },
       errorMessage: null,
+      activePartTaskIds: activeParts,
       statusDetail: 'Preparing response',
     });
 
@@ -1361,6 +1405,8 @@ export class LlamaVTensorWorkerClient {
       prompt,
       sampling: samplingOverride ?? this.state.sampling,
       threadId,
+      partId,
+      salience: opts?.salience,
       visualKappa,
     };
     this.worker.postMessage(req);
@@ -1380,13 +1426,19 @@ export class LlamaVTensorWorkerClient {
       }
     } finally {
       signal?.removeEventListener('abort', onAbort);
+      this.activeGenerationPartByReq.delete(requestId);
       if (this.pending.has(requestId)) {
         sendCancelOnce();
         this.pending.delete(requestId);
+        const remainingParts = Array.from(new Set(this.activeGenerationPartByReq.values()));
         this.patchState({
-          status: 'ready',
+          status: remainingParts.length > 0 ? 'generating' : 'ready',
           prefillProgress: null,
-          statusDetail: `${this.state.model?.displayName ?? 'Model'} ready`,
+          activePartTaskIds: remainingParts,
+          statusDetail:
+            remainingParts.length > 0
+              ? 'Generating response'
+              : `${this.state.model?.displayName ?? 'Model'} ready`,
         });
       }
     }
@@ -1501,6 +1553,36 @@ export class LlamaVTensorWorkerClient {
         ...params,
       },
       20_000,
+    );
+  }
+
+  /**
+   * Runs Semantic Vision QA inside the shared Web Worker (non-KV lane, zero-copy RGBA transfer)
+   * comparing a rendered Studio frame against a unified semantic concept target (`"dog"`, etc.).
+   */
+  async evaluateVisualSemanticQa(params: {
+    readonly width: number;
+    readonly height: number;
+    readonly rgba: Uint8Array | Uint8ClampedArray;
+    readonly target: SemanticVisualQaTarget;
+    readonly minAcceptScoreQ10?: number;
+  }): Promise<SemanticVisualQaReport> {
+    const requestId = this.nextRequestId('vqa');
+    const copy = new Uint8Array(params.rgba.byteLength);
+    copy.set(params.rgba);
+    return this.postRpcWithTimeout<SemanticVisualQaReport>(
+      {
+        type: 'qa_visual_semantic',
+        requestId,
+        width: params.width,
+        height: params.height,
+        rgbaBuffer: copy.buffer,
+        target: params.target,
+        allowAutoLoad: this.state.modelStreamEnabled,
+        minAcceptScoreQ10: params.minAcceptScoreQ10,
+      },
+      20_000,
+      [copy.buffer],
     );
   }
 

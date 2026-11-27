@@ -86,3 +86,8 @@
 
 - **Requirements:** `REQ-PERF-STABILITY-OPTIMIZATION`, `REQ-PRISM-GENERATION`
 - **Decision:** "Continue to refine the plan with a focus on performance and stability, so that all work is focused on optimizing VerdantUI performance, stability, and functionality."
+
+## DEC-018 (2026-11-27)
+
+- **Requirements:** `REQ-SELF-SIMILAR-PRISM-UI`, `REQ-OBSERVER-PROCEDURAL-SYNTHESIS`, `REQ-PRISM-GENERATION`
+- **Decision:** "VerdantUI needs to be a Verdant Prism itself — one Verdant Prism runtime instance rendered by the Observer and maintained by Verdant Studio so navigating between parts never interrupts inference, with cross-modal associative weights and progressive full-fidelity reconciliation."

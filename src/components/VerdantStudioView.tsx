@@ -14,6 +14,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type ChangeEvent,
   type DragEvent,
   type FC,
@@ -72,6 +73,7 @@ import {
 } from '../engine/prismMediaOrgans';
 import { isInternalBootstrapModel } from '../engine/modelCatalog';
 import type { StudioChatBridge } from '../engine/studioChatBridge';
+import type { VerdantRootPrismRuntime } from '../engine/verdantRootPrism';
 import type { EngineState, LlamaVTensorWorkerClient } from '../engine/workerClient';
 import {
   PrismSandboxFrame,
@@ -97,6 +99,7 @@ interface VerdantStudioViewProps {
   engineState: EngineState;
   darkMode: boolean;
   getStudioChatBridge?: () => Promise<StudioChatBridge>;
+  rootPrism?: VerdantRootPrismRuntime;
   onSelectProject: (prismId: string, mode: 'studio' | 'app') => void;
 }
 
@@ -134,8 +137,19 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   engineState,
   darkMode,
   getStudioChatBridge,
+  rootPrism,
   onSelectProject,
 }) => {
+  const runtimePartTask = useSyncExternalStore(
+    useCallback(
+      (cb) => (rootPrism ? rootPrism.subscribePartTask(project.id, cb) : () => {}),
+      [rootPrism, project.id],
+    ),
+    useCallback(
+      () => (rootPrism ? rootPrism.getPartTask(project.id) : null),
+      [rootPrism, project.id],
+    ),
+  );
   const [viewportMode, setViewportMode] = useState<'desktop' | 'mobile'>('desktop');
   const [reloadNonce, setReloadNonce] = useState(0);
   const [runtimeError, setRuntimeError] = useState<PrismRuntimeError | null>(null);
@@ -175,9 +189,8 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     [declaration],
   );
 
+  // Sync local title draft without aborting any background synthesis running in the unified root runtime
   useEffect(() => {
-    activeAgentAbortRef.current?.abort();
-    activeAgentAbortRef.current = null;
     setTitleDraft(project.draft.name);
     setRuntimeError(null);
     setStatusBanner(null);
@@ -283,6 +296,20 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   };
 
   const handlePublish = useCallback(async () => {
+    if (rootPrism) {
+      setPublishing(true);
+      try {
+        const res = await rootPrism.publishPrism(project.id);
+        setStatusBanner(res);
+        if (res.ok) {
+          setJustPublished(true);
+          setTimeout(() => setJustPublished(false), 2000);
+        }
+      } finally {
+        setPublishing(false);
+      }
+      return;
+    }
     bridgeRuntime.evictPrism(project.id);
     setStatusBanner(null);
 
@@ -387,7 +414,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     } finally {
       setPublishing(false);
     }
-  }, [bridgeRuntime, getBuildClient, compiled, declaration, isDeclarative, project.draft.name, project.id, project.sealedDraft, readiness, store, workerClient]);
+  }, [bridgeRuntime, getBuildClient, compiled, declaration, isDeclarative, project.draft.name, project.id, project.sealedDraft, readiness, rootPrism, store, workerClient]);
 
   const handleExportCreation = () => {
     const slug = (declaration?.metadata.slug || project.draft.name)
@@ -465,19 +492,13 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     engineState.model !== null &&
     !isInternalBootstrapModel(engineState.model.id);
 
-  useEffect(() => {
-    return () => {
-      activeAgentAbortRef.current?.abort();
-      activeAgentAbortRef.current = null;
-    };
-  }, []);
-
   const handleCancelNl = useCallback(() => {
     runTokenRef.current += 1;
     activeAgentAbortRef.current?.abort();
     activeAgentAbortRef.current = null;
+    rootPrism?.cancelPartTask(project.id);
     setNlBusy(false);
-  }, []);
+  }, [project.id, rootPrism]);
 
   const handleRunStudioAgentPrompt = useCallback(
     async (systemPrompt: string, userPrompt: string, maxTokens: number): Promise<string> => {
@@ -556,33 +577,6 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       const activeMediaType =
         declaration?.view?.proceduralOrgan?.mediaType ?? declaration?.concept.mediaType;
 
-      // Companion media derived directly from this Prism's features ("Generate cover art for this", "Make a soundtrack for this")
-      const companionMatch = message.match(
-        /\b(?:generate|create|make|compose|design|add)\s+(?:a\s+|an\s+)?(cover\s+art|book\s+cover|album\s+cover|game\s+cover|logo|brand\s*mark|soundtrack|theme\s+song)\b/i,
-      );
-      if (companionMatch && getStudioChatBridge) {
-        const requestedKind = companionMatch[1]!.toLowerCase();
-        const isAudio = /soundtrack|theme\s+song/.test(requestedKind);
-        const isLogo = /logo|brand\s*mark/.test(requestedKind);
-        setNlBusy(true);
-        setNlBusyLabel(isAudio ? 'Composing soundtrack…' : isLogo ? 'Designing logo…' : 'Creating cover art…');
-        try {
-          const bridge = await getStudioChatBridge();
-          const companion = await bridge.refinePrismFromPrompt({
-            target: project.id,
-            instruction: message,
-          });
-          await store.appendMessage(project.id, {
-            role: 'assistant',
-            content: `Created **${companion.prismName}** from this Prism's features and saved it to ${companion.galleryLabel}.`,
-          });
-          onSelectProject(companion.prismId, 'app');
-          return;
-        } finally {
-          setNlBusy(false);
-        }
-      }
-
       // Live in-place organ commands (Document read/write/draft; Audio/Video playback; Picture new variation)
       if (
         project.published !== null &&
@@ -607,6 +601,57 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
           return;
         } catch {
           // Fall through to declarative refinement if sandbox isn't accepting input
+        } finally {
+          setNlBusy(false);
+        }
+      }
+
+      // Companion or pin-preserving refinement executed inside the unified root runtime
+      // so navigating to another creation or tab NEVER interrupts the active work!
+      const isCompanionReq =
+        /\b(?:generate|create|make|compose|design|add)\s+(?:a\s+|an\s+)?(cover\s+art|book\s+cover|album\s+cover|game\s+cover|logo|brand\s*mark|soundtrack|theme\s+song)\b/i.test(
+          message,
+        );
+      if (rootPrism && (isCompanionReq || declaration?.view?.proceduralOrgan)) {
+        const res = await rootPrism.dispatchPrismPrompt(project.id, message);
+        if (res.ok) {
+          await store.appendMessage(project.id, {
+            role: 'assistant',
+            content: res.openPrismId
+              ? `${res.text || 'Created companion asset.'}`
+              : `Updated "${project.draft.name}" while preserving your pinned preferences.`,
+          });
+          if (res.openPrismId) {
+            onSelectProject(res.openPrismId, 'app');
+          } else {
+            onChangeSurfaceMode('preview');
+          }
+        }
+        return;
+      }
+
+      // Companion media derived directly from this Prism's features ("Generate cover art for this", "Make a soundtrack for this")
+      const companionMatch = message.match(
+        /\b(?:generate|create|make|compose|design|add)\s+(?:a\s+|an\s+)?(cover\s+art|book\s+cover|album\s+cover|game\s+cover|logo|brand\s*mark|soundtrack|theme\s+song)\b/i,
+      );
+      if (companionMatch && getStudioChatBridge) {
+        const requestedKind = companionMatch[1]!.toLowerCase();
+        const isAudio = /soundtrack|theme\s+song/.test(requestedKind);
+        const isLogo = /logo|brand\s*mark/.test(requestedKind);
+        setNlBusy(true);
+        setNlBusyLabel(isAudio ? 'Composing soundtrack…' : isLogo ? 'Designing logo…' : 'Creating cover art…');
+        try {
+          const bridge = await getStudioChatBridge();
+          const companion = await bridge.refinePrismFromPrompt({
+            target: project.id,
+            instruction: message,
+          });
+          await store.appendMessage(project.id, {
+            role: 'assistant',
+            content: `Created **${companion.prismName}** from this Prism's features and saved it to ${companion.galleryLabel}.`,
+          });
+          onSelectProject(companion.prismId, 'app');
+          return;
         } finally {
           setNlBusy(false);
         }
@@ -1209,8 +1254,8 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
         onSelectChildPrism={onSelectSystemPrism}
         onSubmitNaturalLanguage={handleSubmitNaturalLanguage}
         onCancelNaturalLanguage={handleCancelNl}
-        nlBusy={nlBusy}
-        nlBusyLabel={nlBusyLabel}
+        nlBusy={nlBusy || Boolean(runtimePartTask?.busy)}
+        nlBusyLabel={runtimePartTask?.busy && runtimePartTask.label ? runtimePartTask.label : nlBusyLabel}
         nlMessages={nlMessages}
         onTypingChange={onTypingChange}
       />

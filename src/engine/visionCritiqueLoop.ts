@@ -231,3 +231,207 @@ export async function perceiveImageFrame(
     summary,
   };
 }
+
+export interface SemanticVisualQaTarget {
+  readonly conceptId: string;
+  readonly canonicalSubject: string;
+  readonly contextualBrief: string;
+  readonly attributes: readonly string[];
+  readonly lighting?: string;
+  readonly semanticVector?: readonly number[];
+}
+
+export interface SemanticVisualQaReport extends VisualCoherenceReport {
+  readonly conceptId: string;
+  readonly scoreQ10: number;
+  readonly residualNorm: number;
+  readonly accepted: boolean;
+  readonly missingAttributes: readonly string[];
+  readonly refinementHint: string;
+  readonly dominantColors: readonly string[];
+  readonly vlmCritique?: string;
+}
+
+/**
+ * Projects a rendered RGBA frame's spatial structure, luminance/color signature, and optional
+ * SigLIP vision embeddings into a 32-dim normalized vector aligned with `UnifiedSemanticAssociator`.
+ */
+export function extractVisualSemanticVector32(
+  frame: VisualFrameInput,
+  coherence: VisualCoherenceReport,
+  dominantColors: readonly string[],
+  siglipEmbeddings?: readonly Float32Array[] | null,
+): Float32Array {
+  const vec = new Float32Array(32);
+  // 1. Structural & lighting coordinates (0..7)
+  vec[0] = Math.fround(coherence.meanLuminance * 2 - 1);
+  vec[1] = Math.fround(coherence.contrastSpan * 2 - 1);
+  vec[2] = Math.fround(coherence.nonUniformRatio * 2 - 1);
+  vec[3] = Math.fround(Math.min(1, coherence.edgeDensity * 5) * 2 - 1);
+  vec[4] = Math.fround(frame.width >= frame.height ? 0.6 : -0.6);
+  vec[5] = Math.fround(Math.min(1, Math.max(frame.width, frame.height) / 512));
+
+  // 2. Dominant RGB chromaticity coordinates (6..14)
+  for (let c = 0; c < 3; c++) {
+    const hex = (dominantColors[c] ?? '#808080').replace(/^#/, '');
+    const r = parseInt(hex.slice(0, 2), 16) || 128;
+    const g = parseInt(hex.slice(2, 4), 16) || 128;
+    const b = parseInt(hex.slice(4, 6), 16) || 128;
+    vec[6 + c * 3] = Math.fround(r / 127.5 - 1);
+    vec[7 + c * 3] = Math.fround(g / 127.5 - 1);
+    vec[8 + c * 3] = Math.fround(b / 127.5 - 1);
+  }
+
+  // 3. Fold real SigLIP embeddings (or spatial 4x4 luminance blocks) into coordinates 15..31
+  if (siglipEmbeddings && siglipEmbeddings.length > 0 && siglipEmbeddings[0]!.length > 0) {
+    const first = siglipEmbeddings[0]!;
+    const stride = Math.max(1, Math.floor(first.length / 17));
+    for (let i = 0; i < 17; i++) {
+      let acc = 0;
+      for (let t = 0; t < siglipEmbeddings.length; t++) {
+        acc += siglipEmbeddings[t]![(i * stride) % first.length] ?? 0;
+      }
+      vec[15 + i] = Math.fround(Math.tanh(acc / siglipEmbeddings.length));
+    }
+  } else {
+    const { rgba, width, height } = frame;
+    for (let by = 0; by < 4; by++) {
+      for (let bx = 0; bx < 4; bx++) {
+        const sx = Math.min(width - 1, Math.floor(((bx + 0.5) / 4) * width));
+        const sy = Math.min(height - 1, Math.floor(((by + 0.5) / 4) * height));
+        const idx = (sy * width + sx) * 4;
+        const lum =
+          (0.2126 * (rgba[idx] ?? 0) + 0.7152 * (rgba[idx + 1] ?? 0) + 0.0722 * (rgba[idx + 2] ?? 0)) /
+          255;
+        vec[15 + by * 4 + bx] = Math.fround(lum * 2 - 1);
+      }
+    }
+    vec[31] = Math.fround(coherence.coherent ? 0.8 : -0.8);
+  }
+
+  let normSq = 0;
+  for (let i = 0; i < 32; i++) normSq += vec[i]! * vec[i]!;
+  const inv = normSq > 1e-8 ? 1 / Math.sqrt(normSq) : 1;
+  for (let i = 0; i < 32; i++) vec[i] = Math.fround(vec[i]! * inv);
+  return vec;
+}
+
+/**
+ * Semantic Vision QA (`evaluateSemanticVisualQa`):
+ * Evaluates a rendered Studio visual frame against a unified semantic target (`"dog"`, etc.)
+ * combining structural coherence, lighting/detail fidelity, optional `SiglipVisionEncoder`
+ * embeddings, optional VLM critique callback, and Gated Delta residual scoring.
+ */
+export async function evaluateSemanticVisualQa(
+  frame: VisualFrameInput,
+  target: SemanticVisualQaTarget,
+  opts?: {
+    readonly visionEncoder?: SiglipVisionEncoder | null;
+    readonly coordinator?: MultimodalCoherenceCoordinator | null;
+    readonly runVlmCritique?: (visionKappa: string, target: SemanticVisualQaTarget) => Promise<string | null>;
+    readonly minAcceptScoreQ10?: number;
+  },
+): Promise<SemanticVisualQaReport> {
+  const base = await evaluateRenderedFrameCoherence(frame, {
+    visionEncoder: opts?.visionEncoder,
+    coordinator: opts?.coordinator,
+  });
+  const dominantColors = extractDominantColors(frame.rgba, frame.width, frame.height);
+  const cachedEntry = opts?.coordinator?.getCachedVisual(base.kappa);
+  const obsVec = extractVisualSemanticVector32(
+    frame,
+    base,
+    dominantColors,
+    cachedEntry?.embeddings ?? null,
+  );
+
+  // Evaluate structural + lighting + semantic alignment
+  const missingAttributes: string[] = [];
+  let score = 680; // baseline Q10 (0..1024)
+
+  if (!base.coherent) {
+    score -= 260;
+    missingAttributes.push('clear figure-ground contrast');
+  } else {
+    score += 110;
+  }
+
+  if (base.edgeDensity < 0.035) {
+    score -= 140;
+    missingAttributes.push(`sharp silhouette for ${target.canonicalSubject}`);
+  } else if (base.edgeDensity >= 0.08) {
+    score += 90;
+  }
+
+  if (base.nonUniformRatio < 0.14) {
+    score -= 160;
+    missingAttributes.push(`richer composition coverage for ${target.canonicalSubject}`);
+  } else if (base.nonUniformRatio >= 0.35) {
+    score += 70;
+  }
+
+  const lightingLower = (target.lighting ?? '').toLowerCase();
+  if (lightingLower.includes('daylight') || lightingLower.includes('bright')) {
+    if (base.meanLuminance < 0.22) {
+      score -= 120;
+      missingAttributes.push('daylight brightness');
+    } else {
+      score += 45;
+    }
+  } else if (lightingLower.includes('midnight') || lightingLower.includes('noir')) {
+    if (base.meanLuminance > 0.72) {
+      score -= 100;
+      missingAttributes.push('nocturnal atmosphere');
+    } else {
+      score += 45;
+    }
+  }
+
+  let residualNorm = 0.25;
+  if (target.semanticVector && target.semanticVector.length === 32) {
+    let sq = 0;
+    for (let i = 0; i < 32; i++) {
+      const d = (target.semanticVector[i] ?? 0) - obsVec[i]!;
+      sq += d * d;
+    }
+    residualNorm = Math.sqrt(sq / 32);
+  }
+
+  let vlmCritique: string | undefined;
+  if (opts?.runVlmCritique) {
+    try {
+      const critique = await opts.runVlmCritique(base.kappa, target);
+      if (critique && critique.trim()) {
+        vlmCritique = critique.trim().slice(0, 220);
+        const lower = vlmCritique.toLowerCase();
+        if (/\b(blurry|unclear|missing|blank|dark|low contrast|not visible|mismatch)\b/.test(lower)) {
+          score -= 160;
+          missingAttributes.push(vlmCritique);
+        } else if (/\b(clear|coherent|accurate|matches|good|sharp|accepted)\b/.test(lower)) {
+          score += 80;
+        }
+      }
+    } catch {
+      // Fall back cleanly to vision-embedding + structural QA
+    }
+  }
+
+  const scoreQ10 = Math.max(0, Math.min(1024, Math.round(score)));
+  const threshold = opts?.minAcceptScoreQ10 ?? 720;
+  const accepted = base.coherent && scoreQ10 >= threshold && missingAttributes.length === 0;
+  const refinementHint = accepted
+    ? `Visual QA accepted "${target.canonicalSubject}" (${Math.round((scoreQ10 / 1024) * 100)}% coherence).`
+    : `Refine ${target.canonicalSubject}: strengthen ${missingAttributes.slice(0, 2).join(' and ') || 'subject definition and contrast'}.`;
+
+  return {
+    ...base,
+    conceptId: target.conceptId,
+    scoreQ10,
+    residualNorm,
+    accepted,
+    missingAttributes,
+    refinementHint,
+    dominantColors,
+    ...(vlmCritique ? { vlmCritique } : {}),
+  };
+}

@@ -1540,3 +1540,355 @@ export function verdantConv2d(
   }
   return { outH, outW };
 }
+
+// ============================================================================
+// Verdant-Engine Core Extrapolations (`afflom/verdant-engine@9d22f5ac`)
+//   1. `verdantGatedDeltaStepF32`      (`verdant-tensor/src/linear/delta_rule.rs`)
+//   2. `stepNeuromorphicSalienceRing`  (`verdant-tensor/src/neural.rs` kernel10)
+//   3. `canonicalizePartCommandMonoid` (`verdant-core/src/runtime_monoid.rs`)
+// ============================================================================
+
+export interface GatedDeltaStepInput {
+  readonly query: Float32Array;
+  readonly key: Float32Array;
+  readonly value: Float32Array;
+  /** Scalar `[g]` or per-coordinate `[g_0..g_{d-1}]` log-decay (`<= 0`). */
+  readonly logDecay: Float32Array;
+  /** Gain applied to prediction residual `(v - S * k)`. */
+  readonly gain: number;
+}
+
+export interface GatedDeltaStepResult {
+  /** RMS prediction residual `||v - S_decayed * k||_2 / sqrt(d)` before update. */
+  readonly residualNorm: number;
+  /** Scale factor `1 / sqrt(d)` applied to query readout. */
+  readonly scale: number;
+}
+
+/**
+ * Exact parity with `verdant-tensor/src/linear/delta_rule.rs::gated_delta_step_f32`.
+ * Decays row-major associative state `state` (`d x d`), computes predictive recall `v_hat = S * k`,
+ * applies rank-one residual correction `S <- S + gain * (v - v_hat) * k^T`, and writes scaled
+ * query readout `scores = (1/sqrt(d)) * S * q`.
+ *
+ * Caller supplies reusable `scratch` of length `>= d*d + 2*d` for zero per-step GC.
+ */
+export function verdantGatedDeltaStepF32(
+  input: GatedDeltaStepInput,
+  state: Float32Array,
+  scores: Float32Array,
+  scratch: Float32Array,
+): GatedDeltaStepResult {
+  const width = input.query.length;
+  const cells = width * width;
+  const needed = cells + width + width;
+  if (
+    width === 0 ||
+    state.length !== cells ||
+    scores.length !== width ||
+    input.key.length !== width ||
+    input.value.length !== width ||
+    (input.logDecay.length !== 1 && input.logDecay.length !== width) ||
+    scratch.length < needed
+  ) {
+    throw new Error('verdantGatedDeltaStepF32: zero or mismatched extents');
+  }
+
+  const next = scratch.subarray(0, cells);
+  const delta = scratch.subarray(cells, cells + width);
+  const factors = scratch.subarray(cells + width, cells + 2 * width);
+  const scale = Math.fround(1.0 / Math.sqrt(width));
+
+  if (input.logDecay.length === 1) {
+    const f = Math.fround(Math.exp(input.logDecay[0]!));
+    factors.fill(f);
+  } else {
+    for (let i = 0; i < width; i++) {
+      factors[i] = Math.fround(Math.exp(input.logDecay[i]!));
+    }
+  }
+
+  // 1. Decay state: next[r, c] = state[r, c] * factors[c]
+  for (let r = 0; r < width; r++) {
+    const rowOff = r * width;
+    for (let c = 0; c < width; c++) {
+      next[rowOff + c] = Math.fround(state[rowOff + c]! * factors[c]!);
+    }
+  }
+
+  // 2. Predict value from decayed state: delta = next * key
+  for (let r = 0; r < width; r++) {
+    const rowOff = r * width;
+    let acc = 0.0;
+    for (let c = 0; c < width; c++) {
+      acc += next[rowOff + c]! * input.key[c]!;
+    }
+    delta[r] = Math.fround(acc);
+  }
+
+  // 3. Rank-one residual update: next[r, c] += gain * (value[r] - delta[r]) * key[c]
+  let sqResidual = 0.0;
+  const gain = Math.fround(input.gain);
+  for (let r = 0; r < width; r++) {
+    const diff = input.value[r]! - delta[r]!;
+    sqResidual += diff * diff;
+    const correction = Math.fround(diff * gain);
+    const rowOff = r * width;
+    for (let c = 0; c < width; c++) {
+      next[rowOff + c] = Math.fround(next[rowOff + c]! + correction * input.key[c]!);
+    }
+  }
+
+  // 4. Scaled query readout: scores = scale * (next * query)
+  for (let r = 0; r < width; r++) {
+    const rowOff = r * width;
+    let acc = 0.0;
+    for (let c = 0; c < width; c++) {
+      acc += next[rowOff + c]! * input.query[c]!;
+    }
+    scores[r] = Math.fround(Math.fround(acc) * scale);
+  }
+
+  // Commit atomically after all arithmetic succeeds
+  state.set(next);
+  return {
+    residualNorm: Math.sqrt(sqResidual / width),
+    scale,
+  };
+}
+
+export interface NeuromorphicSalienceOutput {
+  readonly nextMembraneMilli: readonly number[];
+  readonly spikeMask: number;
+  readonly entitySalienceMilli: readonly number[];
+  readonly attendedSlot: number;
+  /** Monotonic `streaming.rs` LOD rank `0..=3` steered by salience. */
+  readonly foveatedLodRank: 0 | 1 | 2 | 3;
+}
+
+/**
+ * Exact integer parity with `verdant-tensor/src/neural.rs::step_neuromorphic_lif_ssm_ring`
+ * (`kernel10`) + `cybernetics.rs::CyberneticObserverLoop` for deterministic Observer focus
+ * salience across VerdantUI parts.
+ */
+export function stepNeuromorphicSalienceRing(
+  prevMembraneMilli: readonly number[],
+  observerDriveMilli: readonly number[],
+  entitySlots: number,
+  focusedSlot = 0,
+): NeuromorphicSalienceOutput {
+  const stateDim = Math.max(1, Math.min(8, prevMembraneMilli.length || 8));
+  const slots = Math.max(1, Math.floor(entitySlots));
+  const decayNum = 7;
+  const decayDen = 8;
+  const threshold = 1000;
+  const unitQ = 256;
+  const crossQ = 32;
+
+  const nextMembrane: number[] = new Array(stateDim);
+  const postState: number[] = new Array(stateDim);
+  let spikeMask = 0;
+
+  for (let r = 0; r < stateDim; r++) {
+    const prevR = Math.trunc(prevMembraneMilli[r] ?? 0);
+    const prevNext = Math.trunc(prevMembraneMilli[(r + 1) % stateDim] ?? 0);
+    const prevPrev = Math.trunc(prevMembraneMilli[(r + stateDim - 1) % stateDim] ?? 0);
+    const recAcc = ((unitQ * prevR + crossQ * prevNext - crossQ * prevPrev) >> 10) | 0;
+
+    let obsAcc = 0;
+    for (let c = 0; c < stateDim; c++) {
+      const drv = Math.trunc(observerDriveMilli[c] ?? 0);
+      const b = r === c ? unitQ * 2 : ((r + c) & 1) === 0 ? crossQ : 0;
+      obsAcc += b * drv;
+    }
+    obsAcc = (obsAcc >> 10) | 0;
+
+    const leaked = Math.trunc((prevR * decayNum) / decayDen);
+    const integrated = Math.max(-threshold, Math.min(2_000_000, leaked + recAcc + obsAcc));
+    if (integrated >= threshold) {
+      postState[r] = integrated - threshold;
+      spikeMask |= 1 << r;
+    } else {
+      postState[r] = Math.max(0, integrated);
+    }
+    nextMembrane[r] = postState[r]!;
+  }
+
+  const salience: number[] = new Array(slots);
+  let bestSlot = Math.max(0, Math.min(slots - 1, focusedSlot));
+  let bestVal = -1;
+  for (let slot = 0; slot < slots; slot++) {
+    let acc = 0;
+    for (let r = 0; r < stateDim; r++) {
+      const w = r === slot % stateDim ? unitQ * 4 : crossQ;
+      acc += w * postState[r]!;
+    }
+    // Focused slot receives explicit Observer gaze boost while background slots retain baseline
+    const focusBoost = slot === focusedSlot ? 512 : 0;
+    const score = Math.max(128, Math.trunc(acc >> 8) + focusBoost);
+    salience[slot] = score;
+    if (score > bestVal) {
+      bestVal = score;
+      bestSlot = slot;
+    }
+  }
+
+  const topSalience = salience[bestSlot] ?? 0;
+  const foveatedLodRank: 0 | 1 | 2 | 3 =
+    topSalience >= 900 ? 3 : topSalience >= 650 ? 2 : topSalience >= 400 ? 1 : 0;
+
+  return {
+    nextMembraneMilli: nextMembrane,
+    spikeMask,
+    entitySalienceMilli: salience,
+    attendedSlot: bestSlot,
+    foveatedLodRank,
+  };
+}
+
+export type PartCommandKind =
+  | { readonly type: 'toggle'; readonly key: string }
+  | { readonly type: 'param-delta'; readonly key: string; readonly delta: number }
+  | { readonly type: 'set-focus'; readonly partId: string }
+  | { readonly type: 'state-barrier'; readonly label: string };
+
+export interface PartCommandOp {
+  readonly id: number;
+  readonly targetSlot: string;
+  readonly kind: PartCommandKind;
+  readonly dependsOn?: readonly number[];
+}
+
+export interface CanonicalPartCommandReport {
+  readonly fusedOps: readonly PartCommandOp[];
+  readonly rawCount: number;
+  readonly fusedCount: number;
+  readonly involutionCancellations: number;
+  readonly additiveMerges: number;
+  readonly parallelLayers: readonly (readonly PartCommandOp[])[];
+  readonly dagDepth: number;
+}
+
+/**
+ * Exact parity with `verdant-core/src/runtime_monoid.rs::canonicalize_command_monoid` +
+ * `compile_parallel_command_layers`: cancels self-inverse toggles (`I * I = id`), fuses
+ * consecutive deltas on the same `(targetSlot, key)`, honors `state-barrier`, and schedules
+ * independent `targetSlot` operations into parallel Kahn `(max, +)` layers.
+ */
+export function canonicalizePartCommandMonoid(
+  ops: readonly PartCommandOp[],
+): CanonicalPartCommandReport {
+  const fused: PartCommandOp[] = [];
+  let involutionCancellations = 0;
+  let additiveMerges = 0;
+
+  for (const op of ops) {
+    const prevIdx = (() => {
+      for (let i = fused.length - 1; i >= 0; i--) {
+        if (fused[i]!.targetSlot === op.targetSlot) return i;
+      }
+      return -1;
+    })();
+
+    if (prevIdx >= 0 && (!op.dependsOn || op.dependsOn.length === 0)) {
+      const prev = fused[prevIdx]!;
+      if (
+        prev.kind.type === 'toggle' &&
+        op.kind.type === 'toggle' &&
+        prev.kind.key === op.kind.key
+      ) {
+        fused.splice(prevIdx, 1);
+        involutionCancellations += 1;
+        continue;
+      }
+      if (
+        prev.kind.type === 'param-delta' &&
+        op.kind.type === 'param-delta' &&
+        prev.kind.key === op.kind.key
+      ) {
+        const sum = prev.kind.delta + op.kind.delta;
+        additiveMerges += 1;
+        if (sum === 0) {
+          fused.splice(prevIdx, 1);
+        } else {
+          fused[prevIdx] = {
+            ...op,
+            kind: { type: 'param-delta', key: op.kind.key, delta: sum },
+          };
+        }
+        continue;
+      }
+      if (prev.kind.type === 'set-focus' && op.kind.type === 'set-focus') {
+        fused[prevIdx] = op;
+        additiveMerges += 1;
+        continue;
+      }
+    }
+    fused.push(op);
+  }
+
+  // Kahn topological layering with tropical (max, +) critical-path depth
+  const n = fused.length;
+  if (n === 0) {
+    return {
+      fusedOps: [],
+      rawCount: ops.length,
+      fusedCount: 0,
+      involutionCancellations,
+      additiveMerges,
+      parallelLayers: [],
+      dagDepth: 0,
+    };
+  }
+
+  const adj: number[][] = Array.from({ length: n }, () => []);
+  const indegree = new Int32Array(n);
+  const lastOnSlot = new Map<string, number>();
+  let lastBarrier = -1;
+
+  for (let i = 0; i < n; i++) {
+    const op = fused[i]!;
+    const parents = new Set<number>();
+    const prevSlot = lastOnSlot.get(op.targetSlot);
+    if (prevSlot !== undefined) parents.add(prevSlot);
+    if (lastBarrier >= 0) parents.add(lastBarrier);
+    if (op.kind.type === 'state-barrier') {
+      for (const prev of lastOnSlot.values()) parents.add(prev);
+      lastBarrier = i;
+    }
+    lastOnSlot.set(op.targetSlot, i);
+    for (const p of parents) {
+      if (p !== i) {
+        adj[p]!.push(i);
+        indegree[i] = indegree[i]! + 1;
+      }
+    }
+  }
+
+  const layers: PartCommandOp[][] = [];
+  let frontier: number[] = [];
+  for (let i = 0; i < n; i++) {
+    if (indegree[i] === 0) frontier.push(i);
+  }
+  while (frontier.length > 0) {
+    layers.push(frontier.map((idx) => fused[idx]!));
+    const nextFrontier: number[] = [];
+    for (const u of frontier) {
+      for (const v of adj[u]!) {
+        indegree[v] = indegree[v]! - 1;
+        if (indegree[v] === 0) nextFrontier.push(v);
+      }
+    }
+    frontier = nextFrontier;
+  }
+
+  return {
+    fusedOps: fused,
+    rawCount: ops.length,
+    fusedCount: fused.length,
+    involutionCancellations,
+    additiveMerges,
+    parallelLayers: layers,
+    dagDepth: layers.length,
+  };
+}

@@ -154,6 +154,17 @@
       "invariantId": "VUI-OPFS-01",
       "citation": { "kind": "req", "decisionId": "DEC-017" },
       "publicBenefitImpact": "Adds selective OPFS range-read SDXS Q8_0 GGUF loading with reusable scratch buffers, automatic worker respawn with bounded RPC timeouts, singleton IDB handle caching, zero-idle-CPU Video RAF and clean AudioContext teardown, 256px Gallery/Space thumbnails, Prism Details lineage/unpinning/navigation, editorial Research/Utilities/Spaces with durable NL editing, and automatic deterministic Publish verification."
+    },
+    {
+      "id": "VUI-FEAT-015",
+      "title": "Live Root Verdant Prism Runtime, Zero-Interruption Cooperative Scheduling, Gated Delta Cross-Modal Associativity & Progressive Lod0-Lod3 QA",
+      "stage": "active",
+      "introducedIn": "0.9.0",
+      "ownerFile": "src/engine/verdantRootPrism.ts",
+      "testFile": "src/engine/verdantRootPrism.test.ts",
+      "invariantId": "VUI-OBSERVER-01",
+      "citation": { "kind": "req", "decisionId": "DEC-018" },
+      "publicBenefitImpact": "Runs VerdantUI as one live Root Verdant Prism instance rendered by the Observer with 2-tier layout caching, persistent non-unmounting Home Thread, non-preempting salience-ordered worker scheduling, Gated Delta Rule cross-modal semantic associativity with parent-linked kappa revisions, and progressive Lod0-Lod3 Vision/Audio QA reconciliation across all MediaType Galleries."
     }
   ]
 }

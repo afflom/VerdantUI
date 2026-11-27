@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { Suspense, lazy, useCallback, useEffect, useMemo, useState, type FC } from 'react';
+import { Suspense, lazy, useCallback, useEffect, useMemo, useState, useSyncExternalStore, type FC } from 'react';
 import {
   AssistantRuntimeProvider,
   SimpleTextAttachmentAdapter,
@@ -16,7 +16,7 @@ import { PrismSurfaceShell } from './components/PrismSurfaceShell';
 import { SettingsDrawer } from './components/SettingsDrawer';
 import { ThreadSidebar } from './components/ThreadSidebar';
 import { ThreadView } from './components/ThreadView';
-import { createLlamaVTensorAdapter, formatMessagesForLlama, stripReasoningTags } from './engine/assistantAdapter';
+import { createLlamaVTensorAdapter } from './engine/assistantAdapter';
 
 const VTensorInspector = lazy(() =>
   import('./components/VTensorInspector').then((m) => ({ default: m.VTensorInspector })),
@@ -33,34 +33,28 @@ import {
   createVerdantClientTools,
 } from './engine/cognitiveObserver';
 import {
-  ContentGalleryStore,
   GALLERY_LABEL_BY_TYPE,
   type ContentArtifactRecord,
   type GalleryMediaType,
 } from './engine/contentGalleryStore';
 import type { ImportedHarnessSpec } from './engine/harnessConfig';
 import { isInternalBootstrapModel } from './engine/modelCatalog';
-import { ObserverStreamBus } from './engine/observerStreamBus';
 import {
-  buildSystemPartPrisms,
-  descriptorForUserPrism,
   galleryPrismId,
-  synthesizeObserverPrismFrame,
   VERDANT_HOME_PRISM_ID,
   VERDANT_SETTINGS_PRISM_ID,
   type PrismSurfaceMode,
 } from './engine/observerUiSynthesizer';
-import type { PrismBuildWorkerClient } from './engine/prismBuildClient';
-import { PrismHostPool } from './engine/prismHostPool';
-import {
-  PrismStore,
-  type PublishedPrismSummary,
-  type VerdantPrismProject,
+import type { PrismHostPool } from './engine/prismHostPool';
+import type {
+  PublishedPrismSummary,
+  VerdantPrismProject,
 } from './engine/prismStudio';
 import type { StudioChatBridge } from './engine/studioChatBridge';
 import { createVTensorThreadListAdapter } from './engine/threadStorage';
-import { UnifiedExpertRegistry } from './engine/unifiedModelBasis';
-import { LlamaVTensorWorkerClient, type EngineState } from './engine/workerClient';
+import type { UnifiedExpertRegistry } from './engine/unifiedModelBasis';
+import { getVerdantRootPrismRuntime } from './engine/verdantRootPrism';
+import type { EngineState, LlamaVTensorWorkerClient } from './engine/workerClient';
 
 const THEME_STORAGE_KEY = 'vtensor-assistant:theme:v1';
 
@@ -166,95 +160,26 @@ type ActiveWorkspaceView =
   | { readonly kind: 'settings' };
 
 export default function App() {
-  const workerClient = useMemo(() => new LlamaVTensorWorkerClient(), []);
-  const observerBus = useMemo(() => new ObserverStreamBus(), []);
-  const prismBuildClientRef = useMemo<{ instance: PrismBuildWorkerClient | null; promise: Promise<PrismBuildWorkerClient> | null }>(
-    () => ({ instance: null, promise: null }),
-    [],
+  // Single live Root Verdant Prism Runtime (`verdant-ui-root`) rendered by the Observer
+  // and maintained by Verdant Studio — decouples ALL inference & synthesis from view mounting.
+  const rootPrism = useMemo(() => getVerdantRootPrismRuntime(), []);
+  const {
+    workerClient,
+    observerBus,
+    prismStore,
+    galleryStore,
+    expertRegistry,
+    prismPool,
+    systemPartPrisms,
+  } = rootPrism;
+  const getPrismBuildClient = useCallback(
+    () => rootPrism.getPrismBuildClient(),
+    [rootPrism],
   );
-  const getPrismBuildClient = useCallback(async (): Promise<PrismBuildWorkerClient> => {
-    if (prismBuildClientRef.instance) return prismBuildClientRef.instance;
-    if (!prismBuildClientRef.promise) {
-      prismBuildClientRef.promise = import('./engine/prismBuildClient').then(({ PrismBuildWorkerClient }) => {
-        const inst = new PrismBuildWorkerClient(observerBus);
-        prismBuildClientRef.instance = inst;
-        return inst;
-      });
-    }
-    return prismBuildClientRef.promise;
-  }, [observerBus, prismBuildClientRef]);
-  const prismStore = useMemo(() => new PrismStore(), []);
-  const galleryStore = useMemo(() => new ContentGalleryStore(), []);
-  const expertRegistry = useMemo(() => new UnifiedExpertRegistry(), []);
-  const prismPool = useMemo(
-    () =>
-      new PrismHostPool(
-        observerBus,
-        prismStore,
-        workerClient.cognitiveObserver.grants,
-        workerClient,
-        undefined,
-        getPrismBuildClient,
-      ),
-    [observerBus, prismStore, workerClient, getPrismBuildClient],
+  const getStudioChatBridge = useCallback(
+    () => rootPrism.getStudioChatBridge(),
+    [rootPrism],
   );
-  const getStudioChatBridge = useMemo(() => {
-    let cached: Promise<StudioChatBridge> | null = null;
-    return () => {
-      if (!cached) {
-        cached = import('./engine/studioChatBridge').then(
-          ({ StudioChatBridge }) =>
-            new StudioChatBridge({
-              store: prismStore,
-              pool: prismPool,
-              observer: workerClient.cognitiveObserver,
-              galleries: galleryStore,
-              registry: expertRegistry,
-              runLocalStudioPrompt: async (systemPrompt, userPrompt, maxTokens) => {
-                const st = workerClient.getState();
-                if (!st.model || isInternalBootstrapModel(st.model.id)) return '';
-                const formatted = formatMessagesForLlama(
-                  [
-                    {
-                      id: `studio_chat_${Date.now()}`,
-                      role: 'user',
-                      createdAt: new Date(),
-                      content: [{ type: 'text', text: userPrompt }],
-                      attachments: [],
-                      metadata: { custom: {} },
-                    },
-                  ],
-                  st.model,
-                  st.promptMode,
-                  systemPrompt,
-                  { thinkingMode: 'off' },
-                );
-                const ctrl = new AbortController();
-                let out = '';
-                for await (const ev of workerClient.streamGenerate(
-                  formatted,
-                  ctrl.signal,
-                  { ...st.sampling, temperature: 0.25, maxTokens },
-                  'studio:chat-router',
-                )) {
-                  out = stripReasoningTags(ev.accumulatedText);
-                }
-                return out;
-              },
-              synthesizeAudioWav: (params) => workerClient.synthesizeAudioClip(params),
-              synthesizeImageLayer: (params) => workerClient.synthesizeImageLayer(params),
-              onOpenPrism: (prismId) => {
-                setActiveView({ kind: 'prism', prismId, mode: 'app' });
-              },
-              onOpenGallery: (mediaType) => {
-                setActiveView({ kind: 'gallery', mediaType });
-              },
-            }),
-        );
-      }
-      return cached;
-    };
-  }, [prismStore, prismPool, workerClient, galleryStore, expertRegistry]);
   const modelAdapter = useMemo(
     () =>
       createLlamaVTensorAdapter(workerClient, {
@@ -465,6 +390,10 @@ export default function App() {
 
   useEffect(() => {
     let toastTimer: ReturnType<typeof setTimeout> | null = null;
+    rootPrism.setNavigationCallbacks({
+      onOpenPrism: (prismId) => setActiveView({ kind: 'prism', prismId, mode: 'app' }),
+      onOpenGallery: (mediaType) => setActiveView({ kind: 'gallery', mediaType }),
+    });
     prismPool.setCallbacks({
       onNotify: ({ title, body }) => {
         setPrismToast({ title, body });
@@ -491,10 +420,8 @@ export default function App() {
       unsubStore();
       unsubGallery();
       unsubBus();
-      prismPool.dispose();
-      prismBuildClientRef.instance?.dispose();
     };
-  }, [prismStore, galleryStore, expertRegistry, observerBus, workerClient, prismPool, prismBuildClientRef]);
+  }, [rootPrism, prismStore, galleryStore, expertRegistry, observerBus, workerClient, prismPool]);
 
   useEffect(() => {
     workerClient.cognitiveObserver.setModalityResidencyProvider(() => {
@@ -678,7 +605,24 @@ export default function App() {
     [getStudioChatBridge],
   );
 
-  const systemPartPrisms = useMemo(() => buildSystemPartPrisms(), []);
+  const activePartId =
+    activeView.kind === 'prism'
+      ? activeView.prismId
+      : activeView.kind === 'gallery'
+        ? galleryPrismId(activeView.mediaType)
+        : activeView.kind === 'settings'
+          ? VERDANT_SETTINGS_PRISM_ID
+          : VERDANT_HOME_PRISM_ID;
+
+  // Shift focus pointer and salience priority inside the unified root runtime without aborting sibling parts
+  useEffect(() => {
+    rootPrism.setFocusPart(activePartId, userTypingInSurface);
+  }, [rootPrism, activePartId, userTypingInSurface]);
+
+  const busyBackgroundParts = useSyncExternalStore(
+    useCallback((cb) => rootPrism.subscribeActiveTaskIds(cb), [rootPrism]),
+    useCallback(() => rootPrism.getActiveBusyPartIds(), [rootPrism]),
+  );
 
   const handleSelectSystemPrism = useCallback(
     (prismId: string) => {
@@ -782,41 +726,31 @@ export default function App() {
       ? prisms.find((p) => p.id === activeView.prismId) ?? null
       : null;
 
-  // Procedurally synthesize the Root VerdantUI Prism & active part Prism via the Observer
-  const observerFrame = useMemo(() => {
-    const activePrismDescriptor =
-      activeView.kind === 'prism' && focusedPrism
-        ? descriptorForUserPrism(focusedPrism)
-        : activeView.kind === 'gallery'
-          ? systemPartPrisms.find((p) => p.id === galleryPrismId(activeView.mediaType)) ??
-            systemPartPrisms[0]!
-          : activeView.kind === 'settings'
-            ? systemPartPrisms.find((p) => p.id === VERDANT_SETTINGS_PRISM_ID) ??
-              systemPartPrisms[0]!
-            : systemPartPrisms.find((p) => p.id === VERDANT_HOME_PRISM_ID) ??
-              systemPartPrisms[0]!;
-
-    return synthesizeObserverPrismFrame({
-      activePrism: activePrismDescriptor,
-      partPrisms: systemPartPrisms,
-      userPrisms: prisms,
+  // Procedurally synthesize the Root Prism & active part via 2-tier cached layout projection
+  const observerFrame = useMemo(
+    () =>
+      rootPrism.getObserverFrame({
+        activeView,
+        focusedPrism,
+        prisms,
+        surfaceMode,
+        viewportWidthPx: viewportSize.width,
+        viewportHeightPx: viewportSize.height,
+        darkMode,
+        userTyping: userTypingInSurface,
+      }),
+    [
+      rootPrism,
+      activeView,
+      focusedPrism,
+      prisms,
       surfaceMode,
-      viewportWidthPx: viewportSize.width,
-      viewportHeightPx: viewportSize.height,
+      viewportSize.width,
+      viewportSize.height,
       darkMode,
-      userTyping: userTypingInSurface,
-    });
-  }, [
-    activeView,
-    focusedPrism,
-    systemPartPrisms,
-    prisms,
-    surfaceMode,
-    viewportSize.width,
-    viewportSize.height,
-    darkMode,
-    userTypingInSurface,
-  ]);
+      userTypingInSurface,
+    ],
+  );
 
   const settingsActive = activeView.kind === 'settings';
 
@@ -956,70 +890,19 @@ export default function App() {
             onDeletePrism={handleDeletePrism}
           />
 
-          <main className="min-w-0 flex-1 overflow-hidden">
-            {activeView.kind === 'settings' ? (
-              <SettingsDrawer
-                frame={observerFrame}
-                surfaceMode={surfaceMode}
-                onChangeSurfaceMode={setSurfaceMode}
-                onSelectSystemPrism={handleSelectSystemPrism}
-                onTypingChange={setUserTypingInSurface}
-                darkMode={darkMode}
-                onToggleDarkMode={() => setDarkMode((d) => !d)}
-                onSetDarkMode={setDarkMode}
-                cachedBytes={engineState.opfsStorage?.usageBytes ?? 0}
-                onClearCache={handleClearCache}
-                debugMode={debugMode}
-                onOpenDebugPanel={() => setDebugPanelOpen(true)}
-              />
-            ) : activeView.kind === 'gallery' ? (
-              <Suspense fallback={null}>
-                <GalleryView
-                  mediaType={activeView.mediaType}
-                  frame={observerFrame}
-                  surfaceMode={surfaceMode}
-                  onChangeSurfaceMode={setSurfaceMode}
-                  onSelectSystemPrism={handleSelectSystemPrism}
-                  onTypingChange={setUserTypingInSurface}
-                  items={galleryStore.listByGallery(activeView.mediaType)}
-                  categories={galleryStore.listCategoriesForGallery(activeView.mediaType)}
-                  spaces={spacePrisms}
-                  onCreateInGallery={handleCreateInGallery}
-                  onCreateFromPrompt={handleCreateFromGalleryPrompt}
-                  onOpenArtifact={(id, mode) => setActiveView({ kind: 'prism', prismId: id, mode })}
-                  onDeleteArtifact={handleDeletePrism}
-                  onAssignToSpace={handleAssignToSpace}
-                  onOpenSpace={(spaceId) => setActiveView({ kind: 'prism', prismId: spaceId, mode: 'app' })}
-                />
-              </Suspense>
-            ) : activeView.kind === 'prism' && focusedPrism ? (
-              <Suspense fallback={null}>
-                <VerdantStudioView
-                  project={focusedPrism}
-                  mode={activeView.mode}
-                  frame={observerFrame}
-                  surfaceMode={surfaceMode}
-                  onChangeSurfaceMode={setSurfaceMode}
-                  onChangeMode={(nextMode) =>
-                    setActiveView({ kind: 'prism', prismId: focusedPrism.id, mode: nextMode })
-                  }
-                  onSelectSystemPrism={handleSelectSystemPrism}
-                  onTypingChange={setUserTypingInSurface}
-                  store={prismStore}
-                  bus={observerBus}
-                  bridgeRuntime={prismPool}
-                  getBuildClient={getPrismBuildClient}
-                  workerClient={workerClient}
-                  engineState={engineState}
-                  darkMode={darkMode}
-                  getStudioChatBridge={getStudioChatBridge}
-                  onSelectProject={handleSelectPrism}
-                />
-              </Suspense>
-            ) : (
+          <main
+            className="min-w-0 flex-1 overflow-hidden"
+            data-active-part-id={activePartId}
+            data-busy-parts={busyBackgroundParts.length}
+          >
+            {/* Keep Home Thread mounted persistently so navigating to Galleries, Settings, or Prisms NEVER interrupts active streaming */}
+            <div
+              className={activeView.kind === 'thread' ? 'h-full w-full' : 'hidden'}
+              aria-hidden={activeView.kind !== 'thread'}
+            >
               <PrismSurfaceShell
                 frame={observerFrame}
-                mode={surfaceMode}
+                mode={activeView.kind === 'thread' ? surfaceMode : 'preview'}
                 onChangeMode={setSurfaceMode}
                 onSelectChildPrism={handleSelectSystemPrism}
                 previewContent={
@@ -1046,6 +929,72 @@ export default function App() {
                   />
                 }
               />
+            </div>
+
+            {activeView.kind === 'settings' && (
+              <SettingsDrawer
+                frame={observerFrame}
+                surfaceMode={surfaceMode}
+                onChangeSurfaceMode={setSurfaceMode}
+                onSelectSystemPrism={handleSelectSystemPrism}
+                onTypingChange={setUserTypingInSurface}
+                darkMode={darkMode}
+                onToggleDarkMode={() => setDarkMode((d) => !d)}
+                onSetDarkMode={setDarkMode}
+                cachedBytes={engineState.opfsStorage?.usageBytes ?? 0}
+                onClearCache={handleClearCache}
+                debugMode={debugMode}
+                onOpenDebugPanel={() => setDebugPanelOpen(true)}
+              />
+            )}
+
+            {activeView.kind === 'gallery' && (
+              <Suspense fallback={null}>
+                <GalleryView
+                  mediaType={activeView.mediaType}
+                  frame={observerFrame}
+                  surfaceMode={surfaceMode}
+                  onChangeSurfaceMode={setSurfaceMode}
+                  onSelectSystemPrism={handleSelectSystemPrism}
+                  onTypingChange={setUserTypingInSurface}
+                  items={galleryStore.listByGallery(activeView.mediaType)}
+                  categories={galleryStore.listCategoriesForGallery(activeView.mediaType)}
+                  spaces={spacePrisms}
+                  onCreateInGallery={handleCreateInGallery}
+                  onCreateFromPrompt={handleCreateFromGalleryPrompt}
+                  onOpenArtifact={(id, mode) => setActiveView({ kind: 'prism', prismId: id, mode })}
+                  onDeleteArtifact={handleDeletePrism}
+                  onAssignToSpace={handleAssignToSpace}
+                  onOpenSpace={(spaceId) => setActiveView({ kind: 'prism', prismId: spaceId, mode: 'app' })}
+                />
+              </Suspense>
+            )}
+
+            {activeView.kind === 'prism' && focusedPrism && (
+              <Suspense fallback={null}>
+                <VerdantStudioView
+                  project={focusedPrism}
+                  mode={activeView.mode}
+                  frame={observerFrame}
+                  surfaceMode={surfaceMode}
+                  onChangeSurfaceMode={setSurfaceMode}
+                  onChangeMode={(nextMode) =>
+                    setActiveView({ kind: 'prism', prismId: focusedPrism.id, mode: nextMode })
+                  }
+                  onSelectSystemPrism={handleSelectSystemPrism}
+                  onTypingChange={setUserTypingInSurface}
+                  store={prismStore}
+                  bus={observerBus}
+                  bridgeRuntime={prismPool}
+                  getBuildClient={getPrismBuildClient}
+                  workerClient={workerClient}
+                  engineState={engineState}
+                  darkMode={darkMode}
+                  getStudioChatBridge={getStudioChatBridge}
+                  rootPrism={rootPrism}
+                  onSelectProject={handleSelectPrism}
+                />
+              </Suspense>
             )}
           </main>
 

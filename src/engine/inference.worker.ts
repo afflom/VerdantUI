@@ -28,7 +28,13 @@ import {
   type MultimodalCoherenceTelemetry,
 } from './multimodalCoordinator';
 import type { PrecisionContractMode } from './performanceContract';
-import { perceiveImageFrame, type PerceivedImageReport } from './visionCritiqueLoop';
+import {
+  evaluateSemanticVisualQa,
+  perceiveImageFrame,
+  type PerceivedImageReport,
+  type SemanticVisualQaReport,
+  type SemanticVisualQaTarget,
+} from './visionCritiqueLoop';
 import { SiglipVisionEncoder, loadVisionWeightsFromGguf } from './visionEncoder';
 import { WhisperAudioEngine, loadWhisperWeightsFromGgml } from './whisperEngine';
 import {
@@ -85,7 +91,13 @@ export type WorkerRequest =
       prompt: string;
       sampling: SamplingConfig;
       threadId?: string;
+      partId?: string;
+      salience?: number;
       visualKappa?: string;
+    }
+  | {
+      type: 'set_focus_part';
+      partId: string;
     }
   | {
       type: 'cancel';
@@ -169,6 +181,16 @@ export type WorkerRequest =
       allowAutoLoad?: boolean;
     }
   | {
+      type: 'qa_visual_semantic';
+      requestId: string;
+      width: number;
+      height: number;
+      rgbaBuffer: ArrayBuffer;
+      target: SemanticVisualQaTarget;
+      allowAutoLoad?: boolean;
+      minAcceptScoreQ10?: number;
+    }
+  | {
       type: 'shutdown';
     };
 
@@ -250,6 +272,12 @@ export type WorkerResponse =
       width: number;
       height: number;
       rgbaBuffer: ArrayBuffer | null;
+      multimodalTelemetry: MultimodalCoherenceTelemetry;
+    }
+  | {
+      type: 'visual_qa_result';
+      requestId: string;
+      report: SemanticVisualQaReport;
       multimodalTelemetry: MultimodalCoherenceTelemetry;
     }
   | {
@@ -424,6 +452,17 @@ let activeLoadPromise: Promise<void> | null = null;
 let activeGenerationController: AbortController | null = null;
 let activeGenerationPromise: Promise<void> | null = null;
 let activeGenerationCount = 0;
+let focusedPartId = 'verdant-part-home';
+
+interface QueuedGenerationJob {
+  readonly req: Extract<WorkerRequest, { type: 'generate' }>;
+  readonly controller: AbortController;
+  readonly enqueuedSeq: number;
+}
+let generationEnqueueSeq = 0;
+const pendingGenerationQueue: QueuedGenerationJob[] = [];
+let generationPumpActive = false;
+
 let activeOpfsPersistPromise: Promise<void> | null = null;
 let opfsPersistEpoch = 0;
 
@@ -569,6 +608,18 @@ async function preemptSpeculativePrefill(): Promise<void> {
  * NEVER interleaves two generators over the shared `kvPager` / `cachedTokens` / `scratch` state!
  */
 async function preemptActiveGeneration(): Promise<void> {
+  // Drain queued jobs only on destructive administrative actions (model switch/delete/shutdown)
+  while (pendingGenerationQueue.length > 0) {
+    const queued = pendingGenerationQueue.shift()!;
+    queued.controller.abort();
+    activeControllers.delete(queued.req.requestId);
+    post({
+      type: 'done',
+      requestId: queued.req.requestId,
+      telemetry: runtime.getTelemetry(),
+      multimodalTelemetry: multimodalCoordinator.getTelemetry(),
+    });
+  }
   while (activeGenerationController || activeGenerationPromise) {
     const ctrl = activeGenerationController;
     const pending = activeGenerationPromise;
@@ -582,6 +633,165 @@ async function preemptActiveGeneration(): Promise<void> {
     } else {
       break;
     }
+  }
+}
+
+/**
+ * Picks the highest-salience queued generation job (focused `partId` first, then explicit
+ * `kernel10` salience, then FIFO) so independent parts NEVER preempt or corrupt each other's
+ * live `kvPager` state while foreground focus still responds first.
+ */
+function dequeueNextGenerationJob(): QueuedGenerationJob | undefined {
+  if (pendingGenerationQueue.length === 0) return undefined;
+  let bestIdx = 0;
+  let bestScore = -1;
+  for (let i = 0; i < pendingGenerationQueue.length; i++) {
+    const job = pendingGenerationQueue[i]!;
+    const isFocused = (job.req.partId ?? job.req.threadId ?? '') === focusedPartId ? 10_000 : 0;
+    const salience = job.req.salience ?? 512;
+    const score = isFocused + salience;
+    if (score > bestScore) {
+      bestScore = score;
+      bestIdx = i;
+    }
+  }
+  return pendingGenerationQueue.splice(bestIdx, 1)[0];
+}
+
+async function executeSingleGenerationJob(job: QueuedGenerationJob): Promise<void> {
+  const { req, controller } = job;
+  if (controller.signal.aborted) {
+    activeControllers.delete(req.requestId);
+    post({
+      type: 'done',
+      requestId: req.requestId,
+      telemetry: runtime.getTelemetry(),
+      multimodalTelemetry: multimodalCoordinator.getTelemetry(),
+    });
+    return;
+  }
+
+  await preemptSpeculativePrefill();
+  opfsPersistEpoch += 1;
+  activeGenerationController = controller;
+  activeGenerationCount += 1;
+
+  let finishGen!: () => void;
+  const genDone = new Promise<void>((resolve) => {
+    finishGen = resolve;
+  });
+  activeGenerationPromise = genDone;
+  let shouldPersistAfterTurn = false;
+
+  try {
+    let count = 0;
+    let lastPrefillPost = 0;
+    let lastPrefillDetail: string | undefined;
+    let lastTelemetryPost = 0;
+    runtime.beginGenerationSlice();
+    let lastStepMs = performance.now();
+    const cachedVisual = req.visualKappa
+      ? multimodalCoordinator.getCachedVisual(req.visualKappa)
+      : undefined;
+    const modelEmbDim = runtime.getModelSummary()?.hparams.embeddingLength ?? 0;
+    const prefixEmbeddings =
+      cachedVisual &&
+      cachedVisual.embeddings.length > 0 &&
+      cachedVisual.embeddingDim === modelEmbDim
+        ? cachedVisual.embeddings
+        : undefined;
+
+    for await (const tokenEvent of runtime.generate(
+      req.prompt,
+      req.sampling,
+      controller.signal,
+      (progress) => {
+        const now = performance.now();
+        const detailChanged =
+          progress.detail !== undefined && progress.detail !== lastPrefillDetail;
+        if (
+          lastPrefillPost === 0 ||
+          progress.completedTokens === 1 ||
+          progress.completedTokens === progress.totalTokens ||
+          (detailChanged && now - lastPrefillPost >= 100) ||
+          now - lastPrefillPost > 120
+        ) {
+          lastPrefillPost = now;
+          lastPrefillDetail = progress.detail;
+          post({
+            type: 'prefill',
+            requestId: req.requestId,
+            progress,
+          });
+        }
+      },
+      req.threadId,
+      prefixEmbeddings,
+    )) {
+      count += 1;
+      const nowMs = performance.now();
+      const includeTelemetry =
+        count === 1 || tokenEvent.finished || nowMs - lastTelemetryPost >= 150;
+      if (includeTelemetry) {
+        lastTelemetryPost = nowMs;
+      }
+      post({
+        type: 'token',
+        requestId: req.requestId,
+        event: tokenEvent,
+        telemetry: includeTelemetry ? runtime.getTelemetry() : undefined,
+      });
+      const stepUs = (nowMs - lastStepMs) * 1000;
+      lastStepMs = nowMs;
+      multimodalCoordinator.frameOracle.recordFrame(stepUs);
+      await runtime.maybeYieldGenerationStep(stepUs);
+    }
+
+    shouldPersistAfterTurn = !controller.signal.aborted;
+    post({
+      type: 'done',
+      requestId: req.requestId,
+      telemetry: runtime.getTelemetry(),
+      multimodalTelemetry: multimodalCoordinator.getTelemetry(),
+    });
+  } catch (err) {
+    post({
+      type: 'error',
+      requestId: req.requestId,
+      message: err instanceof Error ? err.message : String(err),
+    });
+  } finally {
+    activeGenerationCount = Math.max(0, activeGenerationCount - 1);
+    activeControllers.delete(req.requestId);
+    if (activeGenerationController === controller) {
+      activeGenerationController = null;
+    }
+    if (activeGenerationPromise === genDone) {
+      activeGenerationPromise = null;
+    }
+    finishGen();
+    if (
+      shouldPersistAfterTurn &&
+      activeGenerationCount === 0 &&
+      pendingGenerationQueue.length === 0 &&
+      activeLoadController === null
+    ) {
+      scheduleBackgroundOpfsPersist();
+    }
+  }
+}
+
+async function pumpGenerationQueue(): Promise<void> {
+  if (generationPumpActive) return;
+  generationPumpActive = true;
+  try {
+    while (pendingGenerationQueue.length > 0) {
+      const next = dequeueNextGenerationJob();
+      if (!next) break;
+      await executeSingleGenerationJob(next);
+    }
+  } finally {
+    generationPumpActive = false;
   }
 }
 
@@ -922,7 +1132,26 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       return;
     }
 
+    if (req.type === 'set_focus_part') {
+      focusedPartId = req.partId || 'verdant-part-home';
+      return;
+    }
+
     if (req.type === 'cancel') {
+      // Remove from pending queue if not started yet (never affects sibling parts!)
+      const qIdx = pendingGenerationQueue.findIndex((j) => j.req.requestId === req.requestId);
+      if (qIdx >= 0) {
+        const [removed] = pendingGenerationQueue.splice(qIdx, 1);
+        removed?.controller.abort();
+        activeControllers.delete(req.requestId);
+        post({
+          type: 'done',
+          requestId: req.requestId,
+          telemetry: runtime.getTelemetry(),
+          multimodalTelemetry: multimodalCoordinator.getTelemetry(),
+        });
+        return;
+      }
       const controller = activeControllers.get(req.requestId);
       if (controller) {
         controller.abort();
@@ -1108,6 +1337,31 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       return;
     }
 
+    if (req.type === 'qa_visual_semantic') {
+      const t0 = performance.now();
+      const rgba = new Uint8Array(req.rgbaBuffer);
+      if (req.allowAutoLoad && !activeVisionEncoder && !visionLoadPromise) {
+        void ensureVisionEncoderOnDemand();
+      }
+      const report = await evaluateSemanticVisualQa(
+        { rgba, width: req.width, height: req.height },
+        req.target,
+        {
+          visionEncoder: activeVisionEncoder,
+          coordinator: multimodalCoordinator,
+          minAcceptScoreQ10: req.minAcceptScoreQ10,
+        },
+      );
+      multimodalCoordinator.frameOracle.recordFrame((performance.now() - t0) * 1000);
+      post({
+        type: 'visual_qa_result',
+        requestId: req.requestId,
+        report,
+        multimodalTelemetry: multimodalCoordinator.getTelemetry(),
+      });
+      return;
+    }
+
     if (req.type === 'count_tokens') {
       const tokenCount = runtime.countTokens(req.prompt);
       const maxContextWindow = runtime.getModelSummary()?.maxContextWindow ?? 0;
@@ -1283,110 +1537,17 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     }
 
     if (req.type === 'generate') {
-      await preemptSpeculativePrefill();
-      await preemptActiveGeneration();
-      // Cancel any queued idle persist from the prior turn so generation never contends with OPFS
-      opfsPersistEpoch += 1;
+      // Non-preemptive salience-ordered scheduling: NEVER abort another part's active generation!
+      // Single-writer kvPager guarantees 0% KV thrashing while every part completes cleanly.
       const controller = new AbortController();
       activeControllers.set(req.requestId, controller);
-      activeGenerationController = controller;
-      activeGenerationCount += 1;
-
-      let finishGen!: () => void;
-      const genDone = new Promise<void>((resolve) => {
-        finishGen = resolve;
+      pendingGenerationQueue.push({
+        req,
+        controller,
+        enqueuedSeq: ++generationEnqueueSeq,
       });
-      activeGenerationPromise = genDone;
-      let shouldPersistAfterTurn = false;
-
-      try {
-        let count = 0;
-        let lastPrefillPost = 0;
-        let lastPrefillDetail: string | undefined;
-        let lastTelemetryPost = 0;
-        runtime.beginGenerationSlice();
-        let lastStepMs = performance.now();
-        const cachedVisual = req.visualKappa
-          ? multimodalCoordinator.getCachedVisual(req.visualKappa)
-          : undefined;
-        const modelEmbDim = runtime.getModelSummary()?.hparams.embeddingLength ?? 0;
-        const prefixEmbeddings =
-          cachedVisual &&
-          cachedVisual.embeddings.length > 0 &&
-          cachedVisual.embeddingDim === modelEmbDim
-            ? cachedVisual.embeddings
-            : undefined;
-
-        for await (const tokenEvent of runtime.generate(
-          req.prompt,
-          req.sampling,
-          controller.signal,
-          (progress) => {
-            const now = performance.now();
-            const detailChanged =
-              progress.detail !== undefined && progress.detail !== lastPrefillDetail;
-            if (
-              lastPrefillPost === 0 ||
-              progress.completedTokens === 1 ||
-              progress.completedTokens === progress.totalTokens ||
-              (detailChanged && now - lastPrefillPost >= 100) ||
-              now - lastPrefillPost > 120
-            ) {
-              lastPrefillPost = now;
-              lastPrefillDetail = progress.detail;
-              post({
-                type: 'prefill',
-                requestId: req.requestId,
-                progress,
-              });
-            }
-          },
-          req.threadId,
-          prefixEmbeddings,
-        )) {
-          count += 1;
-          const nowMs = performance.now();
-          const includeTelemetry =
-            count === 1 || tokenEvent.finished || nowMs - lastTelemetryPost >= 150;
-          if (includeTelemetry) {
-            lastTelemetryPost = nowMs;
-          }
-          post({
-            type: 'token',
-            requestId: req.requestId,
-            event: tokenEvent,
-            telemetry: includeTelemetry ? runtime.getTelemetry() : undefined,
-          });
-          // Theorem T7 zero-clamp MessageChannel cooperative yield gated by 16,666 µs frame budget
-          const stepUs = (nowMs - lastStepMs) * 1000;
-          lastStepMs = nowMs;
-          multimodalCoordinator.frameOracle.recordFrame(stepUs);
-          await runtime.maybeYieldGenerationStep(stepUs);
-        }
-
-        // Post `done` immediately (0 ms OPFS flush stall on interactive turn completion);
-        // persist warm KV prefixes asynchronously in a serialized background micro-job!
-        shouldPersistAfterTurn = !controller.signal.aborted;
-        post({
-          type: 'done',
-          requestId: req.requestId,
-          telemetry: runtime.getTelemetry(),
-          multimodalTelemetry: multimodalCoordinator.getTelemetry(),
-        });
-      } finally {
-        activeGenerationCount = Math.max(0, activeGenerationCount - 1);
-        activeControllers.delete(req.requestId);
-        if (activeGenerationController === controller) {
-          activeGenerationController = null;
-        }
-        if (activeGenerationPromise === genDone) {
-          activeGenerationPromise = null;
-        }
-        finishGen();
-        if (shouldPersistAfterTurn && activeGenerationCount === 0 && activeLoadController === null) {
-          scheduleBackgroundOpfsPersist();
-        }
-      }
+      void pumpGenerationQueue();
+      return;
     }
   } catch (err) {
     if ('requestId' in req) {

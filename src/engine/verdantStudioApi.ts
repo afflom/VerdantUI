@@ -89,9 +89,33 @@ export interface StudioConceptModel {
   readonly pinnedFields?: readonly string[];
   /** Linked companion Prism IDs generated coherently from this Prism's features (e.g., cover art, logo, soundtrack). */
   readonly linkedPrismIds?: readonly string[];
+  /** Unified cross-modal semantic concept anchor ID (`UnifiedSemanticAssociator`). */
+  readonly semanticConceptId?: string;
+  /** Content-addressed `kappa` of the latest reconciled semantic revision. */
+  readonly semanticKappa?: string;
+  /** Monotonic semantic revision version (`v1, v2, ...`). */
+  readonly semanticVersion?: number;
+  /** Monotonic 4-tier `verdant-engine` (`streaming.rs`) LOD reconciliation state. */
+  readonly lodState?: PrismLodState;
   readonly stakeholders: readonly StakeholderDecl[];
   readonly opmObjects: readonly OpmObjectDecl[];
   readonly opmProcesses: readonly OpmProcessDecl[];
+}
+
+export type PrismLodRank = 0 | 1 | 2 | 3;
+export type PrismLodLabel =
+  | 'Lod0CoarseProxy'
+  | 'Lod1MediumDetail'
+  | 'Lod2HighDetail'
+  | 'Lod3LosslessSource';
+
+export interface PrismLodState {
+  readonly rank: PrismLodRank;
+  readonly label: PrismLodLabel;
+  readonly qaScoreQ10: number;
+  readonly qaPasses: number;
+  readonly qaSummary: string;
+  readonly updatedAt: number;
 }
 
 export type AssuranceLevel = 'L1' | 'L2' | 'L3';
@@ -410,6 +434,21 @@ export type StudioApiOp =
       readonly seedText?: string;
       readonly pinnedFields?: readonly string[];
       readonly linkedPrismIds?: readonly string[];
+      readonly semanticConceptId?: string;
+      readonly semanticKappa?: string;
+      readonly semanticVersion?: number;
+      readonly lodState?: PrismLodState;
+    }
+  | {
+      readonly op: 'reconcile-semantic-weights';
+      readonly semanticConceptId: string;
+      readonly semanticKappa: string;
+      readonly semanticVersion: number;
+      readonly lodState?: PrismLodState;
+      readonly purpose?: string;
+      readonly weights?: ProceduralOrganWeights;
+      readonly summary?: string;
+      readonly citation?: StudioCitation;
     }
   | {
       readonly op: 'admit-stakeholder';
@@ -1886,6 +1925,10 @@ export function dispatchStudioOp(decl: PrismDeclaration, op: StudioApiOp): Studi
         ...(op.seedText !== undefined ? { seedText: op.seedText } : {}),
         ...(op.pinnedFields !== undefined ? { pinnedFields: [...op.pinnedFields] } : {}),
         ...(op.linkedPrismIds !== undefined ? { linkedPrismIds: [...op.linkedPrismIds] } : {}),
+        ...(op.semanticConceptId !== undefined ? { semanticConceptId: op.semanticConceptId } : {}),
+        ...(op.semanticKappa !== undefined ? { semanticKappa: op.semanticKappa } : {}),
+        ...(op.semanticVersion !== undefined ? { semanticVersion: op.semanticVersion } : {}),
+        ...(op.lodState !== undefined ? { lodState: op.lodState } : {}),
       };
       const nextAssurance = decl.security.reviewedAt
         ? decl.security.assuranceLevel
@@ -1906,6 +1949,48 @@ export function dispatchStudioOp(decl: PrismDeclaration, op: StudioApiOp): Studi
         auditLog: appendAudit(decl, op.op, 'Updated conceptual context & routing profile'),
       };
       return { ok: true, declaration: next, message: 'Updated Conceptual Model profile.' };
+    }
+
+    case 'reconcile-semantic-weights': {
+      const nextConcept: StudioConceptModel = {
+        ...decl.concept,
+        ...(op.purpose !== undefined ? { purpose: op.purpose.trim() } : {}),
+        semanticConceptId: op.semanticConceptId,
+        semanticKappa: op.semanticKappa,
+        semanticVersion: op.semanticVersion,
+        ...(op.lodState !== undefined ? { lodState: op.lodState } : {}),
+      };
+      const existingView = decl.view;
+      const existingOrgan = existingView?.proceduralOrgan;
+      const nextView: StudioViewDecl | null =
+        existingView && existingOrgan && op.weights
+          ? {
+              ...existingView,
+              ...(op.summary !== undefined ? { subtitle: op.summary } : {}),
+              proceduralOrgan: {
+                ...existingOrgan,
+                weights: op.weights,
+              },
+            }
+          : existingView;
+      const next: PrismDeclaration = {
+        ...decl,
+        ...(op.summary !== undefined
+          ? { metadata: { ...decl.metadata, description: op.summary } }
+          : {}),
+        concept: nextConcept,
+        view: nextView,
+        auditLog: appendAudit(
+          decl,
+          op.op,
+          `Reconciled semantic concept ${op.semanticConceptId} v${op.semanticVersion}${op.lodState ? ` (${op.lodState.label})` : ''}`,
+        ),
+      };
+      return {
+        ok: true,
+        declaration: next,
+        message: `Reconciled semantic weights v${op.semanticVersion}.`,
+      };
     }
 
     case 'admit-stakeholder': {
