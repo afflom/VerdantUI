@@ -355,8 +355,8 @@ export async function runProgressivePrismReconciliation(params: {
             const synth = await deps.synthesizeImageLayer({
               prompt: `${currentRev.canonicalSubject}, ${currentRev.attributes.slice(0, 4).join(', ')}, ${currentRev.lighting} lighting, ${currentRev.composition}`,
               seed: pw.seed + tier.rank * 7,
-              latentH: Math.min(32, Math.max(8, tier.latentDim >> 1)),
-              latentW: Math.min(32, Math.max(8, tier.latentDim >> 1)),
+              latentH: tier.latentDim,
+              latentW: tier.latentDim,
             });
             if (synth.neuralAvailable && synth.rgba && synth.width > 0 && synth.height > 0) {
               neuralLayer = { width: synth.width, height: synth.height, rgba: synth.rgba };

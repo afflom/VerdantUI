@@ -4,6 +4,8 @@ import {
   encodePromptToClipTokens,
   loadImageWeightsFromBacking,
   loadImageWeightsFromGguf,
+  sinusoidalTimestepEmbedding,
+  synthesizeDistilledImageAsync,
   synthesizeImageOneStep,
   type ClipTextWeights,
   type DistilledUnetWeights,
@@ -325,4 +327,89 @@ test('loadImageWeightsFromBacking selectively range-reads SDXS+TAESD GGUF with l
   // Negative checks: corrupted header and incomplete GGUF throw explicitly
   assert.throws(() => loadImageWeightsFromGguf(new Uint8Array([1, 2, 3, 4])));
   assert.throws(() => loadImageWeightsFromGguf(buildSyntheticSdxsGguf([])));
+});
+
+test('synthesizeDistilledImageAsync streams multi-layer CLIP, cross-attention UNet, and 3-stage TAESD across Lod0-Lod3 resolutions with bounded scratch', async () => {
+  const D = 8, V = 64, S = 16, C = 8, TC = 4;
+  const fill = (n: number, k: number) => new Float32Array(n).map((_, i) => Math.sin((i + 1) * k) * 0.04);
+  const gguf = buildSyntheticSdxsGguf([
+    { name: 'cond_stage_model.transformer.text_model.embeddings.token_embedding.weight', dims: [D, V], data: fill(D * V, 0.13) },
+    { name: 'cond_stage_model.transformer.text_model.embeddings.position_embedding.weight', dims: [D, S], data: fill(D * S, 0.17) },
+    { name: 'cond_stage_model.transformer.text_model.final_layer_norm.weight', dims: [D], data: new Float32Array(D).fill(1) },
+    { name: 'cond_stage_model.transformer.text_model.final_layer_norm.bias', dims: [D], data: new Float32Array(D) },
+    ...[0, 1].flatMap((l) => [
+      { name: `cond_stage_model.transformer.text_model.encoder.layers.${l}.layer_norm1.weight`, dims: [D], data: new Float32Array(D).fill(1) },
+      { name: `cond_stage_model.transformer.text_model.encoder.layers.${l}.layer_norm1.bias`, dims: [D], data: new Float32Array(D) },
+      { name: `cond_stage_model.transformer.text_model.encoder.layers.${l}.self_attn.q_proj.weight`, dims: [D, D], data: fill(D * D, 0.11 + l) },
+      { name: `cond_stage_model.transformer.text_model.encoder.layers.${l}.self_attn.k_proj.weight`, dims: [D, D], data: fill(D * D, 0.12 + l) },
+      { name: `cond_stage_model.transformer.text_model.encoder.layers.${l}.self_attn.v_proj.weight`, dims: [D, D], data: fill(D * D, 0.13 + l) },
+      { name: `cond_stage_model.transformer.text_model.encoder.layers.${l}.self_attn.out_proj.weight`, dims: [D, D], data: fill(D * D, 0.14 + l) },
+      { name: `cond_stage_model.transformer.text_model.encoder.layers.${l}.layer_norm2.weight`, dims: [D], data: new Float32Array(D).fill(1) },
+      { name: `cond_stage_model.transformer.text_model.encoder.layers.${l}.layer_norm2.bias`, dims: [D], data: new Float32Array(D) },
+      { name: `cond_stage_model.transformer.text_model.encoder.layers.${l}.mlp.fc1.weight`, dims: [D, D * 2], data: fill(D * D * 2, 0.15 + l) },
+      { name: `cond_stage_model.transformer.text_model.encoder.layers.${l}.mlp.fc2.weight`, dims: [D * 2, D], data: fill(D * D * 2, 0.16 + l) },
+    ]),
+    { name: 'model.diffusion_model.input_blocks.0.0.weight', dims: [3, 3, 4, C], data: fill(3 * 3 * 4 * C, 0.07) },
+    { name: 'model.diffusion_model.input_blocks.0.0.bias', dims: [C], data: new Float32Array(C) },
+    { name: 'model.diffusion_model.input_blocks.1.0.in_layers.0.weight', dims: [C], data: new Float32Array(C).fill(1) },
+    { name: 'model.diffusion_model.input_blocks.1.0.in_layers.0.bias', dims: [C], data: new Float32Array(C) },
+    { name: 'model.diffusion_model.input_blocks.1.0.in_layers.2.weight', dims: [3, 3, C, C], data: fill(3 * 3 * C * C, 0.09) },
+    { name: 'model.diffusion_model.input_blocks.1.0.in_layers.2.bias', dims: [C], data: new Float32Array(C) },
+    { name: 'model.diffusion_model.input_blocks.1.0.emb_layers.1.weight', dims: [D, C], data: fill(D * C, 0.12) },
+    { name: 'model.diffusion_model.input_blocks.1.0.emb_layers.1.bias', dims: [C], data: new Float32Array(C) },
+    { name: 'model.diffusion_model.input_blocks.1.0.out_layers.0.weight', dims: [C], data: new Float32Array(C).fill(1) },
+    { name: 'model.diffusion_model.input_blocks.1.0.out_layers.0.bias', dims: [C], data: new Float32Array(C) },
+    { name: 'model.diffusion_model.input_blocks.1.0.out_layers.3.weight', dims: [3, 3, C, C], data: fill(3 * 3 * C * C, 0.14) },
+    { name: 'model.diffusion_model.input_blocks.1.0.out_layers.3.bias', dims: [C], data: new Float32Array(C) },
+    { name: 'model.diffusion_model.input_blocks.1.1.transformer_blocks.0.attn2.to_q.weight', dims: [C, C], data: fill(C * C, 0.21) },
+    { name: 'model.diffusion_model.input_blocks.1.1.transformer_blocks.0.attn2.to_k.weight', dims: [D, C], data: fill(D * C, 0.22) },
+    { name: 'model.diffusion_model.input_blocks.1.1.transformer_blocks.0.attn2.to_v.weight', dims: [D, C], data: fill(D * C, 0.23) },
+    { name: 'model.diffusion_model.input_blocks.1.1.transformer_blocks.0.attn2.to_out.0.weight', dims: [C, C], data: fill(C * C, 0.24) },
+    { name: 'model.diffusion_model.out.2.weight', dims: [3, 3, C, 4], data: fill(3 * 3 * C * 4, 0.06) },
+    { name: 'model.diffusion_model.out.2.bias', dims: [4], data: new Float32Array(4) },
+    { name: 'first_stage_model.decoder.layers.0.weight', dims: [3, 3, 4, TC], data: fill(3 * 3 * 4 * TC, 0.08) },
+    { name: 'first_stage_model.decoder.layers.0.bias', dims: [TC], data: new Float32Array(TC) },
+    { name: 'first_stage_model.decoder.layers.6.weight', dims: [3, 3, TC, TC], data: fill(3 * 3 * TC * TC, 0.05) },
+    { name: 'first_stage_model.decoder.layers.11.weight', dims: [3, 3, TC, TC], data: fill(3 * 3 * TC * TC, 0.06) },
+    { name: 'first_stage_model.decoder.layers.16.weight', dims: [3, 3, TC, TC], data: fill(3 * 3 * TC * TC, 0.07) },
+    { name: 'first_stage_model.decoder.layers.18.weight', dims: [3, 3, TC, 3], data: fill(3 * 3 * TC * 3, 0.09) },
+    { name: 'first_stage_model.decoder.layers.18.bias', dims: [3], data: new Float32Array(3) },
+  ]);
+
+  const tEmb = sinusoidalTimestepEmbedding(999, D);
+  assert.equal(tEmb.length, D);
+  assert.ok(tEmb.every((v) => Number.isFinite(v)));
+
+  const loaded = loadImageWeightsFromGguf(gguf);
+  const tokens = encodePromptToClipTokens('a golden dog sitting in sunlit grass', V, S);
+  let yields = 0;
+
+  // Verify Lod0CoarseProxy (16 -> 128x128) and Lod3LosslessSource (64 -> 512x512)
+  const lod0 = await synthesizeDistilledImageAsync({
+    promptTokens: tokens,
+    latentH: 16,
+    latentW: 16,
+    seed: 42,
+    loaded,
+    yieldFrame: async () => { yields += 1; },
+  });
+  assert.equal(lod0.width, 128);
+  assert.equal(lod0.height, 128);
+  assert.equal(lod0.clipLayersExecuted, 2);
+  assert.equal(lod0.crossAttnBlocksExecuted, 1);
+  assert.ok(yields >= 4, 'Must yield cooperatively across CLIP, UNet cross-attention, and TAESD stages');
+  assert.ok(lod0.peakScratchBytes < 64 * 1024 * 1024);
+
+  const lod3 = await synthesizeDistilledImageAsync({
+    promptTokens: tokens,
+    latentH: 64,
+    latentW: 64,
+    seed: 42,
+    loaded,
+    yieldFrame: async () => { yields += 1; },
+  });
+  assert.equal(lod3.width, 512);
+  assert.equal(lod3.height, 512);
+  assert.equal(lod3.rgba.length, 512 * 512 * 4);
+  assert.ok(lod3.peakScratchBytes < 64 * 1024 * 1024, 'Lod3 512x512 scratch must stay strictly under 64 MB');
 });

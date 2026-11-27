@@ -2,7 +2,7 @@
 
 > Generated mechanically by `npm run studio:publish` from `model/features.json` and `model/release-ledger.json`.
 
-- **Active Features:** 15
+- **Active Features:** 16
 - **Proposed / Planned Features:** 0
 - **Recorded Releases:** 10
 
@@ -25,6 +25,7 @@
 | `VUI-FEAT-013` | **active** | `v0.6.0` | `VUI-STUDIO-02` | Coherent Multi-Facet Synthesis, SVG Logo/Cover Art, Mastered WAV+MIDI & Decluttered Media Prisms |
 | `VUI-FEAT-014` | **active** | `v0.8.0` | `VUI-OPFS-01` | OPFS SDXS GGUF Loader, Worker Auto-Recovery, Compact Thumbnails, Editorial Research/Utility Organs & Deterministic Publish |
 | `VUI-FEAT-015` | **active** | `v0.9.0` | `VUI-OBSERVER-01` | Live Root Verdant Prism Runtime, Zero-Interruption Cooperative Scheduling, Gated Delta Cross-Modal Associativity & Progressive Lod0-Lod3 QA |
+| `VUI-FEAT-016` | **active** | `v0.10.0` | `VUI-OPFS-01` | Layer-Streamed OPFS SDXS-512 CLIP Transformer, Spatial Cross-Attention UNet & Progressive 3-Stage TAESD (128-512px) |
 
 ## Release Ledger
 

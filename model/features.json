@@ -165,6 +165,17 @@
       "invariantId": "VUI-OBSERVER-01",
       "citation": { "kind": "req", "decisionId": "DEC-018" },
       "publicBenefitImpact": "Runs VerdantUI as one live Root Verdant Prism instance rendered by the Observer with 2-tier layout caching, persistent non-unmounting Home Thread, non-preempting salience-ordered worker scheduling, Gated Delta Rule cross-modal semantic associativity with parent-linked kappa revisions, and progressive Lod0-Lod3 Vision/Audio QA reconciliation across all MediaType Galleries."
+    },
+    {
+      "id": "VUI-FEAT-016",
+      "title": "Layer-Streamed OPFS SDXS-512 CLIP Transformer, Spatial Cross-Attention UNet & Progressive 3-Stage TAESD (128-512px)",
+      "stage": "active",
+      "introducedIn": "0.10.0",
+      "ownerFile": "src/engine/imageSynthesisEngine.ts",
+      "testFile": "src/engine/multimodalSynthesis.test.ts",
+      "invariantId": "VUI-OPFS-01",
+      "citation": { "kind": "req", "decisionId": "DEC-018" },
+      "publicBenefitImpact": "Streams multi-layer CLIP text transformer, sinusoidal timestep conditioning, multi-head spatial cross-attention UNet refinement, and progressive 3-stage TAESD decoding (128px Lod0 through 512px Lod3) layer-by-layer from OPFS with cooperative frame yields and bounded <64 MB scratch memory."
     }
   ]
 }

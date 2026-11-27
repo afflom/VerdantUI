@@ -10,7 +10,7 @@ import {
 import {
   encodePromptToClipTokens,
   loadImageWeightsFromBacking,
-  synthesizeImageOneStep,
+  synthesizeDistilledImageAsync,
   type ImageSynthesisScratch,
   type LoadedNeuralImageWeights,
 } from './imageSynthesisEngine';
@@ -1308,15 +1308,14 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         neuralWeights.clip.vocabSize,
         neuralWeights.clip.maxSeqLen,
       );
-      const synth = synthesizeImageOneStep({
+      const synth = await synthesizeDistilledImageAsync({
         promptTokens,
-        latentH: Math.max(4, Math.min(32, req.latentH ?? 8)),
-        latentW: Math.max(4, Math.min(32, req.latentW ?? 8)),
+        latentH: Math.max(8, Math.min(64, req.latentH ?? 16)),
+        latentW: Math.max(8, Math.min(64, req.latentW ?? 16)),
         seed: req.seed,
-        clip: neuralWeights.clip,
-        unet: neuralWeights.unet,
-        taesd: neuralWeights.taesd,
+        loaded: neuralWeights,
         scratch: imageSynthesisScratch,
+        yieldFrame: () => new Promise<void>((resolve) => setTimeout(resolve, 0)),
       });
       multimodalCoordinator.frameOracle.recordFrame((performance.now() - t0) * 1000);
       const copy = new Uint8Array(synth.rgba.byteLength);
