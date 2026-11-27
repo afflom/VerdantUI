@@ -199,7 +199,7 @@ export class PrismHostPool implements PrismBridgeRuntime {
                 ? `Streaming capabilities to your browser (${state.progressPercent}%). Try again in a moment.`
                 : 'Send a prompt in Chat or wait a moment for browser capabilities to initialize.'
               : state.streamingConsent === 'pending'
-                ? 'Confirm browser streaming in the banner above to enable AI capabilities inside apps.'
+                ? 'Enable browser streaming in Settings → Content Streams to enable AI capabilities inside apps.'
                 : 'Offline-only mode is active. Turn off Offline-Only Mode in Settings → Content Streams to enable AI capabilities inside apps.';
           span.addEvent('prism.ask.deferred', { reason: notice }, undefined, 'ok');
           span.end('ok');

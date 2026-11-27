@@ -135,35 +135,6 @@ export interface PublishedPrismSummary {
 
 export type PrismStarterId = 'blank' | 'kanban' | 'focus' | 'budget' | 'writer';
 
-export interface PrismStarterSpec {
-  readonly id: PrismStarterId;
-  readonly label: string;
-  readonly description: string;
-}
-
-export const PRISM_STARTERS: readonly PrismStarterSpec[] = [
-  {
-    id: 'kanban',
-    label: 'Task Board',
-    description: '3-column Kanban board with local persistence, Markdown export, and Thread actions.',
-  },
-  {
-    id: 'focus',
-    label: 'Focus Timer',
-    description: 'Circular Pomodoro timer with audio chime, session log, and live Thread status.',
-  },
-  {
-    id: 'budget',
-    label: 'Expense Tracker',
-    description: 'Interactive expense table with category breakdown bars and CSV export.',
-  },
-  {
-    id: 'writer',
-    label: 'AI Writing Assistant',
-    description: 'Summarize, tighten, or extract action items locally via VerdantUI.',
-  },
-];
-
 /** Matches an explicit request for a built-in starter app when Model Stream is Off. */
 export function matchStarterFromPrompt(prompt: string): PrismStarterId | null {
   const lower = prompt.trim().toLowerCase();
@@ -1059,43 +1030,8 @@ window.verdant.onInput(async (payload) => {
 }
 
 // ============================================================================
-// 4. Targeted Studio Prompting & Patch Extraction (Fast Local Iteration)
+// 4. Targeted Studio Patch Extraction
 // ============================================================================
-
-export function buildStudioSystemPrompt(draft: VerdantPrismSnapshot): string {
-  return [
-    'You are Verdant Studio, building a polished, self-contained client-side web app (a Prism) inside VerdantUI.',
-    'Theme tokens available automatically: --v-bg, --v-surface, --v-border, --v-text, --v-muted, --v-accent, --v-accent-text, plus utility classes (.v-card, .v-btn, .v-btn-primary, .v-input, .v-pill, .v-muted).',
-    'Sandbox API on window.verdant:',
-    '- verdant.storage.get(key) / set(key, value): persistent local app state',
-    '- verdant.ask(prompt, { onToken }): stream local AI completions from VerdantUI',
-    '- verdant.onInput(async (payload) => result): respond when invoked from a Thread or another Prism',
-    '- verdant.emit(eventName, body): emit structured OTel telemetry/state events',
-    '- verdant.browser.copyText(text) / downloadFile(name, content, mime) / notify(title, body)',
-    '- verdant.ui.getState() / callPrism(nameOrId, payload) / openPrism(nameOrId)',
-    '- verdant.fetch(url, init): HTTP fetch (requires user Network grant)',
-    'Emit ONLY the sections that need to change using fenced code blocks:',
-    '- ```html ... ``` for body markup',
-    '- ```css ... ``` for styles',
-    '- ```js ... ``` for script logic',
-    '- Optional ```json ... ``` with {"name","summary","streams"} when updating metadata or input schema.',
-    'Design clean, high-craft UIs with real interactivity and zero external CDN dependencies.',
-    '',
-    `Current Prism: "${draft.name}" — ${draft.summary}`,
-    'Current HTML:',
-    '```html',
-    draft.app.html,
-    '```',
-    'Current CSS:',
-    '```css',
-    draft.app.css,
-    '```',
-    'Current JS:',
-    '```js',
-    draft.app.js,
-    '```',
-  ].join('\n');
-}
 
 export interface ExtractedPrismPatch {
   readonly snapshot: VerdantPrismSnapshot;
@@ -1880,45 +1816,4 @@ export function snapshotFromDeclaration(decl: PrismDeclaration): VerdantPrismSna
           js: '',
         },
   });
-}
-
-/**
- * Optional NL -> Declarative Studio API Operations proposer prompt.
- * NEVER asks the model to write raw HTML, CSS, or JavaScript — only closed StudioApiOp JSON!
- */
-export function buildStudioApiProposerPrompt(decl: PrismDeclaration): string {
-  const fieldsSummary = (decl.encoding?.fields ?? [])
-    .map((f) => `${f.name} (${f.kind}, ${f.min}..${f.max}${f.choices ? `, choices=${JSON.stringify(f.choices)}` : ''})`)
-    .join('; ');
-  return [
-    'You are the Verdant Studio declarative API translator.',
-    'NEVER output HTML, CSS, JavaScript, or LexLean code.',
-    'Output ONLY a valid JSON array of StudioApiOp objects inside a single ```json code fence.',
-    `Current Prism: "${decl.metadata.name}" | Requirements: ${decl.requirements.map((r) => r.id).join(', ')}`,
-    `Current Fields: ${fieldsSummary || 'none'}`,
-    `Current Features: ${decl.features.map((f) => f.id).join(', ') || 'none'} | Refusals: ${decl.refusals.map((r) => r.id).join(', ') || 'none'}`,
-    'Allowed op kinds: "admit-requirement", "propose-encoding", "admit-feature", "admit-refusal", "admit-vector", "set-theme".',
-    'Every feature/refusal must cite an existing requirement via {"kind":"req","requirementId":"REQ-01"}.',
-  ].join('\n');
-}
-
-export function extractStudioApiOpsFromModelOutput(rawText: string): readonly StudioApiOp[] | null {
-  const fenced = rawText.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidate = (fenced ? fenced[1] : rawText).trim();
-  const start = candidate.indexOf('[');
-  const end = candidate.lastIndexOf(']');
-  if (start < 0 || end <= start) return null;
-  try {
-    const parsed = JSON.parse(candidate.slice(start, end + 1));
-    if (!Array.isArray(parsed) || parsed.length === 0) return null;
-    const validOps = parsed.filter(
-      (item): item is StudioApiOp =>
-        item !== null &&
-        typeof item === 'object' &&
-        typeof (item as { op?: unknown }).op === 'string',
-    );
-    return validOps.length > 0 ? validOps : null;
-  } catch {
-    return null;
-  }
 }

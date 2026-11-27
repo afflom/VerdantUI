@@ -618,28 +618,3 @@ export function sliceGgufTensorBytes(model: ParsedGgufModel, info: GgufTensorInf
   return model.rawBytes.subarray(start, end);
 }
 
-export function readGgufTensorInto(
-  model: ParsedGgufModel,
-  info: GgufTensorInfo,
-  backing: {
-    readonly byteLength: number;
-    readRange(fileOffset: number, dst: Uint8Array, dstOffset?: number, length?: number): number;
-  },
-  dst: Uint8Array,
-  dstOffset = 0,
-): number {
-  const start = model.dataOffset + info.offset;
-  if (start + info.byteSize > model.fileByteLength) {
-    throw new Error(
-      `Tensor "${info.name}" exceeds GGUF backing bounds (${start + info.byteSize} > ${model.fileByteLength}).`,
-    );
-  }
-  const read = backing.readRange(start, dst, dstOffset, info.byteSize);
-  if (read !== info.byteSize) {
-    throw new Error(
-      `Short vRAM backing read for "${info.name}": expected ${info.byteSize} bytes, got ${read}.`,
-    );
-  }
-  return read;
-}
-

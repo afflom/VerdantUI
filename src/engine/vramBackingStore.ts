@@ -17,10 +17,6 @@ import type { GgufTensorInfo } from './gguf';
 
 export type VramBackingKind = 'opfs-sync' | 'opfs-demand' | 'local-file-sync' | 'memory';
 
-export function isOpfsBackedKind(kind: VramBackingKind): boolean {
-  return kind === 'opfs-sync' || kind === 'opfs-demand';
-}
-
 export function isDiskPagedBackingKind(kind: VramBackingKind): boolean {
   return kind === 'opfs-sync' || kind === 'opfs-demand' || kind === 'local-file-sync';
 }

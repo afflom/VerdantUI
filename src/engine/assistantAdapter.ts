@@ -1192,7 +1192,7 @@ export function createLlamaVTensorAdapter(
           turnSpan?.end('ok');
           const offlineMessage =
             initialState.streamingConsent === 'pending'
-              ? 'Confirm browser streaming in the banner above to stream capabilities directly to your browser.\n\n*(Quick actions, creations, and your saved apps addressed with `@AppName` work immediately even offline.)*'
+              ? 'Enable browser streaming in **Settings → Content Streams** to stream capabilities directly to your browser.\n\n*(Quick actions, creations, and your saved apps addressed with `@AppName` work immediately even offline.)*'
               : '**Offline-only mode** is active. Turn off Offline-Only Mode in **Settings → Content Streams** to resume browser streaming.\n\n*(Quick actions, creations, and your saved apps addressed with `@AppName` continue working offline.)*';
           yield {
             content: [
@@ -1237,7 +1237,7 @@ export function createLlamaVTensorAdapter(
       if (!state.model || state.model.id === 'stories260k-f32') {
         const unavailableText =
           state.streamingConsent === 'pending'
-            ? 'Confirm browser streaming in the banner above to stream capabilities to your browser.'
+            ? 'Enable browser streaming in **Settings → Content Streams** to stream capabilities to your browser.'
             : '**Offline-only mode** is active. Turn off Offline-Only Mode in **Settings → Content Streams** to resume browser streaming.';
         yield {
           content: [

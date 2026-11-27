@@ -1371,16 +1371,6 @@ export function parseFollowUpInstruction(
 // Optional Local On-Device Model Structured Extraction & Safe Merge
 // ============================================================================
 
-export function buildLocalInterviewExtractionPrompt(sentence: string): string {
-  return [
-    'Extract a concise structured JSON specification from the user sentence.',
-    'NEVER write HTML, CSS, JavaScript, or code.',
-    'Return ONLY a single ```json code fence matching this schema:',
-    '{"name":"Short Title","domain":"general|finance|health|education|games-media|enterprise-ops","audience":"personal|team|public-adults|includes-minors","dataClassification":"none|operational|personal|sensitive-regulated","jurisdictions":["none"|"us"|"eu"|"uk"|"global"],"usesLocalAi":false,"involvesPayments":false,"outputName":"Result","processName":"Evaluate","inputs":[{"name":"camelCase","label":"Human Label","kind":"nat|choice|bool","unit":"optional","max":10000,"choices":["optional"]}]}',
-    `User sentence: ${JSON.stringify(sentence)}`,
-  ].join('\n');
-}
-
 export function mergeLocalModelExtraction(
   rawModelOutput: string,
   fallback: ExtractedPrismIntent,

@@ -23,7 +23,6 @@ import {
 } from './harnessConfig';
 import type { LoadedModelSummary } from './llamaRuntime';
 import {
-  MODEL_CATALOG,
   findCatalogModelById,
   getModelCapacityQ10,
   isInternalBootstrapModel,
@@ -1002,32 +1001,6 @@ function buildCatalogModelFacets(model: CatalogModel): CognitiveVector {
     elaboration,
     toolComp,
   ];
-}
-
-export function pickDefaultNeuralCatalogModel(cachedModelIds: readonly string[] = []): CatalogModel {
-  // Prefer an already-cached general/reasoning Qwen3 checkpoint first
-  const preferenceOrder = [
-    'qwen3-4b-q4_k_m',
-    'qwen3-8b-q4_k_m',
-    'qwen2.5-1.5b-instruct-q4_k_m',
-    'qwen2.5-3b-instruct-q4_k_m',
-    'qwen3-coder-30b-a3b-q4_k_m',
-  ];
-  for (const id of preferenceOrder) {
-    if (cachedModelIds.includes(id)) {
-      const m = findCatalogModelById(id);
-      if (m) return m;
-    }
-  }
-  for (const id of cachedModelIds) {
-    const m = findCatalogModelById(id);
-    if (m) return m;
-  }
-  const nav =
-    typeof navigator !== 'undefined' ? (navigator as Navigator & { deviceMemory?: number }) : undefined;
-  const memGb = typeof nav?.deviceMemory === 'number' ? nav.deviceMemory : 8;
-  const targetId = memGb <= 4 ? 'qwen2.5-1.5b-instruct-q4_k_m' : 'qwen3-4b-q4_k_m';
-  return findCatalogModelById(targetId) ?? MODEL_CATALOG[0];
 }
 
 // ============================================================================

@@ -15,7 +15,6 @@ import {
 import {
   UNIFIED_VERDANT_SYSTEM_PROMPT,
   VerdantCognitiveObserver,
-  pickDefaultNeuralCatalogModel,
   type CognitiveObserverSnapshot,
   type CognitiveRouteCertificate,
 } from './cognitiveObserver';
@@ -93,14 +92,6 @@ export function saveStreamingConsent(consent: StreamingConsentState): void {
   } catch {
     // Ignore storage errors
   }
-}
-
-export function loadSavedModelStreamEnabled(): boolean {
-  return loadSavedStreamingConsent() === 'accepted';
-}
-
-export function saveModelStreamEnabled(enabled: boolean): void {
-  saveStreamingConsent(enabled ? 'accepted' : 'paused');
 }
 
 export type EngineStatus = 'idle' | 'downloading' | 'loading' | 'ready' | 'generating' | 'error';

@@ -393,7 +393,6 @@ export default function App() {
     contentStreams,
     expertRegistry,
     prismPool,
-    systemPartPrisms,
   } = rootPrism;
   const getPrismBuildClient = useCallback(
     () => rootPrism.getPrismBuildClient(),

@@ -26,7 +26,6 @@ import {
 } from './prismMediaOrgans';
 
 export const DECLARATION_SCHEMA = 'verdant-studio/declaration/2' as const;
-export const LEGACY_DECLARATION_SCHEMA_V1 = 'verdant-studio/declaration/1' as const;
 
 export type PrismDomain =
   | 'general'
@@ -683,43 +682,6 @@ export type DeclarativeStarterId =
   | 'eligibility-gate'
   | 'split-calc'
   | 'blank';
-
-export const DECLARATIVE_STARTERS: readonly {
-  readonly id: DeclarativeStarterId;
-  readonly label: string;
-  readonly description: string;
-  readonly preset: PrismThemePreset;
-  readonly viewpoint: PrismViewpoint;
-}[] = [
-  {
-    id: 'budget-guard',
-    label: 'Monthly Budget Guard',
-    description: 'Proved spending limit evaluator with category choices, remaining balance math, and zero/cap refusals.',
-    preset: 'evergreen',
-    viewpoint: 'ledger-tracker',
-  },
-  {
-    id: 'pricing-rules',
-    label: 'Tiered Discount Engine',
-    description: 'Volume & member-tier pricing rules with proved net totals and quantity/price refusals.',
-    preset: 'paper',
-    viewpoint: 'calculator',
-  },
-  {
-    id: 'eligibility-gate',
-    label: 'Access & Plan Gate',
-    description: 'Policy decision table classifying accounts into Approved, Manual Review, or Denied with proved invariants.',
-    preset: 'midnight',
-    viewpoint: 'decision-form',
-  },
-  {
-    id: 'split-calc',
-    label: 'Bill & Tip Splitter',
-    description: 'Per-person total calculator with tip percentage and proved zero-diner / zero-bill refusals.',
-    preset: 'terracotta',
-    viewpoint: 'calculator',
-  },
-];
 
 // ============================================================================
 // Helpers & Pure Rule Evaluation (1-to-1 with Compiled App.lex.tex)
