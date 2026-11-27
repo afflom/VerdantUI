@@ -58,7 +58,7 @@ export interface DiscoveredExpertManifest {
   readonly etag?: string;
 }
 
-const DEFAULT_PREWARM_SLICE_BYTES = 16 * 1024 * 1024; // 16 MiB interruptible background slice (2 x 8 MiB coalesced HTTP Range fetches)
+const DEFAULT_PREWARM_SLICE_BYTES = 32 * 1024 * 1024; // 32 MiB interruptible slice (2 x 16 MiB direct-CDN coalesced fetches)
 const INITIAL_DISCOVERY_HEADER_BYTES = 64 * 1024; // 64 KiB initial probe
 const MAX_DISCOVERY_HEADER_BYTES = 8 * 1024 * 1024; // 8 MiB cap for 150K-vocab headers
 

@@ -10,6 +10,7 @@ import {
 } from './unifiedExpertScheduler';
 import { MemoryCasBackend, OpfsCasStore } from './vramCasStore';
 import {
+  createDefaultAsyncRangeFetcher,
   OpfsDemandVramBackingStore,
   type SyncAccessHandleLike,
 } from './vramBackingStore';
@@ -291,4 +292,34 @@ test('OpfsDemandVramBackingStore coalesces contiguous missing slabs into multi-s
   store.flush();
   assert.equal(flushCalls, 1);
   store.close();
+});
+
+test('createDefaultAsyncRangeFetcher caches redirected CDN URLs and automatically falls back on signed URL expiry', async () => {
+  const originUrl = 'https://huggingface.co/example/model.gguf';
+  const cdnUrl = 'https://cas-bridge.xethub.hf.co/signed-token-123';
+  const requestedUrls: string[] = [];
+  let cdnExpired = false;
+
+  const mockFetch: typeof fetch = async (input) => {
+    const u = String(input);
+    requestedUrls.push(u);
+    if (u === cdnUrl && cdnExpired) {
+      return new Response(null, { status: 403 });
+    }
+    const body = new Uint8Array([1, 2, 3, 4]);
+    const res = new Response(body, { status: 206 });
+    Object.defineProperty(res, 'url', { value: cdnUrl });
+    return res;
+  };
+
+  const fetcher = createDefaultAsyncRangeFetcher(mockFetch);
+  await fetcher(originUrl, 0, 3);
+  await fetcher(originUrl, 4, 7);
+  // First call resolved origin -> CDN; second call hit CDN directly with 0 redirect round-trips!
+  assert.deepEqual(requestedUrls, [originUrl, cdnUrl]);
+
+  // Simulate signed CDN URL expiry (403) -> automatically re-resolves via origin URL cleanly
+  cdnExpired = true;
+  await fetcher(originUrl, 8, 11);
+  assert.deepEqual(requestedUrls, [originUrl, cdnUrl, cdnUrl, originUrl]);
 });

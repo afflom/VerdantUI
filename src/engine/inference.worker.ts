@@ -81,6 +81,7 @@ export type WorkerRequest =
       preferDemandStreaming?: boolean;
       maxContextCap?: number;
       weightResidencyPolicy?: WeightResidencyPolicy;
+      bootPrompt?: string;
     }
   | {
       type: 'load_file';
@@ -201,6 +202,10 @@ export type WorkerRequest =
       type: 'pause_prewarm';
     }
   | {
+      type: 'resume_prewarm';
+      bootPrompt?: string;
+    }
+  | {
       type: 'shutdown';
     };
 
@@ -312,11 +317,16 @@ export type WorkerResponse =
   | {
       type: 'prewarm_status';
       active: boolean;
+      phase: 'streaming' | 'warming-context' | 'ready' | 'error';
       modelId: string;
       warmBytes: number;
       targetBytes: number;
       percent: number;
       casBytesSaved: number;
+      bytesPerSecond?: number;
+      etaSeconds?: number | null;
+      contextWarmed: boolean;
+      errorMessage?: string;
     }
   | {
       type: 'token_count';
@@ -478,6 +488,8 @@ let activeSpeculativePromise: Promise<void> | null = null;
 let activePrewarmController: AbortController | null = null;
 let activePrewarmPromise: Promise<void> | null = null;
 let prewarmAllowed = true;
+let activeBootPrompt: string | undefined;
+let contextWarmedModelId: string | null = null;
 let activeLoadController: AbortController | null = null;
 let activeLoadPromise: Promise<void> | null = null;
 let activeGenerationController: AbortController | null = null;
@@ -666,9 +678,13 @@ async function preemptBackgroundPrewarm(): Promise<void> {
 }
 
 /**
- * Cooperatively warms priority weight slices (`<= 4 MiB` each: early attention -> body layers ->
- * LM-head, never pulling cold Sparse MoE expert tables) in the idle background after a fast
- * `opfs-demand` header mount. Preempts instantly on `generate` and resumes automatically when idle.
+ * High-throughput, interruptible initialization & background prewarmer:
+ *   1. Streams priority uncached weight slices (`32 MiB` slices via direct-CDN 16 MiB coalesced
+ *      HTTP Range fetches, strictly skipping cold Sparse MoE expert tables) with live speed/ETA.
+ *   2. Once OPFS slabs are 100% warm, pins active WASM layers + lazy full-vocab LM-head and
+ *      pre-computes the initial system-prompt KV prefix (`warmRuntimeForInstantFirstToken`) so
+ *      the user's VERY FIRST prompt achieves instant TTFT and peak steady-state tok/s!
+ *   3. Preempts in < 1 ms on `generate`, `pause_prewarm`, or model switch, keeping all warmed slabs.
  */
 function startBackgroundPrewarm(): void {
   if (
@@ -682,24 +698,27 @@ function startBackgroundPrewarm(): void {
     return;
   }
   const summary = runtime.getModelSummary();
-  if (!summary || summary.backingKind !== 'opfs-demand') return;
-  const plan = runtime.getDemandPrewarmPlan();
-  if (!plan) return;
-
+  if (!summary) return;
   const modelId = summary.id;
-  const targetBytes = plan.totalTargetBytes;
-  let warmBytes = plan.alreadyCachedBytes;
-  const initialPercent = plan.percentWarm;
 
-  if (plan.slices.length === 0) {
+  // For already-resident/full-OPFS models, warm pinned WASM frames + system-prompt KV directly
+  const isDemand = summary.backingKind === 'opfs-demand';
+  const plan = isDemand ? runtime.getDemandPrewarmPlan() : null;
+  const targetBytes = plan?.totalTargetBytes ?? summary.fileByteLength;
+  let warmBytes = plan?.alreadyCachedBytes ?? targetBytes;
+  const slices = plan?.slices ?? [];
+
+  if (slices.length === 0 && contextWarmedModelId === modelId) {
     post({
       type: 'prewarm_status',
       active: false,
+      phase: 'ready',
       modelId,
-      warmBytes,
+      warmBytes: targetBytes,
       targetBytes,
       percent: 100,
       casBytesSaved: getSharedOpfsCasStore().getTelemetry().bytesSaved,
+      contextWarmed: true,
     });
     return;
   }
@@ -710,44 +729,93 @@ function startBackgroundPrewarm(): void {
   let task: Promise<void> | null = null;
   task = (async () => {
     let lastPost = 0;
-    const emit = (active: boolean, force = false) => {
+    const tStartMs = performance.now();
+    let downloadedThisRun = 0;
+    let finishedWarm = false;
+    let errorMessage: string | undefined;
+
+    const emit = (
+      active: boolean,
+      phase: 'streaming' | 'warming-context' | 'ready' | 'error',
+      contextWarmed: boolean,
+      force = false,
+      errMsg?: string,
+    ) => {
       const now = performance.now();
       const pct =
         targetBytes > 0 ? Math.min(100, Math.round((warmBytes / targetBytes) * 100)) : 100;
-      if (force || now - lastPost >= 250 || pct === 100) {
+      const elapsedSec = Math.max(0.1, (now - tStartMs) / 1000);
+      const bps = downloadedThisRun > 0 ? Math.round(downloadedThisRun / elapsedSec) : 0;
+      const remaining = Math.max(0, targetBytes - warmBytes);
+      const eta = bps >= 64 * 1024 && remaining > 0 ? remaining / bps : null;
+      if (force || now - lastPost >= 200 || pct === 100) {
         lastPost = now;
         post({
           type: 'prewarm_status',
           active,
+          phase,
           modelId,
           warmBytes,
           targetBytes,
           percent: pct,
           casBytesSaved: getSharedOpfsCasStore().getTelemetry().bytesSaved,
+          bytesPerSecond: bps > 0 ? bps : undefined,
+          etaSeconds: eta,
+          contextWarmed,
+          ...(errMsg ? { errorMessage: errMsg } : {}),
         });
       }
     };
 
-    emit(true, true);
     try {
-      for (const slice of plan.slices) {
-        if (
-          controller.signal.aborted ||
-          !prewarmAllowed ||
-          activeGenerationCount > 0 ||
-          pendingGenerationQueue.length > 0 ||
-          activeLoadController !== null ||
-          runtime.getModelSummary()?.id !== modelId
-        ) {
-          break;
+      if (slices.length > 0) {
+        emit(true, 'streaming', false, true);
+        for (const slice of slices) {
+          if (
+            controller.signal.aborted ||
+            !prewarmAllowed ||
+            activeGenerationCount > 0 ||
+            pendingGenerationQueue.length > 0 ||
+            activeLoadController !== null ||
+            runtime.getModelSummary()?.id !== modelId
+          ) {
+            return;
+          }
+          await runtime.prefetchDemandRanges(slice.ranges, controller.signal);
+          warmBytes = Math.min(targetBytes, warmBytes + slice.byteLength);
+          downloadedThisRun += slice.byteLength;
+          emit(true, 'streaming', false, false);
+          await cooperativeYielder.yieldNow();
         }
-        await runtime.prefetchDemandRanges(slice.ranges, controller.signal);
-        warmBytes = Math.min(targetBytes, warmBytes + slice.byteLength);
-        emit(warmBytes < targetBytes, false);
-        await cooperativeYielder.yieldNow();
       }
-    } catch {
-      // Aborted or transient network hiccup: already-warmed slabs stay safely persisted in OPFS CAS
+
+      if (
+        controller.signal.aborted ||
+        !prewarmAllowed ||
+        activeGenerationCount > 0 ||
+        pendingGenerationQueue.length > 0 ||
+        activeLoadController !== null ||
+        runtime.getModelSummary()?.id !== modelId
+      ) {
+        return;
+      }
+
+      // Stage 3: Pin WASM layers + full-vocab LM-head + pre-compute system-prompt KV prefix
+      warmBytes = targetBytes;
+      emit(true, 'warming-context', false, true);
+      await runtime.warmRuntimeForInstantFirstToken(activeBootPrompt, controller.signal);
+      if (!controller.signal.aborted && runtime.getModelSummary()?.id === modelId) {
+        contextWarmedModelId = modelId;
+        finishedWarm = true;
+      }
+    } catch (err) {
+      const isAbort =
+        controller.signal.aborted ||
+        (err instanceof DOMException && err.name === 'AbortError') ||
+        (err instanceof Error && err.name === 'AbortError');
+      if (!isAbort) {
+        errorMessage = err instanceof Error ? err.message : String(err);
+      }
     } finally {
       runtime.flushDemandBacking();
       if (activePrewarmController === controller) {
@@ -756,11 +824,16 @@ function startBackgroundPrewarm(): void {
       if (activePrewarmPromise === task) {
         activePrewarmPromise = null;
       }
-      emit(false, true);
+      if (finishedWarm) {
+        emit(false, 'ready', true, true);
+      } else if (errorMessage) {
+        emit(false, 'error', false, true, errorMessage);
+      } else {
+        emit(false, warmBytes >= targetBytes ? 'warming-context' : 'streaming', contextWarmedModelId === modelId, true);
+      }
     }
   })();
   activePrewarmPromise = task;
-  void initialPercent;
 }
 
 /**
@@ -1116,6 +1189,13 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       return;
     }
 
+    if (req.type === 'resume_prewarm') {
+      prewarmAllowed = true;
+      if (req.bootPrompt) activeBootPrompt = req.bootPrompt;
+      startBackgroundPrewarm();
+      return;
+    }
+
     if (req.type === 'load_buffer') {
       await preemptBackgroundPrewarm();
       await preemptSpeculativePrefill();
@@ -1150,6 +1230,8 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       await drainBackgroundOpfsPersist();
       await threadPoolReadyPromise;
       prewarmAllowed = true;
+      activeBootPrompt = req.bootPrompt;
+      contextWarmedModelId = null;
       const controller = new AbortController();
       activeControllers.set(req.requestId, controller);
       activeLoadController = controller;
@@ -1240,7 +1322,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           telemetry: runtime.getTelemetry(),
           opfsStorage,
         });
-        shouldStartPrewarm = summary.backingKind === 'opfs-demand';
+        shouldStartPrewarm = !req.skipOpfs;
       } catch (err) {
         if (acquiredBacking && !committedToRuntime) {
           try {

@@ -165,6 +165,8 @@ const SubscribedAppInitializingOverlay: FC<{
     engineStatus: summary.status,
     modelId: summary.modelId,
     storesHydrated,
+    contextWarmed: summary.contextWarmed,
+    prewarmPhase: summary.backgroundPrewarmPhase,
   });
 
   useEffect(() => {
@@ -190,6 +192,13 @@ const SubscribedAppInitializingOverlay: FC<{
         modelId: summary.modelId,
         errorMessage: summary.errorMessage,
         storesHydrated,
+        prewarmActive: summary.backgroundPrewarmActive,
+        prewarmPercent: summary.backgroundPrewarmPercent,
+        prewarmPhase: summary.backgroundPrewarmPhase,
+        prewarmBytesPerSec: summary.backgroundPrewarmBps,
+        prewarmEtaSeconds: summary.backgroundPrewarmEtaSec,
+        prewarmError: summary.backgroundPrewarmError,
+        contextWarmed: summary.contextWarmed,
         sessionUnlocked,
       }),
     [
@@ -199,6 +208,13 @@ const SubscribedAppInitializingOverlay: FC<{
       summary.initStatusDetail,
       summary.modelId,
       summary.errorMessage,
+      summary.backgroundPrewarmActive,
+      summary.backgroundPrewarmPercent,
+      summary.backgroundPrewarmPhase,
+      summary.backgroundPrewarmBps,
+      summary.backgroundPrewarmEtaSec,
+      summary.backgroundPrewarmError,
+      summary.contextWarmed,
       storesHydrated,
       sessionUnlocked,
     ],

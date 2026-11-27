@@ -29,6 +29,14 @@ export interface AppInitializationInput {
   readonly modelId: string | null;
   readonly errorMessage: string | null;
   readonly storesHydrated: boolean;
+  /** Live OPFS + WASM + system-context warming status for instant Turn 1 TTFT. */
+  readonly prewarmActive?: boolean;
+  readonly prewarmPercent?: number;
+  readonly prewarmPhase?: 'idle' | 'streaming' | 'warming-context' | 'ready' | 'error';
+  readonly prewarmBytesPerSec?: number;
+  readonly prewarmEtaSeconds?: number | null;
+  readonly prewarmError?: string | null;
+  readonly contextWarmed?: boolean;
   /** True once the user has already reached a usable session in the current mode. */
   readonly sessionUnlocked: boolean;
 }
@@ -81,11 +89,30 @@ export function formatInitStatusLine(
   return 'Initializing VerdantUI…';
 }
 
+function formatCompactTransferRate(bytesPerSec: number, etaSeconds: number | null | undefined): string {
+  const parts: string[] = [];
+  if (bytesPerSec >= 128 * 1024) {
+    parts.push(`${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`);
+  }
+  if (etaSeconds != null && Number.isFinite(etaSeconds) && etaSeconds > 0.5) {
+    if (etaSeconds < 60) {
+      parts.push(`${Math.ceil(etaSeconds)}s left`);
+    } else {
+      const m = Math.floor(etaSeconds / 60);
+      const s = Math.ceil(etaSeconds % 60);
+      parts.push(`${m}m ${s}s left`);
+    }
+  }
+  return parts.join(' · ');
+}
+
 export function isVerdantUsableForConsent(params: {
   readonly streamingConsent: StreamingConsentState;
   readonly engineStatus: EngineStatus;
   readonly modelId: string | null;
   readonly storesHydrated: boolean;
+  readonly contextWarmed?: boolean;
+  readonly prewarmPhase?: 'idle' | 'streaming' | 'warming-context' | 'ready' | 'error';
 }): boolean {
   if (!params.storesHydrated) return false;
   if (params.streamingConsent === 'pending') {
@@ -98,13 +125,14 @@ export function isVerdantUsableForConsent(params: {
       params.engineStatus !== 'loading'
     );
   }
-  // Accepted streaming consent: ready as soon as the real demand-first runtime is mounted
-  // (background warming continues silently after the screen clears).
+  // Accepted streaming consent: unlock VerdantUI ONLY once the unified core runtime,
+  // active capabilities, AND initial context are warm so Turn 1 achieves instant TTFT & peak tok/s!
   const hasRealRuntime = params.modelId !== null && !isInternalBootstrapModel(params.modelId);
-  return (
+  const runtimeReady =
     hasRealRuntime &&
-    (params.engineStatus === 'ready' || params.engineStatus === 'generating')
-  );
+    (params.engineStatus === 'ready' || params.engineStatus === 'generating');
+  if (!runtimeReady) return false;
+  return Boolean(params.contextWarmed || params.prewarmPhase === 'ready');
 }
 
 export function deriveAppInitializationState(
@@ -118,6 +146,13 @@ export function deriveAppInitializationState(
     modelId,
     errorMessage,
     storesHydrated,
+    prewarmActive = false,
+    prewarmPercent = 0,
+    prewarmPhase = 'idle',
+    prewarmBytesPerSec = 0,
+    prewarmEtaSeconds = null,
+    prewarmError = null,
+    contextWarmed = false,
     sessionUnlocked,
   } = input;
 
@@ -143,6 +178,8 @@ export function deriveAppInitializationState(
     engineStatus,
     modelId,
     storesHydrated,
+    contextWarmed,
+    prewarmPhase,
   });
 
   if (sessionUnlocked || usable) {
@@ -160,7 +197,7 @@ export function deriveAppInitializationState(
           detail: 'Ready',
           status: 'done',
         },
-        { id: 'runtime', label: 'Assistant runtime', detail: 'Ready', status: 'done' },
+        { id: 'runtime', label: 'Assistant & context', detail: 'Ready', status: 'done' },
       ],
       errorMessage: null,
       canRetry: false,
@@ -168,14 +205,17 @@ export function deriveAppInitializationState(
     };
   }
 
-  const clampedProgress = Math.max(0, Math.min(100, Math.round(progressPercent)));
+  const clampedMountProgress = Math.max(0, Math.min(100, Math.round(progressPercent)));
+  const clampedPrewarmPct = Math.max(0, Math.min(100, Math.round(prewarmPercent)));
   const hasRealRuntime = modelId !== null && !isInternalBootstrapModel(modelId);
+  const combinedError = errorMessage || prewarmError;
   const hasInitError =
     streamingConsent === 'accepted' &&
-    !hasRealRuntime &&
-    errorMessage !== null &&
+    combinedError !== null &&
+    !prewarmActive &&
     engineStatus !== 'downloading' &&
-    engineStatus !== 'loading';
+    engineStatus !== 'loading' &&
+    (!hasRealRuntime || prewarmPhase === 'error');
 
   // Offline-only startup: brief hydration + local bootstrap check
   if (streamingConsent === 'paused') {
@@ -214,7 +254,10 @@ export function deriveAppInitializationState(
     };
   }
 
-  // Accepted streaming initialization (or error recovery)
+  // Accepted streaming initialization:
+  // Stage 1: Workspace & saved library (0-8%)
+  // Stage 2: Streaming core capabilities to browser storage (8-86%)
+  // Stage 3: Loading assistant into memory & preparing context for instant first response (86-100%)
   const workspaceStep: InitStepItem = {
     id: 'workspace',
     label: 'Workspace & saved library',
@@ -222,59 +265,69 @@ export function deriveAppInitializationState(
     status: storesHydrated ? 'done' : 'active',
   };
 
-  const capabilitiesDone = hasRealRuntime || engineStatus === 'loading';
+  const capabilitiesReady =
+    hasRealRuntime && (prewarmPhase === 'warming-context' || prewarmPhase === 'ready' || contextWarmed);
+  const rateSuffix = formatCompactTransferRate(prewarmBytesPerSec, prewarmEtaSeconds);
+  const capabilitiesDetail = hasInitError
+    ? 'Connection interrupted'
+    : capabilitiesReady
+      ? 'Ready'
+      : hasRealRuntime
+        ? clampedPrewarmPct > 0
+          ? `${clampedPrewarmPct}%`
+          : 'Starting…'
+        : clampedMountProgress > 0 && engineStatus === 'downloading'
+          ? `Connecting…`
+          : 'Connecting…';
+
   const capabilitiesStep: InitStepItem = {
     id: 'capabilities',
-    label: 'Browser capabilities',
-    detail: hasInitError
-      ? 'Connection interrupted'
-      : capabilitiesDone
-        ? 'Connected'
-        : clampedProgress > 0 && engineStatus === 'downloading'
-          ? `Connecting (${clampedProgress}%)`
-          : 'Connecting…',
+    label: 'Core capabilities',
+    detail: capabilitiesDetail,
     status: hasInitError
       ? 'error'
-      : capabilitiesDone
+      : capabilitiesReady
         ? 'done'
-        : storesHydrated || engineStatus === 'downloading'
+        : storesHydrated || engineStatus === 'downloading' || hasRealRuntime
           ? 'active'
           : 'pending',
   };
 
+  const warmingContextNow = hasRealRuntime && prewarmPhase === 'warming-context';
   const runtimeStep: InitStepItem = {
     id: 'runtime',
-    label: 'Assistant startup',
+    label: 'Assistant & context',
     detail: hasInitError
       ? 'Waiting to retry'
-      : hasRealRuntime
+      : contextWarmed
         ? 'Ready'
-        : engineStatus === 'loading'
-          ? 'Starting on your device…'
+        : warmingContextNow
+          ? 'Preparing context…'
           : 'Waiting…',
     status: hasInitError
       ? 'pending'
-      : hasRealRuntime
+      : contextWarmed
         ? 'done'
-        : engineStatus === 'loading'
+        : warmingContextNow
           ? 'active'
           : 'pending',
   };
 
-  // Smooth monotonic progress across all 3 phases:
-  // Workspace hydration: 0-15%, Capabilities stream: 15-82%, Runtime init: 82-99%
-  let overallPercent = 8;
-  if (storesHydrated) {
-    overallPercent = 15;
-  }
-  if (engineStatus === 'downloading') {
-    const streamFraction = Math.min(1, clampedProgress / 96);
-    overallPercent = Math.max(overallPercent, Math.round(15 + streamFraction * 67));
-  } else if (engineStatus === 'loading') {
-    const loadFraction = Math.max(0, Math.min(1, (clampedProgress - 96) / 4));
-    overallPercent = Math.max(82, Math.round(82 + loadFraction * 16));
-  } else if (hasRealRuntime) {
-    overallPercent = storesHydrated ? 100 : 96;
+  // Smooth monotonic progress across all 3 stages:
+  // Workspace: 0-8%, Header mount: 8-14%, Streaming core capabilities: 14-86%, Warming context: 86-98%
+  let overallPercent = storesHydrated ? 8 : 4;
+  if (!hasRealRuntime) {
+    if (engineStatus === 'downloading') {
+      overallPercent = Math.max(overallPercent, Math.round(8 + (clampedMountProgress / 100) * 5));
+    } else if (engineStatus === 'loading') {
+      overallPercent = Math.max(overallPercent, 14);
+    }
+  } else if (prewarmPhase === 'warming-context') {
+    overallPercent = 92;
+  } else if (prewarmPhase === 'ready' || contextWarmed) {
+    overallPercent = storesHydrated ? 100 : 98;
+  } else {
+    overallPercent = Math.max(14, Math.round(14 + (clampedPrewarmPct / 100) * 72));
   }
 
   if (hasInitError) {
@@ -282,20 +335,30 @@ export function deriveAppInitializationState(
       visible: true,
       phase: 'error',
       headline: 'Unable to finish setup',
-      statusLine: errorMessage || 'Could not reach streaming capabilities.',
+      statusLine: combinedError || 'Could not reach streaming capabilities.',
       overallPercent,
       steps: [workspaceStep, capabilitiesStep, runtimeStep],
-      errorMessage,
+      errorMessage: combinedError,
       canRetry: true,
       canSwitchOffline: true,
     };
   }
 
+  const liveStatusLine = !hasRealRuntime
+    ? formatInitStatusLine(initStatusDetail, engineStatus, clampedMountProgress)
+    : warmingContextNow
+      ? 'Loading assistant into memory and preparing context…'
+      : rateSuffix
+        ? `Streaming core capabilities (${clampedPrewarmPct}% · ${rateSuffix})`
+        : clampedPrewarmPct > 0
+          ? `Streaming core capabilities (${clampedPrewarmPct}%)…`
+          : 'Streaming core capabilities to your browser…';
+
   return {
     visible: true,
     phase: 'initializing',
     headline: 'Initializing VerdantUI',
-    statusLine: formatInitStatusLine(initStatusDetail, engineStatus, clampedProgress),
+    statusLine: liveStatusLine,
     overallPercent,
     steps: [workspaceStep, capabilitiesStep, runtimeStep],
     errorMessage: null,

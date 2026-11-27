@@ -36,8 +36,8 @@ test('First-time visitors start directly on the Splash Initialization Screen in 
   assert.equal(returningBoot.phase, 'initializing');
 });
 
-test('Accepting consent enters the Application Initializing Screen and progresses monotonically until real runtime is ready', () => {
-  // Immediately after clicking Continue (bootstrap model still active, connecting capabilities)
+test('Accepting consent enters the Application Initializing Screen and completes full OPFS + context warming before unlocking for instant TTFT', () => {
+  // Stage 2a: Connecting header/manifest
   const connecting = deriveAppInitializationState({
     streamingConsent: 'accepted',
     engineStatus: 'downloading',
@@ -54,25 +54,50 @@ test('Accepting consent enters the Application Initializing Screen and progresse
   assert.equal(connecting.steps[0]?.status, 'done');
   assert.equal(connecting.steps[1]?.status, 'active');
   assert.equal(connecting.steps[2]?.status, 'pending');
-  assert.ok(connecting.overallPercent >= 15 && connecting.overallPercent < 82);
 
-  // Loading runtime stage
-  const loading = deriveAppInitializationState({
+  // Stage 2b: Streaming core capabilities with live speed & ETA (MUST stay on splash until warm!)
+  const streaming = deriveAppInitializationState({
     streamingConsent: 'accepted',
-    engineStatus: 'loading',
-    progressPercent: 98,
-    initStatusDetail: 'Initializing Qwen3 4B',
-    modelId: 'stories260k-f32',
+    engineStatus: 'ready',
+    progressPercent: 100,
+    initStatusDetail: '',
+    modelId: 'qwen3-4b-q4_k_m',
     errorMessage: null,
     storesHydrated: true,
+    prewarmActive: true,
+    prewarmPercent: 50,
+    prewarmPhase: 'streaming',
+    prewarmBytesPerSec: 45 * 1024 * 1024,
+    prewarmEtaSeconds: 28,
+    contextWarmed: false,
     sessionUnlocked: false,
   });
-  assert.equal(loading.visible, true);
-  assert.equal(loading.steps[1]?.status, 'done');
-  assert.equal(loading.steps[2]?.status, 'active');
-  assert.ok(loading.overallPercent > connecting.overallPercent);
+  assert.equal(streaming.visible, true);
+  assert.equal(streaming.steps[1]?.status, 'active');
+  assert.ok(streaming.statusLine.includes('45.0 MB/s'));
+  assert.ok(streaming.overallPercent > connecting.overallPercent);
 
-  // Real demand-first runtime mounted -> VerdantUI is usable and screen clears immediately
+  // Stage 3: Warming WASM memory & system-prompt KV context
+  const warmingCtx = deriveAppInitializationState({
+    streamingConsent: 'accepted',
+    engineStatus: 'ready',
+    progressPercent: 100,
+    initStatusDetail: '',
+    modelId: 'qwen3-4b-q4_k_m',
+    errorMessage: null,
+    storesHydrated: true,
+    prewarmActive: true,
+    prewarmPercent: 100,
+    prewarmPhase: 'warming-context',
+    contextWarmed: false,
+    sessionUnlocked: false,
+  });
+  assert.equal(warmingCtx.visible, true);
+  assert.equal(warmingCtx.steps[1]?.status, 'done');
+  assert.equal(warmingCtx.steps[2]?.status, 'active');
+  assert.ok(warmingCtx.overallPercent > streaming.overallPercent);
+
+  // Ready: OPFS + WASM layers + LM-head + system-prompt KV prefix are ALL warm -> instant Turn 1 TTFT!
   const ready = deriveAppInitializationState({
     streamingConsent: 'accepted',
     engineStatus: 'ready',
@@ -81,6 +106,10 @@ test('Accepting consent enters the Application Initializing Screen and progresse
     modelId: 'qwen3-4b-q4_k_m',
     errorMessage: null,
     storesHydrated: true,
+    prewarmActive: false,
+    prewarmPercent: 100,
+    prewarmPhase: 'ready',
+    contextWarmed: true,
     sessionUnlocked: false,
   });
   assert.equal(ready.visible, false);

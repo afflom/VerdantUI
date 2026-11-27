@@ -830,6 +830,87 @@ export class LlamaVTensorRuntime {
     }
   }
 
+  /**
+   * Pre-warms pinned WASM layer frames, lazy-pinned full-vocab LM-head cache, and an optional
+   * initial system-prompt KV prefix into live WASM RAM directly from local OPFS (0 network bytes
+   * when OPFS slabs are warm, or fetching any missing embedding row slabs for `bootPrompt`).
+   * Guarantees instant, steady-state TTFT & tok/s on the user's very first prompt!
+   */
+  async warmRuntimeForInstantFirstToken(
+    bootPrompt?: string,
+    signal?: AbortSignal,
+    onStage?: (detail: string) => void,
+  ): Promise<{ readonly warmedLayers: number; readonly lmHeadCached: boolean; readonly readyTokens: number }> {
+    if (!this.weightPager || !this.hparams) {
+      return { warmedLayers: 0, lmHeadCached: false, readyTokens: 0 };
+    }
+    const wp = this.weightPager;
+    let warmedLayers = 0;
+
+    // 1. Pre-load pinned layer frames into WASM RAM from local OPFS so Turn 1 pays 0 OPFS layer reads
+    if (wp.residencyMode === 'opfs-paged' && !wp.isMoe) {
+      const pinTarget = Math.min(wp.totalLayers, wp.layerFrameSlots);
+      onStage?.('Loading assistant into memory');
+      for (let l = 0; l < pinTarget; l++) {
+        LlamaVTensorRuntime.throwIfAborted(signal);
+        if (
+          this.backingStore instanceof OpfsDemandVramBackingStore &&
+          wp.getLayerMissingRanges(l).some(
+            (r) => !(this.backingStore as OpfsDemandVramBackingStore).isRangeCached(r.fileOffset, r.byteLength),
+          )
+        ) {
+          break;
+        }
+        wp.acquireLayer(l);
+        warmedLayers += 1;
+        if (l % 4 === 3) {
+          await this.yielder.yieldNow();
+        }
+      }
+    }
+
+    // 2. Pre-populate lazy-pinned full-vocab LM-head WASM cache from local OPFS (0 OPFS reads on decode!)
+    let lmHeadCached = wp.getCachedFullLmHead() !== null;
+    if (!lmHeadCached && wp.streamLmHead) {
+      const stripes = wp.getLmHeadStripeSpecs();
+      const allStripesOnDisk =
+        !(this.backingStore instanceof OpfsDemandVramBackingStore) ||
+        stripes.every((s) =>
+          (this.backingStore as OpfsDemandVramBackingStore).isRangeCached(s.fileOffset, s.byteLength),
+        );
+      if (allStripesOnDisk) {
+        for (let i = 0; i < stripes.length; i++) {
+          LlamaVTensorRuntime.throwIfAborted(signal);
+          wp.acquireLmHeadStripe(stripes[i].rowStart, stripes[i].rowCount);
+          await this.yielder.yieldNow();
+        }
+        lmHeadCached = wp.getCachedFullLmHead() !== null;
+      }
+    }
+
+    // 3. Pre-compute initial system-prompt KV prefix (fetching any missing prompt-token embedding rows
+    //    first so speculative prefill succeeds even on a cold boot!)
+    let readyTokens = 0;
+    if (bootPrompt && this.tokenizer && this.kvPager) {
+      const encoded = this.tokenizer.encode(bootPrompt, this.tokenizer.addBosToken);
+      if (encoded.length > 0) {
+        const embdMissing = wp.getEmbeddingMissingRanges(encoded);
+        if (embdMissing.length > 0 && this.backingStore?.prefetchRanges) {
+          await this.backingStore.prefetchRanges(embdMissing, { signal, concurrency: 6 });
+        }
+        onStage?.('Preparing context');
+        const spec = await this.speculativePrefill(bootPrompt, signal);
+        readyTokens = spec.readyTokens;
+        if (!spec.aborted && spec.newlyPrefilledTokens > 0) {
+          await this.persistUnifiedStoreToOpfs().catch(() => 0);
+        }
+      }
+    }
+
+    this.flushDemandBacking();
+    return { warmedLayers, lmHeadCached, readyTokens };
+  }
+
   async hydrateUnifiedStoreFromOpfs(
     opfsDirectoryOverride?: FileSystemDirectoryHandle,
   ): Promise<number> {

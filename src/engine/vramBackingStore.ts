@@ -135,8 +135,8 @@ export const OPFS_VRAM_DIR_NAME = 'vram-gguf-v1';
 export const OPFS_STREAM_CHUNK_BYTES = 4 * 1024 * 1024; // 4 MiB streaming window
 export const OPFS_MAX_SYNC_IO_BYTES = 16 * 1024 * 1024; // 16 MiB chunked sync I/O bound
 export const OPFS_DEMAND_SLAB_BYTES = 1 * 1024 * 1024; // 1 MiB Verdant vRAM demand slab (low MoE read amplification)
-export const OPFS_DEMAND_COALESCED_FETCH_SLABS = 8; // Coalesce up to 8 contiguous slabs (8 MiB) per HTTP Range fetch!
-export const OPFS_DEMAND_FLUSH_INTERVAL_SLABS = 32; // Batch SyncAccessHandle.flush() every 32 MiB instead of every layer
+export const OPFS_DEMAND_COALESCED_FETCH_SLABS = 16; // Coalesce up to 16 contiguous slabs (16 MiB) per HTTP Range fetch!
+export const OPFS_DEMAND_FLUSH_INTERVAL_SLABS = 64; // Batch SyncAccessHandle.flush() every 64 MiB instead of every layer
 export const OPFS_DEMAND_PREFETCH_CONCURRENCY = 8; // Parallel async HTTP Range fetch pool
 export const OPFS_DEMAND_MIN_CACHE_BYTES = 128 * 1024 * 1024; // 128 MiB minimum slab pool floor
 export const OPFS_SAFETY_HEADROOM_BYTES = 256 * 1024 * 1024; // 256 MiB origin headroom
@@ -438,10 +438,14 @@ export type AsyncRangeFetcher = (
 ) => Promise<Uint8Array>;
 
 /**
- * Default abortable async HTTP Range fetcher using standard `fetch()` with bounded exponential
- * retry on transient network/CDN errors (408/425/429/5xx). Never blocks the worker event loop.
+ * Default abortable async HTTP Range fetcher using standard `fetch()` with:
+ *  - Redirected CDN URL caching (eliminates hundreds of repeated `302 -> cas-bridge` HuggingFace
+ *    redirect round-trips and API rate-limit pressure, falling back automatically if a signed CDN
+ *    URL expires with 401/403/410).
+ *  - Bounded exponential retry on transient network/CDN errors (408/425/429/5xx).
  */
 export function createDefaultAsyncRangeFetcher(fetchImpl: typeof fetch = fetch): AsyncRangeFetcher {
+  const resolvedUrlBySource = new Map<string, string>();
   return async (
     url: string,
     startByte: number,
@@ -458,12 +462,21 @@ export function createDefaultAsyncRangeFetcher(fetchImpl: typeof fetch = fetch):
       if (signal?.aborted) {
         throw new DOMException('Aborted', 'AbortError');
       }
+      const targetUrl = resolvedUrlBySource.get(url) ?? url;
       try {
-        const res = await fetchImpl(url, {
+        const res = await fetchImpl(targetUrl, {
           headers: { Range: `bytes=${startByte}-${endByteInclusive}` },
           signal,
         });
         if (res.status === 206 || (res.status === 200 && startByte === 0)) {
+          if (
+            res.url &&
+            res.url !== url &&
+            res.url !== targetUrl &&
+            /^https?:\/\//i.test(res.url)
+          ) {
+            resolvedUrlBySource.set(url, res.url);
+          }
           const ab = await res.arrayBuffer();
           const u8 = new Uint8Array(ab);
           if (res.status === 200 && u8.byteLength > expectedLen) {
@@ -476,6 +489,11 @@ export function createDefaultAsyncRangeFetcher(fetchImpl: typeof fetch = fetch):
           }
           return u8.byteLength === expectedLen ? u8 : u8.subarray(0, expectedLen);
         }
+        // If a cached signed CDN URL expired (401/403/410), clear cache and immediately re-resolve via origin URL
+        if (targetUrl !== url && (res.status === 401 || res.status === 403 || res.status === 410)) {
+          resolvedUrlBySource.delete(url);
+          continue;
+        }
         if (!isRetryableHttpStatus(res.status)) {
           throw new Error(
             `HTTP ${res.status} while fetching model range bytes=${startByte}-${endByteInclusive}.`,
@@ -485,6 +503,9 @@ export function createDefaultAsyncRangeFetcher(fetchImpl: typeof fetch = fetch):
       } catch (err) {
         if (isAbortError(err) || signal?.aborted) {
           throw new DOMException('Aborted', 'AbortError');
+        }
+        if (targetUrl !== url) {
+          resolvedUrlBySource.delete(url);
         }
         lastError = err instanceof Error ? err : new Error(String(err));
         if (/^HTTP (400|401|403|404|410)\b/.test(lastError.message)) {

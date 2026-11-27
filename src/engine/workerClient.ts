@@ -114,18 +114,28 @@ export interface SpeculativePrefillState {
 
 export interface BackgroundPrewarmState {
   readonly active: boolean;
+  readonly phase: 'idle' | 'streaming' | 'warming-context' | 'ready' | 'error';
   readonly percent: number;
   readonly warmBytes: number;
   readonly targetBytes: number;
   readonly casBytesSaved: number;
+  readonly bytesPerSecond: number;
+  readonly etaSeconds: number | null;
+  readonly contextWarmed: boolean;
+  readonly errorMessage: string | null;
 }
 
 const INITIAL_BACKGROUND_PREWARM: BackgroundPrewarmState = {
   active: false,
+  phase: 'idle',
   percent: 0,
   warmBytes: 0,
   targetBytes: 0,
   casBytesSaved: 0,
+  bytesPerSecond: 0,
+  etaSeconds: null,
+  contextWarmed: false,
+  errorMessage: null,
 };
 
 export interface EngineState {
@@ -204,6 +214,11 @@ export interface HeaderEngineSummary {
   readonly initStatusDetail: string;
   readonly backgroundPrewarmActive: boolean;
   readonly backgroundPrewarmPercent: number;
+  readonly backgroundPrewarmPhase: BackgroundPrewarmState['phase'];
+  readonly backgroundPrewarmBps: number;
+  readonly backgroundPrewarmEtaSec: number | null;
+  readonly backgroundPrewarmError: string | null;
+  readonly contextWarmed: boolean;
   readonly modelId: string | null;
   readonly modelDisplayName: string | null;
   readonly errorMessage: string | null;
@@ -448,6 +463,11 @@ export class LlamaVTensorWorkerClient {
       initStatusDetail: '',
       backgroundPrewarmActive: false,
       backgroundPrewarmPercent: 0,
+      backgroundPrewarmPhase: 'idle',
+      backgroundPrewarmBps: 0,
+      backgroundPrewarmEtaSec: null,
+      backgroundPrewarmError: null,
+      contextWarmed: false,
       modelId: null,
       modelDisplayName: null,
       errorMessage: null,
@@ -992,6 +1012,11 @@ export class LlamaVTensorWorkerClient {
     const nextActiveCount = this.state.activePartTaskIds.length;
     const nextPrewarmActive = this.state.backgroundPrewarm.active;
     const nextPrewarmPercent = this.state.backgroundPrewarm.percent;
+    const nextPrewarmPhase = this.state.backgroundPrewarm.phase;
+    const nextPrewarmBps = this.state.backgroundPrewarm.bytesPerSecond;
+    const nextPrewarmEtaSec = this.state.backgroundPrewarm.etaSeconds;
+    const nextPrewarmError = this.state.backgroundPrewarm.errorMessage;
+    const nextContextWarmed = this.state.backgroundPrewarm.contextWarmed;
     const nextInitStatusDetail =
       this.state.status === 'downloading' ||
       this.state.status === 'loading' ||
@@ -1006,6 +1031,11 @@ export class LlamaVTensorWorkerClient {
       prevH.initStatusDetail !== nextInitStatusDetail ||
       prevH.backgroundPrewarmActive !== nextPrewarmActive ||
       prevH.backgroundPrewarmPercent !== nextPrewarmPercent ||
+      prevH.backgroundPrewarmPhase !== nextPrewarmPhase ||
+      prevH.backgroundPrewarmBps !== nextPrewarmBps ||
+      prevH.backgroundPrewarmEtaSec !== nextPrewarmEtaSec ||
+      prevH.backgroundPrewarmError !== nextPrewarmError ||
+      prevH.contextWarmed !== nextContextWarmed ||
       prevH.modelId !== nextModelId ||
       prevH.modelDisplayName !== nextModelName ||
       prevH.errorMessage !== this.state.errorMessage ||
@@ -1019,6 +1049,11 @@ export class LlamaVTensorWorkerClient {
         initStatusDetail: nextInitStatusDetail,
         backgroundPrewarmActive: nextPrewarmActive,
         backgroundPrewarmPercent: nextPrewarmPercent,
+        backgroundPrewarmPhase: nextPrewarmPhase,
+        backgroundPrewarmBps: nextPrewarmBps,
+        backgroundPrewarmEtaSec: nextPrewarmEtaSec,
+        backgroundPrewarmError: nextPrewarmError,
+        contextWarmed: nextContextWarmed,
         modelId: nextModelId,
         modelDisplayName: nextModelName,
         errorMessage: this.state.errorMessage,
@@ -1224,22 +1259,27 @@ export class LlamaVTensorWorkerClient {
 
     if (msg.type === 'prewarm_status') {
       const wasWarm =
-        !this.state.backgroundPrewarm.active && this.state.backgroundPrewarm.percent >= 100;
+        !this.state.backgroundPrewarm.active && this.state.backgroundPrewarm.contextWarmed;
       this.patchState({
         backgroundPrewarm: {
           active: msg.active,
+          phase: msg.phase,
           percent: msg.percent,
           warmBytes: msg.warmBytes,
           targetBytes: msg.targetBytes,
           casBytesSaved: msg.casBytesSaved,
+          bytesPerSecond: msg.bytesPerSecond ?? 0,
+          etaSeconds: msg.etaSeconds ?? null,
+          contextWarmed: msg.contextWarmed,
+          errorMessage: msg.errorMessage ?? null,
         },
       });
-      // Once an `opfs-demand` model reaches 100% warm in local OPFS, immediately warm the
-      // initial system-prompt KV prefix locally (0 network bytes) for sub-second first-token latency!
+      // Once warm & context-ready, record bootPrefix as already prefilled so live composer draft
+      // speculative prefill seamlessly extends from the warmed system-prompt KV prefix!
       if (
         !wasWarm &&
         !msg.active &&
-        msg.percent >= 100 &&
+        msg.contextWarmed &&
         this.state.status === 'ready' &&
         this.state.model &&
         !isInternalBootstrapModel(this.state.model.id)
@@ -1253,7 +1293,7 @@ export class LlamaVTensorWorkerClient {
           bootSystem,
         );
         if (bootPrefix) {
-          this.dispatchSpeculativePrefill(bootPrefix);
+          this.lastSpeculativePrompt = bootPrefix;
         }
       }
       return;
@@ -1531,8 +1571,42 @@ export class LlamaVTensorWorkerClient {
     );
   }
 
-  /** Retries the most recently requested catalog model (or re-runs initial boot). */
+  private buildBootSpeculativePrompt(modelId: string): string | undefined {
+    if (isInternalBootstrapModel(modelId)) return undefined;
+    const bootSystem = this.state.importedHarness?.system ?? UNIFIED_VERDANT_SYSTEM_PROMPT;
+    const prompt = formatSpeculativePrefixForLlama(
+      [],
+      '',
+      modelId,
+      this.state.importedHarness?.promptMode ?? this.state.promptMode,
+      bootSystem,
+    );
+    return prompt || undefined;
+  }
+
+  /** Retries the most recently requested catalog model (or resumes interrupted prewarming). */
   async retryLastLoad(): Promise<LoadedModelSummary> {
+    if (
+      this.state.model &&
+      !isInternalBootstrapModel(this.state.model.id) &&
+      this.state.backgroundPrewarm.phase === 'error'
+    ) {
+      const bootPrompt = this.buildBootSpeculativePrompt(this.state.model.id);
+      this.patchState({
+        errorMessage: null,
+        backgroundPrewarm: {
+          ...this.state.backgroundPrewarm,
+          active: true,
+          phase: 'streaming',
+          errorMessage: null,
+        },
+      });
+      this.worker.postMessage({
+        type: 'resume_prewarm',
+        bootPrompt,
+      } satisfies WorkerRequest);
+      return this.state.model;
+    }
     if (this.lastRequestedCatalogModel) {
       return this.loadCatalogModel(this.lastRequestedCatalogModel);
     }
@@ -1559,12 +1633,14 @@ export class LlamaVTensorWorkerClient {
     const requestId = this.nextRequestId('url');
     this.activeLoadRequestId = requestId;
     const resolvedUrl = this.resolveWorkerFetchUrl(url);
+    const bootPrompt = skipOpfs ? undefined : this.buildBootSpeculativePrompt(id);
 
     if (!isInternalBootstrapModel(id)) {
       this.patchState({
         status: 'downloading',
         progressPercent: 2,
         errorMessage: null,
+        backgroundPrewarm: INITIAL_BACKGROUND_PREWARM,
         statusDetail: preferDemandStreaming ? `Connecting ${displayName}` : `Loading ${displayName}`,
       });
     }
@@ -1583,6 +1659,7 @@ export class LlamaVTensorWorkerClient {
         skipOpfs,
         preferDemandStreaming,
         weightResidencyPolicy: this.state.weightResidencyPolicy,
+        bootPrompt,
       } satisfies WorkerRequest);
     });
     this.activeLoadPromise = promise;
