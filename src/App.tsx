@@ -23,10 +23,15 @@ import {
   useRemoteThreadListRuntime,
 } from '@assistant-ui/react';
 import { Menu, Moon, SlidersHorizontal, Sun } from 'lucide-react';
+import { AppInitializingScreen } from './components/AppInitializingScreen';
 import { PrismSurfaceShell } from './components/PrismSurfaceShell';
 import { SettingsDrawer } from './components/SettingsDrawer';
 import { ThreadSidebar } from './components/ThreadSidebar';
 import { ThreadView } from './components/ThreadView';
+import {
+  deriveAppInitializationState,
+  isVerdantUsableForConsent,
+} from './engine/appInitialization';
 import { createLlamaVTensorAdapter } from './engine/assistantAdapter';
 
 const VTensorInspector = lazy(() =>
@@ -139,6 +144,71 @@ const StreamsStatusPill: FC<{
       <span>Streams</span>
       <span className="font-mono text-[11px] tabular-nums opacity-80">{statusLabel}</span>
     </button>
+  );
+});
+
+const SubscribedAppInitializingOverlay: FC<{
+  readonly workerClient: LlamaVTensorWorkerClient;
+  readonly storesHydrated: boolean;
+  readonly onRetry: () => void;
+  readonly onUseOfflineOnly: () => void;
+}> = memo(({ workerClient, storesHydrated, onRetry, onUseOfflineOnly }) => {
+  const summary = useSyncExternalStore(
+    useCallback((cb) => workerClient.subscribeHeaderSummary(cb), [workerClient]),
+    useCallback(() => workerClient.getHeaderSummary(), [workerClient]),
+  );
+  const [unlockedForConsent, setUnlockedForConsent] = useState<'accepted' | 'paused' | null>(null);
+
+  const usable = isVerdantUsableForConsent({
+    streamingConsent: summary.streamingConsent,
+    engineStatus: summary.status,
+    modelId: summary.modelId,
+    storesHydrated,
+  });
+
+  useEffect(() => {
+    if (summary.streamingConsent === 'pending') {
+      if (unlockedForConsent !== null) setUnlockedForConsent(null);
+      return;
+    }
+    if (usable && unlockedForConsent !== summary.streamingConsent) {
+      setUnlockedForConsent(summary.streamingConsent);
+    }
+  }, [summary.streamingConsent, usable, unlockedForConsent]);
+
+  const sessionUnlocked =
+    summary.streamingConsent !== 'pending' && unlockedForConsent === summary.streamingConsent;
+
+  const view = useMemo(
+    () =>
+      deriveAppInitializationState({
+        streamingConsent: summary.streamingConsent,
+        engineStatus: summary.status,
+        progressPercent: summary.progressPercent,
+        initStatusDetail: summary.initStatusDetail,
+        modelId: summary.modelId,
+        errorMessage: summary.errorMessage,
+        storesHydrated,
+        sessionUnlocked,
+      }),
+    [
+      summary.streamingConsent,
+      summary.status,
+      summary.progressPercent,
+      summary.initStatusDetail,
+      summary.modelId,
+      summary.errorMessage,
+      storesHydrated,
+      sessionUnlocked,
+    ],
+  );
+
+  return (
+    <AppInitializingScreen
+      view={view}
+      onRetry={onRetry}
+      onUseOfflineOnly={onUseOfflineOnly}
+    />
   );
 });
 
@@ -392,6 +462,7 @@ export default function App() {
   }, []);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [darkMode, setDarkMode] = useState<boolean>(readInitialDarkMode);
+  const [storesHydrated, setStoresHydrated] = useState(false);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -517,10 +588,14 @@ export default function App() {
       galleryStore.hydrate(),
       contentStreams.hydrate(),
       expertRegistry.basis.hydrate(),
-    ]).then(() => {
-      galleryStore.syncFromPrisms(prismStore.list());
-      expertRegistry.syncPrismsAsExperts(prismStore.list());
-    });
+    ])
+      .then(() => {
+        galleryStore.syncFromPrisms(prismStore.list());
+        expertRegistry.syncPrismsAsExperts(prismStore.list());
+      })
+      .finally(() => {
+        setStoresHydrated(true);
+      });
     const unsubBus = observerBus.subscribe((ev) => {
       if (ev.endpointKind === 'prism') {
         workerClient.cognitiveObserver.recordSensoryEvent(ev);
@@ -1142,6 +1217,13 @@ export default function App() {
             </Suspense>
           )}
         </div>
+
+        <SubscribedAppInitializingOverlay
+          workerClient={workerClient}
+          storesHydrated={storesHydrated}
+          onRetry={handleRetryLoad}
+          onUseOfflineOnly={handleCancelDownload}
+        />
 
         {prismToast && (
           <div

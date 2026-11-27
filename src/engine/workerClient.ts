@@ -201,6 +201,7 @@ export interface HeaderEngineSummary {
   readonly modelStreamEnabled: boolean;
   readonly status: EngineStatus;
   readonly progressPercent: number;
+  readonly initStatusDetail: string;
   readonly backgroundPrewarmActive: boolean;
   readonly backgroundPrewarmPercent: number;
   readonly modelId: string | null;
@@ -444,6 +445,7 @@ export class LlamaVTensorWorkerClient {
       modelStreamEnabled: savedStreamEnabled,
       status: 'idle',
       progressPercent: 0,
+      initStatusDetail: '',
       backgroundPrewarmActive: false,
       backgroundPrewarmPercent: 0,
       modelId: null,
@@ -708,13 +710,17 @@ export class LlamaVTensorWorkerClient {
       }
     }
 
+    if (this.state.streamingConsent === 'accepted') {
+      this.patchState({
+        status: 'downloading',
+        progressPercent: 2,
+        errorMessage: null,
+        statusDetail: 'Checking local cache',
+      });
+    }
     const storage = await this.refreshOpfsStorage().catch(() => INITIAL_OPFS_STORAGE);
     if (this.state.streamingConsent === 'accepted') {
-      try {
-        return await this.warmUnifiedModelOnConsent(storage);
-      } catch {
-        // Offline or transient network failure on boot: stay ready locally with zero crash
-      }
+      return this.warmUnifiedModelOnConsent(storage);
     }
     return this.loadCatalogModel(INTERNAL_BOOTSTRAP_MODEL);
   }
@@ -733,17 +739,25 @@ export class LlamaVTensorWorkerClient {
     if (enabled) {
       this.cognitiveObserver.grants.reset('network-weights');
       this.cognitiveObserver.grants.grant('network-weights');
+      const activeId = this.state.model?.id;
+      const alreadyLoadedRealModel =
+        activeId !== undefined && activeId !== INTERNAL_BOOTSTRAP_MODEL.id;
+      const isAlreadyLoading =
+        this.state.status === 'downloading' || this.state.status === 'loading';
       this.patchState({
         streamingConsent: 'accepted',
         modelStreamEnabled: true,
         errorMessage: null,
-        statusDetail: 'Ready',
+        ...(alreadyLoadedRealModel || isAlreadyLoading
+          ? { statusDetail: alreadyLoadedRealModel ? 'Ready' : this.state.statusDetail }
+          : {
+              status: 'downloading',
+              progressPercent: 2,
+              statusDetail: 'Checking local cache',
+            }),
       });
 
-      const activeId = this.state.model?.id;
-      const alreadyLoadedRealModel =
-        activeId !== undefined && activeId !== INTERNAL_BOOTSTRAP_MODEL.id;
-      if (!alreadyLoadedRealModel && this.state.status !== 'downloading' && this.state.status !== 'loading') {
+      if (!alreadyLoadedRealModel && !isAlreadyLoading) {
         await this.warmUnifiedModelOnConsent().catch(() => undefined);
       }
     } else {
@@ -763,6 +777,9 @@ export class LlamaVTensorWorkerClient {
         statusDetail: consent === 'paused' ? 'Offline only' : 'Ready',
         errorMessage: null,
       });
+      if (consent === 'paused' && !this.state.model) {
+        await this.loadCatalogModel(INTERNAL_BOOTSTRAP_MODEL).catch(() => undefined);
+      }
     }
   }
 
@@ -975,11 +992,18 @@ export class LlamaVTensorWorkerClient {
     const nextActiveCount = this.state.activePartTaskIds.length;
     const nextPrewarmActive = this.state.backgroundPrewarm.active;
     const nextPrewarmPercent = this.state.backgroundPrewarm.percent;
+    const nextInitStatusDetail =
+      this.state.status === 'downloading' ||
+      this.state.status === 'loading' ||
+      this.state.status === 'error'
+        ? this.state.statusDetail
+        : '';
     if (
       prevH.streamingConsent !== this.state.streamingConsent ||
       prevH.modelStreamEnabled !== this.state.modelStreamEnabled ||
       prevH.status !== this.state.status ||
       prevH.progressPercent !== this.state.progressPercent ||
+      prevH.initStatusDetail !== nextInitStatusDetail ||
       prevH.backgroundPrewarmActive !== nextPrewarmActive ||
       prevH.backgroundPrewarmPercent !== nextPrewarmPercent ||
       prevH.modelId !== nextModelId ||
@@ -992,6 +1016,7 @@ export class LlamaVTensorWorkerClient {
         modelStreamEnabled: this.state.modelStreamEnabled,
         status: this.state.status,
         progressPercent: this.state.progressPercent,
+        initStatusDetail: nextInitStatusDetail,
         backgroundPrewarmActive: nextPrewarmActive,
         backgroundPrewarmPercent: nextPrewarmPercent,
         modelId: nextModelId,
