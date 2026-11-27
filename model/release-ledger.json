@@ -212,6 +212,33 @@
         "VUI-FEAT-015"
       ],
       "summary": "Live Root Verdant Prism Runtime, Zero-Interruption Cooperative Scheduling, Gated Delta Cross-Modal Associativity & Progressive Lod0-Lod3 QA"
+    },
+    {
+      "version": "0.11.0",
+      "tag": "v0.11.0",
+      "releasedAt": "2026-11-27T13:25:15.961Z",
+      "commit": "8f2126dd55b9501f6ccbab84a13af2f50d46504b",
+      "engineTag": "v2.22.4",
+      "studioCommit": "85dc9880c955d084c47624107ecb2971daef93f2",
+      "activeFeatureIds": [
+        "VUI-FEAT-001",
+        "VUI-FEAT-002",
+        "VUI-FEAT-003",
+        "VUI-FEAT-004",
+        "VUI-FEAT-005",
+        "VUI-FEAT-006",
+        "VUI-FEAT-007",
+        "VUI-FEAT-008",
+        "VUI-FEAT-009",
+        "VUI-FEAT-010",
+        "VUI-FEAT-011",
+        "VUI-FEAT-012",
+        "VUI-FEAT-013",
+        "VUI-FEAT-014",
+        "VUI-FEAT-015",
+        "VUI-FEAT-016"
+      ],
+      "summary": "Layer-Streamed OPFS SDXS-512 CLIP Transformer, Spatial Cross-Attention UNet & Progressive 3-Stage TAESD (128-512px)"
     }
   ]
 }

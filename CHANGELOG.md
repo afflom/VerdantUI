@@ -2,6 +2,14 @@
 
 > Generated mechanically by `npm run studio:publish` from `model/release-ledger.json` and `model/features.json`.
 
+## v0.11.0 (2026-11-27)
+
+Layer-Streamed OPFS SDXS-512 CLIP Transformer, Spatial Cross-Attention UNet & Progressive 3-Stage TAESD (128-512px)
+
+- **Engine Pin:** `afflom/verdant-engine@v2.22.4`
+- **Studio Pin:** `afflom/verdant-studio@85dc9880c955`
+- **Active Features:** `VUI-FEAT-001`, `VUI-FEAT-002`, `VUI-FEAT-003`, `VUI-FEAT-004`, `VUI-FEAT-005`, `VUI-FEAT-006`, `VUI-FEAT-007`, `VUI-FEAT-008`, `VUI-FEAT-009`, `VUI-FEAT-010`, `VUI-FEAT-011`, `VUI-FEAT-012`, `VUI-FEAT-013`, `VUI-FEAT-014`, `VUI-FEAT-015`, `VUI-FEAT-016`
+
 ## v0.10.0 (2026-11-27)
 
 Live Root Verdant Prism Runtime, Zero-Interruption Cooperative Scheduling, Gated Delta Cross-Modal Associativity & Progressive Lod0-Lod3 QA
