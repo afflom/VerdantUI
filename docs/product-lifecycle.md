@@ -2,7 +2,7 @@
 
 > Generated mechanically by `npm run studio:publish` from `model/features.json` and `model/release-ledger.json`.
 
-- **Active Features:** 11
+- **Active Features:** 12
 - **Proposed / Planned Features:** 0
 - **Recorded Releases:** 6
 
@@ -21,6 +21,7 @@
 | `VUI-FEAT-009` | **active** | `v0.5.0` | `VUI-ENGINE-01` | Coherent Multimodal Perception, 1-Step Image Synthesis, Modal Audio & Closed-Loop Vision Critique |
 | `VUI-FEAT-010` | **active** | `v0.5.0` | `VUI-STUDIO-02` | Autonomous Prism-Backed Chat Tool-Calls & Natural-Language MediaType Selection |
 | `VUI-FEAT-011` | **active** | `v0.6.0` | `VUI-STUDIO-02` | Unified Expert Basis, Global MediaType Galleries, Spaces-as-Prisms & Feature-Complete Media Synthesis |
+| `VUI-FEAT-012` | **active** | `v0.6.0` | `VUI-OBSERVER-01` | Self-Similar Prism UI & Observer Procedural Surface Synthesis |
 
 ## Release Ledger
 

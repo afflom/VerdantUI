@@ -937,7 +937,7 @@ const PROCEDURAL_BASE_CSS = `
   --v-bg: #f8f9fa;
   --v-surface: #ffffff;
   --v-surface-alt: #f1f5f9;
-  --v-border: #d8dee9;
+  --v-border: #e2e8f0;
   --v-text: #0f172a;
   --v-muted: #64748b;
   --v-accent: #0f5132;
@@ -946,9 +946,9 @@ const PROCEDURAL_BASE_CSS = `
 }
 :root.dark, :root[data-theme="dark"] {
   --v-bg: #0b0f14;
-  --v-surface: #111822;
-  --v-surface-alt: #182230;
-  --v-border: #263244;
+  --v-surface: #0f141c;
+  --v-surface-alt: #141b26;
+  --v-border: #1e293b;
   --v-text: #f1f5f9;
   --v-muted: #94a3b8;
   --v-accent: #10b981;
@@ -960,20 +960,56 @@ html, body {
   margin: 0; padding: 0; min-height: 100%;
   background: var(--v-bg); color: var(--v-text);
   font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  font-size: 14px; line-height: 1.45;
+  font-size: 14px; line-height: 1.5;
   -webkit-font-smoothing: antialiased;
 }
-.organ-shell { max-width: 900px; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
-.organ-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 16px; background: var(--v-surface); border: 1px solid var(--v-border); border-radius: 12px; }
-.organ-title { margin: 0; font-size: 16px; font-weight: 700; }
-.organ-sub { margin: 2px 0 0; font-size: 12px; color: var(--v-muted); }
-.organ-card { background: var(--v-surface); border: 1px solid var(--v-border); border-radius: 12px; padding: 16px; }
+.organ-shell { max-width: 960px; margin: 0 auto; padding: 20px 20px 28px; display: flex; flex-direction: column; gap: 14px; }
+.organ-shell.organ-editorial { max-width: 780px; padding: 24px 24px 40px; }
+.organ-card { background: var(--v-surface); border: 1px solid var(--v-border); border-radius: 16px; padding: 20px; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03); }
+.organ-card.organ-card-editorial { background: var(--v-surface); border: 1px solid var(--v-border); border-radius: 18px; padding: 28px 36px 24px; min-height: 68vh; display: flex; flex-direction: column; }
+@media (max-width: 640px) { .organ-card.organ-card-editorial { padding: 18px 18px 20px; } }
+.organ-sub { margin: 0; font-size: 12px; color: var(--v-muted); }
 .organ-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.organ-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 6px 12px; border-radius: 8px; border: 1px solid var(--v-border); background: var(--v-surface-alt); color: var(--v-text); font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
-.organ-btn:hover { opacity: 0.9; }
-.organ-btn.primary { background: var(--v-accent); color: var(--v-accent-text); border-color: transparent; }
-.organ-pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--v-border); background: var(--v-surface-alt); font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
-.organ-input { padding: 7px 10px; border-radius: 8px; border: 1px solid var(--v-border); background: var(--v-surface-alt); color: var(--v-text); font: inherit; font-size: 13px; }
+.organ-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 6px 12px; border-radius: 8px; border: 1px solid var(--v-border); background: var(--v-surface); color: var(--v-text); font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; transition: background 120ms ease, border-color 120ms ease, opacity 120ms ease; }
+.organ-btn:hover { background: var(--v-surface-alt); }
+.organ-btn.primary { background: var(--v-accent); color: var(--v-accent-text); border-color: transparent; font-weight: 600; }
+.organ-btn.primary:hover { opacity: 0.92; background: var(--v-accent); }
+.organ-btn.ghost { border-color: transparent; background: transparent; color: var(--v-muted); padding: 5px 9px; }
+.organ-btn.ghost:hover { background: var(--v-surface-alt); color: var(--v-text); }
+.organ-pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--v-border); background: var(--v-surface-alt); color: var(--v-muted); font-size: 11px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.organ-input { padding: 7px 11px; border-radius: 8px; border: 1px solid var(--v-border); background: var(--v-surface); color: var(--v-text); font: inherit; font-size: 13px; }
+.organ-input:focus { outline: none; border-color: var(--v-accent); }
+.organ-seg { display: inline-flex; padding: 2px; border-radius: 9px; border: 1px solid var(--v-border); background: var(--v-surface-alt); gap: 2px; }
+.organ-seg button { border: 0; background: transparent; color: var(--v-muted); padding: 4px 10px; border-radius: 7px; font: inherit; font-size: 11px; font-weight: 500; cursor: pointer; transition: background 120ms ease, color 120ms ease; }
+.organ-seg button.active { background: var(--v-surface); color: var(--v-text); font-weight: 600; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06); }
+.doc-topbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding-bottom: 16px; margin-bottom: 20px; border-bottom: 1px solid var(--v-border); }
+.doc-chapters { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.doc-ch-pill { display: inline-flex; align-items: center; gap: 5px; border: 0; background: transparent; color: var(--v-muted); padding: 5px 10px; border-radius: 8px; font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; transition: background 120ms ease, color 120ms ease; }
+.doc-ch-pill:hover { background: var(--v-surface-alt); color: var(--v-text); }
+.doc-ch-pill.active { background: var(--v-surface-alt); color: var(--v-text); font-weight: 600; }
+.doc-title-input { width: 100%; border: 0; background: transparent; color: var(--v-text); font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 28px; font-weight: 700; letter-spacing: -0.025em; line-height: 1.25; padding: 0; margin: 0 0 8px; outline: none; }
+.doc-title-input::placeholder { color: var(--v-muted); opacity: 0.55; }
+.doc-sub-input { width: 100%; border: 0; background: transparent; color: var(--v-muted); font-family: Georgia, Charter, "Iowan Old Style", ui-serif, serif; font-style: italic; font-size: 14.5px; line-height: 1.5; padding: 0 0 18px; margin: 0 0 18px; border-bottom: 1px solid var(--v-border); outline: none; }
+.doc-sub-input::placeholder { color: var(--v-muted); opacity: 0.5; }
+.doc-editor { width: 100%; flex: 1; min-height: 340px; border: 0; background: transparent; color: var(--v-text); font-family: Georgia, Charter, "Iowan Old Style", ui-serif, serif; font-size: 16.5px; line-height: 1.85; padding: 0; resize: none; outline: none; }
+.doc-editor::placeholder { color: var(--v-muted); opacity: 0.5; }
+.doc-prose { flex: 1; min-height: 340px; font-family: Georgia, Charter, "Iowan Old Style", ui-serif, serif; font-size: 16.5px; line-height: 1.85; color: var(--v-text); }
+.doc-prose h1 { font-family: Inter, -apple-system, sans-serif; font-size: 24px; font-weight: 700; letter-spacing: -0.02em; margin: 24px 0 10px; }
+.doc-prose h2 { font-family: Inter, -apple-system, sans-serif; font-size: 19px; font-weight: 650; letter-spacing: -0.015em; margin: 22px 0 8px; }
+.doc-prose h3 { font-family: Inter, -apple-system, sans-serif; font-size: 16px; font-weight: 600; margin: 18px 0 6px; }
+.doc-prose p { margin: 0 0 16px; }
+.doc-prose blockquote { margin: 16px 0; padding: 2px 0 2px 16px; border-left: 3px solid var(--v-accent); color: var(--v-muted); font-style: italic; }
+.doc-prose ul, .doc-prose ol { margin: 0 0 16px; padding-left: 22px; }
+.doc-prose li { margin-bottom: 6px; }
+.doc-prose code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; padding: 2px 5px; border-radius: 5px; background: var(--v-surface-alt); }
+.doc-prose hr { border: 0; border-top: 1px solid var(--v-border); margin: 24px 0; }
+.doc-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-top: 24px; padding-top: 14px; border-top: 1px solid var(--v-border); font-size: 11.5px; color: var(--v-muted); }
+.doc-progress { width: 88px; height: 4px; border-radius: 999px; background: var(--v-surface-alt); overflow: hidden; display: inline-block; vertical-align: middle; margin-left: 8px; }
+.doc-progress > i { display: block; height: 100%; background: var(--v-accent); border-radius: 999px; }
+.doc-menu { position: relative; display: inline-flex; }
+.doc-popover { position: absolute; right: 0; top: calc(100% + 6px); z-index: 30; min-width: 156px; padding: 5px; border-radius: 10px; border: 1px solid var(--v-border); background: var(--v-surface); box-shadow: 0 10px 28px rgba(15, 23, 42, 0.12); display: flex; flex-direction: column; gap: 2px; }
+.doc-popover button { width: 100%; justify-content: flex-start; border: 0; background: transparent; padding: 7px 10px; border-radius: 7px; font-size: 12px; font-weight: 500; color: var(--v-text); cursor: pointer; text-align: left; }
+.doc-popover button:hover { background: var(--v-surface-alt); }
 .ms-grid { display: grid; gap: 3px; justify-content: center; margin: 0 auto; user-select: none; touch-action: manipulation; }
 .ms-cell { width: 30px; height: 30px; border-radius: 6px; border: 1px solid var(--v-border); background: var(--v-surface-alt); color: var(--v-text); font-weight: 700; font-size: 13px; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: transform 60ms ease, background 80ms ease; }
 .ms-cell:hover:not(.rev) { filter: brightness(1.06); }
@@ -982,8 +1018,8 @@ html, body {
 .ms-cell.flag { background: rgba(245, 158, 11, 0.22); border-color: #f59e0b; }
 .ms-n1 { color: #2563eb; } .ms-n2 { color: #16a34a; } .ms-n3 { color: #dc2626; } .ms-n4 { color: #7c3aed; }
 .ms-n5 { color: #b45309; } .ms-n6 { color: #0891b2; } .ms-n7 { color: #475569; } .ms-n8 { color: #94a3b8; }
-canvas.organ-canvas { display: block; width: 100%; height: auto; border-radius: 10px; border: 1px solid var(--v-border); background: #0b0f14; }
-.organ-textarea { width: 100%; min-height: 220px; padding: 12px; border-radius: 10px; border: 1px solid var(--v-border); background: var(--v-bg); color: var(--v-text); font: inherit; font-size: 14px; line-height: 1.65; resize: vertical; }
+canvas.organ-canvas { display: block; width: 100%; height: auto; border-radius: 12px; border: 1px solid var(--v-border); background: #0b0f14; }
+.organ-textarea { width: 100%; min-height: 220px; padding: 14px; border-radius: 10px; border: 1px solid var(--v-border); background: var(--v-bg); color: var(--v-text); font: inherit; font-size: 14px; line-height: 1.7; resize: vertical; }
 `;
 
 
@@ -996,9 +1032,8 @@ export function synthesizeProceduralOrganView(
   readonly appJs: string;
 } {
   const title = decl.view?.title || decl.metadata.name || 'Verdant Prism';
-  const subtitle = decl.view?.subtitle || decl.concept.purpose || PRISM_MEDIA_CATALOG[spec.mediaType].shortSummary;
-  const mediaLabel = PRISM_MEDIA_CATALOG[spec.mediaType].label;
   const accent = decl.theme.accent || '#0f5132';
+  const isEditorial = spec.weights.mediaType === 'written-work';
 
   let runtimeJs: string;
   const w = spec.weights;
@@ -1032,6 +1067,9 @@ export function synthesizeProceduralOrganView(
     ? `\n    <footer class="organ-sub" style="text-align:center">${escHtml(decl.view.disclosure.trim())}</footer>`
     : '';
 
+  const shellClass = isEditorial ? 'organ-shell organ-editorial' : 'organ-shell';
+  const cardClass = isEditorial ? 'organ-card organ-card-editorial' : 'organ-card';
+
   const indexHtml = `<!doctype html>
 <html lang="en">
 <head>
@@ -1044,15 +1082,8 @@ export function synthesizeProceduralOrganView(
   <script type="module" src="app.js"></script>
 </head>
 <body>
-  <main class="organ-shell">
-    <header class="organ-header">
-      <div>
-        <h1 class="organ-title">${escHtml(title)}</h1>
-        <p class="organ-sub">${escHtml(subtitle)}</p>
-      </div>
-      <span class="organ-pill">${escHtml(mediaLabel)}</span>
-    </header>
-    <section class="organ-card" id="organ-root"></section>${disclosureHtml}
+  <main class="${shellClass}">
+    <section class="${cardClass}" id="organ-root"></section>${disclosureHtml}
   </main>
 </body>
 </html>

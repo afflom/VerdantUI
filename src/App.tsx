@@ -12,6 +12,7 @@ import {
   useRemoteThreadListRuntime,
 } from '@assistant-ui/react';
 import { Menu, Moon, SlidersHorizontal, Sun } from 'lucide-react';
+import { PrismSurfaceShell } from './components/PrismSurfaceShell';
 import { SettingsDrawer } from './components/SettingsDrawer';
 import { ThreadSidebar } from './components/ThreadSidebar';
 import { ThreadView } from './components/ThreadView';
@@ -40,6 +41,15 @@ import {
 import type { ImportedHarnessSpec } from './engine/harnessConfig';
 import { isInternalBootstrapModel } from './engine/modelCatalog';
 import { ObserverStreamBus } from './engine/observerStreamBus';
+import {
+  buildSystemPartPrisms,
+  descriptorForUserPrism,
+  galleryPrismId,
+  synthesizeObserverPrismFrame,
+  VERDANT_HOME_PRISM_ID,
+  VERDANT_SETTINGS_PRISM_ID,
+  type PrismSurfaceMode,
+} from './engine/observerUiSynthesizer';
 import { PrismBuildWorkerClient } from './engine/prismBuildClient';
 import { PrismHostPool } from './engine/prismHostPool';
 import {
@@ -152,7 +162,8 @@ const VerdantModelContextBridge: FC<{
 type ActiveWorkspaceView =
   | { readonly kind: 'thread' }
   | { readonly kind: 'prism'; readonly prismId: string; readonly mode: 'studio' | 'app' }
-  | { readonly kind: 'gallery'; readonly mediaType: GalleryMediaType };
+  | { readonly kind: 'gallery'; readonly mediaType: GalleryMediaType }
+  | { readonly kind: 'settings' };
 
 export default function App() {
   const workerClient = useMemo(() => new LlamaVTensorWorkerClient(), []);
@@ -287,8 +298,13 @@ export default function App() {
     galleryStore.listAll(),
   );
   const [activeView, setActiveView] = useState<ActiveWorkspaceView>({ kind: 'thread' });
+  const [surfaceMode, setSurfaceMode] = useState<PrismSurfaceMode>('preview');
+  const [userTypingInSurface, setUserTypingInSurface] = useState(false);
+  const [viewportSize, setViewportSize] = useState<{ width: number; height: number }>(() => ({
+    width: typeof window !== 'undefined' ? window.innerWidth : 1280,
+    height: typeof window !== 'undefined' ? window.innerHeight : 800,
+  }));
   const [prismToast, setPrismToast] = useState<{ title: string; body: string } | null>(null);
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [debugPanelOpen, setDebugPanelOpen] = useState(false);
   const debugMode = useMemo(() => {
     if (typeof window === 'undefined') return false;
@@ -296,6 +312,20 @@ export default function App() {
   }, []);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [darkMode, setDarkMode] = useState<boolean>(readInitialDarkMode);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const onResize = () =>
+      setViewportSize({ width: window.innerWidth, height: window.innerHeight });
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  // Reset surface mode back to Preview when switching between Prisms
+  useEffect(() => {
+    setSurfaceMode('preview');
+    setUserTypingInSurface(false);
+  }, [activeView.kind, activeView.kind === 'prism' ? activeView.prismId : activeView.kind === 'gallery' ? activeView.mediaType : '']);
 
   const publishedPrisms = useMemo(
     () => prismStore.listPublishedSummaries(),
@@ -470,7 +500,6 @@ export default function App() {
     const mq = window.matchMedia('(max-width: 1279px)');
     const sync = (matches: boolean) => {
       if (matches) {
-        setSettingsOpen(false);
         setDebugPanelOpen(false);
       }
     };
@@ -501,14 +530,13 @@ export default function App() {
         setMobileSidebarOpen(false);
         return;
       }
-      if ((settingsOpen || debugPanelOpen) && typeof window !== 'undefined' && window.innerWidth < 1280) {
-        setSettingsOpen(false);
+      if (debugPanelOpen && typeof window !== 'undefined' && window.innerWidth < 1280) {
         setDebugPanelOpen(false);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [mobileSidebarOpen, settingsOpen, debugPanelOpen]);
+  }, [mobileSidebarOpen, debugPanelOpen]);
 
   const handleClearHarness = useCallback(() => {
     workerClient.setImportedHarness(null);
@@ -532,7 +560,7 @@ export default function App() {
   }, [workerClient]);
 
   const handleToggleInspector = useCallback(() => {
-    setSettingsOpen((prev) => !prev);
+    setActiveView((prev) => (prev.kind === 'settings' ? { kind: 'thread' } : { kind: 'settings' }));
   }, []);
 
   const handleSpeculativeDraftChange = useCallback(
@@ -601,6 +629,48 @@ export default function App() {
         });
     },
     [getStudioChatBridge],
+  );
+
+  const handleCreateFromGalleryPrompt = useCallback(
+    async (mediaType: GalleryMediaType, prompt: string): Promise<string> => {
+      const bridge = await getStudioChatBridge();
+      const res = await bridge.createArtifactFromPrompt({
+        prompt,
+        forcedMediaType: mediaType,
+      });
+      setActiveView({ kind: 'prism', prismId: res.prismId, mode: 'studio' });
+      return `Created "${res.prismName}" in ${GALLERY_LABEL_BY_TYPE[mediaType]}.`;
+    },
+    [getStudioChatBridge],
+  );
+
+  const systemPartPrisms = useMemo(() => buildSystemPartPrisms(), []);
+
+  const handleSelectSystemPrism = useCallback(
+    (prismId: string) => {
+      if (prismId === VERDANT_HOME_PRISM_ID) {
+        setActiveView({ kind: 'thread' });
+        return;
+      }
+      if (prismId === VERDANT_SETTINGS_PRISM_ID) {
+        setActiveView({ kind: 'settings' });
+        return;
+      }
+      if (prismId.startsWith('verdant-part-gallery-')) {
+        const mt = prismId.slice('verdant-part-gallery-'.length) as GalleryMediaType;
+        setActiveView({ kind: 'gallery', mediaType: mt });
+        return;
+      }
+      const existing = prismStore.get(prismId);
+      if (existing) {
+        setActiveView({
+          kind: 'prism',
+          prismId: existing.id,
+          mode: existing.published ? 'app' : 'studio',
+        });
+      }
+    },
+    [prismStore],
   );
 
   const handleAssignToSpace = useCallback(
@@ -672,14 +742,48 @@ export default function App() {
     [prismStore, prismPool],
   );
 
-  const handleEnableModelStream = useCallback(() => {
-    void workerClient.setModelStreamEnabled(true).catch(() => {});
-  }, [workerClient]);
-
   const focusedPrism =
     activeView.kind === 'prism'
       ? prisms.find((p) => p.id === activeView.prismId) ?? null
       : null;
+
+  // Procedurally synthesize the Root VerdantUI Prism & active part Prism via the Observer
+  const observerFrame = useMemo(() => {
+    const activePrismDescriptor =
+      activeView.kind === 'prism' && focusedPrism
+        ? descriptorForUserPrism(focusedPrism)
+        : activeView.kind === 'gallery'
+          ? systemPartPrisms.find((p) => p.id === galleryPrismId(activeView.mediaType)) ??
+            systemPartPrisms[0]!
+          : activeView.kind === 'settings'
+            ? systemPartPrisms.find((p) => p.id === VERDANT_SETTINGS_PRISM_ID) ??
+              systemPartPrisms[0]!
+            : systemPartPrisms.find((p) => p.id === VERDANT_HOME_PRISM_ID) ??
+              systemPartPrisms[0]!;
+
+    return synthesizeObserverPrismFrame({
+      activePrism: activePrismDescriptor,
+      partPrisms: systemPartPrisms,
+      userPrisms: prisms,
+      surfaceMode,
+      viewportWidthPx: viewportSize.width,
+      viewportHeightPx: viewportSize.height,
+      darkMode,
+      userTyping: userTypingInSurface,
+    });
+  }, [
+    activeView,
+    focusedPrism,
+    systemPartPrisms,
+    prisms,
+    surfaceMode,
+    viewportSize.width,
+    viewportSize.height,
+    darkMode,
+    userTypingInSurface,
+  ]);
+
+  const settingsActive = activeView.kind === 'settings';
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
@@ -694,7 +798,12 @@ export default function App() {
         expertRegistry={expertRegistry}
         opaqueConstraintsNotice={opaqueConstraintsNotice}
       />
-      <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#F8F9FA] text-slate-900 dark:bg-[#0B0F14] dark:text-slate-100">
+      <div
+        data-root-prism-id={observerFrame.rootPrism.id}
+        data-synthesis-digest={observerFrame.synthesisDigest.slice(0, 12)}
+        style={observerFrame.directive.tokens as React.CSSProperties}
+        className="flex h-screen w-screen flex-col overflow-hidden bg-[#F8F9FA] text-slate-900 dark:bg-[#0B0F14] dark:text-slate-100"
+      >
         {/* Top Bar Contract: Single-line brand wordmark on left, concise workspace actions on right */}
         <header className="flex h-14 shrink-0 items-center justify-between gap-3 border-b border-slate-200 bg-white px-3.5 sm:px-5 dark:border-slate-800 dark:bg-[#0F141C]">
           <div className="flex min-w-0 items-center gap-2.5">
@@ -706,9 +815,13 @@ export default function App() {
             >
               <Menu className="h-4 w-4" />
             </button>
-            <span className="font-display text-[15px] font-bold tracking-tight text-slate-950 whitespace-nowrap truncate dark:text-white">
+            <button
+              type="button"
+              onClick={() => setActiveView({ kind: 'thread' })}
+              className="font-display text-[15px] font-bold tracking-tight text-slate-950 whitespace-nowrap truncate hover:opacity-80 dark:text-white"
+            >
               VerdantUI
-            </span>
+            </button>
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
@@ -768,9 +881,9 @@ export default function App() {
             <button
               type="button"
               onClick={handleToggleInspector}
-              aria-pressed={settingsOpen}
+              aria-pressed={settingsActive}
               className={`inline-flex h-9 items-center gap-1.5 rounded-lg px-2.5 sm:px-3 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                settingsOpen
+                settingsActive
                   ? 'bg-[#0F5132] text-white hover:bg-[#0B3D25]'
                   : 'border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800'
               }`}
@@ -790,13 +903,13 @@ export default function App() {
           </div>
         </header>
 
-        {/* Main 3-zone workbench */}
+        {/* Main 3-zone workbench: every zone is a procedurally synthesized Verdant Prism */}
         <div className="flex min-h-0 flex-1 overflow-hidden">
           <ThreadSidebar
             engineState={engineState}
             mobileOpen={mobileSidebarOpen}
             onCloseMobile={() => setMobileSidebarOpen(false)}
-            onOpenInspector={() => setSettingsOpen(true)}
+            onOpenInspector={() => setActiveView({ kind: 'settings' })}
             activeView={activeView}
             onSelectThreadView={() => setActiveView({ kind: 'thread' })}
             spaces={spacePrisms}
@@ -809,14 +922,35 @@ export default function App() {
           />
 
           <main className="min-w-0 flex-1 overflow-hidden">
-            {activeView.kind === 'gallery' ? (
+            {activeView.kind === 'settings' ? (
+              <SettingsDrawer
+                frame={observerFrame}
+                surfaceMode={surfaceMode}
+                onChangeSurfaceMode={setSurfaceMode}
+                onSelectSystemPrism={handleSelectSystemPrism}
+                onTypingChange={setUserTypingInSurface}
+                darkMode={darkMode}
+                onToggleDarkMode={() => setDarkMode((d) => !d)}
+                onSetDarkMode={setDarkMode}
+                cachedBytes={engineState.opfsStorage?.usageBytes ?? 0}
+                onClearCache={handleClearCache}
+                debugMode={debugMode}
+                onOpenDebugPanel={() => setDebugPanelOpen(true)}
+              />
+            ) : activeView.kind === 'gallery' ? (
               <Suspense fallback={null}>
                 <GalleryView
                   mediaType={activeView.mediaType}
+                  frame={observerFrame}
+                  surfaceMode={surfaceMode}
+                  onChangeSurfaceMode={setSurfaceMode}
+                  onSelectSystemPrism={handleSelectSystemPrism}
+                  onTypingChange={setUserTypingInSurface}
                   items={galleryStore.listByGallery(activeView.mediaType)}
                   categories={galleryStore.listCategoriesForGallery(activeView.mediaType)}
                   spaces={spacePrisms}
                   onCreateInGallery={handleCreateInGallery}
+                  onCreateFromPrompt={handleCreateFromGalleryPrompt}
                   onOpenArtifact={(id, mode) => setActiveView({ kind: 'prism', prismId: id, mode })}
                   onDeleteArtifact={handleDeletePrism}
                   onAssignToSpace={handleAssignToSpace}
@@ -828,9 +962,14 @@ export default function App() {
                 <VerdantStudioView
                   project={focusedPrism}
                   mode={activeView.mode}
+                  frame={observerFrame}
+                  surfaceMode={surfaceMode}
+                  onChangeSurfaceMode={setSurfaceMode}
                   onChangeMode={(nextMode) =>
                     setActiveView({ kind: 'prism', prismId: focusedPrism.id, mode: nextMode })
                   }
+                  onSelectSystemPrism={handleSelectSystemPrism}
+                  onTypingChange={setUserTypingInSurface}
                   store={prismStore}
                   bus={observerBus}
                   bridgeRuntime={prismPool}
@@ -838,48 +977,41 @@ export default function App() {
                   workerClient={workerClient}
                   engineState={engineState}
                   darkMode={darkMode}
-                  onEnableModelStream={handleEnableModelStream}
                   onSelectProject={handleSelectPrism}
                 />
               </Suspense>
             ) : (
-              <ThreadView
-                engineState={engineState}
-                onCancelDownload={handleCancelDownload}
-                onRetryLoad={handleRetryLoad}
-                onDismissError={handleDismissError}
-                onToggleInspector={handleToggleInspector}
-                onOpenPrism={handleOpenPrismApp}
-                onEditPrism={handleEditPrismStudio}
-                getPrismById={(id) => prismStore.get(id)}
-                spaces={spacePrisms}
-                onAssignToSpace={handleAssignToSpace}
-                observerBus={observerBus}
-                bridgeRuntime={prismPool}
-                darkMode={darkMode}
-                publishedPrisms={visiblePublishedPrisms}
-                onSpeculativeDraftChange={handleSpeculativeDraftChange}
-                onPerceiveImage={handlePerceiveImage}
-                onClearPendingImage={handleClearPendingImage}
-                onPerceiveAudio={handlePerceiveAudio}
-                onClearPendingAudio={handleClearPendingAudio}
+              <PrismSurfaceShell
+                frame={observerFrame}
+                mode={surfaceMode}
+                onChangeMode={setSurfaceMode}
+                onSelectChildPrism={handleSelectSystemPrism}
+                previewContent={
+                  <ThreadView
+                    engineState={engineState}
+                    onCancelDownload={handleCancelDownload}
+                    onRetryLoad={handleRetryLoad}
+                    onDismissError={handleDismissError}
+                    onToggleInspector={handleToggleInspector}
+                    onOpenPrism={handleOpenPrismApp}
+                    onEditPrism={handleEditPrismStudio}
+                    getPrismById={(id) => prismStore.get(id)}
+                    spaces={spacePrisms}
+                    onAssignToSpace={handleAssignToSpace}
+                    observerBus={observerBus}
+                    bridgeRuntime={prismPool}
+                    darkMode={darkMode}
+                    publishedPrisms={visiblePublishedPrisms}
+                    onSpeculativeDraftChange={handleSpeculativeDraftChange}
+                    onPerceiveImage={handlePerceiveImage}
+                    onClearPendingImage={handleClearPendingImage}
+                    onPerceiveAudio={handlePerceiveAudio}
+                    onClearPendingAudio={handleClearPendingAudio}
+                  />
+                }
               />
             )}
           </main>
-
-          <SettingsDrawer
-            open={settingsOpen && !debugPanelOpen}
-            onClose={() => setSettingsOpen(false)}
-            darkMode={darkMode}
-            onToggleDarkMode={() => setDarkMode((d) => !d)}
-            cachedBytes={engineState.opfsStorage?.usageBytes ?? 0}
-            onClearCache={handleClearCache}
-            debugMode={debugMode}
-            onOpenDebugPanel={() => {
-              setSettingsOpen(false);
-              setDebugPanelOpen(true);
-            }}
-          />
 
           {debugMode && debugPanelOpen && (
             <Suspense fallback={null}>

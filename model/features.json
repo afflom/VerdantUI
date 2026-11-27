@@ -121,6 +121,17 @@
       "invariantId": "VUI-STUDIO-02",
       "citation": { "kind": "req", "decisionId": "DEC-014" },
       "publicBenefitImpact": "Unifies downloaded neural weights, 10-scene procedural picture synthesis, multi-track percussion/stereo audio, complete 10-variant games, living Spaces-as-Prisms, and global MediaType Galleries into one continually adapting on-device model manageable directly from chat threads."
+    },
+    {
+      "id": "VUI-FEAT-012",
+      "title": "Self-Similar Prism UI & Observer Procedural Surface Synthesis",
+      "stage": "active",
+      "introducedIn": "0.6.0",
+      "ownerFile": "src/engine/observerUiSynthesizer.ts",
+      "testFile": "src/engine/observerUiSynthesizer.test.ts",
+      "invariantId": "VUI-OBSERVER-01",
+      "citation": { "kind": "req", "decisionId": "DEC-015" },
+      "publicBenefitImpact": "Models VerdantUI and every part (Home, Galleries, Spaces, Settings, Documents, Media, Games, Utilities) as Verdant Prisms rendered procedurally by the Observer with a unified natural-language interface, full-stage Preview panel, Preview/Details toggle, and distraction-free editorial document canvas."
     }
   ]
 }

@@ -40,7 +40,8 @@ interface ThreadSidebarProps {
   activeView:
     | { readonly kind: 'thread' }
     | { readonly kind: 'prism'; readonly prismId: string; readonly mode: 'studio' | 'app' }
-    | { readonly kind: 'gallery'; readonly mediaType: GalleryMediaType };
+    | { readonly kind: 'gallery'; readonly mediaType: GalleryMediaType }
+    | { readonly kind: 'settings' };
   onSelectThreadView: () => void;
   spaces: readonly VerdantPrismProject[];
   galleryCounts: Readonly<Record<GalleryMediaType, number>>;

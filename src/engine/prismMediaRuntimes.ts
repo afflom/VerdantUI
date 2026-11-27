@@ -757,107 +757,229 @@ export function buildWrittenWorkRuntimeJs(weights: WrittenWorkWeights): string {
 const W = ${safeJsonForScript(weights)};
 const root = document.getElementById('organ-root');
 let chapters = W.chapters.map((c) => ({ ...c }));
-let activeIdx = 0, viewMode = 'write';
+let activeIdx = 0;
+let viewMode = 'write';
+let exportOpen = false;
+let saveStatus = 'Saved locally';
 
-function totalWords() { return chapters.reduce((acc, c) => acc + (c.body.trim() ? c.body.trim().split(/\\s+/).length : 0), 0); }
-function persist() { try { window.verdant?.storage?.set('chapters', chapters); } catch (_) {} }
-async function hydrate() {
-  try { const saved = await window.verdant?.storage?.get('chapters'); if (Array.isArray(saved) && saved.length > 0) { chapters = saved; render(); } } catch (_) {}
+function totalWords() {
+  return chapters.reduce((acc, c) => acc + (c.body && c.body.trim() ? c.body.trim().split(/\\s+/).length : 0), 0);
 }
-function renderSimpleMarkdown(md) {
-  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  return esc(md || '').replace(/^### (.+)$/gm, '<h3>$1</h3>').replace(/^## (.+)$/gm, '<h2>$1</h2>').replace(/^# (.+)$/gm, '<h1>$1</h1>')
-    .replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>').replace(/\\*(.+?)\\*/g, '<em>$1</em>')
-    .replace(/\\n\\n+/g, '</p><p>').replace(/^/, '<p>').replace(/$/, '</p>');
+function chapterWords(c) {
+  return c && c.body && c.body.trim() ? c.body.trim().split(/\\s+/).length : 0;
+}
+function persist() {
+  saveStatus = 'Saved locally';
+  try { window.verdant?.storage?.set('chapters', chapters); } catch (_) {}
+  updateFooter();
+}
+async function hydrate() {
+  try {
+    const saved = await window.verdant?.storage?.get('chapters');
+    if (Array.isArray(saved) && saved.length > 0) {
+      chapters = saved;
+      render();
+    }
+  } catch (_) {}
+}
+function esc(s) {
+  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function renderMarkdownProse(md) {
+  const lines = String(md || '').split('\\n');
+  const out = [];
+  let inList = false;
+  let para = [];
+  const flushPara = () => {
+    if (!para.length) return;
+    const inline = esc(para.join(' '))
+      .replace(/\`([^\`]+)\`/g, '<code>$1</code>')
+      .replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>')
+      .replace(/\\*(.+?)\\*/g, '<em>$1</em>');
+    out.push('<p>' + inline + '</p>');
+    para = [];
+  };
+  const closeList = () => { if (inList) { out.push('</ul>'); inList = false; } };
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    if (!line.trim()) { flushPara(); closeList(); continue; }
+    if (/^---+$/.test(line.trim())) { flushPara(); closeList(); out.push('<hr>'); continue; }
+    const h3 = line.match(/^###\\s+(.+)/); if (h3) { flushPara(); closeList(); out.push('<h3>' + esc(h3[1]) + '</h3>'); continue; }
+    const h2 = line.match(/^##\\s+(.+)/); if (h2) { flushPara(); closeList(); out.push('<h2>' + esc(h2[1]) + '</h2>'); continue; }
+    const h1 = line.match(/^#\\s+(.+)/); if (h1) { flushPara(); closeList(); out.push('<h1>' + esc(h1[1]) + '</h1>'); continue; }
+    const bq = line.match(/^>\\s+(.+)/); if (bq) { flushPara(); closeList(); out.push('<blockquote>' + esc(bq[1]) + '</blockquote>'); continue; }
+    const li = line.match(/^[-*]\\s+(.+)/);
+    if (li) {
+      flushPara();
+      if (!inList) { out.push('<ul>'); inList = true; }
+      out.push('<li>' + esc(li[1]).replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>').replace(/\\*(.+?)\\*/g, '<em>$1</em>') + '</li>');
+      continue;
+    }
+    closeList();
+    para.push(line.trim());
+  }
+  flushPara(); closeList();
+  return out.length ? out.join('') : '<p style="color:var(--v-muted);font-style:italic">Start writing or ask the prompt bar below to draft this section.</p>';
 }
 function fullMarkdown() {
-  return '# ' + W.title + '\\n\\n' + W.premise + '\\n\\n' + chapters.map((c) => '## ' + c.title + '\\n\\n' + (c.body || c.summary)).join('\\n\\n');
+  return '# ' + W.title + '\\n\\n' + (W.premise ? '_' + W.premise + '_\\n\\n' : '') +
+    chapters.map((c) => '## ' + c.title + '\\n\\n' + (c.body || c.summary || '')).join('\\n\\n');
 }
+function updateFooter() {
+  const el = document.getElementById('doc-footer-meta');
+  if (!el) return;
+  const words = totalWords();
+  const readMin = Math.max(1, Math.round(words / 220));
+  const pct = Math.min(100, Math.round((words / Math.max(1, W.targetWordCount)) * 100));
+  el.innerHTML = '<span>' + words.toLocaleString() + ' words · ' + readMin + ' min read</span><span class="doc-progress"><i style="width:' + pct + '%"></i></span>';
+  const st = document.getElementById('doc-save-status');
+  if (st) st.textContent = saveStatus;
+}
+function autoSize(ta) {
+  if (!ta) return;
+  ta.style.height = 'auto';
+  ta.style.height = Math.max(340, ta.scrollHeight) + 'px';
+}
+
 function render() {
   if (activeIdx >= chapters.length) activeIdx = Math.max(0, chapters.length - 1);
   const ch = chapters[activeIdx] || chapters[0];
-  const words = totalWords(), readMin = Math.max(1, Math.round(words / 220));
-  const pct = Math.min(100, Math.round((words / Math.max(1, W.targetWordCount)) * 100));
   root.innerHTML = '';
 
-  const top = document.createElement('div'); top.className = 'organ-row'; top.style.justifyContent = 'space-between'; top.style.marginBottom = '10px';
-  top.innerHTML = '<div class="organ-row"><span class="organ-pill">' + W.genre + '</span><span class="organ-pill">' + words.toLocaleString() + ' / ' + W.targetWordCount.toLocaleString() + ' words (' + pct + '%)</span><span class="organ-pill">~' + readMin + ' min read</span></div>';
-  const actions = document.createElement('div'); actions.className = 'organ-row';
-  for (const [m, lbl] of [['write','Write'],['split','Split'],['preview','Preview']]) {
-    const b = document.createElement('button'); b.className = 'organ-btn' + (viewMode === m ? ' primary' : ''); b.textContent = lbl;
-    b.onclick = () => { viewMode = m; render(); }; actions.appendChild(b);
-  }
-  const addCh = document.createElement('button'); addCh.className = 'organ-btn'; addCh.textContent = '+ Chapter';
-  addCh.onclick = () => { chapters.push({ title: 'Chapter ' + (chapters.length + 1), beat: 'Scene', summary: 'Describe this chapter beat.', body: '' }); activeIdx = chapters.length - 1; persist(); render(); };
-  const copyBtn = document.createElement('button'); copyBtn.className = 'organ-btn'; copyBtn.textContent = 'Copy';
-  copyBtn.onclick = () => { (window.verdant?.browser?.copyText || window.verdant?.copyText)?.(fullMarkdown()); copyBtn.textContent = 'Copied!'; setTimeout(() => (copyBtn.textContent = 'Copy'), 1200); };
-  const expMd = document.createElement('button'); expMd.className = 'organ-btn primary'; expMd.textContent = 'Export MD';
-  expMd.onclick = () => { (window.verdant?.browser?.downloadFile || window.verdant?.downloadFile)?.(W.title.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.md', fullMarkdown(), 'text/markdown'); };
-  const expHtml = document.createElement('button'); expHtml.className = 'organ-btn'; expHtml.textContent = 'Export HTML';
-  expHtml.onclick = () => {
-    const html = '<!doctype html><html><head><meta charset="utf-8"><title>' + W.title + '</title><style>body{max-width:720px;margin:40px auto;font-family:Georgia,serif;line-height:1.7;padding:0 16px}</style></head><body>' + renderSimpleMarkdown(fullMarkdown()) + '</body></html>';
-    (window.verdant?.browser?.downloadFile || window.verdant?.downloadFile)?.(W.title.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.html', html, 'text/html');
-  };
-  actions.append(addCh, copyBtn, expMd, expHtml); top.appendChild(actions); root.appendChild(top);
-
-  const tabs = document.createElement('div'); tabs.className = 'organ-row'; tabs.style.marginBottom = '10px';
+  // Single serene top bar: chapter pills on left, Write/Read + Export menu on right
+  const bar = document.createElement('div'); bar.className = 'doc-topbar';
+  const chRow = document.createElement('div'); chRow.className = 'doc-chapters';
   chapters.forEach((c, idx) => {
-    const b = document.createElement('button'); b.className = 'organ-btn' + (idx === activeIdx ? ' primary' : ''); b.textContent = c.title;
-    b.onclick = () => { activeIdx = idx; render(); }; tabs.appendChild(b);
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'doc-ch-pill' + (idx === activeIdx ? ' active' : '');
+    b.textContent = c.title || ('Section ' + (idx + 1));
+    b.onclick = () => { activeIdx = idx; exportOpen = false; render(); };
+    chRow.appendChild(b);
   });
-  root.appendChild(tabs);
+  const addCh = document.createElement('button');
+  addCh.type = 'button'; addCh.className = 'doc-ch-pill'; addCh.title = 'Add section'; addCh.textContent = '+ Section';
+  addCh.onclick = () => {
+    chapters.push({ title: 'Section ' + (chapters.length + 1), beat: 'Section', summary: '', body: '' });
+    activeIdx = chapters.length - 1; viewMode = 'write'; exportOpen = false; persist(); render();
+  };
+  chRow.appendChild(addCh);
 
-  // Chapter metadata editor + reorder/delete
-  const metaRow = document.createElement('div'); metaRow.className = 'organ-row'; metaRow.style.marginBottom = '10px';
-  const titleIn = document.createElement('input'); titleIn.className = 'organ-input'; titleIn.style.flex = '1'; titleIn.value = ch.title; titleIn.placeholder = 'Chapter title';
-  titleIn.oninput = () => { ch.title = titleIn.value; persist(); };
-  const sumIn = document.createElement('input'); sumIn.className = 'organ-input'; sumIn.style.flex = '2'; sumIn.value = ch.summary; sumIn.placeholder = 'Chapter summary / beat';
-  sumIn.oninput = () => { ch.summary = sumIn.value; persist(); };
-  metaRow.append(titleIn, sumIn);
-  if (chapters.length > 1) {
-    const delBtn = document.createElement('button'); delBtn.className = 'organ-btn'; delBtn.textContent = 'Delete Chapter';
-    delBtn.onclick = () => { chapters.splice(activeIdx, 1); persist(); render(); };
-    metaRow.appendChild(delBtn);
+  const right = document.createElement('div'); right.className = 'organ-row';
+  const seg = document.createElement('div'); seg.className = 'organ-seg';
+  for (const [m, lbl] of [['write', 'Write'], ['read', 'Read']]) {
+    const sb = document.createElement('button'); sb.type = 'button';
+    sb.className = viewMode === m ? 'active' : '';
+    sb.textContent = lbl;
+    sb.onclick = () => { viewMode = m; exportOpen = false; render(); };
+    seg.appendChild(sb);
   }
-  root.appendChild(metaRow);
+  right.appendChild(seg);
 
-  const grid = document.createElement('div');
-  grid.style.display = 'grid'; grid.style.gap = '12px';
-  grid.style.gridTemplateColumns = viewMode === 'split' ? '1fr 1fr' : '1fr';
-  if (viewMode !== 'preview') {
-    const ta = document.createElement('textarea'); ta.className = 'organ-textarea'; ta.placeholder = 'Write ' + ch.title + ' here (Markdown supported)…'; ta.value = ch.body;
-    ta.oninput = () => { ch.body = ta.value; persist(); const pv = document.getElementById('doc-prev'); if (pv) pv.innerHTML = renderSimpleMarkdown(ch.body || ch.summary); };
-    grid.appendChild(ta);
-  }
-  if (viewMode !== 'write') {
-    const pv = document.createElement('div'); pv.id = 'doc-prev';
-    pv.style.padding = '12px'; pv.style.borderRadius = '10px'; pv.style.border = '1px solid var(--v-border)'; pv.style.background = 'var(--v-bg)'; pv.style.minHeight = '220px';
-    pv.innerHTML = renderSimpleMarkdown(ch.body || ch.summary);
-    grid.appendChild(pv);
-  }
-  root.appendChild(grid);
-
-  if (W.allowLocalAssist && window.verdant?.ask) {
-    const aiRow = document.createElement('div'); aiRow.className = 'organ-row'; aiRow.style.marginTop = '10px';
-    for (const [label, directive] of [
-      ['Continue Drafting', 'Continue this ' + W.genre + ' chapter in voice "' + W.voice + '".'],
-      ['Expand Scene', 'Expand the latest paragraph with richer sensory detail and pacing.'],
-      ['Tighten Prose', 'Rewrite the latest paragraph to be sharper and more vivid.'],
-    ]) {
-      const btn = document.createElement('button'); btn.className = 'organ-btn'; btn.textContent = label;
-      btn.onclick = async () => {
-        btn.disabled = true; btn.textContent = 'Working…';
-        try {
-          const reply = await window.verdant.ask(directive + ' Premise: ' + W.premise + '. Summary: ' + ch.summary + '. Draft:\\n' + ch.body.slice(-700));
-          ch.body = (ch.body ? ch.body + '\\n\\n' : '') + String(reply || '').trim();
-          persist(); render();
-        } catch (_) { btn.disabled = false; btn.textContent = label; }
-      };
-      aiRow.appendChild(btn);
+  const menuWrap = document.createElement('div'); menuWrap.className = 'doc-menu';
+  const expTrigger = document.createElement('button'); expTrigger.type = 'button'; expTrigger.className = 'organ-btn ghost'; expTrigger.textContent = 'Export ▾';
+  expTrigger.onclick = (e) => { e.stopPropagation(); exportOpen = !exportOpen; render(); };
+  menuWrap.appendChild(expTrigger);
+  if (exportOpen) {
+    const pop = document.createElement('div'); pop.className = 'doc-popover';
+    const bCopy = document.createElement('button'); bCopy.type = 'button'; bCopy.textContent = 'Copy Markdown';
+    bCopy.onclick = () => { (window.verdant?.browser?.copyText || window.verdant?.copyText)?.(fullMarkdown()); exportOpen = false; saveStatus = 'Copied to clipboard'; render(); };
+    const bMd = document.createElement('button'); bMd.type = 'button'; bMd.textContent = 'Download .md';
+    bMd.onclick = () => { (window.verdant?.browser?.downloadFile || window.verdant?.downloadFile)?.(W.title.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.md', fullMarkdown(), 'text/markdown'); exportOpen = false; render(); };
+    const bHtml = document.createElement('button'); bHtml.type = 'button'; bHtml.textContent = 'Download .html';
+    bHtml.onclick = () => {
+      const html = '<!doctype html><html><head><meta charset="utf-8"><title>' + esc(W.title) + '</title><style>body{max-width:680px;margin:56px auto;font-family:Georgia,serif;font-size:17px;line-height:1.85;padding:0 20px;color:#0f172a}</style></head><body>' + renderMarkdownProse(fullMarkdown()) + '</body></html>';
+      (window.verdant?.browser?.downloadFile || window.verdant?.downloadFile)?.(W.title.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.html', html, 'text/html');
+      exportOpen = false; render();
+    };
+    pop.append(bCopy, bMd, bHtml);
+    if (chapters.length > 1) {
+      const bDel = document.createElement('button'); bDel.type = 'button'; bDel.style.color = '#dc2626'; bDel.textContent = 'Remove current section';
+      bDel.onclick = () => { chapters.splice(activeIdx, 1); activeIdx = Math.max(0, activeIdx - 1); exportOpen = false; persist(); render(); };
+      pop.appendChild(bDel);
     }
-    root.appendChild(aiRow);
+    menuWrap.appendChild(pop);
   }
+  right.appendChild(menuWrap);
+  bar.append(chRow, right);
+  root.appendChild(bar);
+
+  // Borderless on-page editorial heading + subtle subtitle/premise
+  if (viewMode === 'write') {
+    const titleIn = document.createElement('input');
+    titleIn.type = 'text'; titleIn.className = 'doc-title-input';
+    titleIn.value = ch.title || ''; titleIn.placeholder = 'Untitled section';
+    titleIn.oninput = () => {
+      ch.title = titleIn.value;
+      const pills = root.querySelectorAll('.doc-ch-pill');
+      if (pills[activeIdx]) pills[activeIdx].textContent = ch.title || ('Section ' + (activeIdx + 1));
+      persist();
+    };
+    const subIn = document.createElement('input');
+    subIn.type = 'text'; subIn.className = 'doc-sub-input';
+    subIn.value = ch.summary || ''; subIn.placeholder = 'Optional subtitle or focus note…';
+    subIn.oninput = () => { ch.summary = subIn.value; persist(); };
+
+    const ta = document.createElement('textarea');
+    ta.className = 'doc-editor';
+    ta.placeholder = 'Write freely… Markdown formatting works when you switch to Read.';
+    ta.value = ch.body || '';
+    ta.oninput = () => { ch.body = ta.value; autoSize(ta); persist(); };
+    root.append(titleIn, subIn, ta);
+    requestAnimationFrame(() => autoSize(ta));
+  } else {
+    const h = document.createElement('h1'); h.className = 'doc-title-input'; h.textContent = ch.title || 'Untitled section';
+    root.appendChild(h);
+    if (ch.summary) {
+      const sub = document.createElement('p'); sub.className = 'doc-sub-input'; sub.textContent = ch.summary;
+      root.appendChild(sub);
+    }
+    const prose = document.createElement('article'); prose.className = 'doc-prose';
+    prose.innerHTML = renderMarkdownProse(ch.body || ch.summary || '');
+    root.appendChild(prose);
+  }
+
+  // Quiet editorial footer
+  const foot = document.createElement('footer'); foot.className = 'doc-footer';
+  const meta = document.createElement('div'); meta.id = 'doc-footer-meta';
+  const status = document.createElement('span'); status.id = 'doc-save-status'; status.textContent = saveStatus;
+  foot.append(meta, status);
+  root.appendChild(foot);
+  updateFooter();
 }
+
+// Accept live natural-language directives from the Prism's universal Natural Language bar
+if (window.verdant?.onInput) {
+  window.verdant.onInput(async (input) => {
+    const text = typeof input === 'string' ? input : String((input && (input.prompt || input.text)) || '');
+    const lower = text.toLowerCase();
+    if (/\\b(read|reading|preview)\\s*(mode|view)?\\b/.test(lower)) { viewMode = 'read'; render(); return { ok: true, mode: 'read' }; }
+    if (/\\b(write|edit|writing)\\s*(mode|view)?\\b/.test(lower)) { viewMode = 'write'; render(); return { ok: true, mode: 'write' }; }
+    if (/\\b(add|new)\\s+(chapter|section)\\b/.test(lower)) {
+      const nameMatch = text.match(/(?:about|titled|called|named)\\s+["']?([^"'.!?]{2,60})/i);
+      chapters.push({ title: nameMatch ? nameMatch[1].trim() : 'Section ' + (chapters.length + 1), beat: 'Section', summary: '', body: '' });
+      activeIdx = chapters.length - 1; viewMode = 'write'; persist(); render();
+      return { ok: true, added: chapters[activeIdx].title };
+    }
+    if (window.verdant?.ask && text.trim()) {
+      const ch = chapters[activeIdx] || chapters[0];
+      saveStatus = 'Drafting…'; updateFooter();
+      try {
+        const reply = await window.verdant.ask('Document "' + W.title + '" (' + W.genre + ', voice: ' + W.voice + '). Current section "' + ch.title + '":\\n' + (ch.body || ch.summary || '').slice(-900) + '\\n\\nUser request: ' + text + '\\nWrite only the prose to append or revise.');
+        const clean = String(reply || '').trim();
+        if (clean) {
+          ch.body = (ch.body ? ch.body + '\\n\\n' : '') + clean;
+          persist(); render();
+          return { ok: true, words: chapterWords(ch) };
+        }
+      } catch (_) {}
+      saveStatus = 'Saved locally'; updateFooter();
+    }
+    return { ok: true };
+  });
+}
+
+document.addEventListener('click', () => { if (exportOpen) { exportOpen = false; render(); } });
 render();
 hydrate();
 `;

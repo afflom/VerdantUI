@@ -1,10 +1,11 @@
 /**
- * Verdant Studio & Published App Workspace (`src/components/VerdantStudioView.tsx`)
+ * Unified Procedurally Synthesized Prism View (`src/components/VerdantStudioView.tsx`)
  *
- * Implements DEC-011 (Zero Technical Jargon) & DEC-012 (Zero User Tunables):
- * - Studio Mode: Conversational Creator (`StudioGuidedWizard`) + Live Preview & simple Details.
- * - App Mode: Full-stage live published creation + clean Details overlay.
- * - Compilation, formal verification, and sandboxing happen silently behind the scenes on Publish.
+ * Renders EVERY user-owned Artifact Prism and Space Prism through the universal
+ * `PrismSurfaceShell` contract (`DEC-011`, `DEC-012`, `DEC-013`, `DEC-014`, `DEC-015`):
+ *   - Full-stage live Rendering (Preview) Panel (zero cramped side splits, zero stacked toolbars)
+ *   - Single calm `Preview | Details` toggle
+ *   - Homescreen-grade Natural Language Interface bar right beneath the canvas
  */
 
 import {
@@ -23,10 +24,7 @@ import {
   Check,
   CheckCircle2,
   Download,
-  ExternalLink,
-  Eye,
   Globe,
-  Info,
   Loader2,
   Monitor,
   RotateCcw,
@@ -37,10 +35,14 @@ import {
   X,
 } from 'lucide-react';
 import { formatMessagesForLlama, stripReasoningTags } from '../engine/assistantAdapter';
+import type {
+  PrismSurfaceMode,
+  SynthesizedPrismFrame,
+} from '../engine/observerUiSynthesizer';
 import type { ObserverStreamBus, OtelTraceContext } from '../engine/observerStreamBus';
 import type { PrismBuildWorkerClient } from '../engine/prismBuildClient';
 import { compilePrismDeclaration } from '../engine/prismCompiler';
-import type { PrismBridgeRuntime } from '../engine/prismHostPool';
+import type { PrismHostPool } from '../engine/prismHostPool';
 import type {
   PrismStore,
   SealedHoloRecord,
@@ -48,8 +50,8 @@ import type {
 } from '../engine/prismStudio';
 import {
   checkDeclaration,
+  dispatchStudioOp,
   evaluateDeclaredModel,
-  type DeclarativeStarterId,
   type StudioApiOp,
 } from '../engine/verdantStudioApi';
 import { evaluateVerdantRouting } from '../engine/verdantStandardsRouter';
@@ -57,10 +59,21 @@ import {
   buildLocalInterviewExtractionPrompt,
   computeGuidedWizardState,
   mergeLocalModelExtraction,
+  parseIdeaSentence,
+  reconcileWizardTurn,
   type ExtractedPrismIntent,
   type GuidedStepId,
 } from '../engine/prismInterviewEngine';
-import { PRISM_MEDIA_CATALOG } from '../engine/prismMediaOrgans';
+import {
+  assembleProceduralPrismOps,
+  buildAgentCoreModelOps,
+  buildWeightRefinementPrompt,
+  buildWeightRoutingDiscoveryPrompt,
+  classifyArtifactMediaType,
+  parseDiscoveryAgentResponse,
+  type AgentChatTurn,
+} from '../engine/prismStudioAgent';
+import { PRISM_MEDIA_CATALOG, type PrismMediaType } from '../engine/prismMediaOrgans';
 import { isInternalBootstrapModel } from '../engine/modelCatalog';
 import type { EngineState, LlamaVTensorWorkerClient } from '../engine/workerClient';
 import {
@@ -68,29 +81,43 @@ import {
   type HoloviewMountConfig,
   type PrismRuntimeError,
 } from './PrismSandboxFrame';
-import { StudioGuidedWizard } from './StudioGuidedWizard';
+import { PrismSurfaceShell, type PrismSurfaceMessage } from './PrismSurfaceShell';
 
 interface VerdantStudioViewProps {
   project: VerdantPrismProject;
   mode: 'studio' | 'app';
+  frame: SynthesizedPrismFrame;
+  surfaceMode: PrismSurfaceMode;
+  onChangeSurfaceMode: (mode: PrismSurfaceMode) => void;
   onChangeMode: (mode: 'studio' | 'app') => void;
+  onSelectSystemPrism: (prismId: string) => void;
+  onTypingChange?: (typing: boolean) => void;
   store: PrismStore;
   bus: ObserverStreamBus;
-  bridgeRuntime: PrismBridgeRuntime;
+  bridgeRuntime: PrismHostPool;
   buildClient: PrismBuildWorkerClient;
   workerClient: LlamaVTensorWorkerClient;
   engineState: EngineState;
   darkMode: boolean;
-  onEnableModelStream: () => void;
   onSelectProject: (prismId: string, mode: 'studio' | 'app') => void;
 }
 
-type PreviewPaneMode = 'preview' | 'details';
+function isAbortError(err: unknown): boolean {
+  return (
+    (err instanceof DOMException && err.name === 'AbortError') ||
+    (err instanceof Error && (err.name === 'AbortError' || /aborted|cancelled/i.test(err.message)))
+  );
+}
 
 export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   project,
   mode,
+  frame,
+  surfaceMode,
+  onChangeSurfaceMode,
   onChangeMode,
+  onSelectSystemPrism,
+  onTypingChange,
   store,
   bus,
   bridgeRuntime,
@@ -100,9 +127,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   darkMode,
   onSelectProject,
 }) => {
-  const [previewPaneMode, setPreviewPaneMode] = useState<PreviewPaneMode>('preview');
   const [guidedStep, setGuidedStep] = useState<GuidedStepId>('anchor-idea');
-  const [detailsModalOpen, setDetailsModalOpen] = useState(false);
   const [viewportMode, setViewportMode] = useState<'desktop' | 'mobile'>('desktop');
   const [reloadNonce, setReloadNonce] = useState(0);
   const [runtimeError, setRuntimeError] = useState<PrismRuntimeError | null>(null);
@@ -110,11 +135,14 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   const [titleDraft, setTitleDraft] = useState(project.draft.name);
   const [justPublished, setJustPublished] = useState(false);
   const [publishing, setPublishing] = useState(false);
+  const [nlBusy, setNlBusy] = useState(false);
+  const [nlBusyLabel, setNlBusyLabel] = useState('Updating…');
   const [statusBanner, setStatusBanner] = useState<{ ok: boolean; text: string } | null>(null);
   const [draggingFile, setDraggingFile] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const activeAgentAbortRef = useRef<AbortController | null>(null);
+  const runTokenRef = useRef(0);
   const declaration = project.declaration ?? null;
   const isDeclarative = project.kind === 'declarative' || declaration !== null;
   const isExternalHolo = project.kind === 'external-holo';
@@ -134,7 +162,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     () => (declaration ? checkDeclaration(declaration) : null),
     [declaration],
   );
-  const routing = useMemo(
+  const readiness = useMemo(
     () => (declaration ? evaluateVerdantRouting(declaration) : null),
     [declaration],
   );
@@ -145,8 +173,6 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     setTitleDraft(project.draft.name);
     setRuntimeError(null);
     setStatusBanner(null);
-    setDetailsModalOpen(false);
-    setPreviewPaneMode('preview');
     const initialRouting = project.declaration ? evaluateVerdantRouting(project.declaration) : null;
     const initialCheck = project.declaration ? checkDeclaration(project.declaration) : null;
     if (project.declaration && initialRouting && initialCheck) {
@@ -155,18 +181,6 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       setGuidedStep('anchor-idea');
     }
   }, [project.id, project.draft.name, project.declaration?.schema]);
-
-  useEffect(() => {
-    if (!detailsModalOpen && previewPaneMode !== 'details') return;
-    const onKey = (ev: KeyboardEvent) => {
-      if (ev.key === 'Escape') {
-        if (detailsModalOpen) setDetailsModalOpen(false);
-        if (previewPaneMode === 'details') setPreviewPaneMode('preview');
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [detailsModalOpen, previewPaneMode]);
 
   // Closed-loop visual check: listen for rendered canvas sensory reports from this creation
   useEffect(() => {
@@ -244,15 +258,6 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     [project.id, store],
   );
 
-  const handleLoadStarter = useCallback(
-    (starter: DeclarativeStarterId) => {
-      void store.createDeclarative(starter).then((created) => {
-        onSelectProject(created.id, 'studio');
-      });
-    },
-    [onSelectProject, store],
-  );
-
   const handleCommitTitle = async () => {
     setEditingTitle(false);
     const trimmed = titleDraft.trim();
@@ -275,7 +280,6 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     }
   };
 
-  /** Silently verifies, compiles, and publishes in one smooth user action. */
   const handlePublish = useCallback(async () => {
     bridgeRuntime.evictPrism(project.id);
     setStatusBanner(null);
@@ -287,10 +291,10 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       return;
     }
 
-    if (!declaration || !compiled || (routing && !routing.readyToSeal)) {
+    if (!declaration || !compiled || (readiness && !readiness.readyToSeal)) {
       setStatusBanner({
         ok: false,
-        text: 'Describe your idea in Studio first so we can finish building it.',
+        text: 'Describe your idea in the prompt bar below first so we can finish building it.',
       });
       return;
     }
@@ -328,7 +332,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       }
       await store.publishSealedHolo(project.id, sealed);
       setJustPublished(true);
-      setStatusBanner({ ok: true, text: `"${project.draft.name}" is now published and ready to use.` });
+      setStatusBanner({ ok: true, text: `"${project.draft.name}" is now published.` });
       setTimeout(() => setJustPublished(false), 2000);
     } catch (error) {
       setStatusBanner({
@@ -338,7 +342,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     } finally {
       setPublishing(false);
     }
-  }, [bridgeRuntime, buildClient, compiled, declaration, isDeclarative, project.draft.name, project.id, project.sealedDraft, routing, store]);
+  }, [bridgeRuntime, buildClient, compiled, declaration, isDeclarative, project.draft.name, project.id, project.sealedDraft, readiness, store]);
 
   const handleExportCreation = () => {
     const slug = (declaration?.metadata.slug || project.draft.name)
@@ -462,29 +466,15 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     };
   }, []);
 
-  const handleCancelStudioAgent = useCallback(() => {
+  const handleCancelNl = useCallback(() => {
+    runTokenRef.current += 1;
     activeAgentAbortRef.current?.abort();
     activeAgentAbortRef.current = null;
+    setNlBusy(false);
   }, []);
 
-  const handleAppendStudioMessage = useCallback(
-    async (msg: {
-      readonly role: 'user' | 'assistant';
-      readonly content: string;
-      readonly badges?: readonly string[];
-    }) => {
-      await store.appendMessage(project.id, msg);
-    },
-    [project.id, store],
-  );
-
   const handleRunStudioAgentPrompt = useCallback(
-    async (
-      systemPrompt: string,
-      userPrompt: string,
-      maxTokens: number,
-      onProgress?: (charsGenerated: number) => void,
-    ): Promise<string> => {
+    async (systemPrompt: string, userPrompt: string, maxTokens: number): Promise<string> => {
       if (!hasLocalModelReady || !engineState.model) {
         throw new Error('Local AI is not ready yet.');
       }
@@ -508,7 +498,6 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
         { thinkingMode: 'off' },
       );
       let raw = '';
-      let lastProgressAt = 0;
       try {
         for await (const ev of workerClient.streamGenerate(
           prompt,
@@ -518,24 +507,221 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
         )) {
           if (ac.signal.aborted) break;
           raw = stripReasoningTags(ev.accumulatedText);
-          const now = Date.now();
-          if (onProgress && now - lastProgressAt >= 160) {
-            lastProgressAt = now;
-            onProgress(raw.length);
-          }
         }
-        if (ac.signal.aborted) {
-          throw new DOMException('Cancelled.', 'AbortError');
-        }
-        onProgress?.(raw.length);
+        if (ac.signal.aborted) throw new DOMException('Cancelled.', 'AbortError');
         return raw;
       } finally {
-        if (activeAgentAbortRef.current === ac) {
-          activeAgentAbortRef.current = null;
-        }
+        if (activeAgentAbortRef.current === ac) activeAgentAbortRef.current = null;
       }
     },
     [engineState.model, engineState.promptMode, engineState.sampling, hasLocalModelReady, project.id, workerClient],
+  );
+
+  /**
+   * Universal Natural Language handler for this Prism:
+   * handles view toggles ("show details", "publish"), live document commands,
+   * and full procedural Prism synthesis/refinement.
+   */
+  const handleSubmitNaturalLanguage = useCallback(
+    async (rawMessage: string) => {
+      const message = rawMessage.trim();
+      if (!message || nlBusy) return;
+      const lower = message.toLowerCase();
+
+      await store.appendMessage(project.id, { role: 'user', content: message });
+
+      // Direct Prism surface commands
+      if (/^(?:show|open|view)\s+(?:prism\s+)?details\b/.test(lower)) {
+        onChangeSurfaceMode('details');
+        await store.appendMessage(project.id, { role: 'assistant', content: 'Switched to Prism Details.' });
+        return;
+      }
+      if (/^(?:show|open|back\s+to)\s+preview\b/.test(lower)) {
+        onChangeSurfaceMode('preview');
+        await store.appendMessage(project.id, { role: 'assistant', content: 'Switched to live Preview.' });
+        return;
+      }
+      if (/^publish\b/.test(lower)) {
+        await handlePublish();
+        await store.appendMessage(project.id, { role: 'assistant', content: `Published "${project.draft.name}".` });
+        return;
+      }
+
+      const activeMediaType =
+        declaration?.view?.proceduralOrgan?.mediaType ?? declaration?.concept.mediaType;
+
+      // Live in-place Document commands (read/write toggle, add section, continue drafting)
+      if (
+        activeMediaType === 'written-work' &&
+        project.published !== null &&
+        /\b(read|reading|write|edit|add\s+(?:a\s+)?(?:chapter|section)|new\s+(?:chapter|section)|continue|draft|expand|tighten|rewrite|paragraph)\b/.test(lower)
+      ) {
+        setNlBusy(true);
+        setNlBusyLabel('Updating document…');
+        try {
+          await bridgeRuntime.dispatchPublishedPrism(project.id, { prompt: message });
+          onChangeSurfaceMode('preview');
+          await store.appendMessage(project.id, {
+            role: 'assistant',
+            content: 'Updated your document live in Preview.',
+          });
+          return;
+        } catch {
+          // Fall through to declarative refinement if sandbox isn't accepting input
+        } finally {
+          setNlBusy(false);
+        }
+      }
+
+      if (!declaration || !readiness || !checkReport) {
+        await store.appendMessage(project.id, {
+          role: 'assistant',
+          content: 'This imported creation runs in read-only mode.',
+        });
+        return;
+      }
+
+      const nextHistory: AgentChatTurn[] = [
+        ...project.messages.map((m) => ({
+          role: m.role === 'user' ? ('user' as const) : ('studio' as const),
+          text: m.content,
+        })),
+        { role: 'user', text: message },
+      ];
+
+      const classified = classifyArtifactMediaType(message);
+      const isProceduralFlow =
+        Boolean(declaration.view?.proceduralOrgan) ||
+        Boolean(declaration.concept.mediaType) ||
+        classified.mode === 'procedural-organ';
+
+      if (isProceduralFlow) {
+        const resolvedMediaType: PrismMediaType =
+          declaration.view?.proceduralOrgan?.mediaType ??
+          declaration.concept.mediaType ??
+          classified.mediaType;
+
+        const runToken = ++runTokenRef.current;
+        const userTurns = nextHistory.filter((t) => t.role === 'user').length;
+        const isRefining = Boolean(declaration.view?.proceduralOrgan);
+
+        let rawModelJson = '';
+        if (hasLocalModelReady) {
+          setNlBusy(true);
+          setNlBusyLabel(
+            isRefining
+              ? `Updating ${PRISM_MEDIA_CATALOG[resolvedMediaType].label.toLowerCase()}…`
+              : `Creating ${PRISM_MEDIA_CATALOG[resolvedMediaType].label.toLowerCase()}…`,
+          );
+          try {
+            const prompt = isRefining
+              ? buildWeightRefinementPrompt(nextHistory, declaration, message)
+              : buildWeightRoutingDiscoveryPrompt(nextHistory, declaration, userTurns, resolvedMediaType);
+            rawModelJson = await handleRunStudioAgentPrompt(prompt, message, 768);
+          } catch (err) {
+            if (isAbortError(err) || runTokenRef.current !== runToken) {
+              setNlBusy(false);
+              await store.appendMessage(project.id, {
+                role: 'assistant',
+                content: 'Stopped. Send another prompt whenever you are ready.',
+              });
+              return;
+            }
+            rawModelJson = '';
+          } finally {
+            if (runTokenRef.current === runToken) setNlBusy(false);
+          }
+          if (runTokenRef.current !== runToken) return;
+        }
+
+        const { spec } = parseDiscoveryAgentResponse(
+          rawModelJson,
+          message,
+          declaration,
+          userTurns,
+          resolvedMediaType,
+        );
+
+        if (spec.readyToBuild || isRefining) {
+          const assembled = assembleProceduralPrismOps(declaration, spec, message);
+          if (assembled.ops.length > 0) {
+            await handleDispatchOp({ op: 'batch', ops: assembled.ops });
+          }
+          if (mode === 'app') onChangeMode('studio');
+          await store.appendMessage(project.id, {
+            role: 'assistant',
+            content: isRefining
+              ? `Updated "${spec.name}" and refreshed the preview.`
+              : `"${spec.name}" is ready in Preview.`,
+          });
+          setGuidedStep('ready-to-seal');
+          onChangeSurfaceMode('preview');
+        } else {
+          const coreOps = buildAgentCoreModelOps(declaration, spec, message);
+          if (coreOps.length > 0) {
+            let working = declaration;
+            for (const op of coreOps) {
+              const r = dispatchStudioOp(working, op);
+              if (r.ok) working = r.declaration;
+            }
+            await handleDispatchOp({ op: 'batch', ops: coreOps });
+          }
+          await store.appendMessage(project.id, {
+            role: 'assistant',
+            content: spec.reply,
+          });
+          setGuidedStep('confirm-context');
+        }
+        return;
+      }
+
+      let preParsedIntent: ExtractedPrismIntent | undefined;
+      if ((readiness.isUndefined || guidedStep === 'anchor-idea') && hasLocalModelReady) {
+        const runToken = ++runTokenRef.current;
+        setNlBusy(true);
+        setNlBusyLabel('Understanding your idea…');
+        try {
+          const deterministic = parseIdeaSentence(message);
+          preParsedIntent = await handleSynthesizeIdeaWithLocalModel(message, deterministic);
+        } catch {
+          preParsedIntent = parseIdeaSentence(message);
+        } finally {
+          if (runTokenRef.current === runToken) setNlBusy(false);
+        }
+      }
+
+      const result = reconcileWizardTurn(declaration, guidedStep, message, preParsedIntent);
+      if (result.ops.length > 0) {
+        await handleDispatchOp({ op: 'batch', ops: result.ops });
+      }
+      await store.appendMessage(project.id, {
+        role: 'assistant',
+        content: result.assistantReply,
+      });
+      setGuidedStep(result.nextStep);
+      if (result.openPreview) onChangeSurfaceMode('preview');
+    },
+    [
+      activeSnapshot,
+      bridgeRuntime,
+      checkReport,
+      declaration,
+      guidedStep,
+      handleDispatchOp,
+      handlePublish,
+      handleRunStudioAgentPrompt,
+      handleSynthesizeIdeaWithLocalModel,
+      hasLocalModelReady,
+      mode,
+      nlBusy,
+      onChangeMode,
+      onChangeSurfaceMode,
+      project.draft.name,
+      project.id,
+      project.messages,
+      readiness,
+      store,
+    ],
   );
 
   const effectivePreviewDark =
@@ -549,288 +735,141 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   const canUndo = isDeclarative
     ? (project.declarationRevisions?.length ?? 0) > 0
     : project.revisions.length > 0;
-  const mediaLabel = declaration?.view?.proceduralOrgan
-    ? PRISM_MEDIA_CATALOG[declaration.view.proceduralOrgan.mediaType].label
-    : 'Creation';
 
-  const renderDetailsPanel = (onClose?: () => void) => (
-    <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-white dark:bg-[#0B0F14]">
-      <div className="flex shrink-0 items-center justify-between border-b border-zinc-200 px-4 py-2.5 dark:border-zinc-800">
-        <div className="flex items-center gap-2">
-          <Info className="h-4 w-4 text-emerald-600" />
-          <span className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-            {project.draft.name}
-          </span>
-          <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-[10px] font-medium text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
-            {mediaLabel}
-          </span>
-        </div>
-        {onClose && (
+  const nlMessages = useMemo<readonly PrismSurfaceMessage[]>(
+    () =>
+      project.messages.map((m) => ({
+        id: m.id,
+        role: m.role,
+        content: m.content,
+      })),
+    [project.messages],
+  );
+
+  const titleSlot = editingTitle ? (
+    <input
+      type="text"
+      autoFocus
+      value={titleDraft}
+      onChange={(e) => setTitleDraft(e.target.value)}
+      onBlur={() => void handleCommitTitle()}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') void handleCommitTitle();
+        if (e.key === 'Escape') {
+          setTitleDraft(project.draft.name);
+          setEditingTitle(false);
+        }
+      }}
+      className="w-48 rounded-md border border-emerald-600 bg-transparent px-2 py-0.5 text-sm font-semibold text-slate-900 focus:outline-none dark:text-slate-100"
+    />
+  ) : (
+    <button
+      type="button"
+      onClick={() => setEditingTitle(true)}
+      className="truncate text-sm font-semibold tracking-tight text-slate-900 hover:underline dark:text-slate-100"
+      title="Click to rename"
+    >
+      {project.draft.name}
+    </button>
+  );
+
+  const statusDotClass =
+    isPublished && !isModified
+      ? 'bg-emerald-500'
+      : isPublished
+        ? 'bg-amber-500'
+        : 'bg-slate-400';
+
+  const headerActions = (
+    <div className="flex items-center gap-1.5">
+      {surfaceMode === 'preview' && (!isDeclarative || readiness?.readyToPreview) && (
+        <div className="hidden items-center gap-0.5 sm:flex">
           <button
             type="button"
-            onClick={onClose}
-            className="inline-flex items-center gap-1 rounded-md border border-zinc-200 px-2.5 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800"
+            onClick={() => setViewportMode('desktop')}
+            className={`rounded-md p-1.5 transition-colors ${
+              viewportMode === 'desktop'
+                ? 'bg-slate-100 text-slate-900 dark:bg-slate-800 dark:text-slate-100'
+                : 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'
+            }`}
+            title="Desktop view"
+            aria-label="Desktop view"
           >
-            <Eye className="h-3.5 w-3.5" />
-            <span>Back</span>
+            <Monitor className="h-3.5 w-3.5" />
           </button>
-        )}
-      </div>
-
-      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4 text-xs">
-        <div className="rounded-xl border border-zinc-200 p-3.5 dark:border-zinc-800">
-          <p className="font-semibold text-zinc-900 dark:text-zinc-100">About</p>
-          <p className="mt-1 leading-relaxed text-zinc-600 dark:text-zinc-400">
-            {declaration?.concept.purpose ||
-              project.draft.summary ||
-              'Runs privately on your device inside VerdantUI.'}
-          </p>
-          <div className="mt-3 flex flex-wrap gap-2">
-            <button
-              type="button"
-              onClick={handleExportCreation}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-zinc-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900"
-            >
-              <Download className="h-3.5 w-3.5" />
-              Export
-            </button>
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800"
-            >
-              <Upload className="h-3.5 w-3.5" />
-              Import
-            </button>
-          </div>
+          <button
+            type="button"
+            onClick={() => setViewportMode('mobile')}
+            className={`rounded-md p-1.5 transition-colors ${
+              viewportMode === 'mobile'
+                ? 'bg-slate-100 text-slate-900 dark:bg-slate-800 dark:text-slate-100'
+                : 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'
+            }`}
+            title="Mobile view"
+            aria-label="Mobile view"
+          >
+            <Smartphone className="h-3.5 w-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setRuntimeError(null);
+              setReloadNonce((n) => n + 1);
+            }}
+            className="rounded-md p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+            title="Reload preview"
+            aria-label="Reload preview"
+          >
+            <RotateCcw className="h-3.5 w-3.5" />
+          </button>
         </div>
+      )}
 
-        {isPublished && (
-          <div className="space-y-2.5 rounded-xl border border-zinc-200 p-3.5 dark:border-zinc-800">
-            <div className="flex items-center justify-between">
-              <span className="font-semibold text-zinc-900 dark:text-zinc-100">
-                Permissions
-              </span>
-              <button
-                type="button"
-                onClick={async () => {
-                  bridgeRuntime.evictPrism(project.id);
-                  await store.unpublish(project.id);
-                  setDetailsModalOpen(false);
-                  onChangeMode('studio');
-                }}
-                className="rounded px-2 py-0.5 text-[11px] font-medium text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950/40"
-              >
-                Unpublish
-              </button>
-            </div>
-            <p className="text-[11px] text-zinc-500">
-              All permissions start off unless you enable them here.
-            </p>
-            <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-3">
-              {(
-                [
-                  ['storage', 'Save data locally'],
-                  ['browser', 'Downloads & alerts'],
-                  ['network', 'Internet access'],
-                ] as const
-              ).map(([key, label]) => (
-                <label
-                  key={key}
-                  className="flex cursor-pointer items-center justify-between rounded-lg border border-zinc-200 px-2.5 py-2 text-[11px] dark:border-zinc-800"
-                >
-                  <span>{label}</span>
-                  <input
-                    type="checkbox"
-                    checked={activeSnapshot.grants[key]}
-                    onChange={(e) => {
-                      bridgeRuntime.evictPrism(project.id);
-                      void store.updatePublishedGrants(project.id, (prev) => ({
-                        ...prev,
-                        [key]: e.target.checked,
-                      }));
-                    }}
-                    className="h-3.5 w-3.5 accent-emerald-600"
-                  />
-                </label>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
+      {canUndo && (
+        <button
+          type="button"
+          onClick={() => void handleUndo()}
+          title="Undo last change"
+          className="inline-flex h-7 items-center gap-1 rounded-md border border-slate-200 px-2 text-xs text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+        >
+          <Undo2 className="h-3.5 w-3.5" />
+          <span className="hidden md:inline">Undo</span>
+        </button>
+      )}
+
+      {!isExternalHolo && (!isPublished || isModified || justPublished || publishing) && (
+        <button
+          type="button"
+          disabled={publishing}
+          onClick={() => void handlePublish()}
+          className="inline-flex h-7 items-center gap-1 rounded-md bg-[#0F5132] px-2.5 text-xs font-medium text-white hover:bg-[#0B3D25] disabled:opacity-50"
+        >
+          {publishing ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : justPublished ? (
+            <Check className="h-3.5 w-3.5" />
+          ) : (
+            <Globe className="h-3.5 w-3.5" />
+          )}
+          <span>
+            {publishing
+              ? 'Publishing…'
+              : justPublished
+                ? 'Published'
+                : isPublished
+                  ? 'Update'
+                  : 'Publish'}
+          </span>
+        </button>
+      )}
     </div>
   );
 
-  return (
-    <div
-      className="relative flex h-full min-h-0 flex-col bg-[#F8F9FA] dark:bg-[#0B0F14]"
-      onDragOver={(e) => {
-        if (e.dataTransfer?.types?.includes('Files')) {
-          e.preventDefault();
-          if (!draggingFile) setDraggingFile(true);
-        }
-      }}
-      onDragLeave={(e) => {
-        if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
-        setDraggingFile(false);
-      }}
-      onDrop={(e) => void handleDropFile(e)}
-    >
-      {draggingFile && (
-        <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-emerald-950/50 backdrop-blur-xs">
-          <div className="rounded-xl border-2 border-dashed border-emerald-400 bg-white/95 px-6 py-4 text-center shadow-xl dark:bg-zinc-900/95">
-            <Upload className="mx-auto h-6 w-6 text-emerald-600" />
-            <p className="mt-2 text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-              Drop file to open offline
-            </p>
-          </div>
-        </div>
-      )}
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept=".holo,.verdant,.json,application/octet-stream,application/json"
-        className="hidden"
-        onChange={handleImportFileChange}
-      />
-
-      {/* Compact Focus Bar */}
-      <header className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-zinc-200 bg-white px-3 dark:border-zinc-800 dark:bg-[#0E131B]">
-        <div className="flex min-w-0 items-center gap-2">
-          <span
-            className={`h-2 w-2 shrink-0 rounded-full ${
-              isPublished && !isModified
-                ? 'bg-emerald-500'
-                : isPublished
-                  ? 'bg-amber-500'
-                  : 'bg-zinc-400'
-            }`}
-            title={isPublished ? (isModified ? 'Unpublished edits' : 'Published') : 'Draft'}
-          />
-          {editingTitle ? (
-            <input
-              type="text"
-              autoFocus
-              value={titleDraft}
-              onChange={(e) => setTitleDraft(e.target.value)}
-              onBlur={() => void handleCommitTitle()}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') void handleCommitTitle();
-                if (e.key === 'Escape') {
-                  setTitleDraft(project.draft.name);
-                  setEditingTitle(false);
-                }
-              }}
-              className="w-44 rounded border border-emerald-500 bg-transparent px-1.5 py-0.5 text-sm font-semibold focus:outline-none"
-            />
-          ) : (
-            <button
-              type="button"
-              onClick={() => setEditingTitle(true)}
-              className="truncate text-sm font-semibold text-zinc-900 hover:underline dark:text-zinc-100"
-              title="Click to rename"
-            >
-              {project.draft.name}
-            </button>
-          )}
-        </div>
-
-        <div className="flex shrink-0 items-center gap-1.5">
-          {mode === 'studio' && (
-            <>
-              <button
-                type="button"
-                disabled={!canUndo}
-                onClick={() => void handleUndo()}
-                title="Undo last change"
-                className="inline-flex h-7 items-center gap-1 rounded-md border border-zinc-200 px-2 text-xs text-zinc-600 hover:bg-zinc-100 disabled:opacity-40 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
-              >
-                <Undo2 className="h-3.5 w-3.5" />
-                <span className="hidden sm:inline">Undo</span>
-              </button>
-              <button
-                type="button"
-                disabled={publishing}
-                onClick={() => void handlePublish()}
-                className="inline-flex h-7 items-center gap-1 rounded-md bg-emerald-700 px-2.5 text-xs font-medium text-white hover:bg-emerald-800 disabled:opacity-50"
-              >
-                {publishing ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : justPublished ? (
-                  <Check className="h-3.5 w-3.5" />
-                ) : (
-                  <Globe className="h-3.5 w-3.5" />
-                )}
-                <span>
-                  {publishing
-                    ? 'Publishing…'
-                    : justPublished
-                      ? 'Published'
-                      : isPublished
-                        ? isModified
-                          ? 'Update'
-                          : 'Published'
-                        : 'Publish'}
-                </span>
-              </button>
-            </>
-          )}
-
-          {mode === 'app' && (
-            <button
-              type="button"
-              aria-pressed={detailsModalOpen}
-              onClick={() => setDetailsModalOpen((v) => !v)}
-              className={`inline-flex h-7 items-center gap-1 rounded-md border px-2.5 text-xs font-medium transition-colors ${
-                detailsModalOpen
-                  ? 'border-emerald-600 bg-emerald-50 text-emerald-900 dark:border-emerald-500 dark:bg-emerald-950/60 dark:text-emerald-200'
-                  : 'border-zinc-200 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800'
-              }`}
-            >
-              <Info className="h-3.5 w-3.5" />
-              {detailsModalOpen ? 'Back to App' : 'Details'}
-            </button>
-          )}
-
-          {!isExternalHolo && (
-            <div className="inline-flex rounded-lg border border-zinc-200 bg-zinc-100 p-0.5 text-[11px] dark:border-zinc-700 dark:bg-zinc-900">
-              <button
-                type="button"
-                onClick={() => {
-                  setDetailsModalOpen(false);
-                  onChangeMode('studio');
-                }}
-                className={`rounded-md px-2 py-0.5 font-medium transition-colors ${
-                  mode === 'studio'
-                    ? 'bg-white text-zinc-900 shadow-xs dark:bg-zinc-800 dark:text-zinc-100'
-                    : 'text-zinc-500 hover:text-zinc-800 dark:text-zinc-400'
-                }`}
-              >
-                Studio
-              </button>
-              <button
-                type="button"
-                disabled={!isPublished}
-                onClick={() => {
-                  setDetailsModalOpen(false);
-                  onChangeMode('app');
-                }}
-                className={`rounded-md px-2 py-0.5 font-medium transition-colors disabled:opacity-40 ${
-                  mode === 'app'
-                    ? 'bg-white text-zinc-900 shadow-xs dark:bg-zinc-800 dark:text-zinc-100'
-                    : 'text-zinc-500 hover:text-zinc-800 dark:text-zinc-400'
-                }`}
-              >
-                App
-              </button>
-            </div>
-          )}
-        </div>
-      </header>
-
+  const banner = (publishing || statusBanner || runtimeError) ? (
+    <div className="shrink-0">
       {(publishing || statusBanner) && (
         <div
-          className={`flex shrink-0 items-center justify-between gap-2 border-b px-3 py-1.5 text-xs ${
+          className={`flex items-center justify-between gap-2 border-b px-4 py-1.5 text-xs ${
             publishing || statusBanner?.ok
               ? 'border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-900/50 dark:bg-emerald-950/40 dark:text-emerald-200'
               : 'border-red-200 bg-red-50 text-red-900 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-200'
@@ -859,224 +898,195 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
           )}
         </div>
       )}
-
-      {mode === 'app' ? (
-        <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
-          <div className={`h-full w-full ${detailsModalOpen ? 'invisible pointer-events-none' : ''}`}>
-            <PrismSandboxFrame
-              prismId={project.id}
-              snapshot={activeSnapshot}
-              holoview={holoviewConfig}
-              darkMode={effectivePreviewDark}
-              bus={bus}
-              bridgeRuntime={bridgeRuntime}
-              reloadNonce={reloadNonce}
-              onRuntimeError={setRuntimeError}
-              className="h-full w-full border-0"
-            />
-          </div>
-          {detailsModalOpen && (
-            <div className="absolute inset-0 z-20 flex flex-col overflow-hidden bg-white dark:bg-[#0B0F14]">
-              <div className="flex shrink-0 items-center justify-end gap-2 border-b border-zinc-200 px-4 py-2 dark:border-zinc-800">
-                {!isExternalHolo && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setDetailsModalOpen(false);
-                      onChangeMode('studio');
-                    }}
-                    className="inline-flex items-center gap-1 rounded-md border border-zinc-200 px-2.5 py-1 text-xs font-medium hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
-                  >
-                    <ExternalLink className="h-3 w-3" />
-                    Edit in Studio
-                  </button>
-                )}
-              </div>
-              <div className="min-h-0 flex-1 overflow-hidden">
-                {renderDetailsPanel(() => setDetailsModalOpen(false))}
-              </div>
-            </div>
-          )}
+      {runtimeError && (
+        <div className="flex items-center justify-between gap-2 border-b border-red-200 bg-red-50 px-4 py-1.5 text-xs text-red-800 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-200">
+          <span className="truncate">{runtimeError.message}</span>
+          <button
+            type="button"
+            onClick={() => setRuntimeError(null)}
+            className="rounded px-1.5 py-0.5 text-[11px] hover:bg-red-100 dark:hover:bg-red-900/50"
+          >
+            Dismiss
+          </button>
         </div>
-      ) : (
-        <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden lg:flex-row">
-          {/* Left Pane: Conversational Studio Creator */}
-          <div className="flex h-1/2 min-h-0 min-w-0 w-full flex-col overflow-hidden border-b border-zinc-200 lg:h-full lg:w-[440px] lg:shrink-0 lg:border-r lg:border-b-0 dark:border-zinc-800">
-            {isDeclarative && declaration && checkReport && routing ? (
-              <StudioGuidedWizard
-                key={`guided-${project.id}`}
-                declaration={declaration}
-                routing={routing}
-                checkReport={checkReport}
-                messages={project.messages}
-                onAppendMessage={handleAppendStudioMessage}
-                activeStep={guidedStep}
-                onSelectStep={setGuidedStep}
-                onDispatchOp={handleDispatchOp}
-                onSynthesizeWithLocalModel={handleSynthesizeIdeaWithLocalModel}
-                onRunStudioAgentPrompt={handleRunStudioAgentPrompt}
-                onCancelStudioAgent={handleCancelStudioAgent}
-                hasLocalModelReady={hasLocalModelReady}
-                engineStatus={engineState.status}
-                engineProgressPercent={engineState.progressPercent}
-                onOpenPreview={() => setPreviewPaneMode('preview')}
-                onPublish={() => void handlePublish()}
-                publishing={publishing}
-              />
-            ) : (
-              <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center text-xs text-zinc-500">
-                <Sparkles className="h-8 w-8 text-emerald-600/70" />
-                <p className="max-w-xs text-sm font-medium text-zinc-800 dark:text-zinc-200">
-                  Imported Creation
-                </p>
-                <button
-                  type="button"
-                  onClick={() => handleLoadStarter('undefined')}
-                  className="rounded-lg bg-emerald-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-800"
-                >
-                  Start a New Creation
-                </button>
-              </div>
-            )}
+      )}
+    </div>
+  ) : null;
+
+  const previewContent =
+    !isDeclarative || !readiness || readiness.readyToPreview ? (
+      <div className="flex h-full w-full justify-center overflow-hidden bg-[#F8F9FA] dark:bg-[#0B0F14]">
+        <div
+          className={`h-full transition-all ${
+            viewportMode === 'mobile'
+              ? 'my-3 h-[calc(100%-24px)] w-[390px] overflow-hidden rounded-2xl border border-slate-300 shadow-lg dark:border-slate-700'
+              : 'w-full'
+          }`}
+        >
+          <PrismSandboxFrame
+            prismId={project.id}
+            snapshot={activeSnapshot}
+            holoview={holoviewConfig}
+            darkMode={effectivePreviewDark}
+            bus={bus}
+            bridgeRuntime={bridgeRuntime}
+            reloadNonce={reloadNonce}
+            onRuntimeError={setRuntimeError}
+            className="h-full w-full border-0"
+          />
+        </div>
+      </div>
+    ) : (
+      <div className="flex h-full flex-col items-center justify-center p-8 text-center">
+        <div className="max-w-md space-y-3">
+          <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-400">
+            <Sparkles className="h-5 w-5" />
           </div>
+          <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">
+            Describe what you want to create
+          </h2>
+          <p className="text-sm leading-relaxed text-slate-500 dark:text-slate-400">
+            Use the prompt bar below to describe a document, picture, video, audio track, game,
+            research notebook, Space, or everyday utility.
+          </p>
+        </div>
+      </div>
+    );
 
-          {/* Right Pane: Live Preview & Simple Details */}
-          <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-            <div className="relative z-20 flex shrink-0 items-center justify-between gap-2 border-b border-zinc-200 bg-white px-3 py-1.5 dark:border-zinc-800 dark:bg-[#0E131B]">
-              <div className="inline-flex rounded-lg border border-zinc-200 bg-zinc-100 p-0.5 text-xs dark:border-zinc-700 dark:bg-zinc-900">
-                <button
-                  type="button"
-                  aria-pressed={previewPaneMode === 'preview'}
-                  onClick={() => setPreviewPaneMode('preview')}
-                  className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 font-medium transition-colors ${
-                    previewPaneMode === 'preview'
-                      ? 'bg-white text-zinc-900 shadow-xs dark:bg-zinc-800 dark:text-zinc-100'
-                      : 'text-zinc-500 hover:text-zinc-800 dark:text-zinc-400'
-                  }`}
-                >
-                  <Eye className="h-3.5 w-3.5" />
-                  Preview
-                </button>
-                <button
-                  type="button"
-                  aria-pressed={previewPaneMode === 'details'}
-                  onClick={() =>
-                    setPreviewPaneMode((m) => (m === 'details' ? 'preview' : 'details'))
-                  }
-                  className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 font-medium transition-colors ${
-                    previewPaneMode === 'details'
-                      ? 'bg-white text-zinc-900 shadow-xs dark:bg-zinc-800 dark:text-zinc-100'
-                      : 'text-zinc-500 hover:text-zinc-800 dark:text-zinc-400'
-                  }`}
-                >
-                  <Info className="h-3.5 w-3.5" />
-                  Details
-                </button>
-              </div>
+  const detailsExtra = (
+    <div className="space-y-4">
+      <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-[#0F141C]">
+        <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+          Portability
+        </div>
+        <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+          Export this Prism as a portable offline archive or import another saved creation.
+        </p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={handleExportCreation}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900"
+          >
+            <Download className="h-3.5 w-3.5" />
+            <span>Export</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800"
+          >
+            <Upload className="h-3.5 w-3.5" />
+            <span>Import</span>
+          </button>
+        </div>
+      </div>
 
-              <div className="flex items-center gap-1.5">
-                {previewPaneMode === 'preview' && (!isDeclarative || routing?.readyToPreview) && (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => setViewportMode('desktop')}
-                      className={`rounded p-1 ${viewportMode === 'desktop' ? 'bg-zinc-200/80 text-zinc-900 dark:bg-zinc-800 dark:text-zinc-100' : 'text-zinc-400'}`}
-                      title="Desktop view"
-                    >
-                      <Monitor className="h-3.5 w-3.5" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setViewportMode('mobile')}
-                      className={`rounded p-1 ${viewportMode === 'mobile' ? 'bg-zinc-200/80 text-zinc-900 dark:bg-zinc-800 dark:text-zinc-100' : 'text-zinc-400'}`}
-                      title="Mobile view"
-                    >
-                      <Smartphone className="h-3.5 w-3.5" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setRuntimeError(null);
-                        setReloadNonce((n) => n + 1);
-                      }}
-                      className="rounded p-1 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                      title="Reload preview"
-                    >
-                      <RotateCcw className="h-3.5 w-3.5" />
-                    </button>
-                  </>
-                )}
-              </div>
-            </div>
-
-            {runtimeError && (
-              <div className="flex shrink-0 items-center justify-between gap-2 border-b border-red-200 bg-red-50 px-3 py-1.5 text-xs text-red-800 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-200">
-                <span className="truncate">{runtimeError.message}</span>
-                <button
-                  type="button"
-                  onClick={() => setRuntimeError(null)}
-                  className="rounded px-1.5 py-0.5 text-[11px] hover:bg-red-100 dark:hover:bg-red-900/50"
-                >
-                  Dismiss
-                </button>
-              </div>
-            )}
-
-            <div className="relative min-h-0 flex-1 overflow-hidden bg-zinc-100/80 dark:bg-[#090D12]">
-              {(!isDeclarative || !routing || routing.readyToPreview) ? (
-                <div
-                  className={`flex h-full w-full justify-center ${
-                    previewPaneMode !== 'preview' ? 'invisible pointer-events-none' : ''
-                  }`}
-                >
-                  <div
-                    className={`h-full transition-all ${
-                      viewportMode === 'mobile'
-                        ? 'my-2 h-[calc(100%-16px)] w-[390px] overflow-hidden rounded-2xl border border-zinc-300 shadow-lg dark:border-zinc-700'
-                        : 'w-full'
-                    }`}
-                  >
-                    <PrismSandboxFrame
-                      prismId={project.id}
-                      snapshot={activeSnapshot}
-                      holoview={holoviewConfig}
-                      darkMode={effectivePreviewDark}
-                      bus={bus}
-                      bridgeRuntime={bridgeRuntime}
-                      reloadNonce={reloadNonce}
-                      onRuntimeError={setRuntimeError}
-                      className="h-full w-full border-0"
-                    />
-                  </div>
-                </div>
-              ) : (
-                previewPaneMode === 'preview' && (
-                  <div className="flex h-full flex-col items-center justify-center p-8 text-center">
-                    <div className="max-w-sm space-y-2.5">
-                      <div className="mx-auto flex h-11 w-11 items-center justify-center rounded-2xl bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-400">
-                        <Sparkles className="h-5 w-5" />
-                      </div>
-                      <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
-                        Your live preview appears here
-                      </h2>
-                      <p className="text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">
-                        Describe a game, picture, audio track, story, video, research space, or
-                        everyday tool on the left to bring it to life immediately.
-                      </p>
-                    </div>
-                  </div>
-                )
-              )}
-
-              {previewPaneMode === 'details' && (
-                <div className="absolute inset-0 z-10 overflow-hidden">
-                  {renderDetailsPanel(() => setPreviewPaneMode('preview'))}
-                </div>
-              )}
-            </div>
+      {isPublished && (
+        <div className="space-y-2.5 rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-[#0F141C]">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+              Permissions
+            </span>
+            <button
+              type="button"
+              onClick={async () => {
+                bridgeRuntime.evictPrism(project.id);
+                await store.unpublish(project.id);
+                onChangeMode('studio');
+              }}
+              className="rounded px-2 py-0.5 text-[11px] font-medium text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950/40"
+            >
+              Unpublish
+            </button>
+          </div>
+          <p className="text-[11px] text-slate-500 dark:text-slate-400">
+            All permissions start off unless you enable them here.
+          </p>
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+            {(
+              [
+                ['storage', 'Save data locally'],
+                ['browser', 'Downloads & alerts'],
+                ['network', 'Internet access'],
+              ] as const
+            ).map(([key, label]) => (
+              <label
+                key={key}
+                className="flex cursor-pointer items-center justify-between rounded-lg border border-slate-200 px-3 py-2 text-xs text-slate-700 dark:border-slate-800 dark:text-slate-200"
+              >
+                <span>{label}</span>
+                <input
+                  type="checkbox"
+                  checked={activeSnapshot.grants[key]}
+                  onChange={(e) => {
+                    bridgeRuntime.evictPrism(project.id);
+                    void store.updatePublishedGrants(project.id, (prev) => ({
+                      ...prev,
+                      [key]: e.target.checked,
+                    }));
+                  }}
+                  className="h-3.5 w-3.5 accent-emerald-600"
+                />
+              </label>
+            ))}
           </div>
         </div>
       )}
+    </div>
+  );
+
+  return (
+    <div
+      className="relative flex h-full min-h-0 flex-col"
+      onDragOver={(e) => {
+        if (e.dataTransfer?.types?.includes('Files')) {
+          e.preventDefault();
+          if (!draggingFile) setDraggingFile(true);
+        }
+      }}
+      onDragLeave={(e) => {
+        if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+        setDraggingFile(false);
+      }}
+      onDrop={(e) => void handleDropFile(e)}
+    >
+      {draggingFile && (
+        <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-emerald-950/50 backdrop-blur-xs">
+          <div className="rounded-xl border-2 border-dashed border-emerald-400 bg-white/95 px-6 py-4 text-center shadow-xl dark:bg-slate-900/95">
+            <Upload className="mx-auto h-6 w-6 text-emerald-600" />
+            <p className="mt-2 text-sm font-semibold text-slate-900 dark:text-slate-100">
+              Drop file to open offline
+            </p>
+          </div>
+        </div>
+      )}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".holo,.verdant,.json,application/octet-stream,application/json"
+        className="hidden"
+        onChange={handleImportFileChange}
+      />
+
+      <PrismSurfaceShell
+        frame={frame}
+        mode={surfaceMode}
+        onChangeMode={onChangeSurfaceMode}
+        titleSlot={titleSlot}
+        statusDotClass={statusDotClass}
+        headerActions={headerActions}
+        banner={banner}
+        previewContent={previewContent}
+        detailsExtra={detailsExtra}
+        onSelectChildPrism={onSelectSystemPrism}
+        onSubmitNaturalLanguage={handleSubmitNaturalLanguage}
+        onCancelNaturalLanguage={handleCancelNl}
+        nlBusy={nlBusy}
+        nlBusyLabel={nlBusyLabel}
+        nlMessages={nlMessages}
+        onTypingChange={onTypingChange}
+      />
     </div>
   );
 };

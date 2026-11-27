@@ -84,6 +84,12 @@
       "at": "2026-11-26",
       "requirements": ["REQ-UNIFIED-EXPERT-BASIS", "REQ-GLOBAL-MEDIATYPE-GALLERIES", "REQ-SPACES-AS-PRISMS"],
       "quote": "Artifacts are saved to galleries by mediatype and then further categorized from there... Spaces have content and a view of their content. Each Space is a Verdant Prism. All parts of VerdantUI including its language, vision, image, audio, user, and all other models and content are experts and their weights in the VerdantUI unified model. The VerdantUI training basis is never static, so it grows its knowledge and skills as needed."
+    },
+    {
+      "id": "DEC-015",
+      "at": "2026-11-26",
+      "requirements": ["REQ-SELF-SIMILAR-PRISM-UI", "REQ-OBSERVER-PROCEDURAL-SYNTHESIS"],
+      "quote": "Every part of VerdantUI is a natural language interface with a rendering (preview) panel, and a toggle to switch from the preview to the details of the Prism. VerdantUI itself must be a Verdant Prism and all of its parts must also be Verdant Prisms. VerdantUI and all of its parts must be rendered by the Observer using procedural synthesis."
     }
   ]
 }
