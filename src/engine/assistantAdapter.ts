@@ -26,6 +26,7 @@ import type { Tool } from 'assistant-stream';
 import type { ReadonlyJSONObject } from 'assistant-stream/utils';
 import { applyCallSettingsToSampling } from './harnessConfig';
 import type { LoadedModelSummary } from './llamaRuntime';
+import { findCatalogModelById, getModelCapacityQ10 } from './modelCatalog';
 import { estimateTextTokens } from './cognitiveContext';
 import {
   formatDirectOperatorSummary,
@@ -1153,22 +1154,29 @@ export function createLlamaVTensorAdapter(
         }
 
         if (initialState.status === 'downloading' || initialState.status === 'loading') {
-          yield {
-            content: [
-              {
-                type: 'text' as const,
-                text: `Streaming capabilities to your browser (${initialState.progressPercent}% · ${initialState.statusDetail}). Wait a moment and send again.`,
-              },
-            ],
-            status: { type: 'complete', reason: 'stop' },
-            metadata: { custom: { prismRoute: certificate } },
-          };
-          return;
+          // Await the brief (~1-2s) consent-triggered header mount seamlessly instead of rejecting the turn!
+          await client.waitForActiveLoad(abortSignal);
+          if (abortSignal.aborted) return;
         }
 
-        if (abortSignal.aborted) return;
-        await client.ensureUnifiedNeuralRoute(certificate.modelId, abortSignal);
-        if (abortSignal.aborted) return;
+        const postWaitModel = client.getState().model;
+        const needsModelMount = !postWaitModel || postWaitModel.id === 'stories260k-f32';
+        let needsSpecialistUpgrade = false;
+        if (!needsModelMount && postWaitModel.id !== certificate.modelId) {
+          const activeCatalog = findCatalogModelById(postWaitModel.id);
+          const requestedCatalog = findCatalogModelById(certificate.modelId);
+          needsSpecialistUpgrade = Boolean(
+            requestedCatalog &&
+              (!activeCatalog ||
+                getModelCapacityQ10(requestedCatalog) > getModelCapacityQ10(activeCatalog)),
+          );
+        }
+
+        if (needsModelMount || needsSpecialistUpgrade) {
+          if (abortSignal.aborted) return;
+          await client.ensureUnifiedNeuralRoute(certificate.modelId, abortSignal);
+          if (abortSignal.aborted) return;
+        }
       }
 
       const state = client.getState();

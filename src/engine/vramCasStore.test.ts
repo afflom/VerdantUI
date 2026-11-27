@@ -7,6 +7,7 @@ import {
   computeCasUtilityPerByte,
 } from './vramCasStore';
 import {
+  INTERNAL_BOOTSTRAP_MODEL,
   MODEL_CATALOG,
   getModelCapacityQ10,
   getModelStreamingStrategy,
@@ -138,19 +139,23 @@ test('OpfsCasStore evicts lowest utility-per-byte entries under capacity ceiling
   assert.equal(cas.getEntry(sharedKappa), undefined, 'Object with 0 remaining owners must be reclaimed');
 });
 
-test('Model catalog marks Sparse MoE and large models for demand-first streaming with smooth monotonic capacity Q10', () => {
+test('Model catalog marks ALL remote experts for demand-first streaming (zero monolithic full-file pull) with smooth monotonic capacity Q10', () => {
   const moe30b = MODEL_CATALOG.find((m) => m.id === 'qwen3-30b-a3b-q4_k_m');
   const qwen8b = MODEL_CATALOG.find((m) => m.id === 'qwen3-8b-q4_k_m');
   const qwen4b = MODEL_CATALOG.find((m) => m.id === 'qwen3-4b-q4_k_m');
   const qwen05b = MODEL_CATALOG.find((m) => m.id === 'qwen2.5-0.5b-instruct-q4_k_m');
   assert.ok(moe30b && qwen8b && qwen4b && qwen05b);
 
+  assert.equal(getModelStreamingStrategy(INTERNAL_BOOTSTRAP_MODEL), 'compact-resident');
+  assert.equal(shouldPreferDemandStreaming(INTERNAL_BOOTSTRAP_MODEL), false);
   assert.equal(getModelStreamingStrategy(moe30b), 'demand-sparse-moe');
   assert.equal(shouldPreferDemandStreaming(moe30b), true);
   assert.equal(getModelStreamingStrategy(qwen8b), 'demand-layered');
   assert.equal(shouldPreferDemandStreaming(qwen8b), true);
-  assert.equal(getModelStreamingStrategy(qwen05b), 'compact-resident');
-  assert.equal(shouldPreferDemandStreaming(qwen05b), false);
+  assert.equal(getModelStreamingStrategy(qwen4b), 'demand-layered');
+  assert.equal(shouldPreferDemandStreaming(qwen4b), true);
+  assert.equal(getModelStreamingStrategy(qwen05b), 'demand-layered');
+  assert.equal(shouldPreferDemandStreaming(qwen05b), true);
 
   assert.ok(getModelCapacityQ10(qwen05b) < getModelCapacityQ10(qwen4b));
   assert.ok(getModelCapacityQ10(qwen4b) < getModelCapacityQ10(qwen8b));

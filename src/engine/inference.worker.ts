@@ -198,6 +198,9 @@ export type WorkerRequest =
       minAcceptScoreQ10?: number;
     }
   | {
+      type: 'pause_prewarm';
+    }
+  | {
       type: 'shutdown';
     };
 
@@ -305,6 +308,15 @@ export type WorkerResponse =
       readyTokens: number;
       targetTokens: number;
       telemetry?: VTensorTelemetrySnapshot;
+    }
+  | {
+      type: 'prewarm_status';
+      active: boolean;
+      modelId: string;
+      warmBytes: number;
+      targetBytes: number;
+      percent: number;
+      casBytesSaved: number;
     }
   | {
       type: 'token_count';
@@ -463,6 +475,9 @@ async function ensureWhisperEngineOnDemand(): Promise<WhisperAudioEngine | null>
 const activeControllers = new Map<string, AbortController>();
 let activeSpeculativeController: AbortController | null = null;
 let activeSpeculativePromise: Promise<void> | null = null;
+let activePrewarmController: AbortController | null = null;
+let activePrewarmPromise: Promise<void> | null = null;
+let prewarmAllowed = true;
 let activeLoadController: AbortController | null = null;
 let activeLoadPromise: Promise<void> | null = null;
 let activeGenerationController: AbortController | null = null;
@@ -557,19 +572,21 @@ if (typeof BroadcastChannel === 'function') {
         loaded !== null &&
         (loaded.backingKind === 'opfs-sync' || loaded.backingKind === 'opfs-demand');
       if (holdsOpfs && (!msg.modelId || msg.modelId === loaded.id)) {
-        void drainBackgroundOpfsPersist().finally(() => {
-          if (activeGenerationCount > 0 || activeLoadController !== null) return;
-          runtime.unload();
-          try {
-            opfsHandoverChannel?.postMessage({
-              type: 'released',
-              senderId: workerInstanceId,
-              modelId: loaded.id,
-            });
-          } catch {
-            // Ignore closed channel
-          }
-        });
+        void preemptBackgroundPrewarm()
+          .then(() => drainBackgroundOpfsPersist())
+          .finally(() => {
+            if (activeGenerationCount > 0 || activeLoadController !== null) return;
+            runtime.unload();
+            try {
+              opfsHandoverChannel?.postMessage({
+                type: 'released',
+                senderId: workerInstanceId,
+                modelId: loaded.id,
+              });
+            } catch {
+              // Ignore closed channel
+            }
+          });
       }
     };
   } catch {
@@ -624,6 +641,125 @@ async function preemptSpeculativePrefill(): Promise<void> {
       break;
     }
   }
+}
+
+/**
+ * Immediately preempts interruptible background weight prewarming (<1 ms) when a user turn,
+ * model switch, offline toggle, or storage mutation arrives. Already-warmed OPFS CAS slabs
+ * remain persisted and immediately reusable.
+ */
+async function preemptBackgroundPrewarm(): Promise<void> {
+  while (activePrewarmController || activePrewarmPromise) {
+    const ctrl = activePrewarmController;
+    const pending = activePrewarmPromise;
+    if (ctrl) ctrl.abort();
+    if (pending) {
+      try {
+        await pending;
+      } catch {
+        // Ignore prewarm abort/cancellation errors
+      }
+    } else {
+      break;
+    }
+  }
+}
+
+/**
+ * Cooperatively warms priority weight slices (`<= 4 MiB` each: early attention -> body layers ->
+ * LM-head, never pulling cold Sparse MoE expert tables) in the idle background after a fast
+ * `opfs-demand` header mount. Preempts instantly on `generate` and resumes automatically when idle.
+ */
+function startBackgroundPrewarm(): void {
+  if (
+    !prewarmAllowed ||
+    !runtime.isLoaded ||
+    activeGenerationCount > 0 ||
+    pendingGenerationQueue.length > 0 ||
+    activeLoadController !== null ||
+    activePrewarmController !== null
+  ) {
+    return;
+  }
+  const summary = runtime.getModelSummary();
+  if (!summary || summary.backingKind !== 'opfs-demand') return;
+  const plan = runtime.getDemandPrewarmPlan();
+  if (!plan) return;
+
+  const modelId = summary.id;
+  const targetBytes = plan.totalTargetBytes;
+  let warmBytes = plan.alreadyCachedBytes;
+  const initialPercent = plan.percentWarm;
+
+  if (plan.slices.length === 0) {
+    post({
+      type: 'prewarm_status',
+      active: false,
+      modelId,
+      warmBytes,
+      targetBytes,
+      percent: 100,
+      casBytesSaved: getSharedOpfsCasStore().getTelemetry().bytesSaved,
+    });
+    return;
+  }
+
+  const controller = new AbortController();
+  activePrewarmController = controller;
+
+  let task: Promise<void> | null = null;
+  task = (async () => {
+    let lastPost = 0;
+    const emit = (active: boolean, force = false) => {
+      const now = performance.now();
+      const pct =
+        targetBytes > 0 ? Math.min(100, Math.round((warmBytes / targetBytes) * 100)) : 100;
+      if (force || now - lastPost >= 250 || pct === 100) {
+        lastPost = now;
+        post({
+          type: 'prewarm_status',
+          active,
+          modelId,
+          warmBytes,
+          targetBytes,
+          percent: pct,
+          casBytesSaved: getSharedOpfsCasStore().getTelemetry().bytesSaved,
+        });
+      }
+    };
+
+    emit(true, true);
+    try {
+      for (const slice of plan.slices) {
+        if (
+          controller.signal.aborted ||
+          !prewarmAllowed ||
+          activeGenerationCount > 0 ||
+          pendingGenerationQueue.length > 0 ||
+          activeLoadController !== null ||
+          runtime.getModelSummary()?.id !== modelId
+        ) {
+          break;
+        }
+        await runtime.prefetchDemandRanges(slice.ranges, controller.signal);
+        warmBytes = Math.min(targetBytes, warmBytes + slice.byteLength);
+        emit(warmBytes < targetBytes, false);
+        await cooperativeYielder.yieldNow();
+      }
+    } catch {
+      // Aborted or transient network hiccup: already-warmed slabs stay safely persisted in OPFS CAS
+    } finally {
+      if (activePrewarmController === controller) {
+        activePrewarmController = null;
+      }
+      if (activePrewarmPromise === task) {
+        activePrewarmPromise = null;
+      }
+      emit(false, true);
+    }
+  })();
+  activePrewarmPromise = task;
+  void initialPercent;
 }
 
 /**
@@ -694,6 +830,7 @@ async function executeSingleGenerationJob(job: QueuedGenerationJob): Promise<voi
     return;
   }
 
+  await preemptBackgroundPrewarm();
   await preemptSpeculativePrefill();
   opfsPersistEpoch += 1;
   const jobPartId = req.partId ?? req.threadId ?? 'verdant-part-home';
@@ -865,12 +1002,14 @@ async function executeSingleGenerationJob(job: QueuedGenerationJob): Promise<voi
     finishGen();
     if (
       !checkpointed &&
-      shouldPersistAfterTurn &&
       activeGenerationCount === 0 &&
       pendingGenerationQueue.length === 0 &&
       activeLoadController === null
     ) {
-      scheduleBackgroundOpfsPersist();
+      if (shouldPersistAfterTurn) {
+        scheduleBackgroundOpfsPersist();
+      }
+      startBackgroundPrewarm();
     }
   }
 }
@@ -949,6 +1088,8 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
 
   try {
     if (req.type === 'shutdown') {
+      prewarmAllowed = false;
+      if (activePrewarmController) activePrewarmController.abort();
       if (activeSpeculativeController) activeSpeculativeController.abort();
       if (activeGenerationController) activeGenerationController.abort();
       if (activeLoadController) activeLoadController.abort();
@@ -968,7 +1109,14 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       return;
     }
 
+    if (req.type === 'pause_prewarm') {
+      prewarmAllowed = false;
+      await preemptBackgroundPrewarm();
+      return;
+    }
+
     if (req.type === 'load_buffer') {
+      await preemptBackgroundPrewarm();
       await preemptSpeculativePrefill();
       await preemptActiveGeneration();
       await preemptActiveLoad();
@@ -994,17 +1142,20 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     }
 
     if (req.type === 'load_url') {
+      await preemptBackgroundPrewarm();
       await preemptSpeculativePrefill();
       await preemptActiveGeneration();
       await preemptActiveLoad();
       await drainBackgroundOpfsPersist();
       await threadPoolReadyPromise;
+      prewarmAllowed = true;
       const controller = new AbortController();
       activeControllers.set(req.requestId, controller);
       activeLoadController = controller;
       let modelUnloaded = false;
       let acquiredBacking: VramBackingStore | null = null;
       let committedToRuntime = false;
+      let shouldStartPrewarm = false;
       let finishLoad!: () => void;
       const loadDone = new Promise<void>((resolve) => {
         finishLoad = resolve;
@@ -1088,6 +1239,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           telemetry: runtime.getTelemetry(),
           opfsStorage,
         });
+        shouldStartPrewarm = summary.backingKind === 'opfs-demand';
       } catch (err) {
         if (acquiredBacking && !committedToRuntime) {
           try {
@@ -1116,11 +1268,15 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         if (activeLoadController === controller) activeLoadController = null;
         if (activeLoadPromise === loadDone) activeLoadPromise = null;
         finishLoad();
+        if (shouldStartPrewarm) {
+          startBackgroundPrewarm();
+        }
       }
       return;
     }
 
     if (req.type === 'load_file') {
+      await preemptBackgroundPrewarm();
       await preemptSpeculativePrefill();
       await preemptActiveGeneration();
       await preemptActiveLoad();
@@ -1548,6 +1704,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     }
 
     if (req.type === 'set_weight_residency_policy') {
+      await preemptBackgroundPrewarm();
       await preemptSpeculativePrefill();
       await preemptActiveGeneration();
       runtime.setWeightResidencyPolicy(req.policy);
@@ -1570,6 +1727,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     }
 
     if (req.type === 'delete_opfs_model') {
+      await preemptBackgroundPrewarm();
       await preemptSpeculativePrefill();
       await preemptActiveGeneration();
       await drainBackgroundOpfsPersist();
@@ -1591,6 +1749,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     }
 
     if (req.type === 'clear_opfs_models') {
+      await preemptBackgroundPrewarm();
       await preemptSpeculativePrefill();
       await preemptActiveGeneration();
       await drainBackgroundOpfsPersist();

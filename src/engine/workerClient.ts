@@ -41,6 +41,7 @@ import {
   shouldPreferDemandStreaming,
   type CatalogModel,
 } from './modelCatalog';
+import { selectInitialUnifiedBackbone } from './unifiedExpertScheduler';
 import type { MultimodalCoherenceTelemetry } from './multimodalCoordinator';
 import type { PrecisionContractMode } from './performanceContract';
 import type {
@@ -111,6 +112,22 @@ export interface SpeculativePrefillState {
   readonly targetTokens: number;
 }
 
+export interface BackgroundPrewarmState {
+  readonly active: boolean;
+  readonly percent: number;
+  readonly warmBytes: number;
+  readonly targetBytes: number;
+  readonly casBytesSaved: number;
+}
+
+const INITIAL_BACKGROUND_PREWARM: BackgroundPrewarmState = {
+  active: false,
+  percent: 0,
+  warmBytes: 0,
+  targetBytes: 0,
+  casBytesSaved: 0,
+};
+
 export interface EngineState {
   readonly status: EngineStatus;
   readonly progressPercent: number;
@@ -124,6 +141,7 @@ export interface EngineState {
   readonly lastPromptTruncatedTokens: number;
   readonly prefillProgress: PrefillProgressEvent | null;
   readonly speculativePrefill: SpeculativePrefillState;
+  readonly backgroundPrewarm: BackgroundPrewarmState;
   readonly sampling: SamplingConfig;
   readonly samplingCustomized: boolean;
   readonly promptMode: PromptFormatMode;
@@ -183,6 +201,8 @@ export interface HeaderEngineSummary {
   readonly modelStreamEnabled: boolean;
   readonly status: EngineStatus;
   readonly progressPercent: number;
+  readonly backgroundPrewarmActive: boolean;
+  readonly backgroundPrewarmPercent: number;
   readonly modelId: string | null;
   readonly modelDisplayName: string | null;
   readonly errorMessage: string | null;
@@ -360,6 +380,7 @@ export class LlamaVTensorWorkerClient {
   private state: EngineState;
   private disposed = false;
   private lastRequestedCatalogModel: CatalogModel | null = null;
+  private activeLoadPromise: Promise<LoadedModelSummary> | null = null;
   private readonly activeGenerationPartByReq = new Map<string, string>();
   private focusedPartId = 'verdant-part-home';
   private readonly handlePageUnload = (): void => {
@@ -398,6 +419,7 @@ export class LlamaVTensorWorkerClient {
       lastPromptTruncatedTokens: 0,
       prefillProgress: null,
       speculativePrefill: { active: false, readyTokens: 0, targetTokens: 0 },
+      backgroundPrewarm: INITIAL_BACKGROUND_PREWARM,
       sampling: saved.sampling,
       samplingCustomized: false,
       promptMode: saved.promptMode,
@@ -422,6 +444,8 @@ export class LlamaVTensorWorkerClient {
       modelStreamEnabled: savedStreamEnabled,
       status: 'idle',
       progressPercent: 0,
+      backgroundPrewarmActive: false,
+      backgroundPrewarmPercent: 0,
       modelId: null,
       modelDisplayName: null,
       errorMessage: null,
@@ -463,6 +487,7 @@ export class LlamaVTensorWorkerClient {
     };
     const handleWorkerFailure = (errorMsg: string) => {
       this.activeLoadRequestId = null;
+      this.activeLoadPromise = null;
       this.activeGenerationPartByReq.clear();
       for (const [, pendingEntry] of this.pending) {
         pendingEntry.reject(new Error(errorMsg));
@@ -473,6 +498,7 @@ export class LlamaVTensorWorkerClient {
         model: null,
         progressPercent: 0,
         prefillProgress: null,
+        backgroundPrewarm: INITIAL_BACKGROUND_PREWARM,
         conformanceRunning: false,
         activePartTaskIds: [],
         errorMessage: errorMsg,
@@ -610,8 +636,57 @@ export class LlamaVTensorWorkerClient {
   }
 
   /**
-   * Boots the user's previously persisted OPFS catalog model if available,
-   * otherwise initializes the internal offline bootstrap checkpoint silently.
+   * Immediately mounts the optimal demand-first System Stream backbone (~4-8 MB header+norms,
+   * ready in ~1-2s) and starts priority-ordered background prewarming into OPFS CAS.
+   */
+  private async warmUnifiedModelOnConsent(
+    storageOverride?: OpfsQuotaSnapshot,
+  ): Promise<LoadedModelSummary> {
+    const storage =
+      storageOverride ?? (await this.refreshOpfsStorage().catch(() => this.state.opfsStorage));
+    const cachedModelIds = computeCachedIds(storage);
+    const backbone = selectInitialUnifiedBackbone({
+      cachedModelIds,
+      lastModelId: readLastModelId(),
+      hardwareConcurrency:
+        typeof navigator !== 'undefined' && typeof navigator.hardwareConcurrency === 'number'
+          ? navigator.hardwareConcurrency
+          : 4,
+    });
+    return this.loadCatalogModel(backbone);
+  }
+
+  /**
+   * Waits for an in-flight model mount (e.g., consent-triggered ~1-2s header mount) to finish
+   * without rejecting user turns or double-downloading.
+   */
+  async waitForActiveLoad(signal?: AbortSignal): Promise<LoadedModelSummary | null> {
+    const pendingLoad = this.activeLoadPromise;
+    if (!pendingLoad) return this.state.model;
+    if (signal?.aborted) return null;
+    if (!signal) {
+      return pendingLoad.catch(() => this.state.model);
+    }
+    return new Promise<LoadedModelSummary | null>((resolve) => {
+      const onAbort = () => resolve(null);
+      signal.addEventListener('abort', onAbort, { once: true });
+      pendingLoad
+        .then((summary) => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(summary);
+        })
+        .catch(() => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(this.state.model);
+        });
+    });
+  }
+
+  /**
+   * Boots the user's demand-first Unified Model backbone immediately when streaming consent is
+   * already accepted (re-attaching warm OPFS slabs or mounting header+norms in ~1-2s with
+   * cooperative background warming). When consent is `'pending'` or `'paused'` (Offline-Only),
+   * boots the local offline bootstrap runtime with 0 network bytes.
    */
   async bootInitialModel(): Promise<LoadedModelSummary> {
     // Avoid racing OPFS handle creation when coi-serviceworker.js is negotiating a one-shot
@@ -634,21 +709,11 @@ export class LlamaVTensorWorkerClient {
     }
 
     const storage = await this.refreshOpfsStorage().catch(() => INITIAL_OPFS_STORAGE);
-    const cachedIds = computeCachedIds(storage);
-    // Demand-first System Stream: NEVER force an arbitrary upfront multi-GB download on boot!
-    // If streaming is accepted and an expert is ALREADY warm in OPFS, re-attach it at 0 network bytes;
-    // otherwise stay quietly ready on the internal bootstrap runtime until a prompt selects an expert.
-    if (this.state.modelStreamEnabled && cachedIds.length > 0) {
-      const lastId = readLastModelId();
-      if (lastId && cachedIds.includes(lastId)) {
-        const remembered = MODEL_CATALOG.find((m) => m.id === lastId);
-        if (remembered) {
-          return this.loadCatalogModel(remembered);
-        }
-      }
-      const warmCached = MODEL_CATALOG.find((m) => cachedIds.includes(m.id));
-      if (warmCached) {
-        return this.loadCatalogModel(warmCached);
+    if (this.state.streamingConsent === 'accepted') {
+      try {
+        return await this.warmUnifiedModelOnConsent(storage);
+      } catch {
+        // Offline or transient network failure on boot: stay ready locally with zero crash
       }
     }
     return this.loadCatalogModel(INTERNAL_BOOTSTRAP_MODEL);
@@ -656,9 +721,11 @@ export class LlamaVTensorWorkerClient {
 
   /**
    * Sets the user's browser-streaming consent (`'accepted'` vs `'paused'` Offline-Only Mode).
-   * - `'accepted'` grants `network-weights` for the hidden demand-first System Stream + user-enabled
-   *   Content Streams with ZERO forced upfront downloads (re-attaching any already-warm OPFS expert only).
-   * - `'paused'` cancels in-flight transfers and denies `network-weights` (`FK-07` strict offline mode).
+   * - `'accepted'` grants `network-weights` and IMMEDIATELY mounts the demand-first System Stream
+   *   backbone (~4-8 MB header+norms, ready in ~1-2s) + starts interruptible priority-ordered
+   *   background warming into OPFS CAS (NEVER waiting until the user submits a prompt!).
+   * - `'paused'` immediately pauses background prewarming, cancels in-flight transfers, and denies
+   *   `network-weights` (`FK-07` strict offline mode).
    */
   async setStreamingConsent(consent: StreamingConsentState): Promise<void> {
     saveStreamingConsent(consent);
@@ -677,25 +744,20 @@ export class LlamaVTensorWorkerClient {
       const alreadyLoadedRealModel =
         activeId !== undefined && activeId !== INTERNAL_BOOTSTRAP_MODEL.id;
       if (!alreadyLoadedRealModel && this.state.status !== 'downloading' && this.state.status !== 'loading') {
-        const storage = await this.refreshOpfsStorage().catch(() => this.state.opfsStorage);
-        const cachedIds = computeCachedIds(storage);
-        if (cachedIds.length > 0) {
-          const lastId = readLastModelId();
-          const remembered =
-            lastId && cachedIds.includes(lastId)
-              ? MODEL_CATALOG.find((m) => m.id === lastId)
-              : MODEL_CATALOG.find((m) => cachedIds.includes(m.id));
-          if (remembered) {
-            await this.loadCatalogModel(remembered);
-          }
-        }
+        await this.warmUnifiedModelOnConsent().catch(() => undefined);
       }
     } else {
       this.cognitiveObserver.grants.deny('network-weights');
+      try {
+        this.worker.postMessage({ type: 'pause_prewarm' } satisfies WorkerRequest);
+      } catch {
+        // Ignore closed worker
+      }
       this.cancelDownload();
       this.patchState({
         streamingConsent: consent,
         modelStreamEnabled: false,
+        backgroundPrewarm: INITIAL_BACKGROUND_PREWARM,
         status: this.state.model ? 'ready' : 'idle',
         progressPercent: 0,
         statusDetail: consent === 'paused' ? 'Offline only' : 'Ready',
@@ -911,11 +973,15 @@ export class LlamaVTensorWorkerClient {
     const nextModelId = this.state.model?.id ?? null;
     const nextModelName = this.state.model?.displayName ?? null;
     const nextActiveCount = this.state.activePartTaskIds.length;
+    const nextPrewarmActive = this.state.backgroundPrewarm.active;
+    const nextPrewarmPercent = this.state.backgroundPrewarm.percent;
     if (
       prevH.streamingConsent !== this.state.streamingConsent ||
       prevH.modelStreamEnabled !== this.state.modelStreamEnabled ||
       prevH.status !== this.state.status ||
       prevH.progressPercent !== this.state.progressPercent ||
+      prevH.backgroundPrewarmActive !== nextPrewarmActive ||
+      prevH.backgroundPrewarmPercent !== nextPrewarmPercent ||
       prevH.modelId !== nextModelId ||
       prevH.modelDisplayName !== nextModelName ||
       prevH.errorMessage !== this.state.errorMessage ||
@@ -926,6 +992,8 @@ export class LlamaVTensorWorkerClient {
         modelStreamEnabled: this.state.modelStreamEnabled,
         status: this.state.status,
         progressPercent: this.state.progressPercent,
+        backgroundPrewarmActive: nextPrewarmActive,
+        backgroundPrewarmPercent: nextPrewarmPercent,
         modelId: nextModelId,
         modelDisplayName: nextModelName,
         errorMessage: this.state.errorMessage,
@@ -1123,6 +1191,19 @@ export class LlamaVTensorWorkerClient {
       return;
     }
 
+    if (msg.type === 'prewarm_status') {
+      this.patchState({
+        backgroundPrewarm: {
+          active: msg.active,
+          percent: msg.percent,
+          warmBytes: msg.warmBytes,
+          targetBytes: msg.targetBytes,
+          casBytesSaved: msg.casBytesSaved,
+        },
+      });
+      return;
+    }
+
     const entry = this.pending.get(msg.requestId);
     if (!entry) return;
 
@@ -1155,6 +1236,7 @@ export class LlamaVTensorWorkerClient {
         errorMessage: null,
         prefillProgress: null,
         speculativePrefill: { active: false, readyTokens: 0, targetTokens: 0 },
+        backgroundPrewarm: INITIAL_BACKGROUND_PREWARM,
         model: msg.summary,
         telemetry: msg.telemetry,
         opfsStorage: msg.opfsStorage,
@@ -1432,7 +1514,7 @@ export class LlamaVTensorWorkerClient {
       });
     }
 
-    return new Promise<LoadedModelSummary>((resolve, reject) => {
+    const promise = new Promise<LoadedModelSummary>((resolve, reject) => {
       this.pending.set(requestId, {
         resolve: resolve as (v: unknown) => void,
         reject,
@@ -1448,6 +1530,13 @@ export class LlamaVTensorWorkerClient {
         weightResidencyPolicy: this.state.weightResidencyPolicy,
       } satisfies WorkerRequest);
     });
+    this.activeLoadPromise = promise;
+    void promise.finally(() => {
+      if (this.activeLoadPromise === promise) {
+        this.activeLoadPromise = null;
+      }
+    });
+    return promise;
   }
 
   async loadFromFile(file: File): Promise<LoadedModelSummary> {

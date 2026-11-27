@@ -523,14 +523,16 @@ export type ExpertStreamingStrategy = 'demand-sparse-moe' | 'demand-layered' | '
 
 /**
  * Determines the optimal streaming strategy for a System Stream expert:
- * - Sparse MoE checkpoints (`isMoe`) ALWAYS use `demand-sparse-moe` (HTTP Range active-expert CAS).
- * - Dense checkpoints >= 4 GB use `demand-layered` (Range-paged CAS, zero upfront multi-GB wait).
- * - Compact checkpoints (< 4 GB) use `compact-resident`.
+ * - Bundled conformance/bootstrap checkpoints (`model.bundled`) load directly into memory (`compact-resident`).
+ * - Sparse MoE checkpoints (`isMoe`) ALWAYS use `demand-sparse-moe` (HTTP Range active-expert CAS —
+ *   fetching ONLY active experts rather than pulling an entire multi-GB file).
+ * - All remote dense checkpoints use `demand-layered` (Range-paged CAS + interruptible background
+ *   priority warming so the model mounts in ~1-2s on header+norms and never blocks on a full download).
  */
 export function getModelStreamingStrategy(model: CatalogModel): ExpertStreamingStrategy {
+  if (model.bundled) return 'compact-resident';
   if (model.geometry.isMoe) return 'demand-sparse-moe';
-  if (model.approximateBytes >= 4_000_000_000) return 'demand-layered';
-  return 'compact-resident';
+  return 'demand-layered';
 }
 
 export function shouldPreferDemandStreaming(model: CatalogModel): boolean {

@@ -85,6 +85,12 @@ const StreamsStatusPill: FC<{
   const streamActive = consent === 'accepted';
   const isStreaming = summary.status === 'downloading' || summary.status === 'loading';
   const hasError = streamActive && summary.errorMessage !== null;
+  const isWarming =
+    streamActive &&
+    !isStreaming &&
+    !hasError &&
+    summary.backgroundPrewarmActive &&
+    summary.backgroundPrewarmPercent < 100;
   const statusLabel = isStreaming
     ? `${summary.progressPercent}%`
     : consent === 'paused'
@@ -93,9 +99,11 @@ const StreamsStatusPill: FC<{
         ? 'Setup'
         : hasError
           ? 'Retry'
-          : streamsSnap.enabledCount > 0
-            ? `${streamsSnap.enabledCount} on`
-            : 'Active';
+          : isWarming
+            ? `Warming ${summary.backgroundPrewarmPercent}%`
+            : streamsSnap.enabledCount > 0
+              ? `${streamsSnap.enabledCount} on`
+              : 'Active';
 
   return (
     <button
@@ -106,7 +114,9 @@ const StreamsStatusPill: FC<{
           ? 'Offline-only mode is active. Open Settings to manage content streams.'
           : consent === 'pending'
             ? 'Confirm browser streaming or open Settings to manage content streams.'
-            : `Browser streaming active (${streamsSnap.enabledCount} content streams enabled). Open Settings to manage.`
+            : isWarming
+              ? `Ready to chat while warming in the background (${summary.backgroundPrewarmPercent}%). Open Settings to manage.`
+              : `Browser streaming active (${streamsSnap.enabledCount} content streams enabled). Open Settings to manage.`
       }
       onClick={onOpenStreams}
       className={`inline-flex h-9 items-center gap-2 rounded-lg border px-2.5 sm:px-3 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${

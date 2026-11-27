@@ -68,11 +68,17 @@ import { VramKvPager } from './vramKvPager';
 import {
   calibrateBackingReadBandwidthMBs,
   MemoryBackingStore,
+  OpfsDemandVramBackingStore,
   readHotMetadataBundleFromOpfs,
   writeHotMetadataBundleToOpfs,
+  type ByteRange,
   type VramBackingKind,
   type VramBackingStore,
 } from './vramBackingStore';
+import {
+  planPriorityWeightExtents,
+  type ExpertPrewarmPlan,
+} from './unifiedExpertScheduler';
 import {
   computeBackingContentFingerprint,
   computeBackingContentFingerprintAsync,
@@ -760,6 +766,49 @@ export class LlamaVTensorRuntime {
   /** Returns the deterministic `<headerHash64>-<byteLength>` content fingerprint of the loaded model. */
   getContentFingerprint(): string | null {
     return this.modelContentFingerprint;
+  }
+
+  /**
+   * Computes a priority-ordered, interruptible background prewarm plan for the active
+   * `opfs-demand` model (early layers -> body layers -> LM-head stripes, strictly skipping
+   * already-cached slabs and cold Sparse MoE expert tables).
+   */
+  getDemandPrewarmPlan(): ExpertPrewarmPlan | null {
+    if (
+      !this.backingStore ||
+      this.backingStore.kind !== 'opfs-demand' ||
+      !this.weightPager ||
+      !this.hparams
+    ) {
+      return null;
+    }
+    const wp = this.weightPager;
+    const demandStore =
+      this.backingStore instanceof OpfsDemandVramBackingStore ? this.backingStore : null;
+    return planPriorityWeightExtents({
+      totalLayers: this.hparams.blockCount,
+      isMoe: Boolean(this.modelSpec?.isMoe),
+      getLayerRanges: (layerIdx) => wp.getLayerMissingRanges(layerIdx),
+      lmHeadStripes: wp.getLmHeadStripeSpecs(),
+      isRangeCached: demandStore
+        ? (fileOffset, byteLength) => demandStore.isRangeCached(fileOffset, byteLength)
+        : undefined,
+    });
+  }
+
+  /**
+   * Cooperative, abortable background prefetch of a priority weight slice into OPFS CAS.
+   * Preempts immediately when `signal` aborts (e.g., when the user submits a prompt).
+   */
+  async prefetchDemandRanges(
+    ranges: readonly ByteRange[],
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (!this.backingStore?.prefetchRanges || ranges.length === 0) return;
+    await this.backingStore.prefetchRanges(ranges, {
+      signal,
+      concurrency: 4,
+    });
   }
 
   async hydrateUnifiedStoreFromOpfs(

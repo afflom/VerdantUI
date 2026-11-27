@@ -491,7 +491,11 @@ export function derivePerformanceContract(
       )
     : 0;
 
-  const mustPageWeights = model.totalWeightBufferBytes > physicalWeightBudgetBytes;
+  // On remote demand-paged backings (`opfs-demand`), ALWAYS use `opfs-paged` so VerdantUI mounts
+  // in ~1-2s from header + norms (~4-8 MB) and streams active layers/experts lazily via OPFS CAS
+  // instead of blocking on a monolithic 100% upfront download.
+  const mustPageWeights =
+    model.totalWeightBufferBytes > physicalWeightBudgetBytes || backingKind === 'opfs-demand';
   const weightResidencyMode: WeightResidencyMode =
     mustPageWeights || weightResidencyPolicy === 'paged' ? 'opfs-paged' : 'resident-all';
 
