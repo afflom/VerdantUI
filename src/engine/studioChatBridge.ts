@@ -47,6 +47,7 @@ import {
   parseDiscoveryAgentResponse,
 } from './prismStudioAgent';
 import {
+  encodeCompactThumbnailDataUrl,
   inferPictureWeightsFromPrompt,
   renderPictureWithCoherenceCheck,
 } from './proceduralPictureRenderer';
@@ -247,6 +248,7 @@ async function materializeInlineArtifact(
   deps: StudioChatBridgeDeps,
 ): Promise<{
   readonly previewImageDataUrl?: string;
+  readonly thumbnailDataUrl?: string;
   readonly previewImageWidth?: number;
   readonly previewImageHeight?: number;
   readonly audioWavDataUrl?: string;
@@ -277,6 +279,7 @@ async function materializeInlineArtifact(
     });
     return {
       previewImageDataUrl: rendered.pngDataUrl,
+      thumbnailDataUrl: encodeCompactThumbnailDataUrl(rendered.rgba, rendered.width, rendered.height, 256),
       previewImageWidth: rendered.width,
       previewImageHeight: rendered.height,
       coherenceNote: rendered.coherence.coherent
@@ -339,6 +342,7 @@ async function materializeInlineArtifact(
     const poster = await renderPictureWithCoherenceCheck(posterWeights, { maxPreviewDim: 512 });
     return {
       previewImageDataUrl: poster.pngDataUrl,
+      thumbnailDataUrl: encodeCompactThumbnailDataUrl(poster.rgba, poster.width, poster.height, 256),
       previewImageWidth: poster.width,
       previewImageHeight: poster.height,
     };
@@ -493,7 +497,7 @@ export class StudioChatBridge {
       galleries.setArtifactMeta(activeProj.id, {
         categories,
         addSpaceId: resolvedSpaceId,
-        previewDataUrl: rendered.previewImageDataUrl,
+        previewDataUrl: rendered.thumbnailDataUrl ?? rendered.previewImageDataUrl,
         audioDurationSec: rendered.audioDurationSec,
       });
 
@@ -750,6 +754,87 @@ export class StudioChatBridge {
           durationSec: Math.max(2, Number(s.durationSec || 4) - 1),
         }));
       }
+    } else if (mediaType === 'research-program') {
+      const hyps = Array.isArray(patchWeights.hypotheses)
+        ? (patchWeights.hypotheses as Array<Record<string, unknown>>).map((h) => ({ ...h }))
+        : [];
+      const miles = Array.isArray(patchWeights.milestones)
+        ? (patchWeights.milestones as Array<Record<string, unknown>>).map((m) => ({ ...m }))
+        : [];
+      const evs = Array.isArray(patchWeights.evidence)
+        ? (patchWeights.evidence as Array<Record<string, unknown>>).map((e) => ({ ...e }))
+        : [];
+      const addH = params.instruction.match(/\badd\s+hypothesis\b(?:\s+that)?[:\s-]*(.+)$/i);
+      if (addH) {
+        hyps.push({ id: `H${hyps.length + 1}`, statement: addH[1]!.trim().slice(0, 220), status: 'open' });
+        patchWeights.hypotheses = hyps;
+      }
+      const markH = params.instruction.match(/\b(?:mark|set)\s+(h\d+)\s+(?:as\s+)?(open|supported|refuted)\b/i);
+      if (markH) {
+        const hid = markH[1]!.toUpperCase();
+        const st = markH[2]!.toLowerCase();
+        patchWeights.hypotheses = hyps.map((h) => (String(h.id).toUpperCase() === hid ? { ...h, status: st } : h));
+      }
+      const addEv = params.instruction.match(/\b(?:log|add)\s+(?:evidence|finding|observation)\b[:\s-]*(.+)$/i);
+      if (addEv) {
+        const txt = addEv[1]!.trim().slice(0, 360);
+        const verdict = /\b(refut|disprov|fail)/i.test(txt)
+          ? 'refuting'
+          : /\b(support|confirm|improv|drop|gain|faster|lower)/i.test(txt)
+            ? 'supporting'
+            : 'observation';
+        const refH = txt.match(/\b(H\d+)\b/i)?.[1]?.toUpperCase() ?? String(hyps[0]?.id ?? 'H1');
+        evs.unshift({ hypothesisId: refH, verdict, text: txt, date: new Date().toISOString().slice(0, 10) });
+        patchWeights.evidence = evs;
+      }
+      const addM = params.instruction.match(/\badd\s+milestone\b[:\s-]*(.+)$/i);
+      if (addM) {
+        miles.push({ title: addM[1]!.trim().slice(0, 100), status: 'planned', dueLabel: `Week ${miles.length + 1}` });
+        patchWeights.milestones = miles;
+      }
+    } else if (mediaType === 'tool-organ') {
+      const wins = Array.isArray(patchWeights.scheduleWindows)
+        ? (patchWeights.scheduleWindows as Array<Record<string, unknown>>).map((w) => ({ ...w }))
+        : [];
+      const steps = Array.isArray(patchWeights.steps)
+        ? (patchWeights.steps as Array<Record<string, unknown>>).map((s) => ({ ...s }))
+        : [];
+      const tMatch = params.instruction.match(
+        /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:to|-|–|until)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i,
+      );
+      if (tMatch && /\b(protect|block|schedule|focus|quiet|add)\b/i.test(params.instruction)) {
+        const toMin = (hRaw: string, mRaw: string | undefined, mer: string | undefined): number => {
+          let h = Number(hRaw) % 24;
+          const m = mRaw ? Number(mRaw) % 60 : 0;
+          const lowMer = mer?.toLowerCase();
+          if (lowMer === 'pm' && h < 12) h += 12;
+          if (lowMer === 'am' && h === 12) h = 0;
+          return h * 60 + m;
+        };
+        const sMin = toMin(tMatch[1]!, tMatch[2], tMatch[3] || tMatch[6]);
+        const eMin = toMin(tMatch[4]!, tMatch[5], tMatch[6] || tMatch[3]);
+        if (eMin > sMin) {
+          const forMatch = params.instruction.match(/\bfor\s+([a-z0-9][a-z0-9\s-]{1,40})$/i);
+          wins.push({
+            label: forMatch?.[1]?.trim() || 'Protected Block',
+            startMinuteOfDay: sMin,
+            endMinuteOfDay: eMin,
+            daysOfWeek: [0, 1, 2, 3, 4, 5, 6],
+            protectedWindow: true,
+          });
+          patchWeights.scheduleWindows = wins;
+        }
+      }
+      const addStep = params.instruction.match(/\badd\s+step\b[:\s-]*(.+)$/i);
+      if (addStep) {
+        steps.push({ id: `s${Date.now()}`, text: addStep[1]!.trim().slice(0, 180), done: false });
+        patchWeights.steps = steps;
+      }
+    } else if (mediaType === 'space') {
+      if (/\bboard\b/i.test(params.instruction)) patchWeights.layout = 'board';
+      else if (/\bgrid\b/i.test(params.instruction)) patchWeights.layout = 'grid';
+      else if (/\bshowcase\b/i.test(params.instruction)) patchWeights.layout = 'showcase';
+      else if (/\blist\b|\btimeline\b/i.test(params.instruction)) patchWeights.layout = 'timeline';
     }
 
     const seedJson =
@@ -787,8 +872,10 @@ export class StudioChatBridge {
     galleries.syncFromPrisms(refreshedPrisms);
 
     const rendered = await materializeInlineArtifact(updatedProj, this.deps);
-    if (mediaType !== 'space' && rendered.previewImageDataUrl) {
-      galleries.setArtifactMeta(updatedProj.id, { previewDataUrl: rendered.previewImageDataUrl });
+    if (mediaType !== 'space' && (rendered.thumbnailDataUrl || rendered.previewImageDataUrl)) {
+      galleries.setArtifactMeta(updatedProj.id, {
+        previewDataUrl: rendered.thumbnailDataUrl ?? rendered.previewImageDataUrl,
+      });
       const rec = galleries.get(updatedProj.id);
       for (const sid of rec?.spaceIds ?? []) {
         await syncSpacePrismView(sid, this.deps);

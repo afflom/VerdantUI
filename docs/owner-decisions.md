@@ -81,3 +81,8 @@
 
 - **Requirements:** `REQ-PRISM-GENERATION`
 - **Decision:** "We dont need more UI options. VerdantUI is a natural language interface that renders content to its user. The Observer must make use of Verdant Studio to generate its output. We have these language, audio, image, and video models in VerdantUI, so that their weights can be routed into a Verdant Prism in its procedural synthesis."
+
+## DEC-017 (2026-11-27)
+
+- **Requirements:** `REQ-PERF-STABILITY-OPTIMIZATION`, `REQ-PRISM-GENERATION`
+- **Decision:** "Continue to refine the plan with a focus on performance and stability, so that all work is focused on optimizing VerdantUI performance, stability, and functionality."

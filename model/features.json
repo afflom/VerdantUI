@@ -143,6 +143,17 @@
       "invariantId": "VUI-STUDIO-02",
       "citation": { "kind": "req", "decisionId": "DEC-016" },
       "publicBenefitImpact": "Fixes SDXS Q8_0 weights pin, wires neural image synthesis into the worker, adds vector SVG+PNG logos, editorial cover art, mastered stereo WAV + MIDI 1.0, pin-preserving natural-language tuning, feature-derived companion generation, and uncluttered Picture/Audio/Video previews with zero extra UI chrome."
+    },
+    {
+      "id": "VUI-FEAT-014",
+      "title": "OPFS SDXS GGUF Loader, Worker Auto-Recovery, Compact Thumbnails, Editorial Research/Utility Organs & Deterministic Publish",
+      "stage": "active",
+      "introducedIn": "0.8.0",
+      "ownerFile": "src/engine/imageSynthesisEngine.ts",
+      "testFile": "src/engine/multimodalSynthesis.test.ts",
+      "invariantId": "VUI-OPFS-01",
+      "citation": { "kind": "req", "decisionId": "DEC-017" },
+      "publicBenefitImpact": "Adds selective OPFS range-read SDXS Q8_0 GGUF loading with reusable scratch buffers, automatic worker respawn with bounded RPC timeouts, singleton IDB handle caching, zero-idle-CPU Video RAF and clean AudioContext teardown, 256px Gallery/Space thumbnails, Prism Details lineage/unpinning/navigation, editorial Research/Utilities/Spaces with durable NL editing, and automatic deterministic Publish verification."
     }
   ]
 }

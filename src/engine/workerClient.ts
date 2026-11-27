@@ -360,33 +360,7 @@ export class LlamaVTensorWorkerClient {
       pendingAudioContext: null,
     };
 
-    this.worker = new Worker(new URL('./inference.worker.ts', import.meta.url), {
-      type: 'module',
-    });
-    this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
-      this.handleWorkerMessage(event.data);
-    };
-    const handleWorkerFailure = (errorMsg: string) => {
-      this.activeLoadRequestId = null;
-      for (const [, pendingEntry] of this.pending) {
-        pendingEntry.reject(new Error(errorMsg));
-      }
-      this.pending.clear();
-      this.patchState({
-        status: this.state.model ? 'ready' : 'error',
-        progressPercent: 0,
-        prefillProgress: null,
-        conformanceRunning: false,
-        errorMessage: errorMsg,
-        statusDetail: 'Worker error',
-      });
-    };
-    this.worker.onerror = (err) => {
-      handleWorkerFailure(err.message || 'Web Worker runtime error.');
-    };
-    this.worker.onmessageerror = () => {
-      handleWorkerFailure('Web Worker message serialization error.');
-    };
+    this.worker = this.spawnWorker();
 
     if (typeof window !== 'undefined') {
       // Synchronously release OPFS SyncAccessHandles on page reload/navigation so the reloaded
@@ -402,6 +376,109 @@ export class LlamaVTensorWorkerClient {
       void this.updateWeightResidencyPolicy(saved.weightResidencyPolicy).catch(() => {});
     }
     void this.refreshOpfsStorage().catch(() => {});
+  }
+
+  private spawnWorker(): Worker {
+    const worker = new Worker(new URL('./inference.worker.ts', import.meta.url), {
+      type: 'module',
+    });
+    worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
+      this.handleWorkerMessage(event.data);
+    };
+    const handleWorkerFailure = (errorMsg: string) => {
+      this.activeLoadRequestId = null;
+      for (const [, pendingEntry] of this.pending) {
+        pendingEntry.reject(new Error(errorMsg));
+      }
+      this.pending.clear();
+      this.patchState({
+        status: 'error',
+        model: null,
+        progressPercent: 0,
+        prefillProgress: null,
+        conformanceRunning: false,
+        errorMessage: errorMsg,
+        statusDetail: 'Worker restarting',
+      });
+      if (!this.disposed && this.worker === worker) {
+        try {
+          worker.terminate();
+        } catch {
+          // Ignore termination error
+        }
+        this.worker = this.spawnWorker();
+        if (this.state.precisionMode !== 'q8-vnni') {
+          void this.sendPrecisionMode(this.state.precisionMode).catch(() => {});
+        }
+        if (this.state.weightResidencyPolicy !== 'auto') {
+          void this.updateWeightResidencyPolicy(this.state.weightResidencyPolicy).catch(() => {});
+        }
+      }
+    };
+    worker.onerror = (err) => {
+      handleWorkerFailure(err.message || 'Web Worker runtime error.');
+    };
+    worker.onmessageerror = () => {
+      handleWorkerFailure('Web Worker message serialization error.');
+    };
+    return worker;
+  }
+
+  private postRpcWithTimeout<T>(
+    req: WorkerRequest & { readonly requestId: string },
+    timeoutMs: number,
+    transfer?: Transferable[],
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pending.delete(req.requestId)) {
+          reject(new Error(`Worker request "${req.type}" timed out after ${Math.round(timeoutMs / 1000)}s.`));
+        }
+      }, timeoutMs);
+      this.pending.set(req.requestId, {
+        resolve: (v) => {
+          clearTimeout(timer);
+          resolve(v as T);
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      });
+      if (transfer && transfer.length > 0) {
+        this.worker.postMessage(req, transfer);
+      } else {
+        this.worker.postMessage(req);
+      }
+    });
+  }
+
+  private sendPrecisionMode(mode: PrecisionContractMode): Promise<VTensorTelemetrySnapshot> {
+    const requestId = this.nextRequestId('prec');
+    return this.postRpcWithTimeout<VTensorTelemetrySnapshot>(
+      { type: 'set_precision_mode', requestId, mode },
+      8_000,
+    );
+  }
+
+  /**
+   * Executes a critical acceptance/sealing step on the deterministic `strict-f64` contract
+   * without mutating the user's persisted preview preference, restoring the previous mode in `finally`.
+   */
+  async runWithDeterministicPrecision<T>(fn: () => Promise<T>): Promise<T> {
+    const prevMode = this.state.precisionMode;
+    if (prevMode !== 'strict-f64') {
+      this.patchState({ precisionMode: 'strict-f64' });
+      await this.sendPrecisionMode('strict-f64').catch(() => undefined);
+    }
+    try {
+      return await fn();
+    } finally {
+      if (prevMode !== 'strict-f64') {
+        this.patchState({ precisionMode: prevMode });
+        await this.sendPrecisionMode(prevMode).catch(() => undefined);
+      }
+    }
   }
 
   getState(): EngineState {
@@ -567,18 +644,7 @@ export class LlamaVTensorWorkerClient {
       this.state.weightResidencyPolicy,
     );
     this.patchState({ precisionMode });
-    const requestId = this.nextRequestId('prec');
-    return new Promise<VTensorTelemetrySnapshot>((resolve, reject) => {
-      this.pending.set(requestId, {
-        resolve: resolve as (v: unknown) => void,
-        reject,
-      });
-      this.worker.postMessage({
-        type: 'set_precision_mode',
-        requestId,
-        mode: precisionMode,
-      } satisfies WorkerRequest);
-    });
+    return this.sendPrecisionMode(precisionMode);
   }
 
   async updateWeightResidencyPolicy(
@@ -592,17 +658,10 @@ export class LlamaVTensorWorkerClient {
     );
     this.patchState({ weightResidencyPolicy: policy });
     const requestId = this.nextRequestId('wres');
-    return new Promise<VTensorTelemetrySnapshot>((resolve, reject) => {
-      this.pending.set(requestId, {
-        resolve: resolve as (v: unknown) => void,
-        reject,
-      });
-      this.worker.postMessage({
-        type: 'set_weight_residency_policy',
-        requestId,
-        policy,
-      } satisfies WorkerRequest);
-    });
+    return this.postRpcWithTimeout<VTensorTelemetrySnapshot>(
+      { type: 'set_weight_residency_policy', requestId, policy },
+      8_000,
+    );
   }
 
   resetSampling(): void {
@@ -1346,12 +1405,8 @@ export class LlamaVTensorWorkerClient {
     const requestId = this.nextRequestId('img');
     const copy = new Uint8Array(rgba.byteLength);
     copy.set(rgba);
-    return new Promise<PerceivedImageReport>((resolve, reject) => {
-      this.pending.set(requestId, {
-        resolve: resolve as (v: unknown) => void,
-        reject,
-      });
-      const msg: WorkerRequest = {
+    return this.postRpcWithTimeout<PerceivedImageReport>(
+      {
         type: 'perceive_image',
         requestId,
         name,
@@ -1359,9 +1414,10 @@ export class LlamaVTensorWorkerClient {
         height,
         rgbaBuffer: copy.buffer,
         allowAutoLoad: this.state.modelStreamEnabled,
-      };
-      this.worker.postMessage(msg, [copy.buffer]);
-    });
+      },
+      15_000,
+      [copy.buffer],
+    );
   }
 
   clearPendingImageContext(): void {
@@ -1378,20 +1434,17 @@ export class LlamaVTensorWorkerClient {
     const requestId = this.nextRequestId('aud');
     const copy = new Float32Array(pcm16k.length);
     copy.set(pcm16k);
-    return new Promise<PerceivedAudioReport>((resolve, reject) => {
-      this.pending.set(requestId, {
-        resolve: resolve as (v: unknown) => void,
-        reject,
-      });
-      const msg: WorkerRequest = {
+    return this.postRpcWithTimeout<PerceivedAudioReport>(
+      {
         type: 'perceive_audio',
         requestId,
         sampleRate,
         pcmBuffer: copy.buffer,
         allowAutoLoad: this.state.modelStreamEnabled,
-      };
-      this.worker.postMessage(msg, [copy.buffer]);
-    });
+      },
+      15_000,
+      [copy.buffer],
+    );
   }
 
   clearPendingAudioContext(): void {
@@ -1413,22 +1466,20 @@ export class LlamaVTensorWorkerClient {
     readonly durationSec: number;
   }): Promise<{ readonly wavBytes: Uint8Array; readonly sampleRate: number; readonly durationSec: number }> {
     const requestId = this.nextRequestId('syn');
-    return new Promise((resolve, reject) => {
-      this.pending.set(requestId, {
-        resolve: resolve as (v: unknown) => void,
-        reject,
-      });
-      this.worker.postMessage({
+    return this.postRpcWithTimeout(
+      {
         type: 'synthesize_audio',
         requestId,
         ...params,
-      } satisfies WorkerRequest);
-    });
+      },
+      15_000,
+    );
   }
 
   /**
    * Routes resident SDXS/TAESD neural image weights inside the shared Web Worker
-   * when cached locally, returning `{ neuralAvailable: false }` in <1ms otherwise.
+   * when cached locally (or streams lazily when Local AI is On), returning
+   * `{ neuralAvailable: false }` in <1ms when Local AI is Off.
    */
   async synthesizeImageLayer(params: {
     readonly prompt: string;
@@ -1442,17 +1493,15 @@ export class LlamaVTensorWorkerClient {
     readonly rgba: Uint8ClampedArray | null;
   }> {
     const requestId = this.nextRequestId('img');
-    return new Promise((resolve, reject) => {
-      this.pending.set(requestId, {
-        resolve: resolve as (v: unknown) => void,
-        reject,
-      });
-      this.worker.postMessage({
+    return this.postRpcWithTimeout(
+      {
         type: 'synthesize_image',
         requestId,
+        allowAutoLoad: this.state.modelStreamEnabled,
         ...params,
-      } satisfies WorkerRequest);
-    });
+      },
+      20_000,
+    );
   }
 
   /**

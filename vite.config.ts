@@ -120,7 +120,7 @@ export default defineConfig(() => {
               { name: 'vendor-assistant-ui', test: /node_modules[\\/]@assistant-ui[\\/]/ },
               { name: 'vendor-markdown', test: /node_modules[\\/](remark-|rehype-|unified|mdast|micromark|hast|unist|vfile)/ },
               { name: 'vendor-prism', test: /node_modules[\\/]prism-code[\\/]/ },
-              { name: 'verdant-studio-organs', test: /src[\\/]engine[\\/](prismMediaOrgans|prismMediaRuntimes|prismGameRuntimes|proceduralPictureRenderer|prismCompiler|verdantStudioApi)\.ts$/ },
+              { name: 'verdant-studio-organs', test: /src[\\/]engine[\\/](prismMediaOrgans|prismMediaRuntimes|prismVisualRuntimes|prismAudioRuntimes|prismEditorialRuntimes|prismGameRuntimes|proceduralPictureRenderer|prismCompiler|verdantStudioApi)\.ts$/ },
             ],
           },
         },

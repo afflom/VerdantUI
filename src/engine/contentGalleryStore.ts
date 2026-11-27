@@ -428,8 +428,11 @@ export class ContentGalleryStore {
   }
 }
 
+let cachedGalleryDbPromise: Promise<IDBDatabase> | null = null;
+
 function openGalleryDb(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  if (cachedGalleryDbPromise) return cachedGalleryDbPromise;
+  cachedGalleryDbPromise = new Promise<IDBDatabase>((resolve, reject) => {
     const req = indexedDB.open(GALLERY_IDB_NAME, 1);
     req.onupgradeneeded = () => {
       const db = req.result;
@@ -437,7 +440,21 @@ function openGalleryDb(): Promise<IDBDatabase> {
         db.createObjectStore(GALLERY_IDB_STORE);
       }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onclose = () => {
+        cachedGalleryDbPromise = null;
+      };
+      db.onversionchange = () => {
+        db.close();
+        cachedGalleryDbPromise = null;
+      };
+      resolve(db);
+    };
+    req.onerror = () => {
+      cachedGalleryDbPromise = null;
+      reject(req.error);
+    };
   });
+  return cachedGalleryDbPromise;
 }

@@ -8,19 +8,34 @@
  */
 
 import {
+  type GgufTensorInfo,
+  parseGgufFromBacking,
+  type ParsedGgufModel,
+} from './gguf';
+import {
   verdantAdd,
   verdantConv2d,
+  verdantDecodeRow,
   verdantGelu,
   verdantGroupNorm,
   verdantLayerNorm,
   verdantSiLu,
 } from './verdantKernels';
 
+export interface ImageGgufBacking {
+  readonly byteLength: number;
+  readRange(fileOffset: number, dst: Uint8Array, dstOffset?: number, length?: number): number;
+  close?: () => void;
+}
+
 export interface ClipTextWeights {
   readonly vocabSize: number;
   readonly embedDim: number;
   readonly maxSeqLen: number;
-  readonly tokenEmbd: Float32Array; // [vocabSize, embedDim]
+  /** Optional in-memory table `[vocabSize, embedDim]` (small/test models). */
+  readonly tokenEmbd?: Float32Array;
+  /** Optional zero-copy OPFS row reader avoiding ~150 MB full-vocab RAM allocation. */
+  readonly readTokenEmbeddingRow?: (tokenId: number, out: Float32Array) => void;
   readonly posEmbd: Float32Array; // [maxSeqLen, embedDim]
   readonly lnW: Float32Array;
   readonly lnB: Float32Array;
@@ -129,6 +144,394 @@ export function upsampleNearest2x(
   return out;
 }
 
+export interface LoadedNeuralImageWeights {
+  readonly clip: ClipTextWeights;
+  readonly unet: DistilledUnetWeights;
+  readonly taesd: TaesdDecoderWeights;
+  readonly tensorCount: number;
+  readonly residentBytes: number;
+  readonly dispose?: () => void;
+}
+
+export interface ImageSynthesisScratch {
+  unetH0?: Float32Array;
+  unetN1?: Float32Array;
+  unetH1?: Float32Array;
+  unetN2?: Float32Array;
+  unetH2?: Float32Array;
+  unetEps?: Float32Array;
+}
+
+function ensureF32(buf: Float32Array | undefined, len: number): Float32Array {
+  return buf && buf.length === len ? buf : new Float32Array(len);
+}
+
+/** Deterministic CLIP prompt tokenizer (`BOS=49406`, `EOS=49407`, bounded to `maxSeqLen`). */
+export function encodePromptToClipTokens(
+  prompt: string,
+  vocabSize: number,
+  maxSeqLen = 77,
+): number[] {
+  const safeVocab = Math.max(4, vocabSize);
+  const bos = Math.min(49406, safeVocab - 2);
+  const eos = Math.min(49407, safeVocab - 1);
+  const out: number[] = [bos];
+  const words = prompt
+    .toLowerCase()
+    .replace(/[^a-z0-9\s'-]+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  for (const w of words) {
+    if (out.length >= maxSeqLen - 1) break;
+    let h = 2166136261 >>> 0;
+    for (let i = 0; i < w.length; i++) {
+      h ^= w.charCodeAt(i);
+      h = Math.imul(h, 16777619) >>> 0;
+    }
+    out.push(256 + (h % Math.max(1, safeVocab - 260)));
+  }
+  out.push(eos);
+  return out;
+}
+
+function findImageTensor(model: ParsedGgufModel, candidates: readonly string[]): GgufTensorInfo | null {
+  for (const name of candidates) {
+    const info = model.tensorMap.get(name);
+    if (info) return info;
+  }
+  return null;
+}
+
+function decodeBackingTensorToF32(
+  backing: ImageGgufBacking,
+  dataOffset: number,
+  info: GgufTensorInfo,
+): Float32Array {
+  const total = info.dims.reduce((a, b) => a * b, 1);
+  const raw = new Uint8Array(info.byteSize);
+  const got = backing.readRange(dataOffset + info.offset, raw, 0, info.byteSize);
+  if (got < info.byteSize) {
+    throw new Error(`Truncated GGUF tensor "${info.name}" (${got}/${info.byteSize} bytes).`);
+  }
+  const out = new Float32Array(total);
+  const ne0 = info.dims[0] ?? total;
+  const rows = Math.max(1, Math.floor(total / ne0));
+  const rowBytes = Math.floor(info.byteSize / rows);
+  const rowBuf = new Float32Array(ne0);
+  for (let r = 0; r < rows; r++) {
+    verdantDecodeRow(raw, r * rowBytes, info.type, ne0, rowBuf);
+    out.set(rowBuf, r * ne0);
+  }
+  return out;
+}
+
+function padOrSliceF32(src: Float32Array | null, len: number, fill = 0): Float32Array {
+  const out = new Float32Array(len);
+  if (fill !== 0) out.fill(fill);
+  if (!src) return out;
+  out.set(src.subarray(0, Math.min(len, src.length)));
+  return out;
+}
+
+/**
+ * Loads CLIP + 1-step distilled SDXS UNet + bundled TAESD decoder tensors selectively from an
+ * OPFS or in-memory GGUF backing (`parseGgufFromBacking` reads only the ~64 KiB header and keeps
+ * CLIP's 49,408-row vocabulary matrix demand-paged via `readRange`, holding resident RAM ~18 MB).
+ */
+export function loadImageWeightsFromBacking(
+  backing: ImageGgufBacking,
+): LoadedNeuralImageWeights {
+  const parsed = parseGgufFromBacking(backing);
+  const dataOffset = parsed.dataOffset;
+
+  const req = (names: readonly string[], label: string): GgufTensorInfo => {
+    const t = findImageTensor(parsed, names);
+    if (!t) throw new Error(`SDXS GGUF missing required tensor (${label}).`);
+    return t;
+  };
+  const optF32 = (names: readonly string[]): Float32Array | null => {
+    const t = findImageTensor(parsed, names);
+    return t ? decodeBackingTensorToF32(backing, dataOffset, t) : null;
+  };
+
+  // 1. CLIP text encoder (lazy OPFS row reads for token_embedding.weight!)
+  const tokInfo = req(
+    [
+      'cond_stage_model.transformer.text_model.embeddings.token_embedding.weight',
+      'clip.token_embd.weight',
+    ],
+    'clip token_embedding',
+  );
+  const posInfo = req(
+    [
+      'cond_stage_model.transformer.text_model.embeddings.position_embedding.weight',
+      'clip.pos_embd.weight',
+    ],
+    'clip position_embedding',
+  );
+  const embedDim = tokInfo.dims[0] ?? 768;
+  const vocabSize = tokInfo.dims[1] ?? Math.max(1, Math.floor(tokInfo.dims.reduce((a, b) => a * b, 1) / embedDim));
+  const maxSeqLen = posInfo.dims[1] ?? Math.max(1, Math.floor(posInfo.dims.reduce((a, b) => a * b, 1) / embedDim));
+  const tokRowBytes = Math.floor(tokInfo.byteSize / Math.max(1, vocabSize));
+  const tokRowRaw = new Uint8Array(tokRowBytes);
+  const readTokenEmbeddingRow = (tokenId: number, out: Float32Array): void => {
+    const tid = Math.max(0, Math.min(vocabSize - 1, tokenId | 0));
+    const got = backing.readRange(dataOffset + tokInfo.offset + tid * tokRowBytes, tokRowRaw, 0, tokRowBytes);
+    if (got < tokRowBytes) {
+      out.fill(0);
+      return;
+    }
+    verdantDecodeRow(tokRowRaw, 0, tokInfo.type, embedDim, out);
+  };
+  const posEmbd = decodeBackingTensorToF32(backing, dataOffset, posInfo);
+  const lnW = padOrSliceF32(
+    optF32([
+      'cond_stage_model.transformer.text_model.final_layer_norm.weight',
+      'clip.ln.weight',
+    ]),
+    embedDim,
+    1,
+  );
+  const lnB = padOrSliceF32(
+    optF32([
+      'cond_stage_model.transformer.text_model.final_layer_norm.bias',
+      'clip.ln.bias',
+    ]),
+    embedDim,
+    0,
+  );
+  const projWInfo = findImageTensor(parsed, [
+    'cond_stage_model.transformer.text_model.encoder.layers.0.self_attn.out_proj.weight',
+    'clip.proj.weight',
+  ]);
+  const projW = projWInfo
+    ? padOrSliceF32(decodeBackingTensorToF32(backing, dataOffset, projWInfo), embedDim * embedDim, 0)
+    : (() => {
+        const eye = new Float32Array(embedDim * embedDim);
+        for (let i = 0; i < embedDim; i++) eye[i * embedDim + i] = 1;
+        return eye;
+      })();
+  const projB = padOrSliceF32(
+    optF32([
+      'cond_stage_model.transformer.text_model.encoder.layers.0.self_attn.out_proj.bias',
+      'clip.proj.bias',
+    ]),
+    embedDim,
+    0,
+  );
+
+  // 2. 1-step distilled SDXS UNet stem + residual block + out head
+  const convInInfo = req(
+    ['model.diffusion_model.input_blocks.0.0.weight', 'unet.conv_in.weight'],
+    'unet conv_in',
+  );
+  const convInW = decodeBackingTensorToF32(backing, dataOffset, convInInfo);
+  const latentChannels = convInInfo.dims[2] ?? 4;
+  const modelChannels = convInInfo.dims[3] ?? Math.max(4, Math.floor(convInW.length / (9 * latentChannels)));
+  const convInB = padOrSliceF32(
+    optF32(['model.diffusion_model.input_blocks.0.0.bias', 'unet.conv_in.bias']),
+    modelChannels,
+    0,
+  );
+  const norm1W = padOrSliceF32(
+    optF32(['model.diffusion_model.input_blocks.1.0.in_layers.0.weight', 'unet.norm1.weight']),
+    modelChannels,
+    1,
+  );
+  const norm1B = padOrSliceF32(
+    optF32(['model.diffusion_model.input_blocks.1.0.in_layers.0.bias', 'unet.norm1.bias']),
+    modelChannels,
+    0,
+  );
+  const resConv1W = decodeBackingTensorToF32(
+    backing,
+    dataOffset,
+    req(['model.diffusion_model.input_blocks.1.0.in_layers.2.weight', 'unet.res_conv1.weight'], 'unet res_conv1'),
+  );
+  const resConv1B = padOrSliceF32(
+    optF32(['model.diffusion_model.input_blocks.1.0.in_layers.2.bias', 'unet.res_conv1.bias']),
+    modelChannels,
+    0,
+  );
+  const condProjRaw = optF32([
+    'model.diffusion_model.input_blocks.1.0.emb_layers.1.weight',
+    'unet.cond_proj.weight',
+  ]);
+  const condProjW = padOrSliceF32(condProjRaw, modelChannels * embedDim, 0);
+  const condProjB = padOrSliceF32(
+    optF32(['model.diffusion_model.input_blocks.1.0.emb_layers.1.bias', 'unet.cond_proj.bias']),
+    modelChannels,
+    0,
+  );
+  const norm2W = padOrSliceF32(
+    optF32(['model.diffusion_model.input_blocks.1.0.out_layers.0.weight', 'unet.norm2.weight']),
+    modelChannels,
+    1,
+  );
+  const norm2B = padOrSliceF32(
+    optF32(['model.diffusion_model.input_blocks.1.0.out_layers.0.bias', 'unet.norm2.bias']),
+    modelChannels,
+    0,
+  );
+  const resConv2W = decodeBackingTensorToF32(
+    backing,
+    dataOffset,
+    req(['model.diffusion_model.input_blocks.1.0.out_layers.3.weight', 'unet.res_conv2.weight'], 'unet res_conv2'),
+  );
+  const resConv2B = padOrSliceF32(
+    optF32(['model.diffusion_model.input_blocks.1.0.out_layers.3.bias', 'unet.res_conv2.bias']),
+    modelChannels,
+    0,
+  );
+  const convOutW = decodeBackingTensorToF32(
+    backing,
+    dataOffset,
+    req(['model.diffusion_model.out.2.weight', 'unet.conv_out.weight'], 'unet conv_out'),
+  );
+  const convOutB = padOrSliceF32(
+    optF32(['model.diffusion_model.out.2.bias', 'unet.conv_out.bias']),
+    latentChannels,
+    0,
+  );
+
+  let numGroups = 32;
+  while (numGroups > 1 && modelChannels % numGroups !== 0) {
+    numGroups = Math.floor(numGroups / 2);
+  }
+
+  // 3. Bundled TAESD Decoder (`first_stage_model.decoder.layers.0..18`)
+  const dec0Info = req(
+    ['first_stage_model.decoder.layers.0.weight', 'taesd.stage0.weight'],
+    'taesd decoder stem',
+  );
+  const dec0W = decodeBackingTensorToF32(backing, dataOffset, dec0Info);
+  const taesdC = dec0Info.dims[3] ?? Math.max(4, Math.floor(dec0W.length / (9 * latentChannels)));
+  const dec0B = padOrSliceF32(
+    optF32(['first_stage_model.decoder.layers.0.bias', 'taesd.stage0.bias']),
+    taesdC,
+    0,
+  );
+  const stages: TaesdStageWeights[] = [
+    { inC: latentChannels, outC: taesdC, convW: dec0W, convB: dec0B, upsample2x: false },
+  ];
+  const upsampleCandidates: readonly [readonly string[], readonly string[]][] = [
+    [
+      ['first_stage_model.decoder.layers.6.weight', 'first_stage_model.decoder.layers.2.conv.0.weight', 'taesd.up0.weight'],
+      ['first_stage_model.decoder.layers.6.bias', 'first_stage_model.decoder.layers.2.conv.0.bias', 'taesd.up0.bias'],
+    ],
+    [
+      ['first_stage_model.decoder.layers.11.weight', 'first_stage_model.decoder.layers.12.conv.0.weight', 'taesd.up1.weight'],
+      ['first_stage_model.decoder.layers.11.bias', 'first_stage_model.decoder.layers.12.conv.0.bias', 'taesd.up1.bias'],
+    ],
+    [
+      ['first_stage_model.decoder.layers.16.weight', 'first_stage_model.decoder.layers.17.conv.0.weight', 'taesd.up2.weight'],
+      ['first_stage_model.decoder.layers.16.bias', 'first_stage_model.decoder.layers.17.conv.0.bias', 'taesd.up2.bias'],
+    ],
+  ];
+  for (const [wNames, bNames] of upsampleCandidates) {
+    const info = findImageTensor(parsed, wNames);
+    if (!info) continue;
+    const convW = decodeBackingTensorToF32(backing, dataOffset, info);
+    const inC = info.dims[2] ?? taesdC;
+    const outC = info.dims[3] ?? taesdC;
+    const convB = padOrSliceF32(optF32(bNames), outC, 0);
+    stages.push({ inC, outC, convW, convB, upsample2x: true });
+  }
+  const finalInfo = req(
+    ['first_stage_model.decoder.layers.18.weight', 'taesd.final.weight'],
+    'taesd final rgb',
+  );
+  const finalW = decodeBackingTensorToF32(backing, dataOffset, finalInfo);
+  const finalB = padOrSliceF32(
+    optF32(['first_stage_model.decoder.layers.18.bias', 'taesd.final.bias']),
+    3,
+    0,
+  );
+
+  const residentBytes =
+    (posEmbd.byteLength +
+      lnW.byteLength +
+      lnB.byteLength +
+      projW.byteLength +
+      projB.byteLength +
+      convInW.byteLength +
+      convInB.byteLength +
+      norm1W.byteLength +
+      norm1B.byteLength +
+      resConv1W.byteLength +
+      resConv1B.byteLength +
+      condProjW.byteLength +
+      condProjB.byteLength +
+      norm2W.byteLength +
+      norm2B.byteLength +
+      resConv2W.byteLength +
+      resConv2B.byteLength +
+      convOutW.byteLength +
+      convOutB.byteLength +
+      stages.reduce((acc, s) => acc + s.convW.byteLength + s.convB.byteLength, 0) +
+      finalW.byteLength +
+      finalB.byteLength) |
+    0;
+
+  return {
+    clip: {
+      vocabSize,
+      embedDim,
+      maxSeqLen,
+      readTokenEmbeddingRow,
+      posEmbd,
+      lnW,
+      lnB,
+      projW,
+      projB,
+    },
+    unet: {
+      latentChannels,
+      modelChannels,
+      condDim: embedDim,
+      numGroups,
+      convInW,
+      convInB,
+      norm1W,
+      norm1B,
+      resConv1W,
+      resConv1B,
+      condProjW,
+      condProjB,
+      norm2W,
+      norm2B,
+      resConv2W,
+      resConv2B,
+      convOutW,
+      convOutB,
+    },
+    taesd: { stages, finalW, finalB },
+    tensorCount: parsed.tensors.length,
+    residentBytes,
+    dispose: () => {
+      try {
+        backing.close?.();
+      } catch {
+        // Ignore close errors
+      }
+    },
+  };
+}
+
+/** Convenience wrapper loading SDXS/TAESD GGUF weights from an in-memory `Uint8Array`. */
+export function loadImageWeightsFromGguf(ggufBytes: Uint8Array): LoadedNeuralImageWeights {
+  const backing: ImageGgufBacking = {
+    byteLength: ggufBytes.byteLength,
+    readRange(fileOffset, dst, dstOffset = 0, length = dst.byteLength - dstOffset) {
+      const avail = Math.max(0, Math.min(length, ggufBytes.byteLength - fileOffset));
+      if (avail > 0) dst.set(ggufBytes.subarray(fileOffset, fileOffset + avail), dstOffset);
+      return avail;
+    },
+  };
+  return loadImageWeightsFromBacking(backing);
+}
+
 /**
  * Encodes prompt token IDs into pooled CLIP conditioning embedding `[embedDim]`.
  */
@@ -139,15 +542,23 @@ export function encodeClipPrompt(
   const D = w.embedDim;
   const len = Math.max(1, Math.min(tokenIds.length, w.maxSeqLen));
   const pooled = new Float32Array(D);
+  const tokRow = new Float32Array(D);
   const row = new Float32Array(D);
   const norm = new Float32Array(D);
 
   for (let pos = 0; pos < len; pos++) {
     const tid = Math.max(0, Math.min(w.vocabSize - 1, tokenIds[pos] ?? 0));
-    const tBase = tid * D;
+    if (w.readTokenEmbeddingRow) {
+      w.readTokenEmbeddingRow(tid, tokRow);
+    } else if (w.tokenEmbd) {
+      const tBase = tid * D;
+      tokRow.set(w.tokenEmbd.subarray(tBase, tBase + D));
+    } else {
+      tokRow.fill(0);
+    }
     const pBase = pos * D;
     for (let d = 0; d < D; d++) {
-      row[d] = Math.fround(w.tokenEmbd[tBase + d]! + w.posEmbd[pBase + d]!);
+      row[d] = Math.fround(tokRow[d]! + (w.posEmbd[pBase + d] ?? 0));
     }
     verdantLayerNorm(row, w.lnW, w.lnB, norm, D, 1e-5);
     verdantGelu(norm, norm, D, true);
@@ -175,19 +586,24 @@ export function denoiseOneStepDistilledUnet(
   condEmbedding: Float32Array,
   w: DistilledUnetWeights,
   sigma = 1.0,
+  scratch?: ImageSynthesisScratch,
 ): Float32Array {
   const C = w.modelChannels;
   const spatial = latentH * latentW;
+  const planeLen = C * spatial;
 
   // 1. Conv2D stem: [4, H, W] -> [C, H, W]
-  const h0 = new Float32Array(C * spatial);
+  const h0 = ensureF32(scratch?.unetH0, planeLen);
+  if (scratch) scratch.unetH0 = h0;
   verdantConv2d(noisyLatent, w.convInW, w.convInB, h0, w.latentChannels, C, latentH, latentW, 3, 3, 1, 1);
 
   // 2. GroupNorm + SiLU + Conv2D res block 1
-  const n1 = new Float32Array(C * spatial);
+  const n1 = ensureF32(scratch?.unetN1, planeLen);
+  if (scratch) scratch.unetN1 = n1;
   verdantGroupNorm(h0, w.norm1W, w.norm1B, n1, C, w.numGroups, spatial, 1e-5);
   verdantSiLu(n1, n1, n1.length);
-  const h1 = new Float32Array(C * spatial);
+  const h1 = ensureF32(scratch?.unetH1, planeLen);
+  if (scratch) scratch.unetH1 = h1;
   verdantConv2d(n1, w.resConv1W, w.resConv1B, h1, C, C, latentH, latentW, 3, 3, 1, 1);
 
   // 3. Cross-modal text conditioning modulation (FiLM / cross-projection)
@@ -200,15 +616,18 @@ export function denoiseOneStepDistilledUnet(
   }
 
   // 4. GroupNorm + SiLU + Conv2D res block 2 + residual skip
-  const n2 = new Float32Array(C * spatial);
+  const n2 = ensureF32(scratch?.unetN2, planeLen);
+  if (scratch) scratch.unetN2 = n2;
   verdantGroupNorm(h1, w.norm2W, w.norm2B, n2, C, w.numGroups, spatial, 1e-5);
   verdantSiLu(n2, n2, n2.length);
-  const h2 = new Float32Array(C * spatial);
+  const h2 = ensureF32(scratch?.unetH2, planeLen);
+  if (scratch) scratch.unetH2 = h2;
   verdantConv2d(n2, w.resConv2W, w.resConv2B, h2, C, C, latentH, latentW, 3, 3, 1, 1);
   verdantAdd(h0, h2, h2, h2.length);
 
   // 5. Noise prediction convOut: [C, H, W] -> [4, H, W] and 1-step denoised latent z0
-  const epsPred = new Float32Array(w.latentChannels * spatial);
+  const epsPred = ensureF32(scratch?.unetEps, w.latentChannels * spatial);
+  if (scratch) scratch.unetEps = epsPred;
   verdantConv2d(h2, w.convOutW, w.convOutB, epsPred, C, w.latentChannels, latentH, latentW, 3, 3, 1, 1);
 
   const denoised = new Float32Array(noisyLatent.length);
@@ -276,9 +695,18 @@ export function synthesizeImageOneStep(params: {
   readonly clip: ClipTextWeights;
   readonly unet: DistilledUnetWeights;
   readonly taesd: TaesdDecoderWeights;
+  readonly scratch?: ImageSynthesisScratch;
 }): SynthesizedRgbaImage {
   const cond = encodeClipPrompt(params.promptTokens, params.clip);
   const zT = seedGaussianLatent(params.unet.latentChannels, params.latentH, params.latentW, params.seed);
-  const z0 = denoiseOneStepDistilledUnet(zT, params.latentH, params.latentW, cond, params.unet);
+  const z0 = denoiseOneStepDistilledUnet(
+    zT,
+    params.latentH,
+    params.latentW,
+    cond,
+    params.unet,
+    1.0,
+    params.scratch,
+  );
   return decodeTaesdLatentToRgba(z0, params.latentH, params.latentW, params.taesd, params.seed);
 }

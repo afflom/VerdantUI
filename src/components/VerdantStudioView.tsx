@@ -56,15 +56,6 @@ import {
 } from '../engine/verdantStudioApi';
 import { evaluateVerdantRouting } from '../engine/verdantStandardsRouter';
 import {
-  buildLocalInterviewExtractionPrompt,
-  computeGuidedWizardState,
-  mergeLocalModelExtraction,
-  parseIdeaSentence,
-  reconcileWizardTurn,
-  type ExtractedPrismIntent,
-  type GuidedStepId,
-} from '../engine/prismInterviewEngine';
-import {
   assembleProceduralPrismOps,
   buildAgentCoreModelOps,
   buildWeightRefinementPrompt,
@@ -73,7 +64,12 @@ import {
   parseDiscoveryAgentResponse,
   type AgentChatTurn,
 } from '../engine/prismStudioAgent';
-import { PRISM_MEDIA_CATALOG, type PrismMediaType } from '../engine/prismMediaOrgans';
+import {
+  PRISM_MEDIA_CATALOG,
+  type AudioWeights,
+  type PictureWeights,
+  type PrismMediaType,
+} from '../engine/prismMediaOrgans';
 import { isInternalBootstrapModel } from '../engine/modelCatalog';
 import type { StudioChatBridge } from '../engine/studioChatBridge';
 import type { EngineState, LlamaVTensorWorkerClient } from '../engine/workerClient';
@@ -96,13 +92,23 @@ interface VerdantStudioViewProps {
   store: PrismStore;
   bus: ObserverStreamBus;
   bridgeRuntime: PrismHostPool;
-  buildClient: PrismBuildWorkerClient;
+  getBuildClient: () => Promise<PrismBuildWorkerClient>;
   workerClient: LlamaVTensorWorkerClient;
   engineState: EngineState;
   darkMode: boolean;
   getStudioChatBridge?: () => Promise<StudioChatBridge>;
   onSelectProject: (prismId: string, mode: 'studio' | 'app') => void;
 }
+
+const PIN_DISPLAY_LABELS: Readonly<Record<string, string>> = {
+  bpm: 'Tempo',
+  lighting: 'Lighting',
+  palette: 'Palette',
+  scale: 'Scale',
+  style: 'Style',
+  coverFormat: 'Format',
+  generator: 'Scene',
+};
 
 function isAbortError(err: unknown): boolean {
   return (
@@ -123,14 +129,13 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   store,
   bus,
   bridgeRuntime,
-  buildClient,
+  getBuildClient,
   workerClient,
   engineState,
   darkMode,
   getStudioChatBridge,
   onSelectProject,
 }) => {
-  const [guidedStep, setGuidedStep] = useState<GuidedStepId>('anchor-idea');
   const [viewportMode, setViewportMode] = useState<'desktop' | 'mobile'>('desktop');
   const [reloadNonce, setReloadNonce] = useState(0);
   const [runtimeError, setRuntimeError] = useState<PrismRuntimeError | null>(null);
@@ -176,13 +181,6 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     setTitleDraft(project.draft.name);
     setRuntimeError(null);
     setStatusBanner(null);
-    const initialRouting = project.declaration ? evaluateVerdantRouting(project.declaration) : null;
-    const initialCheck = project.declaration ? checkDeclaration(project.declaration) : null;
-    if (project.declaration && initialRouting && initialCheck) {
-      setGuidedStep(computeGuidedWizardState(project.declaration, initialRouting, initialCheck).recommendedStep);
-    } else {
-      setGuidedStep('anchor-idea');
-    }
   }, [project.id, project.draft.name, project.declaration?.schema]);
 
   // Closed-loop visual check: listen for rendered canvas sensory reports from this creation
@@ -209,6 +207,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   const holoviewConfig = useMemo<HoloviewMountConfig | null>(() => {
     const invokeModel = async (requestLine: string, traceContext?: OtelTraceContext): Promise<string> => {
       if (activeHolo && activeHolo.bytes.length > 0) {
+        const buildClient = await getBuildClient();
         return buildClient.runHoloGuest({
           prismId: project.id,
           address: activeHolo.address,
@@ -246,7 +245,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     }
 
     return null;
-  }, [activeHolo, buildClient, compiled, declaration, isExternalHolo, project.id]);
+  }, [activeHolo, getBuildClient, compiled, declaration, isExternalHolo, project.id]);
 
   const handleDispatchOp = useCallback(
     async (op: StudioApiOp, opts?: { readonly pushRevision?: boolean }): Promise<boolean> => {
@@ -304,13 +303,51 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
 
     setPublishing(true);
     try {
+      // Automatic pre-publish visual / audio quality check
+      let qualityNote = '';
+      const organ = declaration.view?.proceduralOrgan;
+      if (organ?.mediaType === 'picture') {
+        const { renderPictureWithCoherenceCheck } = await import('../engine/proceduralPictureRenderer');
+        const check = await renderPictureWithCoherenceCheck(organ.weights as PictureWeights, {
+          maxPreviewDim: 384,
+        });
+        if (!check.coherence.coherent) {
+          qualityNote = ' — low visual contrast noted';
+        }
+      } else if (organ?.mediaType === 'audio') {
+        const {
+          analyzeAudioFidelity,
+          composeMultiTrackArrangement,
+          masterStereoPcm,
+          synthesizeCompositionStereoPcm,
+        } = await import('../engine/audioSynthesisEngine');
+        const aw = organ.weights as AudioWeights;
+        const comp = composeMultiTrackArrangement({
+          title: aw.title,
+          style: aw.style,
+          bpm: aw.bpm,
+          rootMidi: aw.rootMidi,
+          scale: aw.scale,
+          durationSec: Math.min(6, aw.durationSec),
+        });
+        const raw = synthesizeCompositionStereoPcm(comp, 22_050);
+        const mastered = masterStereoPcm(raw.left, raw.right, raw.sampleRate);
+        const fidelity = analyzeAudioFidelity(mastered.left, mastered.right);
+        if (fidelity.hasNaN || !fidelity.nonSilent || fidelity.clippedSamples > 0) {
+          qualityNote = ' — audio level adjusted';
+        }
+      }
+
       let sealed = project.sealedDraft ?? null;
       if (!sealed) {
-        const res = await buildClient.buildAndSeal({
-          prismId: project.id,
-          slug: declaration.metadata.slug,
-          appFiles: compiled.appFiles,
-        });
+        const buildClient = await getBuildClient();
+        const res = await workerClient.runWithDeterministicPrecision(() =>
+          buildClient.buildAndSeal({
+            prismId: project.id,
+            slug: declaration.metadata.slug,
+            appFiles: compiled.appFiles,
+          }),
+        );
         if (!res.ok || !res.holo) {
           setStatusBanner({ ok: false, text: res.message || 'Could not publish right now.' });
           return;
@@ -335,7 +372,12 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       }
       await store.publishSealedHolo(project.id, sealed);
       setJustPublished(true);
-      setStatusBanner({ ok: true, text: `"${project.draft.name}" is now published.` });
+      setStatusBanner({
+        ok: true,
+        text: qualityNote
+          ? `"${project.draft.name}" published${qualityNote}.`
+          : `"${project.draft.name}" verified and published.`,
+      });
       setTimeout(() => setJustPublished(false), 2000);
     } catch (error) {
       setStatusBanner({
@@ -345,7 +387,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     } finally {
       setPublishing(false);
     }
-  }, [bridgeRuntime, buildClient, compiled, declaration, isDeclarative, project.draft.name, project.id, project.sealedDraft, readiness, store]);
+  }, [bridgeRuntime, getBuildClient, compiled, declaration, isDeclarative, project.draft.name, project.id, project.sealedDraft, readiness, store, workerClient]);
 
   const handleExportCreation = () => {
     const slug = (declaration?.metadata.slug || project.draft.name)
@@ -383,6 +425,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
           return;
         }
         setPublishing(true);
+        const buildClient = await getBuildClient();
         const verified = await buildClient.verifyArchive({ prismId: project.id, holoBytes: buf });
         if (!verified.identitiesVerified) {
           setStatusBanner({ ok: false, text: `Could not verify ${file.name}.` });
@@ -399,7 +442,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
         setPublishing(false);
       }
     },
-    [buildClient, onSelectProject, project.id, store],
+    [getBuildClient, onSelectProject, project.id, store],
   );
 
   const handleImportFileChange = async (e: ChangeEvent<HTMLInputElement>) => {
@@ -421,46 +464,6 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
     engineState.modelStreamEnabled &&
     engineState.model !== null &&
     !isInternalBootstrapModel(engineState.model.id);
-
-  const handleSynthesizeIdeaWithLocalModel = useCallback(
-    async (sentence: string, fallback: ExtractedPrismIntent): Promise<ExtractedPrismIntent> => {
-      if (!hasLocalModelReady || !engineState.model) return fallback;
-      const ac = new AbortController();
-      const timeoutId = setTimeout(() => ac.abort(), 12000);
-      try {
-        const syntheticUser: ThreadMessage = {
-          id: `idea_${Date.now()}`,
-          role: 'user',
-          createdAt: new Date(),
-          content: [{ type: 'text', text: sentence }],
-          attachments: [],
-          metadata: { custom: {} },
-        } as ThreadMessage;
-        const prompt = formatMessagesForLlama(
-          [syntheticUser],
-          engineState.model,
-          engineState.promptMode,
-          buildLocalInterviewExtractionPrompt(sentence),
-          { thinkingMode: 'off' },
-        );
-        let raw = '';
-        for await (const ev of workerClient.streamGenerate(
-          prompt,
-          ac.signal,
-          { ...engineState.sampling, temperature: 0.15, maxTokens: 512 },
-          `studio-interview:${project.id}`,
-        )) {
-          raw = stripReasoningTags(ev.accumulatedText);
-        }
-        return mergeLocalModelExtraction(raw, fallback);
-      } catch {
-        return fallback;
-      } finally {
-        clearTimeout(timeoutId);
-      }
-    },
-    [engineState.model, engineState.promptMode, engineState.sampling, hasLocalModelReady, project.id, workerClient],
-  );
 
   useEffect(() => {
     return () => {
@@ -610,11 +613,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       }
 
       // Pin-preserving natural-language refinement for any existing procedural Prism via StudioChatBridge
-      if (
-        declaration?.view?.proceduralOrgan &&
-        declaration.view.proceduralOrgan.mediaType !== 'space' &&
-        getStudioChatBridge
-      ) {
+      if (declaration?.view?.proceduralOrgan && getStudioChatBridge) {
         setNlBusy(true);
         setNlBusyLabel(`Refining ${PRISM_MEDIA_CATALOG[declaration.view.proceduralOrgan.mediaType].label.toLowerCase()}…`);
         try {
@@ -625,9 +624,8 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
           });
           await store.appendMessage(project.id, {
             role: 'assistant',
-            content: `Updated "${refined.prismName}" while preserving your pinned parameters.`,
+            content: `Updated "${refined.prismName}" while preserving your pinned preferences.`,
           });
-          setGuidedStep('ready-to-seal');
           onChangeSurfaceMode('preview');
           return;
         } finally {
@@ -652,116 +650,80 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       ];
 
       const classified = classifyArtifactMediaType(message);
-      const isProceduralFlow =
-        Boolean(declaration.view?.proceduralOrgan) ||
-        Boolean(declaration.concept.mediaType) ||
-        classified.mode === 'procedural-organ';
+      const resolvedMediaType: PrismMediaType =
+        declaration.view?.proceduralOrgan?.mediaType ??
+        declaration.concept.mediaType ??
+        classified.mediaType;
 
-      if (isProceduralFlow) {
-        const resolvedMediaType: PrismMediaType =
-          declaration.view?.proceduralOrgan?.mediaType ??
-          declaration.concept.mediaType ??
-          classified.mediaType;
+      const runToken = ++runTokenRef.current;
+      const userTurns = nextHistory.filter((t) => t.role === 'user').length;
+      const isRefining = Boolean(declaration.view?.proceduralOrgan);
 
-        const runToken = ++runTokenRef.current;
-        const userTurns = nextHistory.filter((t) => t.role === 'user').length;
-        const isRefining = Boolean(declaration.view?.proceduralOrgan);
-
-        let rawModelJson = '';
-        if (hasLocalModelReady) {
-          setNlBusy(true);
-          setNlBusyLabel(
-            isRefining
-              ? `Updating ${PRISM_MEDIA_CATALOG[resolvedMediaType].label.toLowerCase()}…`
-              : `Creating ${PRISM_MEDIA_CATALOG[resolvedMediaType].label.toLowerCase()}…`,
-          );
-          try {
-            const prompt = isRefining
-              ? buildWeightRefinementPrompt(nextHistory, declaration, message)
-              : buildWeightRoutingDiscoveryPrompt(nextHistory, declaration, userTurns, resolvedMediaType);
-            rawModelJson = await handleRunStudioAgentPrompt(prompt, message, 768);
-          } catch (err) {
-            if (isAbortError(err) || runTokenRef.current !== runToken) {
-              setNlBusy(false);
-              await store.appendMessage(project.id, {
-                role: 'assistant',
-                content: 'Stopped. Send another prompt whenever you are ready.',
-              });
-              return;
-            }
-            rawModelJson = '';
-          } finally {
-            if (runTokenRef.current === runToken) setNlBusy(false);
-          }
-          if (runTokenRef.current !== runToken) return;
-        }
-
-        const { spec } = parseDiscoveryAgentResponse(
-          rawModelJson,
-          message,
-          declaration,
-          userTurns,
-          resolvedMediaType,
-        );
-
-        if (spec.readyToBuild || isRefining) {
-          const assembled = assembleProceduralPrismOps(declaration, spec, message);
-          if (assembled.ops.length > 0) {
-            await handleDispatchOp({ op: 'batch', ops: assembled.ops });
-          }
-          if (mode === 'app') onChangeMode('studio');
-          await store.appendMessage(project.id, {
-            role: 'assistant',
-            content: isRefining
-              ? `Updated "${spec.name}" and refreshed the preview.`
-              : `"${spec.name}" is ready in Preview.`,
-          });
-          setGuidedStep('ready-to-seal');
-          onChangeSurfaceMode('preview');
-        } else {
-          const coreOps = buildAgentCoreModelOps(declaration, spec, message);
-          if (coreOps.length > 0) {
-            let working = declaration;
-            for (const op of coreOps) {
-              const r = dispatchStudioOp(working, op);
-              if (r.ok) working = r.declaration;
-            }
-            await handleDispatchOp({ op: 'batch', ops: coreOps });
-          }
-          await store.appendMessage(project.id, {
-            role: 'assistant',
-            content: spec.reply,
-          });
-          setGuidedStep('confirm-context');
-        }
-        return;
-      }
-
-      let preParsedIntent: ExtractedPrismIntent | undefined;
-      if ((readiness.isUndefined || guidedStep === 'anchor-idea') && hasLocalModelReady) {
-        const runToken = ++runTokenRef.current;
+      let rawModelJson = '';
+      if (hasLocalModelReady) {
         setNlBusy(true);
-        setNlBusyLabel('Understanding your idea…');
+        setNlBusyLabel(
+          isRefining
+            ? `Updating ${PRISM_MEDIA_CATALOG[resolvedMediaType].label.toLowerCase()}…`
+            : `Creating ${PRISM_MEDIA_CATALOG[resolvedMediaType].label.toLowerCase()}…`,
+        );
         try {
-          const deterministic = parseIdeaSentence(message);
-          preParsedIntent = await handleSynthesizeIdeaWithLocalModel(message, deterministic);
-        } catch {
-          preParsedIntent = parseIdeaSentence(message);
+          const prompt = isRefining
+            ? buildWeightRefinementPrompt(nextHistory, declaration, message)
+            : buildWeightRoutingDiscoveryPrompt(nextHistory, declaration, userTurns, resolvedMediaType);
+          rawModelJson = await handleRunStudioAgentPrompt(prompt, message, 768);
+        } catch (err) {
+          if (isAbortError(err) || runTokenRef.current !== runToken) {
+            setNlBusy(false);
+            await store.appendMessage(project.id, {
+              role: 'assistant',
+              content: 'Stopped. Send another prompt whenever you are ready.',
+            });
+            return;
+          }
+          rawModelJson = '';
         } finally {
           if (runTokenRef.current === runToken) setNlBusy(false);
         }
+        if (runTokenRef.current !== runToken) return;
       }
 
-      const result = reconcileWizardTurn(declaration, guidedStep, message, preParsedIntent);
-      if (result.ops.length > 0) {
-        await handleDispatchOp({ op: 'batch', ops: result.ops });
+      const { spec } = parseDiscoveryAgentResponse(
+        rawModelJson,
+        message,
+        declaration,
+        userTurns,
+        resolvedMediaType,
+      );
+
+      if (spec.readyToBuild || isRefining) {
+        const assembled = assembleProceduralPrismOps(declaration, spec, message);
+        if (assembled.ops.length > 0) {
+          await handleDispatchOp({ op: 'batch', ops: assembled.ops });
+        }
+        if (mode === 'app') onChangeMode('studio');
+        await store.appendMessage(project.id, {
+          role: 'assistant',
+          content: isRefining
+            ? `Updated "${spec.name}" and refreshed the preview.`
+            : `"${spec.name}" is ready in Preview.`,
+        });
+        onChangeSurfaceMode('preview');
+      } else {
+        const coreOps = buildAgentCoreModelOps(declaration, spec, message);
+        if (coreOps.length > 0) {
+          let working = declaration;
+          for (const op of coreOps) {
+            const r = dispatchStudioOp(working, op);
+            if (r.ok) working = r.declaration;
+          }
+          await handleDispatchOp({ op: 'batch', ops: coreOps });
+        }
+        await store.appendMessage(project.id, {
+          role: 'assistant',
+          content: spec.reply,
+        });
       }
-      await store.appendMessage(project.id, {
-        role: 'assistant',
-        content: result.assistantReply,
-      });
-      setGuidedStep(result.nextStep);
-      if (result.openPreview) onChangeSurfaceMode('preview');
     },
     [
       activeSnapshot,
@@ -769,11 +731,9 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       checkReport,
       declaration,
       getStudioChatBridge,
-      guidedStep,
       handleDispatchOp,
       handlePublish,
       handleRunStudioAgentPrompt,
-      handleSynthesizeIdeaWithLocalModel,
       hasLocalModelReady,
       mode,
       nlBusy,
@@ -1017,8 +977,111 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
       </div>
     );
 
+  const seedText = declaration?.concept.seedText?.trim() || '';
+  const pinnedFields = declaration?.concept.pinnedFields ?? [];
+  const connectedPrisms = useMemo(() => {
+    const all = store.list();
+    const directIds = new Set(declaration?.concept.linkedPrismIds ?? []);
+    const connected: VerdantPrismProject[] = [];
+    const seen = new Set<string>([project.id]);
+    for (const p of all) {
+      if (seen.has(p.id)) continue;
+      const linksBack = p.declaration?.concept.linkedPrismIds?.includes(project.id) ?? false;
+      if (directIds.has(p.id) || linksBack) {
+        seen.add(p.id);
+        connected.push(p);
+      }
+    }
+    return connected;
+  }, [declaration?.concept.linkedPrismIds, project.id, store]);
+
+  const handleUnpinField = useCallback(
+    async (field: string) => {
+      const nextPins = pinnedFields.filter((f) => f !== field);
+      await handleDispatchOp({ op: 'set-concept-profile', pinnedFields: nextPins });
+      if (project.published) {
+        await store.publish(project.id);
+      }
+    },
+    [handleDispatchOp, pinnedFields, project.id, project.published, store],
+  );
+
   const detailsExtra = (
     <div className="space-y-4">
+      {seedText && (
+        <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-[#0F141C]">
+          <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+            Original Prompt
+          </div>
+          <p className="mt-1.5 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+            “{seedText}”
+          </p>
+        </div>
+      )}
+
+      {pinnedFields.length > 0 && (
+        <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-[#0F141C]">
+          <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+            Pinned Preferences
+          </div>
+          <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+            Kept steady when you refine in natural language. Click any item to unpin it.
+          </p>
+          <div className="mt-2.5 flex flex-wrap gap-1.5">
+            {pinnedFields.map((field) => (
+              <button
+                key={field}
+                type="button"
+                data-testid={`unpin-${field}`}
+                onClick={() => void handleUnpinField(field)}
+                className="inline-flex items-center gap-1 rounded-full border border-emerald-700/25 bg-emerald-50 px-2.5 py-1 text-[11px] font-medium text-emerald-900 hover:bg-emerald-100 dark:border-emerald-500/30 dark:bg-emerald-950/50 dark:text-emerald-200 dark:hover:bg-emerald-900/60"
+                title={`Unpin ${PIN_DISPLAY_LABELS[field] ?? field}`}
+              >
+                <span>{PIN_DISPLAY_LABELS[field] ?? field}</span>
+                <X className="h-3 w-3 opacity-70" />
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {connectedPrisms.length > 0 && (
+        <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-[#0F141C]">
+          <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+            Connected Creations
+          </div>
+          <div className="mt-2.5 grid grid-cols-1 gap-2 sm:grid-cols-2">
+            {connectedPrisms.map((linked) => {
+              const linkedType =
+                linked.declaration?.view?.proceduralOrgan?.mediaType ??
+                linked.declaration?.concept.mediaType;
+              const typeLabel = linkedType ? PRISM_MEDIA_CATALOG[linkedType].label : 'Creation';
+              return (
+                <button
+                  key={linked.id}
+                  type="button"
+                  data-testid={`connected-prism-${linked.id}`}
+                  onClick={() => onSelectProject(linked.id, 'app')}
+                  className="flex items-center justify-between gap-2 rounded-lg border border-slate-200 bg-slate-50/70 px-3 py-2 text-left transition-colors hover:border-emerald-600/40 hover:bg-emerald-50/50 dark:border-slate-800 dark:bg-[#141B26] dark:hover:border-emerald-500/40"
+                >
+                  <div className="min-w-0">
+                    <div className="truncate text-xs font-semibold text-slate-900 dark:text-slate-100">
+                      {linked.published?.name ?? linked.draft.name}
+                    </div>
+                    <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                      {typeLabel}
+                    </div>
+                  </div>
+                  <span className="shrink-0 text-[11px] font-medium text-emerald-700 dark:text-emerald-400">
+                    Open
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-[#0F141C]">
         <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
           Portability

@@ -118,6 +118,7 @@ export class PrismHostPool implements PrismBridgeRuntime {
   private evictTimer: ReturnType<typeof setInterval> | null = null;
   private callbacks: PrismHostCallbacks = {};
   private buildClient: PrismBuildWorkerClient | null = null;
+  private getBuildClientFn: (() => Promise<PrismBuildWorkerClient>) | null = null;
 
   constructor(
     private readonly bus: ObserverStreamBus,
@@ -125,13 +126,21 @@ export class PrismHostPool implements PrismBridgeRuntime {
     private readonly grantsMatrix: ContainerGrantMatrix,
     private readonly workerClient: LlamaVTensorWorkerClient | null,
     callbacks?: PrismHostCallbacks,
-    buildClient?: PrismBuildWorkerClient | null,
+    buildClient?: PrismBuildWorkerClient | (() => Promise<PrismBuildWorkerClient>) | null,
   ) {
     if (callbacks) this.callbacks = callbacks;
-    if (buildClient) this.buildClient = buildClient;
+    if (typeof buildClient === 'function') this.getBuildClientFn = buildClient;
+    else if (buildClient) this.buildClient = buildClient;
     if (typeof window !== 'undefined') {
       this.evictTimer = setInterval(() => this.evictIdle(), 15_000);
     }
+  }
+
+  private async resolveBuildClient(): Promise<PrismBuildWorkerClient | null> {
+    if (this.buildClient) return this.buildClient;
+    if (!this.getBuildClientFn) return null;
+    this.buildClient = await this.getBuildClientFn();
+    return this.buildClient;
   }
 
   setBuildClient(client: PrismBuildWorkerClient | null): void {
@@ -745,7 +754,7 @@ export class PrismHostPool implements PrismBridgeRuntime {
       return String(raw ?? '').trim();
     };
 
-    if (project.publishedHolo && this.buildClient) {
+    if (project.publishedHolo && (this.buildClient || this.getBuildClientFn)) {
       const holo = project.publishedHolo;
       const line = formatPayloadForModel(payload, project.declaration);
       const { result } = await this.bus.dispatchToEndpoint(prismId, payload, {
@@ -756,7 +765,9 @@ export class PrismHostPool implements PrismBridgeRuntime {
           endpointId: prismId,
           endpointKind: 'prism',
           dispatch: async (_input, traceContext) => {
-            const answer = await this.buildClient!.runHoloGuest({
+            const client = await this.resolveBuildClient();
+            if (!client) throw new Error('Build worker unavailable.');
+            const answer = await client.runHoloGuest({
               prismId,
               address: holo.address,
               holoBytes: holo.bytes,

@@ -50,7 +50,7 @@ import {
   VERDANT_SETTINGS_PRISM_ID,
   type PrismSurfaceMode,
 } from './engine/observerUiSynthesizer';
-import { PrismBuildWorkerClient } from './engine/prismBuildClient';
+import type { PrismBuildWorkerClient } from './engine/prismBuildClient';
 import { PrismHostPool } from './engine/prismHostPool';
 import {
   PrismStore,
@@ -168,7 +168,21 @@ type ActiveWorkspaceView =
 export default function App() {
   const workerClient = useMemo(() => new LlamaVTensorWorkerClient(), []);
   const observerBus = useMemo(() => new ObserverStreamBus(), []);
-  const prismBuildClient = useMemo(() => new PrismBuildWorkerClient(observerBus), [observerBus]);
+  const prismBuildClientRef = useMemo<{ instance: PrismBuildWorkerClient | null; promise: Promise<PrismBuildWorkerClient> | null }>(
+    () => ({ instance: null, promise: null }),
+    [],
+  );
+  const getPrismBuildClient = useCallback(async (): Promise<PrismBuildWorkerClient> => {
+    if (prismBuildClientRef.instance) return prismBuildClientRef.instance;
+    if (!prismBuildClientRef.promise) {
+      prismBuildClientRef.promise = import('./engine/prismBuildClient').then(({ PrismBuildWorkerClient }) => {
+        const inst = new PrismBuildWorkerClient(observerBus);
+        prismBuildClientRef.instance = inst;
+        return inst;
+      });
+    }
+    return prismBuildClientRef.promise;
+  }, [observerBus, prismBuildClientRef]);
   const prismStore = useMemo(() => new PrismStore(), []);
   const galleryStore = useMemo(() => new ContentGalleryStore(), []);
   const expertRegistry = useMemo(() => new UnifiedExpertRegistry(), []);
@@ -180,9 +194,9 @@ export default function App() {
         workerClient.cognitiveObserver.grants,
         workerClient,
         undefined,
-        prismBuildClient,
+        getPrismBuildClient,
       ),
-    [observerBus, prismStore, workerClient, prismBuildClient],
+    [observerBus, prismStore, workerClient, getPrismBuildClient],
   );
   const getStudioChatBridge = useMemo(() => {
     let cached: Promise<StudioChatBridge> | null = null;
@@ -478,9 +492,9 @@ export default function App() {
       unsubGallery();
       unsubBus();
       prismPool.dispose();
-      prismBuildClient.dispose();
+      prismBuildClientRef.instance?.dispose();
     };
-  }, [prismStore, galleryStore, expertRegistry, observerBus, workerClient, prismPool, prismBuildClient]);
+  }, [prismStore, galleryStore, expertRegistry, observerBus, workerClient, prismPool, prismBuildClientRef]);
 
   useEffect(() => {
     workerClient.cognitiveObserver.setModalityResidencyProvider(() => {
@@ -717,16 +731,17 @@ export default function App() {
           setActiveView({ kind: 'prism', prismId: imported.id, mode: 'studio' });
           return;
         }
-        const verified = await prismBuildClient.verifyArchive({ holoBytes: bytes });
+        const buildClient = await getPrismBuildClient();
+        const verified = await buildClient.verifyArchive({ holoBytes: bytes });
         if (!verified.identitiesVerified) {
-          setPrismToast({ title: 'Import refused', body: `${file.name} failed BLAKE3 integrity verification.` });
+          setPrismToast({ title: 'Import refused', body: `${file.name} failed integrity verification.` });
           return;
         }
         const imported = await prismStore.importBinaryHolo(bytes, verified, true);
         setActiveView({ kind: 'prism', prismId: imported.id, mode: 'app' });
         setPrismToast({
           title: `Verified ${verified.name}`,
-          body: `${verified.vectorsPassed}/${verified.vectorsTotal} acceptance vectors passed.`,
+          body: `${verified.vectorsPassed}/${verified.vectorsTotal} verification checks passed.`,
         });
       } catch (err) {
         setPrismToast({
@@ -735,7 +750,7 @@ export default function App() {
         });
       }
     },
-    [prismBuildClient, prismStore],
+    [getPrismBuildClient, prismStore],
   );
 
   const handleSelectPrism = useCallback((prismId: string, mode: 'studio' | 'app') => {
@@ -993,7 +1008,7 @@ export default function App() {
                   store={prismStore}
                   bus={observerBus}
                   bridgeRuntime={prismPool}
-                  buildClient={prismBuildClient}
+                  getBuildClient={getPrismBuildClient}
                   workerClient={workerClient}
                   engineState={engineState}
                   darkMode={darkMode}

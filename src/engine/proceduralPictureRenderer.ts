@@ -1179,6 +1179,58 @@ export function encodeRgbaToPngDataUrl(
 }
 
 /**
+ * Encodes a compact 256px thumbnail data URL (`image/jpeg` in browser, downsampled PNG in Node)
+ * for Gallery IndexedDB records and Space Prism item cards — 8–10× smaller than full 640px PNGs.
+ */
+export function encodeCompactThumbnailDataUrl(
+  rgba: Uint8ClampedArray,
+  width: number,
+  height: number,
+  maxDim = 256,
+): string {
+  const scale = Math.min(1, maxDim / Math.max(1, width, height));
+  const tw = Math.max(48, Math.round(width * scale));
+  const th = Math.max(48, Math.round(height * scale));
+  if (typeof document !== 'undefined') {
+    try {
+      const srcCanvas = document.createElement('canvas');
+      srcCanvas.width = width;
+      srcCanvas.height = height;
+      const sctx = srcCanvas.getContext('2d');
+      if (sctx) {
+        sctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), width, height), 0, 0);
+        const dstCanvas = document.createElement('canvas');
+        dstCanvas.width = tw;
+        dstCanvas.height = th;
+        const dctx = dstCanvas.getContext('2d');
+        if (dctx) {
+          dctx.drawImage(srcCanvas, 0, 0, tw, th);
+          const jpg = dstCanvas.toDataURL('image/jpeg', 0.78);
+          if (jpg.startsWith('data:image/jpeg;base64,')) return jpg;
+          return dstCanvas.toDataURL('image/png');
+        }
+      }
+    } catch {
+      // Fall back to pure JS downsampled PNG
+    }
+  }
+  const small = new Uint8ClampedArray(tw * th * 4);
+  for (let y = 0; y < th; y++) {
+    const sy = Math.min(height - 1, Math.floor((y / th) * height));
+    for (let x = 0; x < tw; x++) {
+      const sx = Math.min(width - 1, Math.floor((x / tw) * width));
+      const si = (sy * width + sx) * 4;
+      const di = (y * tw + x) * 4;
+      small[di] = rgba[si]!;
+      small[di + 1] = rgba[si + 1]!;
+      small[di + 2] = rgba[si + 2]!;
+      small[di + 3] = 255;
+    }
+  }
+  return encodeRgbaToPngDataUrl(small, tw, th);
+}
+
+/**
  * Renders a high-spec procedural picture and runs a closed-loop visual coherence check
  * (`evaluateRenderedFrameCoherence`), automatically retrying with a boosted-contrast seed
  * if the first render fails coherence.

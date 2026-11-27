@@ -8,10 +8,11 @@ import {
   synthesizeCompositionStereoPcm,
 } from './audioSynthesisEngine';
 import {
+  encodePromptToClipTokens,
+  loadImageWeightsFromBacking,
   synthesizeImageOneStep,
-  type ClipTextWeights,
-  type DistilledUnetWeights,
-  type TaesdDecoderWeights,
+  type ImageSynthesisScratch,
+  type LoadedNeuralImageWeights,
 } from './imageSynthesisEngine';
 import {
   LlamaVTensorRuntime,
@@ -165,6 +166,7 @@ export type WorkerRequest =
       seed: number;
       latentH?: number;
       latentW?: number;
+      allowAutoLoad?: boolean;
     }
   | {
       type: 'shutdown';
@@ -287,14 +289,49 @@ const runtime = new LlamaVTensorRuntime();
 const multimodalCoordinator = new MultimodalCoherenceCoordinator();
 let activeVisionEncoder: SiglipVisionEncoder | null = null;
 let activeWhisperEngine: WhisperAudioEngine | null = null;
-interface ResidentNeuralImageWeights {
-  readonly clip: ClipTextWeights;
-  readonly unet: DistilledUnetWeights;
-  readonly taesd: TaesdDecoderWeights;
-}
-let residentNeuralImageWeights: ResidentNeuralImageWeights | null = null;
-function getResidentNeuralImageWeights(): ResidentNeuralImageWeights | null {
+let residentNeuralImageWeights: LoadedNeuralImageWeights | null = null;
+let imageLoadPromise: Promise<LoadedNeuralImageWeights | null> | null = null;
+const imageSynthesisScratch: ImageSynthesisScratch = {};
+function getResidentNeuralImageWeights(): LoadedNeuralImageWeights | null {
   return residentNeuralImageWeights;
+}
+function disposeResidentNeuralImageWeights(): void {
+  if (residentNeuralImageWeights) {
+    residentNeuralImageWeights.dispose?.();
+    residentNeuralImageWeights = null;
+  }
+}
+async function ensureImageWeightsOnDemand(): Promise<LoadedNeuralImageWeights | null> {
+  if (residentNeuralImageWeights) return residentNeuralImageWeights;
+  if (imageLoadPromise) return imageLoadPromise;
+  const spec = MULTIMODAL_CORE_MODELS.find((m) => m.modality === 'image-synthesis');
+  if (!spec) return null;
+  imageLoadPromise = (async () => {
+    try {
+      const backing = await streamUrlToVramBacking(spec.id, spec.url, { skipOpfs: false });
+      try {
+        const loaded = loadImageWeightsFromBacking(backing);
+        residentNeuralImageWeights = loaded;
+        multimodalCoordinator.activateModality({
+          modality: 'image-synthesis',
+          modelId: spec.id,
+          residentBytes: loaded.residentBytes,
+          evict: () => {
+            disposeResidentNeuralImageWeights();
+          },
+        });
+        return loaded;
+      } catch (err) {
+        backing.close();
+        throw err;
+      }
+    } catch {
+      return null;
+    } finally {
+      imageLoadPromise = null;
+    }
+  })();
+  return imageLoadPromise;
 }
 let visionLoadPromise: Promise<SiglipVisionEncoder | null> | null = null;
 let whisperLoadPromise: Promise<WhisperAudioEngine | null> | null = null;
@@ -614,6 +651,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       for (const ctrl of activeControllers.values()) ctrl.abort();
       activeControllers.clear();
       await drainBackgroundOpfsPersist();
+      disposeResidentNeuralImageWeights();
       runtime.unload();
       runtime.disposeThreadPool();
       try {
@@ -1020,7 +1058,10 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     }
 
     if (req.type === 'synthesize_image') {
-      const neuralWeights = getResidentNeuralImageWeights();
+      const t0 = performance.now();
+      const neuralWeights =
+        getResidentNeuralImageWeights() ??
+        (req.allowAutoLoad ? await ensureImageWeightsOnDemand() : null);
       if (!neuralWeights) {
         post({
           type: 'image_synthesized',
@@ -1033,8 +1074,10 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         });
         return;
       }
-      const promptTokens = Array.from(new TextEncoder().encode(req.prompt.slice(0, 77))).map(
-        (b) => b % Math.max(1, neuralWeights.clip.vocabSize),
+      const promptTokens = encodePromptToClipTokens(
+        req.prompt,
+        neuralWeights.clip.vocabSize,
+        neuralWeights.clip.maxSeqLen,
       );
       const synth = synthesizeImageOneStep({
         promptTokens,
@@ -1044,7 +1087,9 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         clip: neuralWeights.clip,
         unet: neuralWeights.unet,
         taesd: neuralWeights.taesd,
+        scratch: imageSynthesisScratch,
       });
+      multimodalCoordinator.frameOracle.recordFrame((performance.now() - t0) * 1000);
       const copy = new Uint8Array(synth.rgba.byteLength);
       copy.set(synth.rgba);
       const transferBuf = copy.buffer;

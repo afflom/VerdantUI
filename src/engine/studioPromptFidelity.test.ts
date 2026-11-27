@@ -17,10 +17,17 @@ import { PrismHostPool } from './prismHostPool';
 import { PrismStore } from './prismStudio';
 import { classifyArtifactMediaType } from './prismStudioAgent';
 import {
+  encodeCompactThumbnailDataUrl,
   inferPictureWeightsFromPrompt,
   renderPictureWithCoherenceCheck,
   synthesizeLogoSvg,
 } from './proceduralPictureRenderer';
+import {
+  buildResearchProgramRuntimeJs,
+  buildSpaceRuntimeJs,
+  buildToolOrganRuntimeJs,
+  buildVideoRuntimeJs,
+} from './prismMediaRuntimes';
 import { StudioChatBridge, detectStudioChatIntent } from './studioChatBridge';
 import { UnifiedExpertRegistry } from './unifiedModelBasis';
 
@@ -192,4 +199,110 @@ test('1-word seeds, feature-derived companion generation, and pin-preserving tun
   assert.equal(residency.image, true);
   assert.equal(residency.audio, true);
   assert.equal(residency.basis, true);
+
+  // Unpinning bpm allows subsequent natural-language tuning to adjust tempo freely
+  await store.applyStudioOp(
+    track.prismId,
+    { op: 'set-concept-profile', pinnedFields: [] },
+    { pushRevision: false },
+  );
+  await bridge.refinePrismFromPrompt({
+    target: track.prismId,
+    instruction: 'Make it slower and calmer ambient',
+  });
+  const unpinnedAfter = store.get(track.prismId)!.declaration?.view?.proceduralOrgan?.weights as { bpm?: number };
+  assert.ok((unpinnedAfter.bpm ?? 118) < 118, `Expected unpinned BPM to slow down, got ${unpinnedAfter.bpm}`);
+
+  // Compact 256px thumbnail stays significantly smaller than full 640px PNG
+  const picWeights = inferPictureWeightsFromPrompt('Sunset mountain lake', 'Alpine Lake');
+  const fullPic = await renderPictureWithCoherenceCheck(picWeights, { maxPreviewDim: 640 });
+  const thumb = encodeCompactThumbnailDataUrl(fullPic.rgba, fullPic.width, fullPic.height, 256);
+  assert.ok(thumb.startsWith('data:image/'));
+  assert.ok(thumb.length < fullPic.pngDataUrl.length, 'Compact thumbnail must be smaller than full PNG');
+});
+
+test('Editorial Research, Utility, and Space organs persist durable NL mutations and expose clean zero-clutter runtimes', async () => {
+  const store = new PrismStore();
+  const bus = new ObserverStreamBus();
+  const observer = new VerdantCognitiveObserver();
+  const pool = new PrismHostPool(bus, store, observer.grants, null);
+  const galleries = new ContentGalleryStore();
+  const registry = new UnifiedExpertRegistry();
+  const bridge = new StudioChatBridge({ store, pool, observer, galleries, registry });
+
+  // 1. Research notebook durable edits
+  const research = await bridge.createArtifactFromPrompt({
+    prompt: 'Create a research program on browser WASM SIMD paging efficiency',
+    forcedMediaType: 'research-program',
+  });
+  await bridge.refinePrismFromPrompt({
+    target: research.prismId,
+    instruction: 'Add hypothesis that adaptive paging cuts p95 latency by 40%',
+  });
+  await bridge.refinePrismFromPrompt({
+    target: research.prismId,
+    instruction: 'Log evidence: benchmark confirmed 46% latency drop on H1',
+  });
+  await bridge.refinePrismFromPrompt({
+    target: research.prismId,
+    instruction: 'Mark H1 supported',
+  });
+  const resW = store.get(research.prismId)!.declaration!.view!.proceduralOrgan!.weights as unknown as {
+    hypotheses: Array<{ id: string; statement: string; status: string }>;
+    evidence?: Array<{ verdict: string; text: string }>;
+  };
+  assert.ok(resW.hypotheses.some((h) => /adaptive paging/i.test(h.statement)));
+  assert.equal(resW.hypotheses[0]?.status, 'supported');
+  assert.ok((resW.evidence?.length ?? 0) >= 1);
+  assert.equal(resW.evidence?.[0]?.verdict, 'supporting');
+
+  const resJs = buildResearchProgramRuntimeJs(
+    store.get(research.prismId)!.declaration!.view!.proceduralOrgan!.weights as never,
+  );
+  assert.ok(!resJs.includes("createElement('select')"), 'Editorial Research organ must have zero <select> clutter');
+  assert.ok(resJs.includes('window.verdant?.onInput'), 'Research organ must wire onInput');
+
+  // 2. Utility durable edits (protected schedule block + workflow step)
+  const util = await bridge.createArtifactFromPrompt({
+    prompt: 'Create a schedule guard utility to protect daily deep work',
+    forcedMediaType: 'tool-organ',
+  });
+  await bridge.refinePrismFromPrompt({
+    target: util.prismId,
+    instruction: 'Protect 9:00am to 11:00am for Deep Focus',
+  });
+  const utilW = store.get(util.prismId)!.declaration!.view!.proceduralOrgan!.weights as unknown as {
+    scheduleWindows: Array<{ label: string; startMinuteOfDay: number; endMinuteOfDay: number }>;
+  };
+  assert.ok(
+    utilW.scheduleWindows.some(
+      (w) => /Deep Focus/i.test(w.label) && w.startMinuteOfDay === 540 && w.endMinuteOfDay === 660,
+    ),
+  );
+  const utilJs = buildToolOrganRuntimeJs(
+    store.get(util.prismId)!.declaration!.view!.proceduralOrgan!.weights as never,
+  );
+  assert.ok(!utilJs.includes("type = 'time'"), 'Editorial Utility organ must have zero inline time-picker strips');
+  assert.ok(utilJs.includes('window.verdant?.onInput'), 'Utility organ must wire onInput');
+
+  // 3. Space durable layout change & visibility-aware Video RAF check
+  const space = await bridge.manageSpacesAndPrisms({ action: 'create', name: 'Studio Lab' });
+  await bridge.refinePrismFromPrompt({
+    target: space.prismId,
+    instruction: 'Switch layout to board',
+  });
+  const spaceW = store.get(space.prismId)!.declaration!.view!.proceduralOrgan!.weights as { layout: string };
+  assert.equal(spaceW.layout, 'board');
+  assert.ok(buildSpaceRuntimeJs(spaceW as never).includes('window.verdant?.onInput'));
+
+  const vidJs = buildVideoRuntimeJs({
+    mediaType: 'video',
+    aspectRatio: '16:9',
+    fps: 30,
+    style: 'storyboard-scenes',
+    palette: ['#020617', '#0f172a', '#34d399'],
+    scenes: [{ title: 'Intro', subtitle: 'Sub', durationSec: 4, motion: 'rise', accent: '#10b981' }],
+  });
+  assert.ok(vidJs.includes('visibilitychange'), 'Video runtime must pause RAF when tab is hidden');
+  assert.ok(vidJs.includes('stopLoop()'), 'Video runtime must cancel RAF when paused');
 });

@@ -1,9 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  encodePromptToClipTokens,
+  loadImageWeightsFromBacking,
+  loadImageWeightsFromGguf,
   synthesizeImageOneStep,
   type ClipTextWeights,
   type DistilledUnetWeights,
+  type ImageSynthesisScratch,
   type TaesdDecoderWeights,
 } from './imageSynthesisEngine';
 import {
@@ -219,4 +223,106 @@ test('Closed-loop Vision self-critique catches blank frames, approves coherent v
   assert.equal(pA.visionCacheHit, false);
   assert.equal(pB.visionCacheHit, true);
   assert.equal(freshCoord.getTelemetry().visualCacheHits, 1);
+});
+
+function buildSyntheticSdxsGguf(tensors: readonly { readonly name: string; readonly dims: readonly number[]; readonly data: Float32Array }[]): Uint8Array {
+  const enc = new TextEncoder();
+  const headerChunks: Uint8Array[] = [];
+  const pushU32 = (v: number) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, v, true); headerChunks.push(b); };
+  const pushU64 = (v: number) => { const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, BigInt(v), true); headerChunks.push(b); };
+  const pushStr = (s: string) => { const bytes = enc.encode(s); pushU64(bytes.length); headerChunks.push(bytes); };
+
+  headerChunks.push(enc.encode('GGUF'));
+  pushU32(3);
+  pushU64(tensors.length);
+  pushU64(0); // kvCount=0 matching real sdxs-512-tinySDdistilled_Q8_0.gguf
+
+  let dataOffsetRel = 0;
+  for (const t of tensors) {
+    pushStr(t.name);
+    pushU32(t.dims.length);
+    for (const d of t.dims) pushU64(d);
+    pushU32(GgmlType.F32);
+    pushU64(dataOffsetRel);
+    const bytes = t.data.byteLength;
+    dataOffsetRel += Math.ceil(bytes / 32) * 32;
+  }
+
+  const rawHeaderLen = headerChunks.reduce((a, c) => a + c.byteLength, 0);
+  const alignedDataOffset = Math.ceil(rawHeaderLen / 32) * 32;
+  const full = new Uint8Array(alignedDataOffset + dataOffsetRel);
+  let pos = 0;
+  for (const c of headerChunks) { full.set(c, pos); pos += c.byteLength; }
+
+  let rel = 0;
+  for (const t of tensors) {
+    full.set(new Uint8Array(t.data.buffer, t.data.byteOffset, t.data.byteLength), alignedDataOffset + rel);
+    rel += Math.ceil(t.data.byteLength / 32) * 32;
+  }
+  return full;
+}
+
+test('loadImageWeightsFromBacking selectively range-reads SDXS+TAESD GGUF with lazy CLIP rows and reusable scratch parity', () => {
+  const D = 8, V = 64, S = 16, C = 8, TC = 8;
+  const fill = (n: number, k: number) => new Float32Array(n).map((_, i) => Math.sin((i + 1) * k) * 0.05);
+  const gguf = buildSyntheticSdxsGguf([
+    { name: 'cond_stage_model.transformer.text_model.embeddings.token_embedding.weight', dims: [D, V], data: fill(D * V, 0.13) },
+    { name: 'cond_stage_model.transformer.text_model.embeddings.position_embedding.weight', dims: [D, S], data: fill(D * S, 0.17) },
+    { name: 'cond_stage_model.transformer.text_model.final_layer_norm.weight', dims: [D], data: new Float32Array(D).fill(1) },
+    { name: 'cond_stage_model.transformer.text_model.final_layer_norm.bias', dims: [D], data: new Float32Array(D) },
+    { name: 'cond_stage_model.transformer.text_model.encoder.layers.0.self_attn.out_proj.weight', dims: [D, D], data: fill(D * D, 0.11) },
+    { name: 'cond_stage_model.transformer.text_model.encoder.layers.0.self_attn.out_proj.bias', dims: [D], data: new Float32Array(D) },
+    { name: 'model.diffusion_model.input_blocks.0.0.weight', dims: [3, 3, 4, C], data: fill(3 * 3 * 4 * C, 0.07) },
+    { name: 'model.diffusion_model.input_blocks.0.0.bias', dims: [C], data: new Float32Array(C) },
+    { name: 'model.diffusion_model.input_blocks.1.0.in_layers.0.weight', dims: [C], data: new Float32Array(C).fill(1) },
+    { name: 'model.diffusion_model.input_blocks.1.0.in_layers.0.bias', dims: [C], data: new Float32Array(C) },
+    { name: 'model.diffusion_model.input_blocks.1.0.in_layers.2.weight', dims: [3, 3, C, C], data: fill(3 * 3 * C * C, 0.09) },
+    { name: 'model.diffusion_model.input_blocks.1.0.in_layers.2.bias', dims: [C], data: new Float32Array(C) },
+    { name: 'model.diffusion_model.input_blocks.1.0.emb_layers.1.weight', dims: [D, C], data: fill(D * C, 0.12) },
+    { name: 'model.diffusion_model.input_blocks.1.0.emb_layers.1.bias', dims: [C], data: new Float32Array(C) },
+    { name: 'model.diffusion_model.input_blocks.1.0.out_layers.0.weight', dims: [C], data: new Float32Array(C).fill(1) },
+    { name: 'model.diffusion_model.input_blocks.1.0.out_layers.0.bias', dims: [C], data: new Float32Array(C) },
+    { name: 'model.diffusion_model.input_blocks.1.0.out_layers.3.weight', dims: [3, 3, C, C], data: fill(3 * 3 * C * C, 0.14) },
+    { name: 'model.diffusion_model.input_blocks.1.0.out_layers.3.bias', dims: [C], data: new Float32Array(C) },
+    { name: 'model.diffusion_model.out.2.weight', dims: [3, 3, C, 4], data: fill(3 * 3 * C * 4, 0.06) },
+    { name: 'model.diffusion_model.out.2.bias', dims: [4], data: new Float32Array(4) },
+    { name: 'first_stage_model.decoder.layers.0.weight', dims: [3, 3, 4, TC], data: fill(3 * 3 * 4 * TC, 0.08) },
+    { name: 'first_stage_model.decoder.layers.0.bias', dims: [TC], data: new Float32Array(TC) },
+    { name: 'first_stage_model.decoder.layers.6.weight', dims: [3, 3, TC, TC], data: fill(3 * 3 * TC * TC, 0.05) },
+    { name: 'first_stage_model.decoder.layers.18.weight', dims: [3, 3, TC, 3], data: fill(3 * 3 * TC * 3, 0.09) },
+    { name: 'first_stage_model.decoder.layers.18.bias', dims: [3], data: new Float32Array(3) },
+  ]);
+
+  let closed = false;
+  let rangeReads = 0;
+  const loaded = loadImageWeightsFromBacking({
+    byteLength: gguf.byteLength,
+    readRange(fileOffset, dst, dstOffset = 0, length = dst.byteLength - dstOffset) {
+      rangeReads += 1;
+      const avail = Math.max(0, Math.min(length, gguf.byteLength - fileOffset));
+      if (avail > 0) dst.set(gguf.subarray(fileOffset, fileOffset + avail), dstOffset);
+      return avail;
+    },
+    close() { closed = true; },
+  });
+
+  assert.equal(loaded.tensorCount, 25);
+  assert.equal(loaded.clip.tokenEmbd, undefined, 'CLIP vocab must stay demand-paged via readTokenEmbeddingRow');
+  assert.equal(typeof loaded.clip.readTokenEmbeddingRow, 'function');
+
+  const tokens = encodePromptToClipTokens('emerald alpine sunrise', loaded.clip.vocabSize, loaded.clip.maxSeqLen);
+  const scratch: ImageSynthesisScratch = {};
+  const readsBefore = rangeReads;
+  const img1 = synthesizeImageOneStep({ promptTokens: tokens, latentH: 4, latentW: 4, seed: 42, ...loaded, scratch });
+  const img2 = synthesizeImageOneStep({ promptTokens: tokens, latentH: 4, latentW: 4, seed: 42, ...loaded, scratch });
+  assert.ok(rangeReads > readsBefore, 'Expected lazy CLIP row reads during prompt encoding');
+  assert.equal(img1.width, 8);
+  assert.equal(img1.height, 8);
+  assert.deepEqual(Array.from(img1.rgba), Array.from(img2.rgba), 'Reusable scratch must stay bit-exact deterministic');
+  loaded.dispose?.();
+  assert.equal(closed, true);
+
+  // Negative checks: corrupted header and incomplete GGUF throw explicitly
+  assert.throws(() => loadImageWeightsFromGguf(new Uint8Array([1, 2, 3, 4])));
+  assert.throws(() => loadImageWeightsFromGguf(buildSyntheticSdxsGguf([])));
 });

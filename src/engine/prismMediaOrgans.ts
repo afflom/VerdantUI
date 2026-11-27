@@ -325,6 +325,13 @@ export interface ResearchMilestoneWeight {
   readonly dueLabel: string;
 }
 
+export interface ResearchEvidenceWeight {
+  readonly hypothesisId: string;
+  readonly verdict: 'supporting' | 'refuting' | 'observation';
+  readonly text: string;
+  readonly date?: string;
+}
+
 export interface ResearchProgramWeights {
   readonly mediaType: 'research-program';
   readonly topic: string;
@@ -333,6 +340,7 @@ export interface ResearchProgramWeights {
   readonly tracks: readonly string[];
   readonly hypotheses: readonly ResearchHypothesisWeight[];
   readonly milestones: readonly ResearchMilestoneWeight[];
+  readonly evidence?: readonly ResearchEvidenceWeight[];
 }
 
 export interface ScheduleWindowWeight {
@@ -349,6 +357,12 @@ export interface ToolOrganMetricWeight {
   readonly unit: string;
 }
 
+export interface ToolWorkflowStepWeight {
+  readonly id: string;
+  readonly text: string;
+  readonly done: boolean;
+}
+
 export interface ToolOrganWeights {
   readonly mediaType: 'tool-organ';
   readonly role: 'habit-guardian' | 'schedule-guard' | 'calculator' | 'workflow-helper';
@@ -357,6 +371,7 @@ export interface ToolOrganWeights {
   readonly rulesSummary: string;
   readonly scheduleWindows: readonly ScheduleWindowWeight[];
   readonly metrics: readonly ToolOrganMetricWeight[];
+  readonly steps?: readonly ToolWorkflowStepWeight[];
 }
 
 export interface SpaceArtifactEntry {
@@ -850,6 +865,18 @@ export function normalizeOrganWeights(
     const tracks = Array.isArray(p.tracks)
       ? p.tracks.map((t) => safeStr(t, '', 48)).filter(Boolean).slice(0, 8)
       : ['Core Theory', 'Experiments', 'Synthesis'];
+    const rawEvidence = Array.isArray(p.evidence) ? p.evidence : [];
+    const evidence: ResearchEvidenceWeight[] = rawEvidence.slice(0, 24).map((e) => {
+      const obj = (e ?? {}) as Record<string, unknown>;
+      const v: ResearchEvidenceWeight['verdict'] =
+        obj.verdict === 'supporting' || obj.verdict === 'refuting' ? obj.verdict : 'observation';
+      return {
+        hypothesisId: safeStr(obj.hypothesisId, hypotheses[0]?.id ?? 'General', 24),
+        verdict: v,
+        text: safeStr(obj.text, '', 360),
+        ...(typeof obj.date === 'string' && obj.date.trim() ? { date: obj.date.trim().slice(0, 32) } : {}),
+      };
+    }).filter((e) => e.text.length > 0);
     return {
       mediaType: 'research-program',
       topic: safeStr(p.topic, titleHint, 120),
@@ -858,6 +885,7 @@ export function normalizeOrganWeights(
       tracks,
       hypotheses,
       milestones,
+      ...(evidence.length > 0 ? { evidence } : {}),
     };
   }
 
@@ -941,6 +969,19 @@ export function normalizeOrganWeights(
         })
       : [{ label: isHabit ? 'Daily streak' : 'Completed items', target: 1, unit: 'today' }];
 
+  const rawSteps = Array.isArray(p.steps) ? p.steps : [];
+  const steps: ToolWorkflowStepWeight[] = rawSteps
+    .slice(0, 24)
+    .map((s, i) => {
+      const obj = (s ?? {}) as Record<string, unknown>;
+      return {
+        id: safeStr(obj.id, `s${i + 1}`, 24),
+        text: safeStr(obj.text, '', 180),
+        done: Boolean(obj.done),
+      };
+    })
+    .filter((s) => s.text.length > 0);
+
   return {
     mediaType: 'tool-organ',
     role,
@@ -953,6 +994,7 @@ export function normalizeOrganWeights(
     ),
     scheduleWindows,
     metrics,
+    ...(steps.length > 0 ? { steps } : {}),
   };
 }
 
