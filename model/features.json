@@ -187,6 +187,28 @@
       "invariantId": "VUI-SIMD-01",
       "citation": { "kind": "req", "decisionId": "DEC-019" },
       "publicBenefitImpact": "Eliminates root App 120ms decode re-renders and redundant Tropical layout solves, adds 64-token KV page-boundary checkpoint/auto-resume and MessageChannel yields, promotes SDXS-512 images to 100% primary display with lean IndexedDB revisions and live VLM Vision QA, and executes the exact 610-tensor SDXS-512 UNet and 19-layer residual TAESD on native F16/Q8_0 WASM SIMD with zero-bloat OPFS/GGUF CLIP BPE."
+    },
+    {
+      "id": "VUI-FEAT-018",
+      "title": "Regimented 3-Tier Content-Addressed OPFS Slab CAS & Demand-First Sparse Expert Streaming",
+      "stage": "active",
+      "introducedIn": "0.13.0",
+      "ownerFile": "src/engine/vramCasStore.ts",
+      "testFile": "src/engine/vramCasStore.test.ts",
+      "invariantId": "VUI-DEDUP-01",
+      "citation": { "kind": "req", "decisionId": "DEC-020" },
+      "publicBenefitImpact": "Eliminates arbitrary upfront multi-GB downloads and redundant storage by deduplicating weight slabs, boot headers, and tokenizers across models by content hash with utility-per-byte eviction and demand-first Sparse MoE expert streaming."
+    },
+    {
+      "id": "VUI-FEAT-019",
+      "title": "Hidden Unmanaged System Stream, Continuous Observer Quality Sensing, Opt-In Content Stream Catalogs & Zero-Cutoff Prism Ingestion",
+      "stage": "active",
+      "introducedIn": "0.13.0",
+      "ownerFile": "src/engine/contentStreamCatalog.ts",
+      "testFile": "src/engine/realtimeWeightStreamer.test.ts",
+      "invariantId": "VUI-OBSERVER-01",
+      "citation": { "kind": "req", "decisionId": "DEC-020" },
+      "publicBenefitImpact": "Replaces contrived thresholds and Local AI buttons with plain-language browser-streaming consent, continuous Observer intent/quality sensing across immediate and global user context, uncluttered opt-in Content Stream catalogs with custom streams and Offline-Only Mode, and two-stage deduplicated realtime ingestion into VerdantUI Prisms with no training cutoff."
     }
   ]
 }

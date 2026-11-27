@@ -32,8 +32,10 @@ import {
   UNIFIED_VERDANT_SYSTEM_PROMPT,
   type VerdantThinkingPolicy,
 } from './cognitiveObserver';
+import type { ContentStreamCatalogStore } from './contentStreamCatalog';
 import type { ObserverStreamBus } from './observerStreamBus';
 import type { PublishedPrismSummary } from './prismStudio';
+import type { UnifiedExpertRegistry } from './unifiedModelBasis';
 import type { LlamaVTensorWorkerClient, PromptFormatMode } from './workerClient';
 
 export type DetectedChatTemplate =
@@ -952,6 +954,8 @@ function hasPendingToolResults(msg: ThreadMessage | null | undefined): boolean {
 
 export interface StudioAdapterBridge {
   readonly bus: ObserverStreamBus;
+  readonly contentStreams?: ContentStreamCatalogStore;
+  readonly expertRegistry?: UnifiedExpertRegistry;
   getPublishedPrisms(): readonly PublishedPrismSummary[];
   onOpenPrism?: (prismId: string) => void;
   /**
@@ -1019,6 +1023,7 @@ export function createLlamaVTensorAdapter(
       client.cognitiveContext.ingestMessages(threadId, messages);
       const ledgerStats = client.cognitiveContext.getThreadLedgerStats(threadId);
       const publishedPrisms = studioBridge?.getPublishedPrisms() ?? [];
+      const hasEnabledContentStreams = Boolean(studioBridge?.contentStreams?.hasEnabledStreams());
       const { certificate, snapshot } = client.cognitiveObserver.selectRoute({
         threadId,
         messages,
@@ -1030,6 +1035,7 @@ export function createLlamaVTensorAdapter(
         hasImportedHarness: initialState.importedHarness !== null,
         publishedPrisms,
         hasConsolidatedHistory: ledgerStats.consolidatedTurns > 0,
+        hasEnabledContentStreams,
       });
       client.recordCognitiveObservation(certificate, snapshot);
       turnSpan?.setAttributes({
@@ -1118,22 +1124,26 @@ export function createLlamaVTensorAdapter(
       }
 
       // ---------------------------------------------------------------------
-      // Path B: Neural Stream Gate (`FK-07` ContainerGrantMatrix + persistent Model Stream toggle)
-      // NEVER start a surprise network download when submitting a prompt while Model Stream is Off!
+      // Path B: Hidden Unmanaged System Stream Gate (`FK-07` ContainerGrantMatrix + streaming consent)
+      // NEVER start a network download while streaming consent is pending or Offline-Only Mode is active.
       // ---------------------------------------------------------------------
       if (certificate.kind === 'neural-on-demand' && certificate.modelId) {
         const isAlreadyCachedLocally = initialState.cachedModelIds.includes(certificate.modelId);
         const streamAllowed =
-          initialState.modelStreamEnabled &&
+          initialState.streamingConsent === 'accepted' &&
           client.cognitiveObserver.grants.isAllowed('network-weights');
 
         if (!isAlreadyCachedLocally && !streamAllowed) {
           turnSpan?.end('ok');
+          const offlineMessage =
+            initialState.streamingConsent === 'pending'
+              ? 'Confirm browser streaming in the banner above to stream capabilities directly to your browser.\n\n*(Quick actions, creations, and your saved apps addressed with `@AppName` work immediately even offline.)*'
+              : '**Offline-only mode** is active. Turn off Offline-Only Mode in **Settings → Content Streams** to resume browser streaming.\n\n*(Quick actions, creations, and your saved apps addressed with `@AppName` continue working offline.)*';
           yield {
             content: [
               {
                 type: 'text' as const,
-                text: 'Local AI is currently **Off**. Turn **Local AI** on in the top bar to enable private on-device responses.\n\n*(Quick actions, Studio creations, and your saved apps addressed with `@AppName` work immediately even while Local AI is off.)*',
+                text: offlineMessage,
               },
             ],
             status: { type: 'complete', reason: 'stop' },
@@ -1147,7 +1157,7 @@ export function createLlamaVTensorAdapter(
             content: [
               {
                 type: 'text' as const,
-                text: `Local AI is still getting ready (${initialState.progressPercent}% · ${initialState.statusDetail}). Wait a moment and send again.`,
+                text: `Streaming capabilities to your browser (${initialState.progressPercent}% · ${initialState.statusDetail}). Wait a moment and send again.`,
               },
             ],
             status: { type: 'complete', reason: 'stop' },
@@ -1163,11 +1173,15 @@ export function createLlamaVTensorAdapter(
 
       const state = client.getState();
       if (!state.model || state.model.id === 'stories260k-f32') {
+        const unavailableText =
+          state.streamingConsent === 'pending'
+            ? 'Confirm browser streaming in the banner above to stream capabilities to your browser.'
+            : '**Offline-only mode** is active. Turn off Offline-Only Mode in **Settings → Content Streams** to resume browser streaming.';
         yield {
           content: [
             {
               type: 'text' as const,
-              text: 'Local AI is currently **Off**. Turn **Local AI** on in the top bar to start private on-device AI.',
+              text: unavailableText,
             },
           ],
           status: { type: 'complete', reason: 'stop' },
@@ -1219,8 +1233,40 @@ export function createLlamaVTensorAdapter(
         systemTokensEstimate: estimateTextTokens(systemMessage) + (activeTools ? 380 : 0),
       });
 
+      // Zero-cutoff realtime Content Stream ingestion (opt-in user streams only; tail-injected -> 0 KV prefix wipe!)
+      let liveStreamContextBlock: string | null = null;
+      if (
+        !isToolContinuationStep &&
+        state.streamingConsent === 'accepted' &&
+        client.cognitiveObserver.grants.isAllowed('network-weights') &&
+        certificate.qualityBudget.shouldConsultContentStreams &&
+        studioBridge?.contentStreams?.hasEnabledStreams() &&
+        studioBridge?.expertRegistry &&
+        !abortSignal.aborted
+      ) {
+        try {
+          const { streamRealtimeWeightsToPrism } = await import('./realtimeWeightStreamer');
+          const streamed = await streamRealtimeWeightsToPrism({
+            query: latestUserText,
+            catalogStore: studioBridge.contentStreams,
+            registry: studioBridge.expertRegistry,
+            maxStreams: certificate.qualityBudget.featureRichness === 'full' ? 3 : 2,
+            signal: abortSignal,
+          });
+          if (streamed.promptContextBlock && streamed.promptContextBlock.trim().length > 0) {
+            liveStreamContextBlock = streamed.promptContextBlock;
+          }
+        } catch {
+          // Live stream failure never interrupts local generation
+        }
+      }
+
       const sensory = client.consumePendingSensory();
-      const combinedTailRecall = [projected.foveatedRecallBlock, sensory.textBlock]
+      const combinedTailRecall = [
+        projected.foveatedRecallBlock,
+        liveStreamContextBlock,
+        sensory.textBlock,
+      ]
         .filter((s): s is string => Boolean(s && s.trim()))
         .join('\n\n') || null;
 

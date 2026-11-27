@@ -107,12 +107,20 @@ export interface UnifiedExpertDescriptor {
 export interface BasisKnowledgeEntry {
   readonly kappa: string;
   readonly expertId: string;
-  readonly kind: 'artifact' | 'space' | 'skill';
+  readonly kind: 'artifact' | 'space' | 'skill' | 'streamed-knowledge';
   readonly title: string;
   readonly mediaType: PrismMediaType;
   readonly summary: string;
   readonly categories: readonly string[];
   readonly updatedAt: number;
+  readonly streamId?: string;
+  readonly catalogId?: string;
+  readonly provider?: string;
+  readonly sourceUrl?: string;
+  readonly conceptId?: string;
+  readonly fetchedAt?: number;
+  readonly ttlMs?: number;
+  readonly salienceQ10?: number;
 }
 
 export interface UserStyleAffinities {
@@ -162,7 +170,7 @@ export interface UnifiedModelTelemetrySnapshot {
 const BASIS_IDB_NAME = 'verdant-ui-basis-v1';
 const BASIS_IDB_STORE = 'basis';
 const BASIS_RECORD_KEY = 'living-basis:owner';
-const MAX_KNOWLEDGE_ENTRIES = 256;
+const MAX_KNOWLEDGE_ENTRIES = 1024;
 
 function clampQ10(v: number): number {
   const n = Math.round(v);
@@ -356,8 +364,10 @@ export class LivingTrainingBasis {
     });
 
     if (this.knowledgeByKappa.size > MAX_KNOWLEDGE_ENTRIES) {
-      const oldest = [...this.knowledgeByKappa.values()].sort((a, b) => a.updatedAt - b.updatedAt)[0];
-      if (oldest) this.knowledgeByKappa.delete(oldest.kappa);
+      const victim = [...this.knowledgeByKappa.values()].sort(
+        (a, b) => (a.salienceQ10 ?? 512) - (b.salienceQ10 ?? 512) || a.updatedAt - b.updatedAt,
+      )[0];
+      if (victim) this.knowledgeByKappa.delete(victim.kappa);
     }
 
     this.adaptationSteps += 1;
@@ -365,6 +375,108 @@ export class LivingTrainingBasis {
     this.emit();
     void this.persist();
     return this.snapshot();
+  }
+
+  hasKnowledgeKappa(kappa: string): boolean {
+    return this.knowledgeByKappa.has(kappa);
+  }
+
+  refreshKnowledgeTimestamp(kappa: string, nowMs = Date.now()): void {
+    const prev = this.knowledgeByKappa.get(kappa);
+    if (!prev) return;
+    this.knowledgeByKappa.set(kappa, {
+      ...prev,
+      fetchedAt: nowMs,
+      updatedAt: nowMs,
+    });
+  }
+
+  /**
+   * Folds a deduplicated realtime Content Stream chunk into the Living Training Basis
+   * (`kind: 'streamed-knowledge'`) with provenance, TTL, and salience-protected retention.
+   */
+  recordStreamedKnowledge(entry: {
+    readonly kappa: string;
+    readonly streamId: string;
+    readonly catalogId: string;
+    readonly provider: string;
+    readonly conceptId?: string;
+    readonly title: string;
+    readonly sourceUrl: string;
+    readonly summary: string;
+    readonly categories: readonly string[];
+    readonly fetchedAt: number;
+    readonly ttlMs: number;
+  }): boolean {
+    if (this.knowledgeByKappa.has(entry.kappa)) {
+      this.refreshKnowledgeTimestamp(entry.kappa, entry.fetchedAt);
+      return false;
+    }
+    this.knowledgeByKappa.set(entry.kappa, {
+      kappa: entry.kappa,
+      expertId: `stream:${entry.streamId}`,
+      kind: 'streamed-knowledge',
+      title: entry.title.slice(0, 96),
+      mediaType: 'research-program',
+      summary: entry.summary.slice(0, 480),
+      categories: entry.categories.slice(0, 8),
+      updatedAt: entry.fetchedAt,
+      streamId: entry.streamId,
+      catalogId: entry.catalogId,
+      provider: entry.provider,
+      sourceUrl: entry.sourceUrl,
+      conceptId: entry.conceptId,
+      fetchedAt: entry.fetchedAt,
+      ttlMs: entry.ttlMs,
+      salienceQ10: 448,
+    });
+    if (this.knowledgeByKappa.size > MAX_KNOWLEDGE_ENTRIES) {
+      const victim = [...this.knowledgeByKappa.values()].sort(
+        (a, b) => (a.salienceQ10 ?? 512) - (b.salienceQ10 ?? 512) || a.updatedAt - b.updatedAt,
+      )[0];
+      if (victim) this.knowledgeByKappa.delete(victim.kappa);
+    }
+    this.adaptationSteps += 1;
+    this.updatedAt = entry.fetchedAt;
+    this.emit();
+    void this.persist();
+    return true;
+  }
+
+  /**
+   * Pre-fetch freshness TTL lookup for streamed knowledge (`0` network calls when a fresh
+   * deduplicated chunk from an enabled stream already answers the topic).
+   */
+  findFreshStreamedKnowledge(
+    queryText: string,
+    enabledStreamIds: ReadonlySet<string>,
+    nowMs = Date.now(),
+    limit = 3,
+  ): readonly BasisKnowledgeEntry[] {
+    const tokens = queryText
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]+/g, ' ')
+      .split(/\s+/)
+      .filter((t) => t.length >= 3);
+    if (tokens.length === 0) return [];
+    const scored: Array<{ entry: BasisKnowledgeEntry; score: number }> = [];
+    for (const entry of this.knowledgeByKappa.values()) {
+      if (entry.kind !== 'streamed-knowledge') continue;
+      if (entry.streamId && !enabledStreamIds.has(entry.streamId)) continue;
+      const fetchedAt = entry.fetchedAt ?? entry.updatedAt;
+      const ttl = entry.ttlMs ?? 6 * 3600 * 1000;
+      if (nowMs - fetchedAt > ttl) continue;
+      const hay = `${entry.title} ${entry.summary} ${entry.conceptId ?? ''}`.toLowerCase();
+      let hits = 0;
+      for (const tok of tokens) {
+        if (hay.includes(tok)) hits += 1;
+      }
+      if (hits >= Math.min(2, tokens.length)) {
+        scored.push({ entry, score: hits });
+      }
+    }
+    scored.sort((a, b) => b.score - a.score || (b.entry.fetchedAt ?? 0) - (a.entry.fetchedAt ?? 0));
+    return scored.slice(0, limit).map((x) => x.entry);
   }
 
   /**

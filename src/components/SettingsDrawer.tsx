@@ -7,14 +7,20 @@
  * - Natural Language Interface bar ("Switch to dark mode", "Clear cached data")
  */
 
-import { useState, type FC } from 'react';
+import { Suspense, lazy, useState, type FC } from 'react';
 import { Moon, Sun, Trash2 } from 'lucide-react';
+import type { ContentStreamCatalogStore, StreamCatalogId } from '../engine/contentStreamCatalog';
 import { formatBytes } from '../engine/modelCatalog';
 import type {
   PrismSurfaceMode,
   SynthesizedPrismFrame,
 } from '../engine/observerUiSynthesizer';
+import type { StreamingConsentState } from '../engine/workerClient';
 import { PrismSurfaceShell, type PrismSurfaceMessage } from './PrismSurfaceShell';
+
+const ContentStreamsSection = lazy(() =>
+  import('./ContentStreamsSection').then((m) => ({ default: m.ContentStreamsSection })),
+);
 
 interface SettingsDrawerProps {
   frame: SynthesizedPrismFrame;
@@ -25,6 +31,9 @@ interface SettingsDrawerProps {
   darkMode: boolean;
   onToggleDarkMode: () => void;
   onSetDarkMode?: (dark: boolean) => void;
+  contentStreams?: ContentStreamCatalogStore;
+  streamingConsent?: StreamingConsentState;
+  onSetStreamingConsent?: (next: 'accepted' | 'paused') => void;
   cachedBytes: number;
   onClearCache?: () => Promise<void>;
   debugMode?: boolean;
@@ -40,6 +49,9 @@ export const SettingsDrawer: FC<SettingsDrawerProps> = ({
   darkMode,
   onToggleDarkMode,
   onSetDarkMode,
+  contentStreams,
+  streamingConsent = 'pending',
+  onSetStreamingConsent,
   cachedBytes,
   onClearCache,
   debugMode = false,
@@ -91,6 +103,79 @@ export const SettingsDrawer: FC<SettingsDrawerProps> = ({
       ]);
       return;
     }
+    if (/\b(turn\s+on|enable|use)\s+offline\b|\bpause\s+streaming\b/.test(lower)) {
+      if (onSetStreamingConsent) {
+        onSetStreamingConsent('paused');
+        setMessages((prev) => [...prev, { id: `a_${Date.now()}`, role: 'assistant', content: 'Switched to Offline-Only Mode.' }]);
+        return;
+      }
+    }
+    if (/\b(turn\s+off|disable)\s+offline\b|\b(resume|enable|start)\s+(?:browser\s+)?streaming\b|\bgo\s+online\b/.test(lower)) {
+      if (onSetStreamingConsent) {
+        onSetStreamingConsent('accepted');
+        setMessages((prev) => [...prev, { id: `a_${Date.now()}`, role: 'assistant', content: 'Browser streaming is now active.' }]);
+        return;
+      }
+    }
+    if (contentStreams) {
+      const addUrlMatch = prompt.match(/\badd\s+stream\s+(https:\/\/\S+)/i);
+      if (addUrlMatch) {
+        const added = contentStreams.addCustomStream({ url: addUrlMatch[1]! });
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `a_${Date.now()}`,
+            role: 'assistant',
+            content: added.ok
+              ? `Added and enabled "${added.stream.name}".`
+              : added.error,
+          },
+        ]);
+        return;
+      }
+      const toggleVerb = /\b(enable|turn\s+on|activate)\b/.test(lower)
+        ? true
+        : /\b(disable|turn\s+off|mute)\b/.test(lower)
+          ? false
+          : null;
+      if (toggleVerb !== null) {
+        const catMap: ReadonlyArray<{ readonly id: StreamCatalogId; readonly re: RegExp; readonly label: string }> = [
+          { id: 'reference', re: /\breference|knowledge\b/, label: 'Reference & Knowledge' },
+          { id: 'science', re: /\bscience|research\b/, label: 'Science & Research' },
+          { id: 'technology', re: /\bcode|tech|technology|documentation|docs\b/, label: 'Code & Documentation' },
+          { id: 'world', re: /\bworld|weather|places|events\b/, label: 'Live World & Places' },
+          { id: 'custom', re: /\bcustom\b/, label: 'Custom Streams' },
+        ];
+        const matchedCat = catMap.find((c) => c.re.test(lower) && /\b(catalog|streams?)\b/.test(lower));
+        if (matchedCat) {
+          contentStreams.toggleCatalog(matchedCat.id, toggleVerb);
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `a_${Date.now()}`,
+              role: 'assistant',
+              content: `${toggleVerb ? 'Enabled' : 'Disabled'} ${matchedCat.label} streams.`,
+            },
+          ]);
+          return;
+        }
+        const matchedStream = contentStreams.listAll().find(
+          (s) => lower.includes(s.name.toLowerCase()) || lower.includes(s.id.toLowerCase()),
+        );
+        if (matchedStream) {
+          contentStreams.toggleStream(matchedStream.id, toggleVerb);
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `a_${Date.now()}`,
+              role: 'assistant',
+              content: `${toggleVerb ? 'Enabled' : 'Disabled'} ${matchedStream.name}.`,
+            },
+          ]);
+          return;
+        }
+      }
+    }
     if (/^(?:show|open|view)\s+(?:prism\s+)?details\b/.test(lower)) {
       onChangeSurfaceMode('details');
       return;
@@ -100,7 +185,7 @@ export const SettingsDrawer: FC<SettingsDrawerProps> = ({
       {
         id: `a_${Date.now()}`,
         role: 'assistant',
-        content: 'Try "Switch to dark mode", "Switch to light mode", or "Clear cached data".',
+        content: 'Try "Enable Wikipedia", "Turn on offline mode", "Switch to dark mode", or "Clear cached data".',
       },
     ]);
   };
@@ -113,7 +198,7 @@ export const SettingsDrawer: FC<SettingsDrawerProps> = ({
             Settings
           </h2>
           <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-            Appearance and private on-device storage.
+            Appearance, content streams, and private on-device storage.
           </p>
         </div>
 
@@ -139,6 +224,23 @@ export const SettingsDrawer: FC<SettingsDrawerProps> = ({
             </button>
           </div>
         </section>
+
+        {/* Content Streams */}
+        {contentStreams && onSetStreamingConsent && (
+          <Suspense
+            fallback={
+              <div className="rounded-2xl border border-slate-200 bg-white p-4 text-xs text-slate-500 dark:border-slate-800 dark:bg-[#0F141C] dark:text-slate-400">
+                Loading content streams…
+              </div>
+            }
+          >
+            <ContentStreamsSection
+              contentStreams={contentStreams}
+              streamingConsent={streamingConsent}
+              onSetStreamingConsent={onSetStreamingConsent}
+            />
+          </Suspense>
+        )}
 
         {/* Local Storage */}
         <section className="space-y-2.5">

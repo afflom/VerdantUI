@@ -19,7 +19,12 @@ import {
   masterStereoPcm,
   synthesizeCompositionStereoPcm,
 } from './audioSynthesisEngine';
-import type { VerdantCognitiveObserver } from './cognitiveObserver';
+import {
+  observeInputSensoryState,
+  senseUserQualityBudget,
+  type VerdantCognitiveObserver,
+} from './cognitiveObserver';
+import type { ContentStreamCatalogStore } from './contentStreamCatalog';
 import {
   GALLERY_LABEL_BY_TYPE,
   inferCategoriesForArtifact,
@@ -102,6 +107,7 @@ export interface StudioChatBridgeDeps {
   readonly pool: PrismHostPool;
   readonly observer: VerdantCognitiveObserver;
   readonly galleries: ContentGalleryStore;
+  readonly contentStreams?: ContentStreamCatalogStore;
   readonly registry: UnifiedExpertRegistry;
   readonly runLocalStudioPrompt?: (
     systemPrompt: string,
@@ -420,6 +426,57 @@ export class StudioChatBridge {
     const created = await store.createDeclarative('undefined');
     const baseDecl = created.declaration!;
     const affinities = registry.basis.getStyleAffinities();
+    const studioObs = observeInputSensoryState([], promptText, false);
+    const studioSnap = observer.getThreadSnapshot('studio');
+    const qualityBudget = senseUserQualityBudget({
+      latestUserText: promptText,
+      immediateObs: studioObs.vector,
+      integratedBelief: studioSnap.belief,
+      surpriseQ10: studioSnap.lastSurpriseQ10,
+      retryEscalationLevel: studioSnap.retryEscalationLevel,
+      globalUserFacetsQ10: registry.basis.getUserFacetsQ10(),
+      hasEnabledContentStreams: Boolean(this.deps.contentStreams?.hasEnabledStreams()),
+    });
+
+    // Optional Zero-Cutoff Realtime Content Stream grounding (strictly opt-in user streams)
+    let liveStreamEvidence: Array<{
+      readonly hypothesisId: string;
+      readonly verdict: 'supporting' | 'refuting' | 'observation';
+      readonly text: string;
+      readonly date: string;
+    }> = [];
+    let liveContextSummary = '';
+    if (
+      mediaType !== 'space' &&
+      qualityBudget.shouldConsultContentStreams &&
+      this.deps.contentStreams?.hasEnabledStreams() &&
+      observer.grants.isAllowed('network-weights')
+    ) {
+      try {
+        const { streamRealtimeWeightsToPrism } = await import('./realtimeWeightStreamer');
+        const streamed = await streamRealtimeWeightsToPrism({
+          query: promptText,
+          catalogStore: this.deps.contentStreams,
+          registry,
+          maxStreams: qualityBudget.featureRichness === 'full' ? 3 : 2,
+        });
+        if (streamed.chunks.length > 0) {
+          const today = new Date().toISOString().slice(0, 10);
+          liveStreamEvidence = streamed.chunks.slice(0, 4).map((c) => ({
+            hypothesisId: 'H1',
+            verdict: 'observation' as const,
+            text: `[${c.provider}] ${c.title}: ${c.canonicalText.slice(0, 220)} (${c.sourceUrl})`,
+            date: today,
+          }));
+          liveContextSummary = streamed.chunks
+            .slice(0, 2)
+            .map((c) => `${c.title}: ${c.canonicalText.slice(0, 140)}`)
+            .join(' · ');
+        }
+      } catch {
+        // Offline or stream unreachable; proceed seamlessly with local basis
+      }
+    }
 
     // Stage 1: Contextualize prompt into cross-modal Unified Semantic Associator (delta_rule.rs)
     // so adjacent modalities ("a dog" -> "make a video of that dog") share the same semantic anchor.
@@ -466,6 +523,11 @@ export class StudioChatBridge {
                   : {}),
                 ...(params.weightOverrides ?? {}),
               }
+          : mediaType === 'research-program' && liveStreamEvidence.length > 0
+            ? {
+                evidence: liveStreamEvidence,
+                ...(params.weightOverrides ?? {}),
+              }
             : { ...(params.weightOverrides ?? {}) };
 
     // Engage on-device LLM weight router when Local AI is active for richer custom specs
@@ -488,7 +550,10 @@ export class StudioChatBridge {
       rawModelJson ||
       JSON.stringify({
         name: title,
-        purpose: semanticRev.contextualBrief || promptText.slice(0, 220),
+        purpose:
+          liveContextSummary
+            ? `${semanticRev.contextualBrief || promptText.slice(0, 140)} (${liveContextSummary.slice(0, 140)})`
+            : semanticRev.contextualBrief || promptText.slice(0, 220),
         mediaType,
         readyToBuild: true,
         weights: { mediaType, ...baseWeightsSeed },
@@ -616,14 +681,15 @@ export class StudioChatBridge {
       }
     }
 
-    // Schedule non-interruptible background Lod1 -> Lod3 progressive QA reconciliation inside VerdantRootPrismRuntime
+    // Schedule non-interruptible background LOD reconciliation scaled to Observer's sensed user quality budget
     if (mediaType !== 'space' && this.deps.scheduleProgressiveReconciliation) {
+      const targetMaxRank = Math.max(1, qualityBudget.targetLodRank) as PrismLodRank;
       this.deps.scheduleProgressiveReconciliation({
         prismId: activeProj.id,
         prompt: promptText,
         initialRevision: semanticRev,
         startRank: 1,
-        maxRank: 3,
+        maxRank: targetMaxRank,
       });
     }
 
@@ -985,12 +1051,26 @@ export class StudioChatBridge {
     }
 
     if (mediaType !== 'space' && this.deps.scheduleProgressiveReconciliation) {
+      const refineObs = observeInputSensoryState([], params.instruction, false);
+      const refineSnap = observer.getThreadSnapshot('studio');
+      const refineBudget = senseUserQualityBudget({
+        latestUserText: params.instruction,
+        immediateObs: refineObs.vector,
+        integratedBelief: refineSnap.belief,
+        surpriseQ10: Math.max(420, refineSnap.lastSurpriseQ10),
+        retryEscalationLevel: refineSnap.retryEscalationLevel + 1,
+        globalUserFacetsQ10: registry.basis.getUserFacetsQ10(),
+        hasEnabledContentStreams: Boolean(this.deps.contentStreams?.hasEnabledStreams()),
+      });
       this.deps.scheduleProgressiveReconciliation({
         prismId: updatedProj.id,
         prompt: `${updatedProj.draft.name}: ${params.instruction}`,
         initialRevision: refinedSemanticRev,
         startRank: 1,
-        maxRank: 3,
+        maxRank:
+          refineBudget.featureRichness === 'minimal'
+            ? (Math.max(1, refineBudget.targetLodRank) as PrismLodRank)
+            : 3,
       });
     }
 

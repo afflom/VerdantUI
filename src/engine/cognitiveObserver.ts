@@ -25,7 +25,9 @@ import type { LoadedModelSummary } from './llamaRuntime';
 import {
   MODEL_CATALOG,
   findCatalogModelById,
+  getModelCapacityQ10,
   isInternalBootstrapModel,
+  shouldPreferDemandStreaming,
   type CatalogModel,
 } from './modelCatalog';
 import {
@@ -892,6 +894,124 @@ export interface RouteEnergyCandidate {
   readonly refusalReason?: string;
 }
 
+export interface ObserverQualityBudget {
+  /** Continuous sensed quality/definition requirement in Q10 (0..1024). */
+  readonly demandedQualityQ10: number;
+  /** Continuous sensed epistemic novelty / knowledge gap in Q10 (0..1024). */
+  readonly epistemicGapQ10: number;
+  /** Monotonic target LOD ceiling derived continuously from demandedQualityQ10. */
+  readonly targetLodRank: 0 | 1 | 2 | 3;
+  readonly featureRichness: 'minimal' | 'balanced' | 'full';
+  /** True when user context indicates enabled Content Streams will reduce epistemic surprise. */
+  readonly shouldConsultContentStreams: boolean;
+  readonly rationale: string;
+}
+
+/**
+ * Continuously senses the user's quality/definition requirement and epistemic gap from
+ * Immediate Context (prompt specificity, explicit brevity vs craft cues, refinement/retry
+ * prediction error) coupled harmonically with Global User Context (`LivingTrainingBasis`
+ * userFacetsQ10 & concept familiarity). Zero contrived hard-coded threshold cliffs.
+ */
+export function senseUserQualityBudget(params: {
+  readonly latestUserText: string;
+  readonly immediateObs: CognitiveVector;
+  readonly integratedBelief: CognitiveVector;
+  readonly surpriseQ10: number;
+  readonly retryEscalationLevel: number;
+  readonly globalUserFacetsQ10?: CognitiveVector | null;
+  readonly conceptResidualNorm?: number;
+  readonly hasEnabledContentStreams?: boolean;
+}): ObserverQualityBudget {
+  const lower = params.latestUserText.trim().toLowerCase();
+  const wordCount = lower ? lower.split(/\s+/).length : 0;
+
+  // Immediate explicit quality & brevity cues (continuous smooth bias in Q10)
+  let explicitQualityDelta = 0;
+  if (/\b(quick|brief|rough|sketch|draft|simple|minimal|short|tl;?dr|basic|outline)\b/.test(lower)) {
+    explicitQualityDelta -= 220;
+  }
+  if (
+    /\b(detailed|comprehensive|thorough|production|full[\s-]resolution|high[\s-]definition|in[\s-]depth|rigorous|architecture|refactor|prove|verify|research|analyze|analyse)\b/.test(
+      lower,
+    )
+  ) {
+    explicitQualityDelta += 210;
+  }
+
+  // Immediate complexity pressure: weighted average of deductive, code, elaboration, verification
+  const immComplexity = Math.round(
+    (params.immediateObs[1] * 3 +
+      params.immediateObs[2] * 3 +
+      params.immediateObs[6] * 2 +
+      params.immediateObs[0] * 1 +
+      params.integratedBelief[1] * 2 +
+      params.integratedBelief[2] * 2) /
+      13,
+  );
+
+  // Global user context prior (LivingTrainingBasis userFacetsQ10)
+  const gFacets = params.globalUserFacetsQ10;
+  const globalPriorQ10 = gFacets
+    ? Math.round((gFacets[0] + gFacets[1] + gFacets[2] + gFacets[6]) / 4)
+    : 512;
+
+  // Prediction-error / refinement signal: if the user retried or concept residual is high, lift demand
+  const retryLift = params.retryEscalationLevel * 180;
+  const residualLift =
+    typeof params.conceptResidualNorm === 'number'
+      ? Math.round(Math.min(1, Math.max(0, params.conceptResidualNorm)) * 160)
+      : 0;
+  const lengthSignal = Math.min(120, Math.round(wordCount * 4));
+
+  const demandedQualityQ10 = clampQ10(
+    Math.round((immComplexity * 5 + globalPriorQ10 * 2 + params.surpriseQ10) / 8) +
+      explicitQualityDelta +
+      retryLift +
+      residualLift +
+      lengthSignal,
+  );
+
+  // Epistemic gap: elevated for live/factual/research/URL/entity queries or high uncertainty/surprise
+  const liveEntityCue =
+    /\b(latest|current|recent|today|202\d|paper|study|research|wikipedia|github|npm|crate|weather|forecast|news|release|version|who\s+is|what\s+is|explain|history\s+of)\b/.test(
+      lower,
+    ) || /https?:\/\/\S+/i.test(params.latestUserText);
+  const epistemicGapQ10 = clampQ10(
+    Math.round((params.immediateObs[4] * 3 + params.integratedBelief[4] * 2 + params.surpriseQ10 * 2) / 7) +
+      (liveEntityCue ? 280 : 0),
+  );
+
+  const targetLodRank: 0 | 1 | 2 | 3 =
+    demandedQualityQ10 >= 740
+      ? 3
+      : demandedQualityQ10 >= 540
+        ? 2
+        : demandedQualityQ10 >= 360
+          ? 1
+          : 0;
+  const featureRichness: ObserverQualityBudget['featureRichness'] =
+    demandedQualityQ10 >= 700 ? 'full' : demandedQualityQ10 >= 440 ? 'balanced' : 'minimal';
+  const shouldConsultContentStreams =
+    Boolean(params.hasEnabledContentStreams) && (liveEntityCue || epistemicGapQ10 >= 520);
+
+  const rationale =
+    featureRichness === 'minimal'
+      ? 'Sensed lightweight exploratory intent — minimizing feature overhead for fast output.'
+      : featureRichness === 'full'
+        ? 'Sensed high-definition intent from immediate & global user context — engaging full quality synthesis.'
+        : 'Sensed balanced quality intent from immediate & global user context.';
+
+  return {
+    demandedQualityQ10,
+    epistemicGapQ10,
+    targetLodRank,
+    featureRichness,
+    shouldConsultContentStreams,
+    rationale,
+  };
+}
+
 export interface CognitiveRouteCertificate {
   readonly routeId: string;
   readonly label: string;
@@ -910,6 +1030,7 @@ export interface CognitiveRouteCertificate {
   readonly freeEnergy: number;
   readonly surpriseQ10: number;
   readonly escalatedFromRetry: boolean;
+  readonly qualityBudget: ObserverQualityBudget;
   readonly digest: string;
   readonly rationale: string;
   readonly candidates: readonly RouteEnergyCandidate[];
@@ -959,6 +1080,10 @@ export interface RouteDecisionContext {
   readonly publishedPrisms?: readonly PublishedPrismSummary[];
   /** True once the thread has consolidated turns in its lossless episodic ledger (`recall_thread_memory`). */
   readonly hasConsolidatedHistory?: boolean;
+  /** True when the user has enabled at least one Content Stream in Settings. */
+  readonly hasEnabledContentStreams?: boolean;
+  /** Optional unresolved semantic residual from UnifiedSemanticAssociator for active concept. */
+  readonly conceptResidualNorm?: number;
 }
 
 /**
@@ -1214,7 +1339,20 @@ export class VerdantCognitiveObserver {
       mem.turnCount += 1;
     }
 
-    // Derive cognitive execution posture directly from integrated belief (zero manual modes!)
+    // Continuously sense user quality / definition budget from Immediate + Global User Context
+    const globalUserFacetsQ10 = this.userBasisFacetsProvider ? this.userBasisFacetsProvider() : null;
+    const qualityBudget = senseUserQualityBudget({
+      latestUserText: ctx.latestUserText,
+      immediateObs: escalatedObs,
+      integratedBelief: nextBelief,
+      surpriseQ10,
+      retryEscalationLevel: mem.retryEscalationLevel,
+      globalUserFacetsQ10,
+      conceptResidualNorm: ctx.conceptResidualNorm,
+      hasEnabledContentStreams: ctx.hasEnabledContentStreams,
+    });
+
+    // Derive cognitive execution posture directly from integrated belief + sensed quality budget (zero manual modes!)
     const deepReasoningSignal = Math.max(nextBelief[1], escalatedObs[1]);
     const epistemicPressure = Math.max(nextBelief[4], escalatedObs[4]);
     const toolCompSignal = Math.max(nextBelief[7], escalatedObs[7]);
@@ -1222,6 +1360,7 @@ export class VerdantCognitiveObserver {
     const needsThinking =
       !ctx.isToolContinuationStep &&
       (mem.retryEscalationLevel > 0 ||
+        qualityBudget.featureRichness === 'full' ||
         deepReasoningSignal >= 544 ||
         (deepReasoningSignal >= 448 && epistemicPressure >= 512));
 
@@ -1283,15 +1422,23 @@ export class VerdantCognitiveObserver {
       });
     }
 
+    // Helper: smooth quadratic pragmatic quality gap (zero arbitrary hard thresholds!)
+    const computePragmaticRisk = (resonance: number, capacityQ10: number): number => {
+      const baseGap = Math.max(0, 1800 - resonance);
+      const qualityShortfall = Math.max(0, qualityBudget.demandedQualityQ10 - capacityQ10);
+      const qualityPenalty = Math.round((qualityShortfall * qualityShortfall) / 110);
+      return baseGap + qualityPenalty;
+    };
+
     // Candidate 2: Currently Resident Neural Route (zero transfer/switch cost!)
     if (hasLoadedRealModel && ctx.activeModel) {
       const cat = findCatalogModelById(ctx.activeModel.id);
       const facets: CognitiveVector = cat
         ? buildCatalogModelFacets(cat)
         : [640, 768, 704, 640, 704, 768, 768, 768];
+      const capacityQ10 = cat ? getModelCapacityQ10(cat) : 740;
       const resonance = dotCognitiveQ10(nextBelief, facets);
-      // Pragmatic risk = inverse resonance normalized cleanly
-      const pragmaticRisk = Math.max(0, 1800 - resonance);
+      const pragmaticRisk = computePragmaticRisk(resonance, capacityQ10);
       const computeTicks = cat
         ? Math.round(cat.geometry.activeParamsBillions * 120)
         : 360;
@@ -1320,10 +1467,9 @@ export class VerdantCognitiveObserver {
       const cat = findCatalogModelById(cachedId);
       if (!cat) continue;
       const facets = buildCatalogModelFacets(cat);
+      const capacityQ10 = getModelCapacityQ10(cat);
       const resonance = dotCognitiveQ10(nextBelief, facets);
-      const pragmaticRisk = Math.max(0, 1800 - resonance);
-      // Switching OPFS checkpoints incurs warm-load penalty (480 ticks) so we only switch when
-      // a cached specialist genuinely dominates (e.g. heavy code -> cached coder, or nothing loaded yet)
+      const pragmaticRisk = computePragmaticRisk(resonance, capacityQ10);
       const switchPenalty = hasLoadedRealModel ? 480 : 40;
       const costVector: PrismArtifactCostVector = {
         dramReadCost: 120,
@@ -1344,32 +1490,51 @@ export class VerdantCognitiveObserver {
       });
     }
 
-    // Candidate 4: Cold-start Seamless Promotion Route (auto-streams default unified neural route)
-    if (!hasLoadedRealModel && candidates.every((c) => !c.admitted || c.kind === 'lod0-verified')) {
-      const defModel = pickDefaultNeuralCatalogModel(ctx.cachedModelIds);
-      const facets = buildCatalogModelFacets(defModel);
+    // Candidate 4: Unbounded Demand-First System Stream Expert Pool (no 4B ceiling, no magic cliffs!)
+    // Evaluates compact fast experts AND demand-streamed 30B-A3B Sparse MoE experts continuously
+    // via Expected Free Energy: demand-paged MoE pays ONLY for active-expert Range bytes!
+    const networkAllowed = this.grants.isAllowed('network-weights');
+    const systemStreamPoolIds = [
+      'qwen2.5-0.5b-instruct-q4_k_m',
+      'qwen2.5-1.5b-instruct-q4_k_m',
+      'qwen3-4b-q4_k_m',
+      'qwen3-30b-a3b-q4_k_m',
+      'qwen3-coder-30b-a3b-q4_k_m',
+    ];
+    for (const poolId of systemStreamPoolIds) {
+      if (hasLoadedRealModel && ctx.activeModel?.id === poolId) continue;
+      if (ctx.cachedModelIds.includes(poolId)) continue;
+      const cat = findCatalogModelById(poolId);
+      if (!cat) continue;
+      const facets = buildCatalogModelFacets(cat);
+      const capacityQ10 = getModelCapacityQ10(cat);
       const resonance = dotCognitiveQ10(nextBelief, facets);
-      const pragmaticRisk = Math.max(0, 1800 - resonance);
-      const networkAllowed = this.grants.isAllowed('network-weights');
+      const pragmaticRisk = computePragmaticRisk(resonance, capacityQ10);
+      // Demand-streamed Sparse MoE fetches ONLY active experts (8/128) via OPFS CAS, not 18.56 GB!
+      const isDemand = shouldPreferDemandStreaming(cat);
+      const baseTransfer = isDemand
+        ? 520 + Math.round(cat.geometry.activeParamsBillions * 45)
+        : 320 + Math.round(cat.geometry.paramsBillions * 90);
+      const hostTransferCost = hasLoadedRealModel ? baseTransfer + 260 : baseTransfer;
       const costVector: PrismArtifactCostVector = {
-        dramReadCost: 240,
-        computeOpCost: Math.round(defModel.geometry.activeParamsBillions * 120),
-        quantEncodeCost: 30,
-        syncBarrierCost: 20,
-        hostTransferCost: 850,
+        dramReadCost: isDemand ? 180 : 120,
+        computeOpCost: Math.round(cat.geometry.activeParamsBillions * 110),
+        quantEncodeCost: 25,
+        syncBarrierCost: 15,
+        hostTransferCost,
       };
       candidates.push({
-        routeId: `neural:promote:${defModel.id}`,
-        label: defModel.shortName,
+        routeId: `neural:promote:${cat.id}`,
+        label: cat.shortName,
         kind: 'neural-on-demand',
-        modelId: defModel.id,
+        modelId: cat.id,
         admitted: networkAllowed,
         resonanceQ10: resonance,
         freeEnergy: canonicalObjectiveScore(costVector) + pragmaticRisk,
         costVector,
         refusalReason: networkAllowed
           ? undefined
-          : 'Network weight streaming denied by ContainerGrantMatrix (FK-07)',
+          : 'Browser streaming is paused or awaiting acknowledgment (FK-07)',
       });
     }
 
@@ -1426,6 +1591,7 @@ export class VerdantCognitiveObserver {
       freeEnergy: winner.freeEnergy,
       surpriseQ10,
       escalatedFromRetry: isRetry,
+      qualityBudget,
       digest,
       rationale,
       candidates,

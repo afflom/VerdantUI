@@ -25,6 +25,7 @@ import {
   formatDirectOperatorSummary,
   harmonicIntegrateBelief,
   observeInputSensoryState,
+  senseUserQualityBudget,
 } from './cognitiveObserver';
 import { LlamaVTensorRuntime, type LoadedModelSummary } from './llamaRuntime';
 
@@ -430,4 +431,90 @@ test('evaluateMathExpression, all 5 client tools, and unified ModelContext run d
   for (const s of UNIFIED_VERDANT_SUGGESTIONS) {
     assert.equal(/\b(LOD0|OPFS|WASM|SIMD|vTensor|Verdant engine|SharedArrayBuffer)\b/i.test(`${s.label ?? ''} ${s.prompt}`), false);
   }
+});
+
+test('Observer continuously senses user quality budget from Immediate + Global Context and escalates unbounded System Stream without arbitrary ceilings', () => {
+  const observer = new VerdantCognitiveObserver();
+
+  // 1. Brief / quick exploratory request senses minimal feature richness & low LOD rank (no forced 4B/30B overhead)
+  const quickObs = observeInputSensoryState([], 'Quick rough sketch of a cat', false);
+  const quickBudget = senseUserQualityBudget({
+    latestUserText: 'Quick rough sketch of a cat',
+    immediateObs: quickObs.vector,
+    integratedBelief: quickObs.vector,
+    surpriseQ10: 120,
+    retryEscalationLevel: 0,
+    globalUserFacetsQ10: [380, 380, 320, 400, 320, 300, 360, 320],
+    hasEnabledContentStreams: false,
+  });
+  assert.equal(quickBudget.featureRichness, 'minimal');
+  assert.ok(quickBudget.targetLodRank <= 1);
+  assert.equal(quickBudget.shouldConsultContentStreams, false);
+
+  // 2. High-definition rigorous architecture / coding demand + high-rigor global user basis senses full richness & Lod3
+  const deepPrompt =
+    'Provide a thorough, detailed, rigorous production architecture and verify the lock-free ring buffer proof in Rust.';
+  const deepObs = observeInputSensoryState([], deepPrompt, false);
+  const deepBudget = senseUserQualityBudget({
+    latestUserText: deepPrompt,
+    immediateObs: deepObs.vector,
+    integratedBelief: deepObs.vector,
+    surpriseQ10: 680,
+    retryEscalationLevel: 1,
+    globalUserFacetsQ10: [820, 900, 920, 640, 720, 512, 880, 600],
+    hasEnabledContentStreams: true,
+  });
+  assert.equal(deepBudget.featureRichness, 'full');
+  assert.equal(deepBudget.targetLodRank, 3);
+  assert.ok(deepBudget.demandedQualityQ10 > quickBudget.demandedQualityQ10 + 350);
+
+  // 3. Unbounded System Stream selects lightweight expert for simple chat and escalates past 4B to demand-streamed 30B-A3B Sparse MoE when quality demand is high!
+  const lightRoute = observer.selectRoute({
+    threadId: 'unbounded-light',
+    messages: [makeUserMsg('Say hello briefly.')],
+    latestUserText: 'Say hello briefly.',
+    hasAttachment: false,
+    activeModel: null,
+    cachedModelIds: [],
+    isToolContinuationStep: false,
+    hasImportedHarness: false,
+  });
+  assert.equal(lightRoute.certificate.kind, 'neural-on-demand');
+  assert.ok(lightRoute.certificate.qualityBudget.demandedQualityQ10 < 520);
+
+  // High-rigor user basis + deep coding proof -> Observer routes past 4B to a 30B-A3B Sparse MoE demand-streamed expert
+  observer.setUserBasisFacetsProvider(() => [880, 920, 960, 600, 760, 512, 920, 640]);
+  const heavyRoute = observer.selectRoute({
+    threadId: 'unbounded-heavy',
+    messages: [makeUserMsg(deepPrompt)],
+    latestUserText: deepPrompt,
+    hasAttachment: false,
+    activeModel: null,
+    cachedModelIds: [],
+    isToolContinuationStep: false,
+    hasImportedHarness: false,
+    hasEnabledContentStreams: true,
+  });
+  assert.equal(heavyRoute.certificate.kind, 'neural-on-demand');
+  assert.equal(heavyRoute.certificate.qualityBudget.featureRichness, 'full');
+  assert.ok(
+    heavyRoute.certificate.modelId?.includes('30b-a3b'),
+    `Expected unbounded Observer to escalate to 30B-A3B Sparse MoE, got ${heavyRoute.certificate.modelId}`,
+  );
+
+  // Non-coder deductive theorem proof escalates to thinking-capable 30B-A3B with System-2 thinking enabled
+  const proofPrompt =
+    'Provide a rigorous mathematical proof of the convergence bound for stochastic mirror descent with comprehensive formal verification steps.';
+  const proofRoute = observer.selectRoute({
+    threadId: 'unbounded-proof',
+    messages: [makeUserMsg(proofPrompt)],
+    latestUserText: proofPrompt,
+    hasAttachment: false,
+    activeModel: null,
+    cachedModelIds: [],
+    isToolContinuationStep: false,
+    hasImportedHarness: false,
+  });
+  assert.equal(proofRoute.certificate.modelId, 'qwen3-30b-a3b-q4_k_m');
+  assert.equal(proofRoute.certificate.thinkingPolicy, 'on');
 });

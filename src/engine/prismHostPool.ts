@@ -193,9 +193,14 @@ export class PrismHostPool implements PrismBridgeRuntime {
           state.model !== null && !isInternalBootstrapModel(state.model.id);
 
         if (!hasRealModel) {
-          const notice = state.modelStreamEnabled
-            ? `Local AI is getting ready (${state.progressPercent}%). Try again in a moment.`
-            : 'Local AI is currently off. Turn Local AI on in the top bar to enable on-device AI inside apps.';
+          const notice =
+            state.streamingConsent === 'accepted'
+              ? state.status === 'downloading' || state.status === 'loading'
+                ? `Streaming capabilities to your browser (${state.progressPercent}%). Try again in a moment.`
+                : 'Send a prompt in Chat or wait a moment for browser capabilities to initialize.'
+              : state.streamingConsent === 'pending'
+                ? 'Confirm browser streaming in the banner above to enable AI capabilities inside apps.'
+                : 'Offline-only mode is active. Turn off Offline-Only Mode in Settings → Content Streams to enable AI capabilities inside apps.';
           span.addEvent('prism.ask.deferred', { reason: notice }, undefined, 'ok');
           span.end('ok');
           throw new Error(notice);

@@ -38,6 +38,7 @@ import {
   findCatalogModelById,
   formatBytes,
   isInternalBootstrapModel,
+  shouldPreferDemandStreaming,
   type CatalogModel,
 } from './modelCatalog';
 import type { MultimodalCoherenceTelemetry } from './multimodalCoordinator';
@@ -61,25 +62,44 @@ const LEGACY_GGUF_CACHE_NAME = 'vtensor-gguf-models-v1';
 const PREFS_STORAGE_KEY = 'vtensor-assistant:prefs:v1';
 const LAST_MODEL_STORAGE_KEY = 'vtensor-assistant:last-model:v1';
 const MODEL_STREAM_STORAGE_KEY = 'verdant-ui:model-stream-enabled:v1';
+const STREAMING_CONSENT_STORAGE_KEY = 'verdant-ui:streaming-consent:v1';
 
-export function loadSavedModelStreamEnabled(): boolean {
+export type StreamingConsentState = 'pending' | 'accepted' | 'paused';
+
+export function loadSavedStreamingConsent(): StreamingConsentState {
   if (typeof window === 'undefined' || typeof window.localStorage === 'undefined') {
-    return false;
+    return 'pending';
   }
   try {
-    return window.localStorage.getItem(MODEL_STREAM_STORAGE_KEY) === 'true';
+    const saved = window.localStorage.getItem(STREAMING_CONSENT_STORAGE_KEY);
+    if (saved === 'accepted' || saved === 'paused' || saved === 'pending') {
+      return saved;
+    }
+    const legacy = window.localStorage.getItem(MODEL_STREAM_STORAGE_KEY);
+    if (legacy === 'true') return 'accepted';
+    if (legacy === 'false') return 'paused';
+    return 'pending';
   } catch {
-    return false;
+    return 'pending';
   }
 }
 
-export function saveModelStreamEnabled(enabled: boolean): void {
+export function saveStreamingConsent(consent: StreamingConsentState): void {
   if (typeof window === 'undefined' || typeof window.localStorage === 'undefined') return;
   try {
-    window.localStorage.setItem(MODEL_STREAM_STORAGE_KEY, enabled ? 'true' : 'false');
+    window.localStorage.setItem(STREAMING_CONSENT_STORAGE_KEY, consent);
+    window.localStorage.setItem(MODEL_STREAM_STORAGE_KEY, consent === 'accepted' ? 'true' : 'false');
   } catch {
     // Ignore storage errors
   }
+}
+
+export function loadSavedModelStreamEnabled(): boolean {
+  return loadSavedStreamingConsent() === 'accepted';
+}
+
+export function saveModelStreamEnabled(enabled: boolean): void {
+  saveStreamingConsent(enabled ? 'accepted' : 'paused');
 }
 
 export type EngineStatus = 'idle' | 'downloading' | 'loading' | 'ready' | 'generating' | 'error';
@@ -109,6 +129,7 @@ export interface EngineState {
   readonly promptMode: PromptFormatMode;
   readonly precisionMode: PrecisionContractMode;
   readonly weightResidencyPolicy: WeightResidencyPolicy;
+  readonly streamingConsent: StreamingConsentState;
   readonly modelStreamEnabled: boolean;
   readonly lastRouteCertificate: CognitiveRouteCertificate | null;
   readonly observerSnapshot: CognitiveObserverSnapshot | null;
@@ -158,6 +179,7 @@ const INITIAL_TELEMETRY: VTensorTelemetrySnapshot = {
 };
 
 export interface HeaderEngineSummary {
+  readonly streamingConsent: StreamingConsentState;
   readonly modelStreamEnabled: boolean;
   readonly status: EngineStatus;
   readonly progressPercent: number;
@@ -168,6 +190,7 @@ export interface HeaderEngineSummary {
 }
 
 export interface AppShellEngineSummary {
+  readonly streamingConsent: StreamingConsentState;
   readonly model: LoadedModelSummary | null;
   readonly opfsStorage: OpfsQuotaSnapshot;
   readonly sampling: SamplingConfig;
@@ -354,7 +377,8 @@ export class LlamaVTensorWorkerClient {
   constructor() {
     const saved = loadSavedPrefs();
     const savedHarness = loadSavedHarness();
-    const savedStreamEnabled = loadSavedModelStreamEnabled();
+    const savedConsent = loadSavedStreamingConsent();
+    const savedStreamEnabled = savedConsent === 'accepted';
     if (!savedStreamEnabled) {
       this.cognitiveObserver.grants.deny('network-weights');
     } else {
@@ -364,7 +388,7 @@ export class LlamaVTensorWorkerClient {
     this.state = {
       status: 'idle',
       progressPercent: 0,
-      statusDetail: savedStreamEnabled ? 'Starting local AI' : 'Local AI off',
+      statusDetail: savedStreamEnabled ? 'Ready' : savedConsent === 'paused' ? 'Offline only' : 'Ready',
       errorMessage: null,
       model: null,
       telemetry: INITIAL_TELEMETRY,
@@ -379,6 +403,7 @@ export class LlamaVTensorWorkerClient {
       promptMode: saved.promptMode,
       precisionMode: saved.precisionMode,
       weightResidencyPolicy: saved.weightResidencyPolicy,
+      streamingConsent: savedConsent,
       modelStreamEnabled: savedStreamEnabled,
       lastRouteCertificate: null,
       observerSnapshot: null,
@@ -393,6 +418,7 @@ export class LlamaVTensorWorkerClient {
       activePartTaskIds: [],
     };
     this.headerSummary = {
+      streamingConsent: savedConsent,
       modelStreamEnabled: savedStreamEnabled,
       status: 'idle',
       progressPercent: 0,
@@ -402,6 +428,7 @@ export class LlamaVTensorWorkerClient {
       activePartTaskCount: 0,
     };
     this.appShellSummary = {
+      streamingConsent: savedConsent,
       model: null,
       opfsStorage: INITIAL_OPFS_STORAGE,
       sampling: saved.sampling,
@@ -608,9 +635,10 @@ export class LlamaVTensorWorkerClient {
 
     const storage = await this.refreshOpfsStorage().catch(() => INITIAL_OPFS_STORAGE);
     const cachedIds = computeCachedIds(storage);
-    // Respect persisted Model Stream toggle: disabled upon first entry (never auto-downloads).
-    // When enabled across reload, immediately resume/load the remembered or unified default model!
-    if (this.state.modelStreamEnabled) {
+    // Demand-first System Stream: NEVER force an arbitrary upfront multi-GB download on boot!
+    // If streaming is accepted and an expert is ALREADY warm in OPFS, re-attach it at 0 network bytes;
+    // otherwise stay quietly ready on the internal bootstrap runtime until a prompt selects an expert.
+    if (this.state.modelStreamEnabled && cachedIds.length > 0) {
       const lastId = readLastModelId();
       if (lastId && cachedIds.includes(lastId)) {
         const remembered = MODEL_CATALOG.find((m) => m.id === lastId);
@@ -618,23 +646,32 @@ export class LlamaVTensorWorkerClient {
           return this.loadCatalogModel(remembered);
         }
       }
-      const target = pickDefaultNeuralCatalogModel(cachedIds);
-      return this.loadCatalogModel(target);
+      const warmCached = MODEL_CATALOG.find((m) => cachedIds.includes(m.id));
+      if (warmCached) {
+        return this.loadCatalogModel(warmCached);
+      }
     }
     return this.loadCatalogModel(INTERNAL_BOOTSTRAP_MODEL);
   }
 
   /**
-   * Toggles the persistent Model Stream setting (`false` on first visit, remembered across reloads).
-   * - Turning ON grants `network-weights` and immediately starts streaming/activating the unified model.
-   * - Turning OFF cancels any in-flight stream and denies `network-weights` (`FK-07`).
+   * Sets the user's browser-streaming consent (`'accepted'` vs `'paused'` Offline-Only Mode).
+   * - `'accepted'` grants `network-weights` for the hidden demand-first System Stream + user-enabled
+   *   Content Streams with ZERO forced upfront downloads (re-attaching any already-warm OPFS expert only).
+   * - `'paused'` cancels in-flight transfers and denies `network-weights` (`FK-07` strict offline mode).
    */
-  async setModelStreamEnabled(enabled: boolean): Promise<void> {
-    saveModelStreamEnabled(enabled);
+  async setStreamingConsent(consent: StreamingConsentState): Promise<void> {
+    saveStreamingConsent(consent);
+    const enabled = consent === 'accepted';
     if (enabled) {
       this.cognitiveObserver.grants.reset('network-weights');
       this.cognitiveObserver.grants.grant('network-weights');
-      this.patchState({ modelStreamEnabled: true, errorMessage: null });
+      this.patchState({
+        streamingConsent: 'accepted',
+        modelStreamEnabled: true,
+        errorMessage: null,
+        statusDetail: 'Ready',
+      });
 
       const activeId = this.state.model?.id;
       const alreadyLoadedRealModel =
@@ -642,25 +679,33 @@ export class LlamaVTensorWorkerClient {
       if (!alreadyLoadedRealModel && this.state.status !== 'downloading' && this.state.status !== 'loading') {
         const storage = await this.refreshOpfsStorage().catch(() => this.state.opfsStorage);
         const cachedIds = computeCachedIds(storage);
-        const lastId = readLastModelId();
-        const remembered =
-          lastId && cachedIds.includes(lastId)
-            ? MODEL_CATALOG.find((m) => m.id === lastId)
-            : undefined;
-        const target = remembered ?? pickDefaultNeuralCatalogModel(cachedIds);
-        await this.loadCatalogModel(target);
+        if (cachedIds.length > 0) {
+          const lastId = readLastModelId();
+          const remembered =
+            lastId && cachedIds.includes(lastId)
+              ? MODEL_CATALOG.find((m) => m.id === lastId)
+              : MODEL_CATALOG.find((m) => cachedIds.includes(m.id));
+          if (remembered) {
+            await this.loadCatalogModel(remembered);
+          }
+        }
       }
     } else {
       this.cognitiveObserver.grants.deny('network-weights');
       this.cancelDownload();
       this.patchState({
+        streamingConsent: consent,
         modelStreamEnabled: false,
         status: this.state.model ? 'ready' : 'idle',
         progressPercent: 0,
-        statusDetail: 'Local AI off',
+        statusDetail: consent === 'paused' ? 'Offline only' : 'Ready',
         errorMessage: null,
       });
     }
+  }
+
+  async setModelStreamEnabled(enabled: boolean): Promise<void> {
+    return this.setStreamingConsent(enabled ? 'accepted' : 'paused');
   }
 
   /**
@@ -867,6 +912,7 @@ export class LlamaVTensorWorkerClient {
     const nextModelName = this.state.model?.displayName ?? null;
     const nextActiveCount = this.state.activePartTaskIds.length;
     if (
+      prevH.streamingConsent !== this.state.streamingConsent ||
       prevH.modelStreamEnabled !== this.state.modelStreamEnabled ||
       prevH.status !== this.state.status ||
       prevH.progressPercent !== this.state.progressPercent ||
@@ -876,6 +922,7 @@ export class LlamaVTensorWorkerClient {
       prevH.activePartTaskCount !== nextActiveCount
     ) {
       this.headerSummary = {
+        streamingConsent: this.state.streamingConsent,
         modelStreamEnabled: this.state.modelStreamEnabled,
         status: this.state.status,
         progressPercent: this.state.progressPercent,
@@ -891,6 +938,7 @@ export class LlamaVTensorWorkerClient {
 
     const prevS = this.appShellSummary;
     if (
+      prevS.streamingConsent !== this.state.streamingConsent ||
       prevS.model !== this.state.model ||
       prevS.opfsStorage !== this.state.opfsStorage ||
       prevS.sampling !== this.state.sampling ||
@@ -898,6 +946,7 @@ export class LlamaVTensorWorkerClient {
       prevS.importedHarness !== this.state.importedHarness
     ) {
       this.appShellSummary = {
+        streamingConsent: this.state.streamingConsent,
         model: this.state.model,
         opfsStorage: this.state.opfsStorage,
         sampling: this.state.sampling,
@@ -1309,12 +1358,18 @@ export class LlamaVTensorWorkerClient {
   async loadCatalogModel(model: CatalogModel): Promise<LoadedModelSummary> {
     this.lastRequestedCatalogModel = model;
     if (model.id !== INTERNAL_BOOTSTRAP_MODEL.id && !this.state.modelStreamEnabled) {
-      saveModelStreamEnabled(true);
+      saveStreamingConsent('accepted');
       this.cognitiveObserver.grants.reset('network-weights');
       this.cognitiveObserver.grants.grant('network-weights');
-      this.patchState({ modelStreamEnabled: true });
+      this.patchState({ streamingConsent: 'accepted', modelStreamEnabled: true });
     }
-    return this.loadFromUrl(model.id, model.name, model.url, model.bundled);
+    return this.loadFromUrl(
+      model.id,
+      model.name,
+      model.url,
+      model.bundled,
+      shouldPreferDemandStreaming(model),
+    );
   }
 
   /** Retries the most recently requested catalog model (or re-runs initial boot). */
@@ -1339,6 +1394,7 @@ export class LlamaVTensorWorkerClient {
     displayName: string,
     url: string,
     skipOpfs = false,
+    preferDemandStreaming = false,
   ): Promise<LoadedModelSummary> {
     this.cancelDownload();
     const requestId = this.nextRequestId('url');
@@ -1350,7 +1406,7 @@ export class LlamaVTensorWorkerClient {
         status: 'downloading',
         progressPercent: 2,
         errorMessage: null,
-        statusDetail: `Loading ${displayName}`,
+        statusDetail: preferDemandStreaming ? `Connecting ${displayName}` : `Loading ${displayName}`,
       });
     }
 
@@ -1366,6 +1422,7 @@ export class LlamaVTensorWorkerClient {
         displayName,
         url: resolvedUrl,
         skipOpfs,
+        preferDemandStreaming,
         weightResidencyPolicy: this.state.weightResidencyPolicy,
       } satisfies WorkerRequest);
     });

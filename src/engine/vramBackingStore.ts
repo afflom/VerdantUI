@@ -588,6 +588,18 @@ export interface OpfsDemandSlabStats {
  *    into the LRU OPFS slot, and serves the requested byte slice immediately.
  *  - Persists its slab directory in `<modelId>.vram.idx` so reloads retain all warm slabs.
  */
+export interface DemandCasStoreLike {
+  resolveOrStoreSlab(params: {
+    readonly contentFingerprint: string;
+    readonly slabIndex: number;
+    readonly ownerModelId: string;
+    readonly salienceQ10?: number;
+    readonly sourceUrl?: string;
+    readonly etag?: string;
+    readonly fetchFn: () => Promise<Uint8Array>;
+  }): Promise<{ readonly bytes: Uint8Array; readonly kappa: string; readonly hit: boolean; readonly dedupLinked: boolean }>;
+}
+
 export class OpfsDemandVramBackingStore implements VramBackingStore {
   readonly kind: VramBackingKind = 'opfs-demand';
   readonly modelId: string;
@@ -601,6 +613,8 @@ export class OpfsDemandVramBackingStore implements VramBackingStore {
   private readonly fetcher: SyncRangeFetcher;
   private readonly asyncFetcher: AsyncRangeFetcher;
   private readonly onPersistIndex?: (meta: DemandSlabIndexMeta) => void;
+  private readonly casStore?: DemandCasStoreLike;
+  private readonly contentFingerprintKey: string;
   private handle: SyncAccessHandleLike | null;
   private etag?: string;
 
@@ -635,12 +649,15 @@ export class OpfsDemandVramBackingStore implements VramBackingStore {
     asyncRangeFetcher?: AsyncRangeFetcher;
     fetchFn?: typeof fetch;
     onPersistIndex?: (meta: DemandSlabIndexMeta) => void;
+    casStore?: DemandCasStoreLike;
   }) {
     this.modelId = options.modelId;
     this.url = options.url;
     this.byteLength = Math.max(0, Math.floor(options.totalBytes));
     this.handle = options.handle;
     this.etag = options.etag;
+    this.casStore = options.casStore;
+    this.contentFingerprintKey = `${options.etag ?? options.url}:${this.byteLength}`;
     this.slabBytes = Math.max(4096, Math.floor(options.slabBytes ?? OPFS_DEMAND_SLAB_BYTES));
     this.totalSlabs = Math.max(1, Math.ceil(this.byteLength / this.slabBytes));
     const computedMaxSlots = Math.max(2, Math.floor(options.maxCacheBytes / this.slabBytes));
@@ -1035,7 +1052,18 @@ export class OpfsDemandVramBackingStore implements VramBackingStore {
         const startByte = slabId * this.slabBytes;
         const endInclusive = startByte + slabLen - 1;
         const fetchTask = (async () => {
-          const data = await this.asyncFetcher(this.url, startByte, endInclusive, signal);
+          const data = this.casStore
+            ? (
+                await this.casStore.resolveOrStoreSlab({
+                  contentFingerprint: this.contentFingerprintKey,
+                  slabIndex: slabId,
+                  ownerModelId: this.modelId,
+                  sourceUrl: this.url,
+                  etag: this.etag,
+                  fetchFn: () => this.asyncFetcher(this.url, startByte, endInclusive, signal),
+                })
+              ).bytes
+            : await this.asyncFetcher(this.url, startByte, endInclusive, signal);
           if (signal?.aborted) {
             throw new DOMException('Aborted', 'AbortError');
           }
@@ -2441,6 +2469,14 @@ export interface ResumableStreamOptions {
   syncRangeFetcherOverride?: SyncRangeFetcher;
   /** Injectable demand slab size in bytes for fast unit tests (default: 4 MiB). */
   demandSlabBytesOverride?: number;
+  /**
+   * Demand-first streaming mode (`true` for Sparse MoE, large checkpoints >= 4 GB, and layered
+   * multimodal checkpoints): opens `OpfsDemandVramBackingStore` immediately on header probe and
+   * fetches ONLY active slabs/experts via HTTP Range instead of downloading the full file upfront.
+   */
+  preferDemandStreaming?: boolean;
+  /** Optional shared Content-Addressed OPFS Slab Store (`OpfsCasStore`) for cross-model slab dedup. */
+  casStore?: DemandCasStoreLike;
 }
 
 /**
@@ -2722,6 +2758,7 @@ export async function streamUrlToVramBacking(
             syncRangeFetcher: options?.syncRangeFetcherOverride,
             fetchFn: fetchImpl,
             onPersistIndex: (meta) => writeDemandIndexSync(idxSync, meta),
+            casStore: options?.casStore,
           });
           const originalClose = demandStore.close.bind(demandStore);
           demandStore.close = () => {
@@ -2933,13 +2970,25 @@ export async function streamUrlToVramBacking(
                 }
               }
 
-              // Smart OPFS tier selection: auto-reclaim oldest inactive models first, then
-              // seamlessly activate Verdant Demand-Paged OPFS Slab Cache if model exceeds origin quota!
+              // Smart OPFS tier selection:
+              // 1) Demand-first streaming (`preferDemandStreaming`): open Range-paged CAS immediately
+              //    for Sparse MoE & layered checkpoints so ONLY active experts/layers are fetched!
+              // 2) Otherwise reclaim inactive models if needed, falling back to demand cache on tight quota.
               if (!quotaChecked && knownTotalBytes > 0) {
                 quotaChecked = true;
                 const neededBytes = Math.max(0, knownTotalBytes - writtenOffset);
                 let space = await estimateAvailableOpfsSpace(options?.storageEstimateOverride);
                 const headroom = space.quota > 0 ? Math.min(OPFS_SAFETY_HEADROOM_BYTES, Math.floor(space.quota * 0.05)) : 0;
+
+                if (options?.preferDemandStreaming && acceptRanges !== 'none' && knownTotalBytes >= 64 * 1024) {
+                  const targetCachePool =
+                    space.quota > 0 && space.free > 0
+                      ? Math.min(knownTotalBytes, space.free)
+                      : knownTotalBytes;
+                  attemptController.abort();
+                  void res.body?.cancel().catch(() => {});
+                  return await switchToDemandSlabCache(knownTotalBytes, targetCachePool, knownEtag);
+                }
 
                 if (space.quota > 0 && neededBytes + headroom > space.free) {
                   const protectedIds = new Set<string>([base]);

@@ -27,6 +27,7 @@ import {
   verdantLinearBatchSimd,
   type VerdantWasmArena,
 } from './verdantWasmSimd';
+import { getSharedOpfsCasStore } from './vramCasStore';
 
 export interface ImageGgufBacking {
   readonly byteLength: number;
@@ -386,6 +387,24 @@ export async function ensureClipBpeVocabularyCached(
       if (!vResp.ok || !mResp.ok) return null;
       const [vText, mText] = await Promise.all([vResp.text(), mResp.text()]);
       const parsed = parseClipBpeFromJsonAndMerges(vText, mText, 'opfs-cache');
+      // Register CLIP BPE assets inside the unified Content-Addressed OPFS store for global dedup
+      const cas = getSharedOpfsCasStore();
+      void Promise.all([
+        cas.putObject({
+          kind: 'tokenizer-bpe',
+          bytes: clipUtf8Encoder.encode(vText),
+          ownerId: 'system:clip-bpe-vocab',
+          salienceQ10: 960,
+          sourceUrl: CLIP_BPE_VOCAB_URL,
+        }),
+        cas.putObject({
+          kind: 'tokenizer-bpe',
+          bytes: clipUtf8Encoder.encode(mText),
+          ownerId: 'system:clip-bpe-merges',
+          salienceQ10: 960,
+          sourceUrl: CLIP_BPE_MERGES_URL,
+        }),
+      ]).catch(() => {});
       if (dir) {
         try {
           const writeText = async (name: string, content: string) => {

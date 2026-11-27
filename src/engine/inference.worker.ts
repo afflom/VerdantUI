@@ -53,6 +53,7 @@ import {
   createCooperativeYielder,
   shouldCheckpointAtKvPageBoundary,
 } from './vramSwapPolicy';
+import { getSharedOpfsCasStore } from './vramCasStore';
 import type { WeightResidencyPolicy } from './vramWeightPager';
 import {
   type ConformanceSuiteReport,
@@ -77,6 +78,7 @@ export type WorkerRequest =
       displayName: string;
       url: string;
       skipOpfs?: boolean;
+      preferDemandStreaming?: boolean;
       maxContextCap?: number;
       weightResidencyPolicy?: WeightResidencyPolicy;
     }
@@ -341,7 +343,10 @@ async function ensureImageWeightsOnDemand(): Promise<LoadedNeuralImageWeights | 
   if (!spec) return null;
   imageLoadPromise = (async () => {
     try {
-      const backing = await streamUrlToVramBacking(spec.id, spec.url, { skipOpfs: false });
+      const backing = await streamUrlToVramBacking(spec.id, spec.url, {
+        skipOpfs: false,
+        casStore: getSharedOpfsCasStore(),
+      });
       try {
         const loaded = loadImageWeightsFromBacking(backing);
         residentNeuralImageWeights = loaded;
@@ -390,7 +395,10 @@ async function ensureVisionEncoderOnDemand(): Promise<SiglipVisionEncoder | null
   if (!spec) return null;
   visionLoadPromise = (async () => {
     try {
-      const backing = await streamUrlToVramBacking(spec.id, spec.url, { skipOpfs: false });
+      const backing = await streamUrlToVramBacking(spec.id, spec.url, {
+        skipOpfs: false,
+        casStore: getSharedOpfsCasStore(),
+      });
       try {
         const bytes = readBackingBytes(backing);
         const weights = loadVisionWeightsFromGguf(bytes);
@@ -423,7 +431,10 @@ async function ensureWhisperEngineOnDemand(): Promise<WhisperAudioEngine | null>
   if (!spec) return null;
   whisperLoadPromise = (async () => {
     try {
-      const backing = await streamUrlToVramBacking(spec.id, spec.url, { skipOpfs: false });
+      const backing = await streamUrlToVramBacking(spec.id, spec.url, {
+        skipOpfs: false,
+        casStore: getSharedOpfsCasStore(),
+      });
       try {
         const bytes = readBackingBytes(backing);
         const weights = loadWhisperWeightsFromGgml(bytes);
@@ -1007,6 +1018,8 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         const activeIdBeforeLoad = runtime.getModelSummary()?.id;
         const backing = await streamUrlToVramBacking(req.id, req.url, {
           skipOpfs: req.skipOpfs,
+          preferDemandStreaming: req.preferDemandStreaming,
+          casStore: getSharedOpfsCasStore(),
           activeModelId: activeIdBeforeLoad,
           signal: controller.signal,
           onProgress: (p) => {
@@ -1558,6 +1571,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         modelUnloaded = true;
       }
       await deleteOpfsModel(req.modelId);
+      await getSharedOpfsCasStore().releaseOwner(req.modelId).catch(() => undefined);
       const storage = await inspectOpfsVramStorage();
       post({
         type: 'opfs_storage',
@@ -1578,15 +1592,18 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       const canWipeDir = !activeId || (activeKind !== 'opfs-sync' && activeKind !== 'opfs-demand');
       if (canWipeDir) {
         await clearAllOpfsModels();
+        await getSharedOpfsCasStore().clearAll().catch(() => undefined);
       } else {
         for (const entry of before.storedModels) {
           if (entry.modelId !== activeId) {
             await deleteOpfsModel(entry.modelId);
+            await getSharedOpfsCasStore().releaseOwner(entry.modelId).catch(() => undefined);
           }
         }
         for (const partial of before.partialModels ?? []) {
           if (partial.modelId !== activeId) {
             await deleteOpfsModel(partial.modelId);
+            await getSharedOpfsCasStore().releaseOwner(partial.modelId).catch(() => undefined);
           }
         }
       }

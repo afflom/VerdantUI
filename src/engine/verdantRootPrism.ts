@@ -22,6 +22,7 @@ import {
   type ContentArtifactRecord,
   type GalleryMediaType,
 } from './contentGalleryStore';
+import { ContentStreamCatalogStore } from './contentStreamCatalog';
 import { isInternalBootstrapModel } from './modelCatalog';
 import { ObserverStreamBus } from './observerStreamBus';
 import {
@@ -130,6 +131,7 @@ export interface VerdantRootPrismOptions {
   readonly observerBus?: ObserverStreamBus;
   readonly prismStore?: PrismStore;
   readonly galleryStore?: ContentGalleryStore;
+  readonly contentStreams?: ContentStreamCatalogStore;
   readonly expertRegistry?: UnifiedExpertRegistry;
 }
 
@@ -138,6 +140,7 @@ export class VerdantRootPrismRuntime {
   readonly observerBus: ObserverStreamBus;
   readonly prismStore: PrismStore;
   readonly galleryStore: ContentGalleryStore;
+  readonly contentStreams: ContentStreamCatalogStore;
   readonly expertRegistry: UnifiedExpertRegistry;
   readonly prismPool: PrismHostPool;
   readonly systemPartPrisms: readonly VerdantSystemPrismDescriptor[];
@@ -183,6 +186,7 @@ export class VerdantRootPrismRuntime {
     this.observerBus = opts?.observerBus ?? new ObserverStreamBus();
     this.prismStore = opts?.prismStore ?? new PrismStore();
     this.galleryStore = opts?.galleryStore ?? new ContentGalleryStore();
+    this.contentStreams = opts?.contentStreams ?? new ContentStreamCatalogStore();
     this.expertRegistry = opts?.expertRegistry ?? new UnifiedExpertRegistry();
     this.systemPartPrisms = buildSystemPartPrisms();
     this.prismPool = new PrismHostPool(
@@ -224,6 +228,7 @@ export class VerdantRootPrismRuntime {
             pool: this.prismPool,
             observer: this.workerClient.cognitiveObserver,
             galleries: this.galleryStore,
+            contentStreams: this.contentStreams,
             registry: this.expertRegistry,
             runLocalStudioPrompt: (systemPrompt, userPrompt, maxTokens, partId) =>
               this.runLocalLanguageHelper(systemPrompt, userPrompt, maxTokens, partId),

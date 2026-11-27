@@ -2,7 +2,7 @@
 
 > Generated mechanically by `npm run studio:publish` from `model/features.json` and `model/release-ledger.json`.
 
-- **Active Features:** 17
+- **Active Features:** 19
 - **Proposed / Planned Features:** 0
 - **Recorded Releases:** 12
 
@@ -27,6 +27,8 @@
 | `VUI-FEAT-015` | **active** | `v0.9.0` | `VUI-OBSERVER-01` | Live Root Verdant Prism Runtime, Zero-Interruption Cooperative Scheduling, Gated Delta Cross-Modal Associativity & Progressive Lod0-Lod3 QA |
 | `VUI-FEAT-016` | **active** | `v0.10.0` | `VUI-OPFS-01` | Layer-Streamed OPFS SDXS-512 CLIP Transformer, Spatial Cross-Attention UNet & Progressive 3-Stage TAESD (128-512px) |
 | `VUI-FEAT-017` | **active** | `v0.11.0` | `VUI-SIMD-01` | Zero-Churn Scoped UI Subscriptions, 64-Token KV Checkpoint/Resume, 100% Neural Picture Sandbox, Live VLM QA & Native F16/Q8_0 SIMD SDXS-512 Graph |
+| `VUI-FEAT-018` | **active** | `v0.13.0` | `VUI-DEDUP-01` | Regimented 3-Tier Content-Addressed OPFS Slab CAS & Demand-First Sparse Expert Streaming |
+| `VUI-FEAT-019` | **active** | `v0.13.0` | `VUI-OBSERVER-01` | Hidden Unmanaged System Stream, Continuous Observer Quality Sensing, Opt-In Content Stream Catalogs & Zero-Cutoff Prism Ingestion |
 
 ## Release Ledger
 

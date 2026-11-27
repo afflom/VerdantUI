@@ -503,7 +503,7 @@ export const VerdantStudioView: FC<VerdantStudioViewProps> = ({
   const handleRunStudioAgentPrompt = useCallback(
     async (systemPrompt: string, userPrompt: string, maxTokens: number): Promise<string> => {
       if (!hasLocalModelReady || !engineState.model) {
-        throw new Error('Local AI is not ready yet.');
+        throw new Error('Browser streaming is not active yet.');
       }
       activeAgentAbortRef.current?.abort();
       const ac = new AbortController();

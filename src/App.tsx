@@ -48,6 +48,7 @@ import {
   type ContentArtifactRecord,
   type GalleryMediaType,
 } from './engine/contentGalleryStore';
+import type { ContentStreamCatalogStore } from './engine/contentStreamCatalog';
 import type { ImportedHarnessSpec } from './engine/harnessConfig';
 import { isInternalBootstrapModel } from './engine/modelCatalog';
 import {
@@ -67,49 +68,56 @@ import type { UnifiedExpertRegistry } from './engine/unifiedModelBasis';
 import { getVerdantRootPrismRuntime } from './engine/verdantRootPrism';
 import type { LlamaVTensorWorkerClient } from './engine/workerClient';
 
-const LocalAiStatusPill: FC<{
+const StreamsStatusPill: FC<{
   readonly workerClient: LlamaVTensorWorkerClient;
-  readonly onToggle: () => void;
-}> = memo(({ workerClient, onToggle }) => {
+  readonly contentStreams: ContentStreamCatalogStore;
+  readonly onOpenStreams: () => void;
+}> = memo(({ workerClient, contentStreams, onOpenStreams }) => {
   const summary = useSyncExternalStore(
     useCallback((cb) => workerClient.subscribeHeaderSummary(cb), [workerClient]),
     useCallback(() => workerClient.getHeaderSummary(), [workerClient]),
   );
-  const streamOn = summary.modelStreamEnabled;
+  const streamsSnap = useSyncExternalStore(
+    useCallback((cb) => contentStreams.subscribe(cb), [contentStreams]),
+    useCallback(() => contentStreams.getSnapshot(), [contentStreams]),
+  );
+  const consent = summary.streamingConsent;
+  const streamActive = consent === 'accepted';
   const isStreaming = summary.status === 'downloading' || summary.status === 'loading';
-  const hasRealModel = summary.modelId !== null && !isInternalBootstrapModel(summary.modelId);
-  const hasError = streamOn && summary.errorMessage !== null;
-  const statusLabel = !streamOn
-    ? 'Off'
-    : isStreaming
-      ? `${summary.progressPercent}%`
-      : hasError
-        ? 'Error'
-        : hasRealModel
-          ? 'Ready'
-          : 'On';
+  const hasError = streamActive && summary.errorMessage !== null;
+  const statusLabel = isStreaming
+    ? `${summary.progressPercent}%`
+    : consent === 'paused'
+      ? 'Offline'
+      : consent === 'pending'
+        ? 'Setup'
+        : hasError
+          ? 'Retry'
+          : streamsSnap.enabledCount > 0
+            ? `${streamsSnap.enabledCount} on`
+            : 'Active';
 
   return (
     <button
       type="button"
-      role="switch"
-      aria-checked={streamOn}
-      data-testid="model-stream-toggle"
+      data-testid="streams-status-pill"
       title={
-        streamOn
-          ? 'Local AI is active on your device. Click to pause.'
-          : 'Local AI is off. Click to enable private on-device AI.'
+        consent === 'paused'
+          ? 'Offline-only mode is active. Open Settings to manage content streams.'
+          : consent === 'pending'
+            ? 'Confirm browser streaming or open Settings to manage content streams.'
+            : `Browser streaming active (${streamsSnap.enabledCount} content streams enabled). Open Settings to manage.`
       }
-      onClick={onToggle}
+      onClick={onOpenStreams}
       className={`inline-flex h-9 items-center gap-2 rounded-lg border px-2.5 sm:px-3 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-        streamOn
+        streamActive
           ? 'border-emerald-700/40 bg-emerald-50 text-emerald-950 hover:bg-emerald-100/80 dark:border-emerald-500/40 dark:bg-emerald-950/50 dark:text-emerald-200 dark:hover:bg-emerald-950/80'
           : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-300 dark:hover:bg-slate-800'
       }`}
     >
       <span
         className={`inline-block h-2 w-2 rounded-full ${
-          !streamOn
+          !streamActive
             ? 'bg-slate-400 dark:bg-slate-500'
             : hasError
               ? 'bg-red-500'
@@ -118,7 +126,7 @@ const LocalAiStatusPill: FC<{
                 : 'bg-emerald-600 dark:bg-emerald-400'
         }`}
       />
-      <span>Local AI</span>
+      <span>Streams</span>
       <span className="font-mono text-[11px] tabular-nums opacity-80">{statusLabel}</span>
     </button>
   );
@@ -284,6 +292,7 @@ export default function App() {
     observerBus,
     prismStore,
     galleryStore,
+    contentStreams,
     expertRegistry,
     prismPool,
     systemPartPrisms,
@@ -300,6 +309,8 @@ export default function App() {
     () =>
       createLlamaVTensorAdapter(workerClient, {
         bus: observerBus,
+        contentStreams,
+        expertRegistry,
         getPublishedPrisms: () =>
           workerClient.cognitiveObserver.getVisiblePublishedPrismsForSpace(
             prismStore.listPublishedSummaries(),
@@ -327,7 +338,7 @@ export default function App() {
           });
         },
       }),
-    [workerClient, observerBus, prismStore, prismPool, galleryStore, expertRegistry, getStudioChatBridge],
+    [workerClient, observerBus, contentStreams, prismStore, prismPool, galleryStore, expertRegistry, getStudioChatBridge],
   );
   const attachmentAdapter = useMemo(() => new SimpleTextAttachmentAdapter(), []);
   const threadListAdapter = useMemo(() => createVTensorThreadListAdapter(), []);
@@ -491,7 +502,12 @@ export default function App() {
     });
     const unsubStore = prismStore.subscribe(setPrisms);
     const unsubGallery = galleryStore.subscribe(setGalleryArtifacts);
-    void Promise.all([prismStore.hydrate(), galleryStore.hydrate(), expertRegistry.basis.hydrate()]).then(() => {
+    void Promise.all([
+      prismStore.hydrate(),
+      galleryStore.hydrate(),
+      contentStreams.hydrate(),
+      expertRegistry.basis.hydrate(),
+    ]).then(() => {
       galleryStore.syncFromPrisms(prismStore.list());
       expertRegistry.syncPrismsAsExperts(prismStore.list());
     });
@@ -506,7 +522,7 @@ export default function App() {
       unsubGallery();
       unsubBus();
     };
-  }, [rootPrism, prismStore, galleryStore, expertRegistry, observerBus, workerClient, prismPool]);
+  }, [rootPrism, prismStore, galleryStore, contentStreams, expertRegistry, observerBus, workerClient, prismPool]);
 
   useEffect(() => {
     workerClient.cognitiveObserver.setModalityResidencyProvider(() => {
@@ -582,13 +598,19 @@ export default function App() {
     workerClient.setImportedHarness(null);
   }, [workerClient]);
 
-  const handleToggleModelStream = useCallback(() => {
-    const next = !workerClient.getState().modelStreamEnabled;
-    void workerClient.setModelStreamEnabled(next).catch(() => {});
-  }, [workerClient]);
+  const handleSetStreamingConsent = useCallback(
+    (next: 'accepted' | 'paused') => {
+      void workerClient.setStreamingConsent(next).catch(() => {});
+    },
+    [workerClient],
+  );
+
+  const handleOpenStreamsSettings = useCallback(() => {
+    setActiveView({ kind: 'settings' });
+  }, []);
 
   const handleCancelDownload = useCallback(() => {
-    void workerClient.setModelStreamEnabled(false).catch(() => {});
+    void workerClient.setStreamingConsent('paused').catch(() => {});
   }, [workerClient]);
 
   const handleRetryLoad = useCallback(() => {
@@ -890,9 +912,10 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
-            <LocalAiStatusPill
+            <StreamsStatusPill
               workerClient={workerClient}
-              onToggle={handleToggleModelStream}
+              contentStreams={contentStreams}
+              onOpenStreams={handleOpenStreamsSettings}
             />
 
             <button
@@ -941,10 +964,45 @@ export default function App() {
           />
 
           <main
-            className="min-w-0 flex-1 overflow-hidden"
+            className="flex min-w-0 flex-1 flex-col overflow-hidden"
             data-active-part-id={activePartId}
             data-busy-parts={busyBackgroundParts.length}
           >
+            {appShellSummary.streamingConsent === 'pending' && (
+              <div
+                role="region"
+                aria-label="Browser streaming notice"
+                data-testid="streaming-consent-banner"
+                className="shrink-0 border-b border-emerald-700/20 bg-emerald-50/75 px-4 py-3 dark:border-emerald-500/20 dark:bg-emerald-950/35"
+              >
+                <div className="mx-auto flex max-w-4xl flex-wrap items-center justify-between gap-3">
+                  <p className="min-w-0 flex-1 text-xs leading-relaxed text-slate-800 dark:text-slate-200">
+                    VerdantUI runs privately in your browser and streams capabilities and your chosen
+                    content sources directly to your device as needed.
+                  </p>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <button
+                      type="button"
+                      data-testid="streaming-consent-offline"
+                      onClick={() => handleSetStreamingConsent('paused')}
+                      className="inline-flex h-8 items-center rounded-lg border border-slate-300 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
+                    >
+                      Use Offline Only
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="streaming-consent-accept"
+                      onClick={() => handleSetStreamingConsent('accepted')}
+                      className="inline-flex h-8 items-center rounded-lg bg-[#0F5132] px-3.5 text-xs font-medium text-white hover:bg-[#0B3D25] transition-colors whitespace-nowrap"
+                    >
+                      Continue
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <div className="min-h-0 flex-1 overflow-hidden">
             {/* Keep Home Thread mounted persistently so navigating to Galleries, Settings, or Prisms NEVER interrupts active streaming */}
             <div
               className={activeView.kind === 'thread' ? 'h-full w-full' : 'hidden'}
@@ -991,6 +1049,9 @@ export default function App() {
                 darkMode={darkMode}
                 onToggleDarkMode={() => setDarkMode((d) => !d)}
                 onSetDarkMode={setDarkMode}
+                contentStreams={contentStreams}
+                streamingConsent={appShellSummary.streamingConsent}
+                onSetStreamingConsent={handleSetStreamingConsent}
                 cachedBytes={appShellSummary.opfsStorage?.usageBytes ?? 0}
                 onClearCache={handleClearCache}
                 debugMode={debugMode}
@@ -1045,6 +1106,7 @@ export default function App() {
                 />
               </Suspense>
             )}
+            </div>
           </main>
 
           {debugMode && debugPanelOpen && (

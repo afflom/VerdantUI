@@ -28,7 +28,6 @@ import {
   MEDIA_GALLERIES,
   type GalleryMediaType,
 } from '../engine/contentGalleryStore';
-import { isInternalBootstrapModel } from '../engine/modelCatalog';
 import type { VerdantPrismProject } from '../engine/prismStudio';
 import type { EngineState, HeaderEngineSummary } from '../engine/workerClient';
 
@@ -127,14 +126,14 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
     }
   };
   const archivedCount = useAuiState((s) => s.threads.archivedThreadIds.length);
-  const activeModelId = headerSummary ? headerSummary.modelId : (engineState?.model?.id ?? null);
-  const modelStreamEnabled = headerSummary
-    ? headerSummary.modelStreamEnabled
-    : Boolean(engineState?.modelStreamEnabled);
+  const streamingConsent = headerSummary
+    ? headerSummary.streamingConsent
+    : (engineState?.streamingConsent ?? 'pending');
+  const engineStatus = headerSummary ? headerSummary.status : (engineState?.status ?? 'idle');
+  const isActivelyStreaming = engineStatus === 'downloading' || engineStatus === 'loading';
   const progressPercent = headerSummary
     ? headerSummary.progressPercent
     : (engineState?.progressPercent ?? 0);
-  const isBootstrapUnbound = isInternalBootstrapModel(activeModelId);
   const busyPartSet = busyPartIds && busyPartIds.length > 0 ? new Set(busyPartIds) : null;
 
   const sidebarContent = (
@@ -439,11 +438,11 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
           VerdantUI
         </div>
         <div className="mt-0.5 truncate text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
-          {isBootstrapUnbound
-            ? modelStreamEnabled
-              ? `Preparing AI · ${progressPercent}%`
-              : 'On-device · Private'
-            : 'Local AI ready · Private'}
+          {isActivelyStreaming
+            ? `Streaming · ${progressPercent}%`
+            : streamingConsent === 'paused'
+              ? 'Offline only · Private'
+              : 'Private · On-device'}
         </div>
 
         <div className="mt-3">

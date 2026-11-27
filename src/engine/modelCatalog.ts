@@ -519,6 +519,37 @@ export function isInternalBootstrapModel(modelId: string | null | undefined): bo
   return !modelId || modelId === INTERNAL_BOOTSTRAP_MODEL.id;
 }
 
+export type ExpertStreamingStrategy = 'demand-sparse-moe' | 'demand-layered' | 'compact-resident';
+
+/**
+ * Determines the optimal streaming strategy for a System Stream expert:
+ * - Sparse MoE checkpoints (`isMoe`) ALWAYS use `demand-sparse-moe` (HTTP Range active-expert CAS).
+ * - Dense checkpoints >= 4 GB use `demand-layered` (Range-paged CAS, zero upfront multi-GB wait).
+ * - Compact checkpoints (< 4 GB) use `compact-resident`.
+ */
+export function getModelStreamingStrategy(model: CatalogModel): ExpertStreamingStrategy {
+  if (model.geometry.isMoe) return 'demand-sparse-moe';
+  if (model.approximateBytes >= 4_000_000_000) return 'demand-layered';
+  return 'compact-resident';
+}
+
+export function shouldPreferDemandStreaming(model: CatalogModel): boolean {
+  return getModelStreamingStrategy(model) !== 'compact-resident';
+}
+
+/**
+ * Smooth continuous cognitive capacity rating in Q10 (`0..1024`) derived directly from model
+ * total/active parameter geometry (zero contrived tier cliffs).
+ */
+export function getModelCapacityQ10(model: CatalogModel): number {
+  const effectiveParams = model.geometry.isMoe
+    ? model.geometry.paramsBillions * 0.68 + model.geometry.activeParamsBillions * 2.2
+    : model.geometry.paramsBillions;
+  // Smooth logarithmic scaling from ~0.5B (420) -> 1.5B (560) -> 4B (720) -> 14B (885) -> 30B-A3B (975) -> 32B (995)
+  const raw = Math.round(350 + 185 * Math.log2(1 + Math.max(0.25, effectiveParams)));
+  return Math.max(256, Math.min(1024, raw));
+}
+
 export function getModelsByCategory(category: ModelCategory): readonly CatalogModel[] {
   if (category === 'all') return MODEL_CATALOG;
   return MODEL_CATALOG.filter((m) => m.category === category);
