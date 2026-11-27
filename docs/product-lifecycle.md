@@ -4,7 +4,7 @@
 
 - **Active Features:** 19
 - **Proposed / Planned Features:** 0
-- **Recorded Releases:** 12
+- **Recorded Releases:** 13
 
 ## Feature Register
 
@@ -46,3 +46,4 @@
 | `v0.10.0` | `v2.22.4` | `85dc9880c9` | 15 | Live Root Verdant Prism Runtime, Zero-Interruption Cooperative Scheduling, Gated Delta Cross-Modal Associativity & Progressive Lod0-Lod3 QA |
 | `v0.11.0` | `v2.22.4` | `85dc9880c9` | 16 | Layer-Streamed OPFS SDXS-512 CLIP Transformer, Spatial Cross-Attention UNet & Progressive 3-Stage TAESD (128-512px) |
 | `v0.12.0` | `v2.22.4` | `85dc9880c9` | 17 | Zero-Churn Scoped UI Subscriptions, 64-Token KV Checkpoint/Resume, 100% Neural Picture Sandbox, Live VLM QA & Native F16/Q8_0 SIMD SDXS-512 Graph |
+| `v0.13.0` | `v2.22.4` | `85dc9880c9` | 19 | Regimented 3-Tier Content-Addressed OPFS Slab CAS & Demand-First Sparse Expert Streaming; Hidden Unmanaged System Stream, Continuous Observer Quality Sensing, Opt-In Content Stream Catalogs & Zero-Cutoff Prism Ingestion |

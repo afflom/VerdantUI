@@ -267,6 +267,36 @@
         "VUI-FEAT-017"
       ],
       "summary": "Zero-Churn Scoped UI Subscriptions, 64-Token KV Checkpoint/Resume, 100% Neural Picture Sandbox, Live VLM QA & Native F16/Q8_0 SIMD SDXS-512 Graph"
+    },
+    {
+      "version": "0.13.0",
+      "tag": "v0.13.0",
+      "releasedAt": "2026-11-27T16:40:43.067Z",
+      "commit": "a46b1d2f6e688369cd06f26bd4c2e610b7d21d00",
+      "engineTag": "v2.22.4",
+      "studioCommit": "85dc9880c955d084c47624107ecb2971daef93f2",
+      "activeFeatureIds": [
+        "VUI-FEAT-001",
+        "VUI-FEAT-002",
+        "VUI-FEAT-003",
+        "VUI-FEAT-004",
+        "VUI-FEAT-005",
+        "VUI-FEAT-006",
+        "VUI-FEAT-007",
+        "VUI-FEAT-008",
+        "VUI-FEAT-009",
+        "VUI-FEAT-010",
+        "VUI-FEAT-011",
+        "VUI-FEAT-012",
+        "VUI-FEAT-013",
+        "VUI-FEAT-014",
+        "VUI-FEAT-015",
+        "VUI-FEAT-016",
+        "VUI-FEAT-017",
+        "VUI-FEAT-018",
+        "VUI-FEAT-019"
+      ],
+      "summary": "Regimented 3-Tier Content-Addressed OPFS Slab CAS & Demand-First Sparse Expert Streaming; Hidden Unmanaged System Stream, Continuous Observer Quality Sensing, Opt-In Content Stream Catalogs & Zero-Cutoff Prism Ingestion"
     }
   ]
 }
