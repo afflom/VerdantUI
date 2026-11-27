@@ -55,6 +55,12 @@ import { detectStudioChatIntent } from './studioChatIntent';
 import type { StudioChatBridge } from './studioChatBridge';
 import type { GalleryMediaType } from './contentGalleryStore';
 import type { UnifiedExpertRegistry } from './unifiedModelBasis';
+import {
+  ObserverChronology,
+  computeTimelinessPressureQ10,
+  type TemporalCoherenceSnapshot,
+  type UserInteractionCadence,
+} from './observerChronology';
 
 export type VerdantThinkingPolicy = 'auto' | 'on' | 'off';
 
@@ -1036,6 +1042,7 @@ export interface RouteEnergyCandidate {
   readonly admitted: boolean;
   readonly resonanceQ10: number;
   readonly freeEnergy: number;
+  readonly projectedTtftMs?: number;
   readonly costVector: PrismArtifactCostVector;
   readonly refusalReason?: string;
 }
@@ -1158,6 +1165,16 @@ export function senseUserQualityBudget(params: {
   };
 }
 
+export interface RouteTemporalAnchor {
+  readonly wallClockMs: number;
+  readonly projectedTtftMs: number;
+  readonly turnBudgetMs: number;
+  readonly streamTimeoutMs: number;
+  readonly timelinessQ10: number;
+  readonly userCadence: UserInteractionCadence;
+  readonly circadianPhaseQ10: number;
+}
+
 export interface CognitiveRouteCertificate {
   readonly routeId: string;
   readonly label: string;
@@ -1177,6 +1194,7 @@ export interface CognitiveRouteCertificate {
   readonly surpriseQ10: number;
   readonly escalatedFromRetry: boolean;
   readonly qualityBudget: ObserverQualityBudget;
+  readonly temporalAnchor?: RouteTemporalAnchor;
   readonly digest: string;
   readonly rationale: string;
   readonly candidates: readonly RouteEnergyCandidate[];
@@ -1197,6 +1215,7 @@ export interface CognitiveObserverSnapshot {
   readonly workingMemory: readonly WorkingMemoryFact[];
   readonly grants: Record<BrowserCapabilityOrgan, boolean>;
   readonly lastCertificate: CognitiveRouteCertificate | null;
+  readonly temporalCoherence?: TemporalCoherenceSnapshot;
 }
 
 interface InternalThreadMemory {
@@ -1250,6 +1269,8 @@ export class VerdantCognitiveObserver {
   readonly grants = new ContainerGrantMatrix();
   /** Unified possession hierarchy (`Observer ⊇ User ⊇ {Threads, Prisms, ContextCompartments}`) & non-leaking boundary. */
   readonly possession = new ObserverPossessionStore('personal');
+  /** Unified wall-clock + monotonic chronological & periodicity spine anchoring all modalities. */
+  readonly chronology = new ObserverChronology();
   private userBasisFacetsProvider: (() => CognitiveVector) | null = null;
   private modalityResidencyProvider: (() => ActiveModalityResidency) | null = null;
 
@@ -1361,6 +1382,14 @@ export class VerdantCognitiveObserver {
     return formatOpaqueConstraintsForContext(projected);
   }
 
+  /** Returns opaque availability windows currently active on the local wall clock. */
+  getActiveScheduleWindows(spaceId?: ContextCompartmentId) {
+    const target = spaceId ?? this.possession.getActiveCompartmentId();
+    return this.chronology.getActiveScheduleWindows(
+      this.possession.getProjectedConstraintsFor(target),
+    );
+  }
+
   private getOrCreateThread(threadId: string): InternalThreadMemory {
     const key = threadId || 'default-thread';
     let mem = this.threads.get(key);
@@ -1402,6 +1431,7 @@ export class VerdantCognitiveObserver {
       workingMemory: [...mem.workingMemory],
       grants: this.grants.snapshot(),
       lastCertificate: mem.lastCertificate,
+      temporalCoherence: this.chronology.snapshot(),
     };
   }
 
@@ -1498,6 +1528,22 @@ export class VerdantCognitiveObserver {
       hasEnabledContentStreams: ctx.hasEnabledContentStreams,
     });
 
+    // Sense wall-clock time, circadian phase, and user turn periodicity
+    const { cadence: userCadence } = !ctx.isToolContinuationStep
+      ? this.chronology.observeUserTurn()
+      : { cadence: this.chronology.getUserCadence() };
+    const chronoInstant = this.chronology.now();
+    const turnBudgetMs =
+      qualityBudget.featureRichness === 'full'
+        ? 6_000
+        : userCadence === 'rapid'
+          ? 1_800
+          : this.chronology.slas.turnTtftTargetMs;
+    const uncachedPrefillTokens = Math.min(
+      256,
+      Math.max(8, Math.ceil(ctx.latestUserText.length / 4) + 12),
+    );
+
   // Derive cognitive execution posture directly from integrated belief + sensed quality budget (zero manual modes!)
   // Suppress costly hidden <think> chains on explicit brief/minimal queries while boosting analytical
   // precision on debugging, proofs, edge cases, complexity, and counting puzzles.
@@ -1578,6 +1624,7 @@ export class VerdantCognitiveObserver {
         admitted,
         resonanceQ10: resonance,
         freeEnergy,
+        projectedTtftMs: 1,
         costVector,
         refusalReason: admitted
           ? undefined
@@ -1594,6 +1641,7 @@ export class VerdantCognitiveObserver {
       const qualityPenalty = Math.round((qualityShortfall * qualityShortfall) / 110);
       return baseGap + qualityPenalty;
     };
+    const thinkingTokensEstimate = thinkingPolicy === 'on' ? 48 : 0;
 
     // Candidate 2: Currently Resident Neural Route (zero transfer/switch cost!)
     if (hasLoadedRealModel && ctx.activeModel) {
@@ -1604,6 +1652,16 @@ export class VerdantCognitiveObserver {
       const capacityQ10 = cat ? getModelCapacityQ10(cat) : 740;
       const resonance = dotCognitiveQ10(nextBelief, facets);
       const pragmaticRisk = computePragmaticRisk(resonance, capacityQ10);
+      const projectedTtftMs = this.chronology.projectTurnTtftMs({
+        missingTransferBytes: 0,
+        opfsReadBytes: 0,
+        uncachedPrefillTokens,
+        thinkingTokensEstimate,
+      });
+      const timelinessPenalty = Math.min(
+        240,
+        Math.round(computeTimelinessPressureQ10(projectedTtftMs, turnBudgetMs) * 0.25),
+      );
       const computeTicks = cat
         ? Math.round(cat.geometry.activeParamsBillions * 120)
         : 360;
@@ -1621,7 +1679,8 @@ export class VerdantCognitiveObserver {
         modelId: ctx.activeModel.id,
         admitted: true,
         resonanceQ10: resonance,
-        freeEnergy: canonicalObjectiveScore(costVector) + pragmaticRisk,
+        freeEnergy: canonicalObjectiveScore(costVector) + pragmaticRisk + timelinessPenalty,
+        projectedTtftMs,
         costVector,
       });
     }
@@ -1635,6 +1694,16 @@ export class VerdantCognitiveObserver {
       const capacityQ10 = getModelCapacityQ10(cat);
       const resonance = dotCognitiveQ10(nextBelief, facets);
       const pragmaticRisk = computePragmaticRisk(resonance, capacityQ10);
+      const projectedTtftMs = this.chronology.projectTurnTtftMs({
+        missingTransferBytes: 0,
+        opfsReadBytes: Math.min(cat.approximateBytes, 256 * 1024 * 1024),
+        uncachedPrefillTokens,
+        thinkingTokensEstimate,
+      });
+      const timelinessPenalty = Math.min(
+        280,
+        Math.round(computeTimelinessPressureQ10(projectedTtftMs, turnBudgetMs) * 0.28),
+      );
       const switchPenalty = hasLoadedRealModel ? 480 : 40;
       const costVector: PrismArtifactCostVector = {
         dramReadCost: 120,
@@ -1650,7 +1719,8 @@ export class VerdantCognitiveObserver {
         modelId: cat.id,
         admitted: true,
         resonanceQ10: resonance,
-        freeEnergy: canonicalObjectiveScore(costVector) + pragmaticRisk,
+        freeEnergy: canonicalObjectiveScore(costVector) + pragmaticRisk + timelinessPenalty,
+        projectedTtftMs,
         costVector,
       });
     }
@@ -1677,6 +1747,19 @@ export class VerdantCognitiveObserver {
       const pragmaticRisk = computePragmaticRisk(resonance, capacityQ10);
       // Demand-streamed Sparse MoE fetches ONLY active experts (8/128) via OPFS CAS, not 18.56 GB!
       const isDemand = shouldPreferDemandStreaming(cat);
+      const estimatedColdBytes = isDemand
+        ? Math.round(cat.geometry.activeParamsBillions * 55 * 1024 * 1024)
+        : Math.round(cat.approximateBytes * 0.25);
+      const projectedTtftMs = this.chronology.projectTurnTtftMs({
+        missingTransferBytes: estimatedColdBytes,
+        opfsReadBytes: 0,
+        uncachedPrefillTokens,
+        thinkingTokensEstimate,
+      });
+      const timelinessPenalty = Math.min(
+        320,
+        Math.round(computeTimelinessPressureQ10(projectedTtftMs, turnBudgetMs) * 0.3),
+      );
       const baseTransfer = isDemand
         ? 520 + Math.round(cat.geometry.activeParamsBillions * 45)
         : 320 + Math.round(cat.geometry.paramsBillions * 90);
@@ -1695,7 +1778,8 @@ export class VerdantCognitiveObserver {
         modelId: cat.id,
         admitted: networkAllowed,
         resonanceQ10: resonance,
-        freeEnergy: canonicalObjectiveScore(costVector) + pragmaticRisk,
+        freeEnergy: canonicalObjectiveScore(costVector) + pragmaticRisk + timelinessPenalty,
+        projectedTtftMs,
         costVector,
         refusalReason: networkAllowed
           ? undefined
@@ -1743,6 +1827,19 @@ export class VerdantCognitiveObserver {
       mem.toolsLatched = true;
     }
 
+    const winnerProjectedTtftMs = winner.projectedTtftMs ?? 0;
+    const temporalAnchor: RouteTemporalAnchor = {
+      wallClockMs: chronoInstant.wallClockMs,
+      projectedTtftMs: winnerProjectedTtftMs,
+      turnBudgetMs,
+      streamTimeoutMs: this.chronology.deriveAdaptiveStreamTimeoutMs(qualityBudget.featureRichness),
+      timelinessQ10: clampQ10(
+        1024 - computeTimelinessPressureQ10(winnerProjectedTtftMs, turnBudgetMs),
+      ),
+      userCadence,
+      circadianPhaseQ10: chronoInstant.circadianPhaseQ10,
+    };
+
     const certificate: CognitiveRouteCertificate = {
       routeId: winner.routeId,
       label: winner.label,
@@ -1757,6 +1854,7 @@ export class VerdantCognitiveObserver {
       surpriseQ10,
       escalatedFromRetry: isRetry,
       qualityBudget,
+      temporalAnchor,
       digest,
       rationale,
       candidates,

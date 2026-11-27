@@ -1139,24 +1139,43 @@ export function createLlamaVTensorAdapter(
         readonly promptContextBlock: string | null;
         readonly titles: ReadonlySet<string>;
       }> | null = shouldStartLiveStreams
-        ? import('./realtimeWeightStreamer')
-            .then(({ streamRealtimeWeightsToPrism }) =>
-              streamRealtimeWeightsToPrism({
-                query: latestUserText,
-                catalogStore: studioBridge!.contentStreams!,
-                registry: studioBridge!.expertRegistry!,
-                maxStreams: certificate.qualityBudget.featureRichness === 'full' ? 3 : 2,
-                signal: abortSignal,
-              }),
-            )
-            .then((streamed) => ({
-              promptContextBlock:
-                streamed.promptContextBlock && streamed.promptContextBlock.trim().length > 0
-                  ? streamed.promptContextBlock
-                  : null,
-              titles: new Set(streamed.chunks.map((c) => c.title.toLowerCase())),
-            }))
-            .catch(() => ({ promptContextBlock: null, titles: new Set<string>() }))
+        ? (() => {
+            const streamTimeoutMs =
+              certificate.temporalAnchor?.streamTimeoutMs ??
+              client.cognitiveObserver.chronology.deriveAdaptiveStreamTimeoutMs(
+                certificate.qualityBudget.featureRichness,
+              );
+            const streamObjId = `stream:turn:${threadId}`;
+            client.cognitiveObserver.chronology.beginObject({
+              objectId: streamObjId,
+              modality: 'stream',
+              kind: 'stream-fetch',
+              label: 'Content streams grounding',
+              budgetMs: streamTimeoutMs,
+            });
+            return import('./realtimeWeightStreamer')
+              .then(({ streamRealtimeWeightsToPrism }) =>
+                streamRealtimeWeightsToPrism({
+                  query: latestUserText,
+                  catalogStore: studioBridge!.contentStreams!,
+                  registry: studioBridge!.expertRegistry!,
+                  maxStreams: certificate.qualityBudget.featureRichness === 'full' ? 3 : 2,
+                  timeoutMs: streamTimeoutMs,
+                  signal: abortSignal,
+                }),
+              )
+              .then((streamed) => ({
+                promptContextBlock:
+                  streamed.promptContextBlock && streamed.promptContextBlock.trim().length > 0
+                    ? streamed.promptContextBlock
+                    : null,
+                titles: new Set(streamed.chunks.map((c) => c.title.toLowerCase())),
+              }))
+              .catch(() => ({ promptContextBlock: null, titles: new Set<string>() }))
+              .finally(() => {
+                client.cognitiveObserver.chronology.completeObject(streamObjId);
+              });
+          })()
         : null;
 
       // ---------------------------------------------------------------------
@@ -1331,6 +1350,17 @@ export function createLlamaVTensorAdapter(
       let lastPromptTokens = 0;
       let lastGeneratedTokens = 0;
       let lastTokensPerSecond = 0;
+      const turnTtftObjId = `turn:ttft:${threadId}`;
+      const generateStartMs = Date.now();
+      client.cognitiveObserver.chronology.beginObject({
+        objectId: turnTtftObjId,
+        modality: 'language',
+        kind: 'turn-ttft',
+        label: certificate.label,
+        budgetMs:
+          certificate.temporalAnchor?.turnBudgetMs ??
+          client.cognitiveObserver.chronology.slas.turnTtftTargetMs,
+      });
 
       try {
         for await (const event of client.streamGenerate(
@@ -1342,6 +1372,7 @@ export function createLlamaVTensorAdapter(
         )) {
           if (firstTokenTime === undefined) {
             firstTokenTime = Date.now();
+            client.cognitiveObserver.chronology.completeObject(turnTtftObjId);
           }
           totalChunks += 1;
           latestText = event.accumulatedText;
@@ -1380,6 +1411,24 @@ export function createLlamaVTensorAdapter(
           }
         }
       } finally {
+        if (firstTokenTime === undefined) {
+          client.cognitiveObserver.chronology.completeObject(turnTtftObjId);
+        }
+        // Close the real-time throughput calibration loop on ObserverChronology
+        if (lastGeneratedTokens >= 4 && lastTokensPerSecond > 0) {
+          const prefillElapsedSec =
+            firstTokenTime !== undefined && firstTokenTime > generateStartMs
+              ? (firstTokenTime - generateStartMs) / 1000
+              : 0;
+          const observedPrefillTokSec =
+            lastPromptTokens >= 16 && prefillElapsedSec >= 0.08
+              ? lastPromptTokens / prefillElapsedSec
+              : undefined;
+          client.cognitiveObserver.chronology.recordInferenceThroughput({
+            decodeTokSec: lastTokensPerSecond,
+            prefillTokSec: observedPrefillTokSec,
+          });
+        }
         abortSignal.removeEventListener('abort', onExternalAbort);
       }
 

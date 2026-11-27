@@ -731,6 +731,13 @@ export class LlamaVTensorWorkerClient {
     }
 
     if (this.state.streamingConsent === 'accepted') {
+      this.cognitiveObserver.chronology.beginObject({
+        objectId: 'app:init',
+        modality: 'system',
+        kind: 'app-init',
+        label: 'Application initialization',
+        budgetMs: this.cognitiveObserver.chronology.slas.appInitTargetMs,
+      });
       this.patchState({
         status: 'downloading',
         progressPercent: 2,
@@ -778,6 +785,13 @@ export class LlamaVTensorWorkerClient {
       });
 
       if (!alreadyLoadedRealModel && !isAlreadyLoading) {
+        this.cognitiveObserver.chronology.beginObject({
+          objectId: 'app:init',
+          modality: 'system',
+          kind: 'app-init',
+          label: 'Application initialization',
+          budgetMs: this.cognitiveObserver.chronology.slas.appInitTargetMs,
+        });
         await this.warmUnifiedModelOnConsent().catch(() => undefined);
       }
     } else {
@@ -1260,6 +1274,12 @@ export class LlamaVTensorWorkerClient {
     if (msg.type === 'prewarm_status') {
       const wasWarm =
         !this.state.backgroundPrewarm.active && this.state.backgroundPrewarm.contextWarmed;
+      if (typeof msg.bytesPerSecond === 'number' && msg.bytesPerSecond > 0) {
+        this.cognitiveObserver.chronology.recordNetworkThroughput(msg.bytesPerSecond);
+      }
+      if (!msg.active && msg.contextWarmed) {
+        this.cognitiveObserver.chronology.completeObject('app:init');
+      }
       this.patchState({
         backgroundPrewarm: {
           active: msg.active,
@@ -1339,6 +1359,7 @@ export class LlamaVTensorWorkerClient {
       });
       // Warm initial prompt prefix for real resident models (skip bootstrap & demand-paged models)
       if (!isInternalBootstrap && msg.summary.backingKind !== 'opfs-demand') {
+        this.cognitiveObserver.chronology.completeObject('app:init');
         const bootSystem = this.state.importedHarness?.system ?? UNIFIED_VERDANT_SYSTEM_PROMPT;
         const bootPrefix = formatSpeculativePrefixForLlama(
           [],

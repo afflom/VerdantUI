@@ -24,6 +24,11 @@ import {
 } from './contentGalleryStore';
 import { ContentStreamCatalogStore } from './contentStreamCatalog';
 import { isInternalBootstrapModel } from './modelCatalog';
+import type {
+  ObserverChronology,
+  TemporalCoherenceSnapshot,
+  TimelinessState,
+} from './observerChronology';
 import { ObserverStreamBus } from './observerStreamBus';
 import {
   buildCanonicalWorkspaceUiTree,
@@ -77,6 +82,10 @@ export interface PartRuntimeTask {
   readonly label: string;
   readonly banner: { readonly ok: boolean; readonly text: string } | null;
   readonly updatedAt: number;
+  readonly startedAtWallMs?: number;
+  readonly elapsedMs?: number;
+  readonly timelinessQ10?: number;
+  readonly timelinessState?: TimelinessState;
 }
 
 export interface RootFocusSnapshot {
@@ -98,7 +107,6 @@ interface QueuedReconciliationJob {
 }
 
 const MAX_CONCURRENT_RECONCILIATIONS = 2;
-const RECONCILE_STAGE_TIMEOUT_MS = 30_000;
 const LOD_LABELS: readonly PrismLodLabel[] = [
   'Lod0CoarseProxy',
   'Lod1MediumDetail',
@@ -205,6 +213,16 @@ export class VerdantRootPrismRuntime {
   }): void {
     this.onOpenPrismCallback = cbs.onOpenPrism ?? null;
     this.onOpenGalleryCallback = cbs.onOpenGallery ?? null;
+  }
+
+  /** Unified wall-clock + monotonic chronological spine shared with the Cognitive Observer. */
+  get chronology(): ObserverChronology {
+    return this.workerClient.cognitiveObserver.chronology;
+  }
+
+  /** Returns live cross-modality timeliness coherence across all parts, turns, and streams. */
+  getTemporalCoherenceSnapshot(): TemporalCoherenceSnapshot {
+    return this.chronology.snapshot();
   }
 
   async getPrismBuildClient(): Promise<PrismBuildWorkerClient> {
@@ -541,6 +559,7 @@ export class VerdantRootPrismRuntime {
         removed?.resolve();
       }
     }
+    this.chronology.completeObject(`prism:${partId}`);
     this.setPartTask(partId, {
       status: 'idle',
       busy: false,
@@ -637,11 +656,27 @@ export class VerdantRootPrismRuntime {
   private async runReconciliationJob(job: QueuedReconciliationJob): Promise<void> {
     const isStale = () =>
       job.controller.signal.aborted || this.partEpochs.get(job.prismId) !== job.epoch;
+    const prismObjId = `prism:${job.prismId}`;
+    const stageBudgetMs = this.chronology.derivePrismStageBudgetMs(job.maxRank);
+    const chronoRec = this.chronology.beginObject({
+      objectId: prismObjId,
+      modality: 'prism',
+      kind: 'prism-part',
+      label: job.prompt.slice(0, 64) || job.prismId,
+      budgetMs: stageBudgetMs,
+      periodMs: 1_000,
+    });
+    this.setPartTask(job.prismId, {
+      startedAtWallMs: chronoRec.bornAtWallMs,
+      elapsedMs: 0,
+      timelinessQ10: 1024,
+      timelinessState: 'on-time',
+    });
     let watchdog: ReturnType<typeof setTimeout> | null = null;
     try {
       watchdog = setTimeout(() => {
         job.controller.abort();
-      }, RECONCILE_STAGE_TIMEOUT_MS);
+      }, stageBudgetMs);
 
       const { runProgressivePrismReconciliation } = await import('./prismReconciliationLoop');
       const res = await runProgressivePrismReconciliation({
@@ -653,6 +688,7 @@ export class VerdantRootPrismRuntime {
         isStale,
         onProgress: (ev) => {
           if (isStale()) return;
+          const obs = this.chronology.observeObject(prismObjId);
           this.setPartTask(job.prismId, {
             status: ev.lodRank >= job.maxRank ? 'ready' : 'qa-reconciling',
             busy: ev.lodRank < job.maxRank,
@@ -662,6 +698,13 @@ export class VerdantRootPrismRuntime {
             semanticVersion: ev.semanticVersion,
             epoch: job.epoch,
             label: ev.statusLabel,
+            ...(obs
+              ? {
+                  elapsedMs: obs.elapsedMs,
+                  timelinessQ10: obs.timelinessQ10,
+                  timelinessState: obs.state,
+                }
+              : {}),
           });
         },
         deps: {
@@ -690,6 +733,7 @@ export class VerdantRootPrismRuntime {
         },
       });
 
+      const finalObs = this.chronology.completeObject(prismObjId);
       if (!isStale()) {
         this.setPartTask(job.prismId, {
           status: 'ready',
@@ -700,14 +744,29 @@ export class VerdantRootPrismRuntime {
           semanticVersion: res.finalRevision.version,
           epoch: job.epoch,
           label: '',
+          ...(finalObs
+            ? {
+                elapsedMs: finalObs.elapsedMs,
+                timelinessQ10: finalObs.timelinessQ10,
+                timelinessState: finalObs.state,
+              }
+            : {}),
         });
       }
     } catch {
+      const finalObs = this.chronology.completeObject(prismObjId);
       if (!isStale()) {
         this.setPartTask(job.prismId, {
           status: 'ready',
           busy: false,
           label: '',
+          ...(finalObs
+            ? {
+                elapsedMs: finalObs.elapsedMs,
+                timelinessQ10: finalObs.timelinessQ10,
+                timelinessState: finalObs.state,
+              }
+            : {}),
         });
       }
     } finally {
@@ -740,12 +799,24 @@ export class VerdantRootPrismRuntime {
         trimmed,
       );
 
+    const prismObjId = `prism:${prismId}`;
+    const chronoRec = this.chronology.beginObject({
+      objectId: prismObjId,
+      modality: 'prism',
+      kind: 'prism-part',
+      label: trimmed.slice(0, 64),
+      budgetMs: this.chronology.derivePrismStageBudgetMs(2),
+    });
     this.setPartTask(prismId, {
       status: 'synthesizing',
       busy: true,
       epoch,
       label: isCompanionReq ? 'Creating companion…' : 'Refining…',
       banner: null,
+      startedAtWallMs: chronoRec.bornAtWallMs,
+      elapsedMs: 0,
+      timelinessQ10: 1024,
+      timelinessState: 'on-time',
     });
 
     try {
@@ -754,6 +825,7 @@ export class VerdantRootPrismRuntime {
         target: prismId,
         instruction: trimmed,
       });
+      const finalObs = this.chronology.completeObject(prismObjId);
       if (isStale()) return { ok: false, text: '' };
 
       const openedCompanion = res.prismId !== prismId ? res.prismId : undefined;
@@ -762,6 +834,13 @@ export class VerdantRootPrismRuntime {
         busy: false,
         epoch,
         label: '',
+        ...(finalObs
+          ? {
+              elapsedMs: finalObs.elapsedMs,
+              timelinessQ10: finalObs.timelinessQ10,
+              timelinessState: finalObs.state,
+            }
+          : {}),
         banner: {
           ok: true,
           text: openedCompanion
@@ -771,6 +850,7 @@ export class VerdantRootPrismRuntime {
       });
       return { ok: true, text: res.summary, openPrismId: openedCompanion };
     } catch (err) {
+      this.chronology.completeObject(prismObjId);
       if (isStale()) return { ok: false, text: '' };
       const msg = err instanceof Error ? err.message : String(err);
       this.setPartTask(prismId, {

@@ -16,6 +16,7 @@
  *    window with quantized hysteresis keeps UI locked to 60 Hz (`16,666 µs`) with zero user knobs.
  */
 
+import { ObserverChronology } from './observerChronology';
 import { prismContentDigest } from './prismKernel';
 
 export type CoherentModality = 'language' | 'vision' | 'audio' | 'image-synthesis';
@@ -55,6 +56,8 @@ export interface MultimodalCoherenceTelemetry {
   readonly audioCacheHits: number;
   readonly modalityEvictions: number;
   readonly frameBudget: FrameBudgetStabilityReport;
+  /** Cross-modality wall-clock timeliness coherence in exact integer Q10 (0..1024). */
+  readonly temporalCoherenceQ10: number;
 }
 
 export interface FrameBudgetStabilityReport {
@@ -187,6 +190,7 @@ export function computeMediaKappa(
  */
 export class MultimodalCoherenceCoordinator {
   readonly frameOracle: FrameBudgetOracle;
+  readonly chronology: ObserverChronology;
   private readonly residentSlots = new Map<CoherentModality, ModalityResidencySlot>();
   private readonly visualCache = new Map<string, CachedVisualEncoding>();
   private readonly audioCache = new Map<string, CachedAudioTranscript>();
@@ -197,8 +201,25 @@ export class MultimodalCoherenceCoordinator {
   private audioCacheHits = 0;
   private modalityEvictions = 0;
 
-  constructor(private readonly maxResidentAuxiliaryBytes = 384 * 1024 * 1024) {
+  constructor(
+    private readonly maxResidentAuxiliaryBytes = 384 * 1024 * 1024,
+    chronology?: ObserverChronology,
+  ) {
     this.frameOracle = new FrameBudgetOracle(DEFAULT_FRAME_BUDGET_US);
+    this.chronology = chronology ?? new ObserverChronology();
+  }
+
+  /** Records a 60 Hz frame duration on both the FrameBudgetOracle and the Observer temporal spine. */
+  recordFrame(frameUs: number): number {
+    this.chronology.pulseObject({
+      objectId: 'modal:frame-clock',
+      modality: 'video',
+      kind: 'modal-frame',
+      label: 'Frame pacing clock',
+      periodMs: this.chronology.slas.framePeriodMs,
+      budgetMs: this.chronology.slas.framePeriodMs,
+    });
+    return this.frameOracle.recordFrame(frameUs);
   }
 
   /**
@@ -209,6 +230,14 @@ export class MultimodalCoherenceCoordinator {
   activateModality(slot: Omit<ModalityResidencySlot, 'lastUsedAt'>): void {
     const now = Date.now();
     this.residentSlots.set(slot.modality, { ...slot, lastUsedAt: now });
+    this.chronology.pulseObject({
+      objectId: `modality:${slot.modality}`,
+      modality: slot.modality === 'image-synthesis' ? 'vision' : slot.modality,
+      kind: 'modal-frame',
+      label: slot.modelId,
+      periodMs: slot.modality === 'audio' ? 1_000 : this.chronology.slas.framePeriodMs,
+      budgetMs: 5_000,
+    });
     this.enforceAuxiliaryBudget(slot.modality);
   }
 
@@ -265,9 +294,25 @@ export class MultimodalCoherenceCoordinator {
       this.visualCache.delete(kappa);
       this.visualCache.set(kappa, cached);
       this.touchModality('vision');
+      this.chronology.pulseObject({
+        objectId: 'modal:vision-encode',
+        modality: 'vision',
+        kind: 'modal-frame',
+        label: 'Vision encoding (cache hit)',
+        periodMs: this.chronology.slas.framePeriodMs,
+        budgetMs: 2_500,
+      });
       return { entry: cached, cacheHit: true };
     }
 
+    this.chronology.beginObject({
+      objectId: 'modal:vision-encode',
+      modality: 'vision',
+      kind: 'modal-frame',
+      label: 'Vision encoding',
+      budgetMs: 2_500,
+      periodMs: this.chronology.slas.framePeriodMs,
+    });
     let pending = this.inFlightVisual.get(kappa);
     if (!pending) {
       pending = encodeFn()
@@ -282,6 +327,7 @@ export class MultimodalCoherenceCoordinator {
         })
         .finally(() => {
           this.inFlightVisual.delete(kappa);
+          this.chronology.completeObject('modal:vision-encode');
         });
       this.inFlightVisual.set(kappa, pending);
     }
@@ -303,9 +349,25 @@ export class MultimodalCoherenceCoordinator {
       this.audioCache.delete(kappa);
       this.audioCache.set(kappa, cached);
       this.touchModality('audio');
+      this.chronology.pulseObject({
+        objectId: 'modal:audio-transcribe',
+        modality: 'audio',
+        kind: 'modal-frame',
+        label: 'Audio transcription (cache hit)',
+        periodMs: 1_000,
+        budgetMs: 3_000,
+      });
       return { entry: cached, cacheHit: true };
     }
 
+    this.chronology.beginObject({
+      objectId: 'modal:audio-transcribe',
+      modality: 'audio',
+      kind: 'modal-frame',
+      label: 'Audio transcription',
+      budgetMs: 3_000,
+      periodMs: 1_000,
+    });
     let pending = this.inFlightAudio.get(kappa);
     if (!pending) {
       pending = transcribeFn()
@@ -320,6 +382,7 @@ export class MultimodalCoherenceCoordinator {
         })
         .finally(() => {
           this.inFlightAudio.delete(kappa);
+          this.chronology.completeObject('modal:audio-transcribe');
         });
       this.inFlightAudio.set(kappa, pending);
     }
@@ -341,6 +404,7 @@ export class MultimodalCoherenceCoordinator {
       audioCacheHits: this.audioCacheHits,
       modalityEvictions: this.modalityEvictions,
       frameBudget: this.frameOracle.report(),
+      temporalCoherenceQ10: this.chronology.snapshot().coherenceQ10,
     };
   }
 

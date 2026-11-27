@@ -21,6 +21,7 @@ import {
   dotCognitiveQ10,
   type CognitiveVector,
 } from './cognitiveObserver';
+import { computeKnowledgeFreshnessQ10 } from './observerChronology';
 import { prismContentDigest } from './prismKernel';
 import type { PrismMediaType } from './prismMediaOrgans';
 import type { VerdantPrismProject } from './prismStudio';
@@ -520,6 +521,7 @@ export class LivingTrainingBasis {
     readonly text?: string;
     readonly mediaType?: PrismMediaType;
     readonly limit?: number;
+    readonly nowMs?: number;
   }): readonly BasisKnowledgeEntry[] {
     const STOP_WORDS = new Set([
       'the', 'and', 'for', 'with', 'that', 'this', 'from', 'have', 'what', 'when',
@@ -532,6 +534,7 @@ export class LivingTrainingBasis {
     const tokens = rawTokens.filter((t) => !STOP_WORDS.has(t) && t.length >= 3);
     const effectiveTokens = tokens.length > 0 ? tokens : rawTokens;
     const limit = Math.max(1, Math.min(12, query.limit ?? 5));
+    const nowMs = query.nowMs ?? Date.now();
 
     // Also probe UnifiedSemanticAssociator for associative concept attributes (e.g., learned visual/factual concepts)
     const semanticAttrs = new Set<string>();
@@ -547,7 +550,11 @@ export class LivingTrainingBasis {
     const scored = [...this.knowledgeByKappa.values()]
       .filter((entry) => !query.mediaType || entry.mediaType === query.mediaType)
       .map((entry) => {
-        if (effectiveTokens.length === 0) return { entry, score: 1 };
+        const freshnessQ10 =
+          entry.fetchedAt !== undefined && entry.ttlMs !== undefined && entry.ttlMs > 0
+            ? computeKnowledgeFreshnessQ10(nowMs - entry.fetchedAt, entry.ttlMs)
+            : 1024;
+        if (effectiveTokens.length === 0) return { entry, score: 512 + freshnessQ10 };
         const titleLower = entry.title.toLowerCase();
         const catLower = entry.categories.join(' ').toLowerCase();
         const hay = `${titleLower} ${entry.summary.toLowerCase()} ${catLower} ${entry.mediaType}`;
@@ -568,7 +575,8 @@ export class LivingTrainingBasis {
         if (effectiveTokens.length >= 3 && matchedTokens === 1 && score < 4) {
           score = 0;
         }
-        return { entry, score };
+        // Modulate topical relevance smoothly by wall-clock freshness (`computeKnowledgeFreshnessQ10`)
+        return { entry, score: score > 0 ? score * (512 + freshnessQ10) : 0 };
       })
       .filter((x) => x.score > 0)
       .sort((a, b) => b.score - a.score || b.entry.updatedAt - a.entry.updatedAt);
@@ -584,10 +592,11 @@ export class LivingTrainingBasis {
     queryText: string,
     limit = 3,
     excludeTitles?: ReadonlySet<string>,
+    nowMs?: number,
   ): string | null {
     const trimmed = queryText.trim();
     if (trimmed.length < 4 || this.knowledgeByKappa.size === 0) return null;
-    const hits = this.recallKnowledge({ text: trimmed, limit: limit + 2 }).filter(
+    const hits = this.recallKnowledge({ text: trimmed, limit: limit + 2, nowMs }).filter(
       (entry) => !excludeTitles?.has(entry.title.toLowerCase()),
     );
     if (hits.length === 0) return null;

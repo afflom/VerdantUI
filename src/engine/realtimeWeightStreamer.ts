@@ -479,6 +479,8 @@ export async function streamRealtimeWeightsToPrism(params: {
   readonly signal?: AbortSignal;
   readonly maxStreams?: number;
   readonly nowMs?: number;
+  /** Optional adaptive wall-clock deadline (ms) derived by ObserverChronology. */
+  readonly timeoutMs?: number;
 }): Promise<StreamRealtimeResult> {
   const enabled = params.catalogStore.getEnabledStreams();
   if (enabled.length === 0) {
@@ -528,17 +530,36 @@ export async function streamRealtimeWeightsToPrism(params: {
 
   const selectedStreams = selectRelevantEnabledStreams(params.query, enabled, params.maxStreams ?? 2);
   const fetchImpl = params.fetchFn ?? fetch;
+  const deadlineCtrl = new AbortController();
+  const onParentAbort = () => deadlineCtrl.abort();
+  if (params.signal?.aborted) {
+    deadlineCtrl.abort();
+  } else {
+    params.signal?.addEventListener('abort', onParentAbort, { once: true });
+  }
+  const overallTimeoutMs =
+    typeof params.timeoutMs === 'number' && params.timeoutMs >= 400
+      ? params.timeoutMs
+      : STREAM_FETCH_TIMEOUT_MS + 600;
+  const deadlineTimer = setTimeout(() => deadlineCtrl.abort(), overallTimeoutMs);
+
   let networkFetches = 0;
   let kappaDedupHits = 0;
   let foldedNovelChunks = 0;
   const collected: StreamedKnowledgeChunk[] = [];
 
-  await Promise.all(
-    selectedStreams.map(async (stream) => {
-      if (params.signal?.aborted) return;
-      networkFetches += 1;
-      try {
-        const rawItems = await fetchFromStreamProvider(stream, topic, fetchImpl, params.signal);
+  try {
+    await Promise.all(
+      selectedStreams.map(async (stream) => {
+        if (deadlineCtrl.signal.aborted) return;
+        networkFetches += 1;
+        try {
+          const rawItems = await fetchFromStreamProvider(
+            stream,
+            topic,
+            fetchImpl,
+            deadlineCtrl.signal,
+          );
         let addedForStream = 0;
         for (const item of rawItems) {
           const canonicalText = canonicalizeStreamText(item.rawText, MAX_CHUNK_CHARS);
@@ -610,12 +631,16 @@ export async function streamRealtimeWeightsToPrism(params: {
           });
         }
         params.catalogStore.recordStreamSync(stream.id, addedForStream, null);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : 'Unable to reach stream';
-        params.catalogStore.recordStreamSync(stream.id, 0, msg);
-      }
-    }),
-  );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : 'Unable to reach stream';
+          params.catalogStore.recordStreamSync(stream.id, 0, msg);
+        }
+      }),
+    );
+  } finally {
+    clearTimeout(deadlineTimer);
+    params.signal?.removeEventListener('abort', onParentAbort);
+  }
 
   const bounded = collected.slice(0, 4);
   const promptContextBlock =
