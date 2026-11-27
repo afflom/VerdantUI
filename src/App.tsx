@@ -304,15 +304,32 @@ export default function App() {
     [prismStore, prisms],
   );
 
-  // Sync owned Prisms into the unified possession model, expert registry, and global gallery index.
-  const { opaqueConstraintsNotice, visiblePublishedPrisms, spacePrisms, galleryCounts } = useMemo(() => {
-    const activeSpace = workerClient.cognitiveObserver.possession.getActiveCompartmentId();
+  // Sync owned Prisms into the unified possession model, expert registry, and global gallery index
+  // cleanly in an effect (NEVER mutate/emit stores synchronously during render!).
+  useEffect(() => {
     workerClient.cognitiveObserver.syncPublishedPrisms(prisms);
     expertRegistry.syncPrismsAsExperts(prisms);
     galleryStore.syncFromPrisms(prisms);
+  }, [workerClient, expertRegistry, galleryStore, prisms]);
+
+  // Pure derived workspace views (zero store mutations during render)
+  const { opaqueConstraintsNotice, visiblePublishedPrisms, spacePrisms, galleryCounts } = useMemo(() => {
+    const activeSpace = workerClient.cognitiveObserver.possession.getActiveCompartmentId();
     const spacesOnly = prisms.filter(
       (p) => (p.declaration?.view?.proceduralOrgan?.mediaType ?? p.declaration?.concept.mediaType) === 'space',
     );
+    const counts: Record<GalleryMediaType, number> = {
+      picture: 0,
+      video: 0,
+      audio: 0,
+      'written-work': 0,
+      'interactive-game': 0,
+      'research-program': 0,
+      'tool-organ': 0,
+    };
+    for (const rec of galleryArtifacts) {
+      counts[rec.mediaType] += 1;
+    }
     return {
       opaqueConstraintsNotice:
         workerClient.cognitiveObserver.getOpaqueConstraintsPromptForSpace(activeSpace),
@@ -321,10 +338,9 @@ export default function App() {
         activeSpace,
       ),
       spacePrisms: spacesOnly,
-      galleryCounts: galleryStore.galleryCounts(),
+      galleryCounts: counts,
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workerClient, expertRegistry, galleryStore, prisms, publishedPrisms, galleryArtifacts]);
+  }, [workerClient, prisms, publishedPrisms, galleryArtifacts]);
 
   // Couple Living Training Basis user facets into VerdantCognitiveObserver active inference
   useEffect(() => {

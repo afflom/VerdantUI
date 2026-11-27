@@ -193,10 +193,12 @@ export class ContentGalleryStore {
     return this.records.get(id) ?? null;
   }
 
-  /** Synchronizes every non-Space Prism into the global MediaType gallery index. */
+  /** Synchronizes every non-Space Prism into the global MediaType gallery index (idempotent). */
   syncFromPrisms(prisms: readonly VerdantPrismProject[]): void {
     const seen = new Set<string>();
     const validSpaceIds = new Set<string>();
+    let changed = false;
+
     for (const p of prisms) {
       const mt = p.declaration?.view?.proceduralOrgan?.mediaType ?? p.declaration?.concept.mediaType;
       if (mt === 'space') validSpaceIds.add(p.id);
@@ -218,7 +220,7 @@ export class ContentGalleryStore {
           : inferCategoriesForArtifact(rawType, snap.name, snap.summary, weights);
       const cleanedSpaces = (meta?.spaceIds ?? []).filter((sid) => validSpaceIds.has(sid));
 
-      this.records.set(p.id, {
+      const nextRec: ContentArtifactRecord = {
         id: p.id,
         mediaType: rawType,
         title: snap.name,
@@ -231,15 +233,31 @@ export class ContentGalleryStore {
         audioDurationSec: meta?.audioDurationSec,
         createdAt: p.createdAt,
         updatedAt: p.updatedAt,
-      });
+      };
+      const prev = this.records.get(p.id);
+      if (
+        !prev ||
+        prev.kappa !== nextRec.kappa ||
+        prev.title !== nextRec.title ||
+        prev.published !== nextRec.published ||
+        prev.previewDataUrl !== nextRec.previewDataUrl ||
+        prev.spaceIds.length !== nextRec.spaceIds.length ||
+        prev.categories.length !== nextRec.categories.length
+      ) {
+        changed = true;
+      }
+      this.records.set(p.id, nextRec);
     }
 
     for (const id of [...this.records.keys()]) {
       if (!seen.has(id)) {
         this.records.delete(id);
+        changed = true;
       }
     }
-    this.emit();
+    if (changed) {
+      this.emit();
+    }
   }
 
   /** Updates cached thumbnail, sub-categories, or Space memberships for an artifact. */

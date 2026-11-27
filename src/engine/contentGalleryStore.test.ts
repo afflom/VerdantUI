@@ -63,4 +63,12 @@ test('ContentGalleryStore globally indexes artifacts by MediaType, sub-categorie
   // Category inference covers diverse media types cleanly
   assert.ok(inferCategoriesForArtifact('audio', 'Lo-Fi Beat', '112 bpm drum pulse', { style: 'rhythm-pulse' }).includes('Beats & Rhythm'));
   assert.ok(inferCategoriesForArtifact('interactive-game', 'Breakout', 'arcade bricks', { archetype: 'arcade-canvas' }).includes('Arcade'));
+
+  // Regression guard: syncFromPrisms must be strictly idempotent (never emit on unchanged state -> prevents React render loops)
+  let emitCount = 0;
+  const unsub = galleries.subscribe(() => { emitCount += 1; });
+  galleries.syncFromPrisms(store.list());
+  galleries.syncFromPrisms(store.list());
+  unsub();
+  assert.equal(emitCount, 0, 'syncFromPrisms must not emit when no artifact records changed');
 });
