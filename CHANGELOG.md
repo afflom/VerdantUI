@@ -2,6 +2,14 @@
 
 > Generated mechanically by `npm run studio:publish` from `model/release-ledger.json` and `model/features.json`.
 
+## v0.7.0 (2026-11-27)
+
+Self-Similar Prism UI & Observer Procedural Surface Synthesis
+
+- **Engine Pin:** `afflom/verdant-engine@v2.22.4`
+- **Studio Pin:** `afflom/verdant-studio@da5083b5ee22`
+- **Active Features:** `VUI-FEAT-001`, `VUI-FEAT-002`, `VUI-FEAT-003`, `VUI-FEAT-004`, `VUI-FEAT-005`, `VUI-FEAT-006`, `VUI-FEAT-007`, `VUI-FEAT-008`, `VUI-FEAT-009`, `VUI-FEAT-010`, `VUI-FEAT-011`, `VUI-FEAT-012`
+
 ## v0.6.0 (2026-11-26)
 
 Unified Expert Basis, Global MediaType Galleries, Spaces-as-Prisms & Feature-Complete Media Synthesis

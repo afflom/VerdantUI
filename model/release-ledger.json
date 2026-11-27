@@ -114,6 +114,29 @@
         "VUI-FEAT-011"
       ],
       "summary": "Unified Expert Basis, Global MediaType Galleries, Spaces-as-Prisms & Feature-Complete Media Synthesis"
+    },
+    {
+      "version": "0.7.0",
+      "tag": "v0.7.0",
+      "releasedAt": "2026-11-27T04:26:59.239Z",
+      "commit": "82b9bc7039468d882da2c65cb5f93ea5b2a32fb7",
+      "engineTag": "v2.22.4",
+      "studioCommit": "da5083b5ee22e2d9942acee0e03a5b1a0a22e091",
+      "activeFeatureIds": [
+        "VUI-FEAT-001",
+        "VUI-FEAT-002",
+        "VUI-FEAT-003",
+        "VUI-FEAT-004",
+        "VUI-FEAT-005",
+        "VUI-FEAT-006",
+        "VUI-FEAT-007",
+        "VUI-FEAT-008",
+        "VUI-FEAT-009",
+        "VUI-FEAT-010",
+        "VUI-FEAT-011",
+        "VUI-FEAT-012"
+      ],
+      "summary": "Self-Similar Prism UI & Observer Procedural Surface Synthesis"
     }
   ]
 }
