@@ -239,6 +239,34 @@
         "VUI-FEAT-016"
       ],
       "summary": "Layer-Streamed OPFS SDXS-512 CLIP Transformer, Spatial Cross-Attention UNet & Progressive 3-Stage TAESD (128-512px)"
+    },
+    {
+      "version": "0.12.0",
+      "tag": "v0.12.0",
+      "releasedAt": "2026-11-27T14:06:37.398Z",
+      "commit": "694db73bb705efc78fd5117b3ed6cc2ef86aae21",
+      "engineTag": "v2.22.4",
+      "studioCommit": "85dc9880c955d084c47624107ecb2971daef93f2",
+      "activeFeatureIds": [
+        "VUI-FEAT-001",
+        "VUI-FEAT-002",
+        "VUI-FEAT-003",
+        "VUI-FEAT-004",
+        "VUI-FEAT-005",
+        "VUI-FEAT-006",
+        "VUI-FEAT-007",
+        "VUI-FEAT-008",
+        "VUI-FEAT-009",
+        "VUI-FEAT-010",
+        "VUI-FEAT-011",
+        "VUI-FEAT-012",
+        "VUI-FEAT-013",
+        "VUI-FEAT-014",
+        "VUI-FEAT-015",
+        "VUI-FEAT-016",
+        "VUI-FEAT-017"
+      ],
+      "summary": "Zero-Churn Scoped UI Subscriptions, 64-Token KV Checkpoint/Resume, 100% Neural Picture Sandbox, Live VLM QA & Native F16/Q8_0 SIMD SDXS-512 Graph"
     }
   ]
 }
