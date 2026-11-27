@@ -4,7 +4,7 @@
 
 - **Active Features:** 15
 - **Proposed / Planned Features:** 0
-- **Recorded Releases:** 9
+- **Recorded Releases:** 10
 
 ## Feature Register
 
@@ -39,3 +39,4 @@
 | `v0.7.0` | `v2.22.4` | `da5083b5ee` | 12 | Self-Similar Prism UI & Observer Procedural Surface Synthesis |
 | `v0.8.0` | `v2.22.4` | `8a1f0ae8f7` | 13 | Coherent Multi-Facet Synthesis, SVG Logo/Cover Art, Mastered WAV+MIDI & Decluttered Media Prisms |
 | `v0.9.0` | `v2.22.4` | `85dc9880c9` | 14 | OPFS SDXS GGUF Loader, Worker Auto-Recovery, Compact Thumbnails, Editorial Research/Utility Organs & Deterministic Publish |
+| `v0.10.0` | `v2.22.4` | `85dc9880c9` | 15 | Live Root Verdant Prism Runtime, Zero-Interruption Cooperative Scheduling, Gated Delta Cross-Modal Associativity & Progressive Lod0-Lod3 QA |

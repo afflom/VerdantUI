@@ -1,7 +1,7 @@
 {
   "name": "verdant-ui",
   "private": true,
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "100% client-side local AI workbench powered by Verdant Tensor multi-threaded WASM SIMD and vTensor.",
   "license": "Apache-2.0",
   "type": "module",

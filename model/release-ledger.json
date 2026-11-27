@@ -186,6 +186,32 @@
         "VUI-FEAT-014"
       ],
       "summary": "OPFS SDXS GGUF Loader, Worker Auto-Recovery, Compact Thumbnails, Editorial Research/Utility Organs & Deterministic Publish"
+    },
+    {
+      "version": "0.10.0",
+      "tag": "v0.10.0",
+      "releasedAt": "2026-11-27T13:21:43.876Z",
+      "commit": "6ac40f66687c96f0c8c0bfab4728f6722680704b",
+      "engineTag": "v2.22.4",
+      "studioCommit": "85dc9880c955d084c47624107ecb2971daef93f2",
+      "activeFeatureIds": [
+        "VUI-FEAT-001",
+        "VUI-FEAT-002",
+        "VUI-FEAT-003",
+        "VUI-FEAT-004",
+        "VUI-FEAT-005",
+        "VUI-FEAT-006",
+        "VUI-FEAT-007",
+        "VUI-FEAT-008",
+        "VUI-FEAT-009",
+        "VUI-FEAT-010",
+        "VUI-FEAT-011",
+        "VUI-FEAT-012",
+        "VUI-FEAT-013",
+        "VUI-FEAT-014",
+        "VUI-FEAT-015"
+      ],
+      "summary": "Live Root Verdant Prism Runtime, Zero-Interruption Cooperative Scheduling, Gated Delta Cross-Modal Associativity & Progressive Lod0-Lod3 QA"
     }
   ]
 }
