@@ -6,8 +6,8 @@ import {
   isVerdantUsableForConsent,
 } from './appInitialization';
 
-test('Initializing screen stays hidden while streaming consent is pending', () => {
-  const view = deriveAppInitializationState({
+test('First-time visitors start directly on the Splash Initialization Screen in consent phase (returning users bypass consent)', () => {
+  const firstVisit = deriveAppInitializationState({
     streamingConsent: 'pending',
     engineStatus: 'ready',
     progressPercent: 100,
@@ -17,8 +17,23 @@ test('Initializing screen stays hidden while streaming consent is pending', () =
     storesHydrated: true,
     sessionUnlocked: false,
   });
-  assert.equal(view.visible, false);
-  assert.equal(view.phase, 'hidden');
+  assert.equal(firstVisit.visible, true);
+  assert.equal(firstVisit.phase, 'consent');
+  assert.equal(firstVisit.canSwitchOffline, true);
+
+  // Returning user with saved accepted consent NEVER sees consent phase
+  const returningBoot = deriveAppInitializationState({
+    streamingConsent: 'accepted',
+    engineStatus: 'downloading',
+    progressPercent: 10,
+    initStatusDetail: 'Checking local cache',
+    modelId: null,
+    errorMessage: null,
+    storesHydrated: false,
+    sessionUnlocked: false,
+  });
+  assert.equal(returningBoot.visible, true);
+  assert.equal(returningBoot.phase, 'initializing');
 });
 
 test('Accepting consent enters the Application Initializing Screen and progresses monotonically until real runtime is ready', () => {

@@ -33,6 +33,7 @@ export interface ByteRange {
 export interface PrefetchRangesOptions {
   readonly signal?: AbortSignal;
   readonly concurrency?: number;
+  readonly flush?: boolean;
   readonly onProgress?: (doneSlabs: number, totalSlabs: number, bytesFetched: number) => void;
 }
 
@@ -134,6 +135,8 @@ export const OPFS_VRAM_DIR_NAME = 'vram-gguf-v1';
 export const OPFS_STREAM_CHUNK_BYTES = 4 * 1024 * 1024; // 4 MiB streaming window
 export const OPFS_MAX_SYNC_IO_BYTES = 16 * 1024 * 1024; // 16 MiB chunked sync I/O bound
 export const OPFS_DEMAND_SLAB_BYTES = 1 * 1024 * 1024; // 1 MiB Verdant vRAM demand slab (low MoE read amplification)
+export const OPFS_DEMAND_COALESCED_FETCH_SLABS = 8; // Coalesce up to 8 contiguous slabs (8 MiB) per HTTP Range fetch!
+export const OPFS_DEMAND_FLUSH_INTERVAL_SLABS = 32; // Batch SyncAccessHandle.flush() every 32 MiB instead of every layer
 export const OPFS_DEMAND_PREFETCH_CONCURRENCY = 8; // Parallel async HTTP Range fetch pool
 export const OPFS_DEMAND_MIN_CACHE_BYTES = 128 * 1024 * 1024; // 128 MiB minimum slab pool floor
 export const OPFS_SAFETY_HEADROOM_BYTES = 256 * 1024 * 1024; // 256 MiB origin headroom
@@ -589,6 +592,8 @@ export interface OpfsDemandSlabStats {
  *  - Persists its slab directory in `<modelId>.vram.idx` so reloads retain all warm slabs.
  */
 export interface DemandCasStoreLike {
+  lookupExtentKappa?(contentFingerprint: string, slabIndex: number): string | null;
+  getObject?(kappa: string): Promise<Uint8Array | null>;
   resolveOrStoreSlab(params: {
     readonly contentFingerprint: string;
     readonly slabIndex: number;
@@ -1033,91 +1038,181 @@ export class OpfsDemandVramBackingStore implements VramBackingStore {
       if (waitInFlight.length > 0) {
         await Promise.all(waitInFlight);
       }
+      if (options?.flush && this.handle && this.dirtySincePersist > 0) {
+        this.handle.flush();
+        this.persistIndexNow();
+      }
       return;
     }
 
+    // Sort ascending so contiguous missing slabs coalesce into multi-MiB HTTP Range runs (8× fewer
+    // HTTP requests, eliminating CDN tiny-range throttling and per-slab OPFS createWritable fsyncs!).
+    missingSlabs.sort((a, b) => a - b);
+
     const total = missingSlabs.length;
-    const concurrency = Math.max(
-      1,
-      Math.min(options?.concurrency ?? OPFS_DEMAND_PREFETCH_CONCURRENCY, total),
-    );
-    let cursor = 0;
     let completed = 0;
     let fetchedInBatch = 0;
 
-    const worker = async (): Promise<void> => {
-      while (true) {
-        if (signal?.aborted) {
-          throw new DOMException('Aborted', 'AbortError');
-        }
-        const idx = cursor++;
-        if (idx >= total) return;
-        const slabId = missingSlabs[idx];
+    // 1. Zero-network cross-model CAS hit check: serve any slab already cached by another model/mirror
+    const networkSlabs: number[] = [];
+    if (this.casStore?.lookupExtentKappa && this.casStore?.getObject) {
+      for (let i = 0; i < missingSlabs.length; i++) {
+        const slabId = missingSlabs[i];
         if (this.hasSlab(slabId)) {
           completed += 1;
           continue;
         }
-        const existingFlight = this.inFlightSlabs.get(slabId);
-        if (existingFlight) {
-          await existingFlight;
-          completed += 1;
-          continue;
+        const knownKappa = this.casStore.lookupExtentKappa(this.contentFingerprintKey, slabId);
+        if (knownKappa) {
+          const cached = await this.casStore.getObject(knownKappa).catch(() => null);
+          if (cached && cached.byteLength >= this.slabLength(slabId) && this.handle) {
+            this.putSlab(slabId, cached);
+            completed += 1;
+            options?.onProgress?.(completed, total, fetchedInBatch);
+            continue;
+          }
         }
-        const slabLen = this.slabLength(slabId);
-        const startByte = slabId * this.slabBytes;
-        const endInclusive = startByte + slabLen - 1;
-        const fetchTask = (async () => {
-          const data = this.casStore
-            ? (
-                await this.casStore.resolveOrStoreSlab({
-                  contentFingerprint: this.contentFingerprintKey,
-                  slabIndex: slabId,
-                  ownerModelId: this.modelId,
-                  sourceUrl: this.url,
-                  etag: this.etag,
-                  fetchFn: () => this.asyncFetcher(this.url, startByte, endInclusive, signal),
-                })
-              ).bytes
-            : await this.asyncFetcher(this.url, startByte, endInclusive, signal);
+        networkSlabs.push(slabId);
+      }
+    } else {
+      networkSlabs.push(...missingSlabs);
+    }
+
+    // 2. Coalesce contiguous missing slabs into runs of up to OPFS_DEMAND_COALESCED_FETCH_SLABS (8 MiB)
+    interface SlabRun {
+      readonly startSlab: number;
+      readonly count: number;
+    }
+    const runs: SlabRun[] = [];
+    for (let i = 0; i < networkSlabs.length; ) {
+      const startSlab = networkSlabs[i];
+      let count = 1;
+      while (
+        i + count < networkSlabs.length &&
+        count < OPFS_DEMAND_COALESCED_FETCH_SLABS &&
+        networkSlabs[i + count] === startSlab + count
+      ) {
+        count += 1;
+      }
+      runs.push({ startSlab, count });
+      i += count;
+    }
+
+    if (runs.length > 0) {
+      const totalRuns = runs.length;
+      const concurrency = Math.max(
+        1,
+        Math.min(options?.concurrency ?? OPFS_DEMAND_PREFETCH_CONCURRENCY, totalRuns),
+      );
+      let cursor = 0;
+
+      const worker = async (): Promise<void> => {
+        while (true) {
           if (signal?.aborted) {
             throw new DOMException('Aborted', 'AbortError');
           }
-          if (!this.handle) {
-            return;
+          const idx = cursor++;
+          if (idx >= totalRuns) return;
+          const run = runs[idx];
+
+          // Trim leading/trailing slabs that were populated while queued
+          let first = run.startSlab;
+          let last = run.startSlab + run.count - 1;
+          while (first <= last && this.hasSlab(first)) {
+            first += 1;
+            completed += 1;
           }
-          if (data.byteLength < slabLen) {
-            throw new Error(
-              `Demand slab ${slabId} truncated (${data.byteLength} < ${slabLen} bytes).`,
-            );
+          while (last >= first && this.hasSlab(last)) {
+            last -= 1;
+            completed += 1;
           }
-          this.putSlab(slabId, data);
-          this.slabMisses += 1;
-          this.bytesFetched += slabLen;
-          fetchedInBatch += slabLen;
-        })();
-        this.inFlightSlabs.set(slabId, fetchTask);
-        try {
-          await fetchTask;
-        } finally {
-          if (this.inFlightSlabs.get(slabId) === fetchTask) {
-            this.inFlightSlabs.delete(slabId);
+          if (first > last) continue;
+
+          // Wait on any slab already in flight from an overlapping lookahead prefetch
+          const runSlabIds: number[] = [];
+          for (let s = first; s <= last; s++) {
+            const existingFlight = this.inFlightSlabs.get(s);
+            if (existingFlight) {
+              await existingFlight;
+              completed += 1;
+            } else if (!this.hasSlab(s)) {
+              runSlabIds.push(s);
+            } else {
+              completed += 1;
+            }
           }
+          if (runSlabIds.length === 0) continue;
+
+          // Fetch the contiguous range [runFirst .. runLast] in ONE HTTP Range request!
+          const runFirst = runSlabIds[0];
+          const runLast = runSlabIds[runSlabIds.length - 1];
+          const startByte = runFirst * this.slabBytes;
+          const lastSlabLen = this.slabLength(runLast);
+          const expectedTotalLen = (runLast - runFirst) * this.slabBytes + lastSlabLen;
+          const endInclusive = startByte + expectedTotalLen - 1;
+
+          const fetchTask = (async () => {
+            const data = await this.asyncFetcher(this.url, startByte, endInclusive, signal);
+            if (signal?.aborted) {
+              throw new DOMException('Aborted', 'AbortError');
+            }
+            if (!this.handle) {
+              return;
+            }
+            if (data.byteLength < expectedTotalLen) {
+              throw new Error(
+                `Demand slabs ${runFirst}..${runLast} truncated (${data.byteLength} < ${expectedTotalLen} bytes).`,
+              );
+            }
+            for (let s = runFirst; s <= runLast; s++) {
+              if (this.hasSlab(s)) continue;
+              const relOff = (s - runFirst) * this.slabBytes;
+              const sLen = this.slabLength(s);
+              this.putSlab(s, data.subarray(relOff, relOff + sLen));
+              this.slabMisses += 1;
+              this.bytesFetched += sLen;
+              fetchedInBatch += sLen;
+            }
+          })();
+
+          for (let s = runFirst; s <= runLast; s++) {
+            if (!this.inFlightSlabs.has(s)) {
+              this.inFlightSlabs.set(s, fetchTask);
+            }
+          }
+          try {
+            await fetchTask;
+          } finally {
+            for (let s = runFirst; s <= runLast; s++) {
+              if (this.inFlightSlabs.get(s) === fetchTask) {
+                this.inFlightSlabs.delete(s);
+              }
+            }
+          }
+          completed += runSlabIds.length;
+          options?.onProgress?.(completed, total, fetchedInBatch);
         }
-        completed += 1;
-        options?.onProgress?.(completed, total, fetchedInBatch);
+      };
+
+      const workers: Promise<void>[] = [];
+      for (let w = 0; w < concurrency; w++) {
+        workers.push(worker());
       }
-    };
-
-    const workers: Promise<void>[] = [];
-    for (let w = 0; w < concurrency; w++) {
-      workers.push(worker());
+      if (waitInFlight.length > 0) {
+        workers.push(...waitInFlight);
+      }
+      await Promise.all(workers);
+    } else if (waitInFlight.length > 0) {
+      await Promise.all(waitInFlight);
     }
-    if (waitInFlight.length > 0) {
-      workers.push(...waitInFlight);
-    }
-    await Promise.all(workers);
 
-    if (this.handle && this.dirtySincePersist > 0) {
+    // Batch OPFS flush/index writes every 32 MiB (or when caller explicitly requests flush)
+    // to eliminate dozens of per-layer OS fsync() stalls during inference and warming.
+    if (
+      this.handle &&
+      this.dirtySincePersist > 0 &&
+      (options?.flush || this.dirtySincePersist >= OPFS_DEMAND_FLUSH_INTERVAL_SLABS)
+    ) {
       this.handle.flush();
       this.persistIndexNow();
     }

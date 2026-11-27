@@ -749,6 +749,7 @@ function startBackgroundPrewarm(): void {
     } catch {
       // Aborted or transient network hiccup: already-warmed slabs stay safely persisted in OPFS CAS
     } finally {
+      runtime.flushDemandBacking();
       if (activePrewarmController === controller) {
         activePrewarmController = null;
       }
@@ -1787,7 +1788,8 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       if (
         activeGenerationCount > 0 ||
         !runtime.isLoaded ||
-        runtime.getModelSummary()?.backingKind === 'opfs-demand'
+        (runtime.getModelSummary()?.backingKind === 'opfs-demand' &&
+          !runtime.isDemandModelFullyWarm())
       ) {
         return;
       }
@@ -1795,7 +1797,8 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       if (
         activeGenerationCount > 0 ||
         !runtime.isLoaded ||
-        runtime.getModelSummary()?.backingKind === 'opfs-demand'
+        (runtime.getModelSummary()?.backingKind === 'opfs-demand' &&
+          !runtime.isDemandModelFullyWarm())
       ) {
         return;
       }

@@ -150,9 +150,10 @@ const StreamsStatusPill: FC<{
 const SubscribedAppInitializingOverlay: FC<{
   readonly workerClient: LlamaVTensorWorkerClient;
   readonly storesHydrated: boolean;
+  readonly onAcceptConsent: () => void;
   readonly onRetry: () => void;
   readonly onUseOfflineOnly: () => void;
-}> = memo(({ workerClient, storesHydrated, onRetry, onUseOfflineOnly }) => {
+}> = memo(({ workerClient, storesHydrated, onAcceptConsent, onRetry, onUseOfflineOnly }) => {
   const summary = useSyncExternalStore(
     useCallback((cb) => workerClient.subscribeHeaderSummary(cb), [workerClient]),
     useCallback(() => workerClient.getHeaderSummary(), [workerClient]),
@@ -206,6 +207,7 @@ const SubscribedAppInitializingOverlay: FC<{
   return (
     <AppInitializingScreen
       view={view}
+      onAcceptConsent={onAcceptConsent}
       onRetry={onRetry}
       onUseOfflineOnly={onUseOfflineOnly}
     />
@@ -1053,40 +1055,6 @@ export default function App() {
             data-active-part-id={activePartId}
             data-busy-parts={busyBackgroundParts.length}
           >
-            {appShellSummary.streamingConsent === 'pending' && (
-              <div
-                role="region"
-                aria-label="Browser streaming notice"
-                data-testid="streaming-consent-banner"
-                className="shrink-0 border-b border-emerald-700/20 bg-emerald-50/75 px-4 py-3 dark:border-emerald-500/20 dark:bg-emerald-950/35"
-              >
-                <div className="mx-auto flex max-w-4xl flex-wrap items-center justify-between gap-3">
-                  <p className="min-w-0 flex-1 text-xs leading-relaxed text-slate-800 dark:text-slate-200">
-                    VerdantUI runs privately in your browser and streams capabilities and your chosen
-                    content sources directly to your device as needed.
-                  </p>
-                  <div className="flex shrink-0 items-center gap-2">
-                    <button
-                      type="button"
-                      data-testid="streaming-consent-offline"
-                      onClick={() => handleSetStreamingConsent('paused')}
-                      className="inline-flex h-8 items-center rounded-lg border border-slate-300 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
-                    >
-                      Use Offline Only
-                    </button>
-                    <button
-                      type="button"
-                      data-testid="streaming-consent-accept"
-                      onClick={() => handleSetStreamingConsent('accepted')}
-                      className="inline-flex h-8 items-center rounded-lg bg-[#0F5132] px-3.5 text-xs font-medium text-white hover:bg-[#0B3D25] transition-colors whitespace-nowrap"
-                    >
-                      Continue
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
-
             <div className="min-h-0 flex-1 overflow-hidden">
             {/* Keep Home Thread mounted persistently so navigating to Galleries, Settings, or Prisms NEVER interrupts active streaming */}
             <div
@@ -1221,6 +1189,7 @@ export default function App() {
         <SubscribedAppInitializingOverlay
           workerClient={workerClient}
           storesHydrated={storesHydrated}
+          onAcceptConsent={() => handleSetStreamingConsent('accepted')}
           onRetry={handleRetryLoad}
           onUseOfflineOnly={handleCancelDownload}
         />

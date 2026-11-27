@@ -19,7 +19,7 @@ export interface InitStepItem {
   readonly status: InitStepStatus;
 }
 
-export type AppInitPhase = 'hidden' | 'initializing' | 'error' | 'ready';
+export type AppInitPhase = 'hidden' | 'consent' | 'initializing' | 'error' | 'ready';
 
 export interface AppInitializationInput {
   readonly streamingConsent: StreamingConsentState;
@@ -121,18 +121,20 @@ export function deriveAppInitializationState(
     sessionUnlocked,
   } = input;
 
-  // Before consent is decided, show the consent banner inside the app (not the initializing screen).
+  // First-time visitor: present the Splash Initialization Screen with built-in consent directly
+  // on page load (returning users with saved consent bypass this phase automatically).
   if (streamingConsent === 'pending') {
     return {
-      visible: false,
-      phase: 'hidden',
-      headline: 'Initializing VerdantUI',
-      statusLine: 'Waiting for confirmation',
+      visible: true,
+      phase: 'consent',
+      headline: 'Welcome to VerdantUI',
+      statusLine:
+        'VerdantUI runs privately in your browser and streams capabilities and your chosen content sources directly to your device as needed.',
       overallPercent: 0,
       steps: [],
       errorMessage: null,
       canRetry: false,
-      canSwitchOffline: false,
+      canSwitchOffline: true,
     };
   }
 

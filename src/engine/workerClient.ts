@@ -1068,9 +1068,17 @@ export class LlamaVTensorWorkerClient {
     }
   }
 
+  private canSpeculativePrefillModel(): boolean {
+    if (this.state.status !== 'ready' || !this.state.model) return false;
+    if (isInternalBootstrapModel(this.state.model.id)) return false;
+    if (this.state.model.backingKind === 'opfs-demand') {
+      return !this.state.backgroundPrewarm.active && this.state.backgroundPrewarm.percent >= 100;
+    }
+    return true;
+  }
+
   private dispatchSpeculativePrefill(prompt: string, threadId?: string): void {
-    if (this.state.status !== 'ready' || !this.state.model || !prompt) return;
-    if (this.state.model.backingKind === 'opfs-demand') return;
+    if (!prompt || !this.canSpeculativePrefillModel()) return;
     if (prompt === this.lastSpeculativePrompt && threadId === this.activeSpeculativeThreadId) return;
     this.lastSpeculativePrompt = prompt;
     if (threadId !== undefined) {
@@ -1135,10 +1143,8 @@ export class LlamaVTensorWorkerClient {
     if (threadId && this.activeSpeculativeThreadId && threadId !== this.activeSpeculativeThreadId) {
       this.lastSpeculativePrompt = '';
     }
-    if (this.state.status !== 'ready' || !this.state.model) return;
-    if (this.state.model.backingKind === 'opfs-demand') return;
-
-    const model = this.state.model;
+    if (!this.canSpeculativePrefillModel()) return;
+    const model = this.state.model!;
     const mode = this.state.importedHarness?.promptMode ?? this.state.promptMode;
     const systemPrompt =
       systemMessage ?? this.state.importedHarness?.system ?? UNIFIED_VERDANT_SYSTEM_PROMPT;
@@ -1217,6 +1223,8 @@ export class LlamaVTensorWorkerClient {
     }
 
     if (msg.type === 'prewarm_status') {
+      const wasWarm =
+        !this.state.backgroundPrewarm.active && this.state.backgroundPrewarm.percent >= 100;
       this.patchState({
         backgroundPrewarm: {
           active: msg.active,
@@ -1226,6 +1234,28 @@ export class LlamaVTensorWorkerClient {
           casBytesSaved: msg.casBytesSaved,
         },
       });
+      // Once an `opfs-demand` model reaches 100% warm in local OPFS, immediately warm the
+      // initial system-prompt KV prefix locally (0 network bytes) for sub-second first-token latency!
+      if (
+        !wasWarm &&
+        !msg.active &&
+        msg.percent >= 100 &&
+        this.state.status === 'ready' &&
+        this.state.model &&
+        !isInternalBootstrapModel(this.state.model.id)
+      ) {
+        const bootSystem = this.state.importedHarness?.system ?? UNIFIED_VERDANT_SYSTEM_PROMPT;
+        const bootPrefix = formatSpeculativePrefixForLlama(
+          [],
+          '',
+          this.state.model,
+          this.state.importedHarness?.promptMode ?? this.state.promptMode,
+          bootSystem,
+        );
+        if (bootPrefix) {
+          this.dispatchSpeculativePrefill(bootPrefix);
+        }
+      }
       return;
     }
 

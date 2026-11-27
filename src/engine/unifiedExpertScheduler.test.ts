@@ -10,6 +10,10 @@ import {
 } from './unifiedExpertScheduler';
 import { MemoryCasBackend, OpfsCasStore } from './vramCasStore';
 import {
+  OpfsDemandVramBackingStore,
+  type SyncAccessHandleLike,
+} from './vramBackingStore';
+import {
   derivePerformanceContract,
   type EnvironmentProfile,
   type ModelGeometrySpec,
@@ -188,4 +192,93 @@ test('derivePerformanceContract enforces opfs-paged + streamed embeddings/LM-hea
   assert.equal(contract.weightResidencyMode, 'opfs-paged');
   assert.equal(contract.streamEmbeddings, true);
   assert.equal(contract.streamLmHead, true);
+  assert.equal(
+    contract.weightLayerFrameSlots,
+    36,
+    'opfs-demand auto residency must pin all 36 layers when they fit in WASM budget (0 OPFS layer reads per decode token)',
+  );
+});
+
+test('OpfsDemandVramBackingStore coalesces contiguous missing slabs into multi-slab Range fetches and batches OPFS flushes', async () => {
+  const slabBytes = 4096;
+  const totalSlabs = 10;
+  const totalBytes = slabBytes * totalSlabs;
+  const remoteFile = new Uint8Array(totalBytes);
+  for (let i = 0; i < totalBytes; i++) remoteFile[i] = (i * 13 + 7) & 0xff;
+
+  let backingData = new Uint8Array(0);
+  let flushCalls = 0;
+  const memHandle: SyncAccessHandleLike = {
+    getSize: () => backingData.byteLength,
+    truncate: (sz: number) => {
+      const next = new Uint8Array(sz);
+      next.set(backingData.subarray(0, Math.min(sz, backingData.byteLength)));
+      backingData = next;
+    },
+    read: (buf, opts) => {
+      const view =
+        buf instanceof ArrayBuffer
+          ? new Uint8Array(buf)
+          : new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+      const off = opts?.at ?? 0;
+      const len = Math.min(view.byteLength, Math.max(0, backingData.byteLength - off));
+      view.set(backingData.subarray(off, off + len), 0);
+      return len;
+    },
+    write: (buf, opts) => {
+      const view =
+        buf instanceof ArrayBuffer
+          ? new Uint8Array(buf)
+          : new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+      const off = opts?.at ?? 0;
+      const end = off + view.byteLength;
+      if (end > backingData.byteLength) {
+        const next = new Uint8Array(end);
+        next.set(backingData);
+        backingData = next;
+      }
+      backingData.set(view, off);
+      return view.byteLength;
+    },
+    flush: () => {
+      flushCalls += 1;
+    },
+    close: () => {},
+  };
+
+  const rangeCalls: Array<{ start: number; end: number }> = [];
+  const store = new OpfsDemandVramBackingStore({
+    modelId: 'coalesce-test',
+    url: 'https://example.invalid/model.gguf',
+    totalBytes,
+    handle: memHandle,
+    maxCacheBytes: totalBytes,
+    slabBytes,
+    asyncRangeFetcher: async (_url, start, end) => {
+      rangeCalls.push({ start, end });
+      return remoteFile.subarray(start, end + 1);
+    },
+  });
+
+  // Prefetch 8 contiguous slabs -> MUST coalesce into 1 single HTTP Range fetch (not 8!)
+  await store.prefetchRanges([{ fileOffset: 0, byteLength: 8 * slabBytes }]);
+  assert.equal(
+    rangeCalls.length,
+    1,
+    `Expected 8 contiguous slabs to coalesce into 1 HTTP Range fetch, got ${rangeCalls.length}`,
+  );
+  assert.equal(rangeCalls[0]!.start, 0);
+  assert.equal(rangeCalls[0]!.end, 8 * slabBytes - 1);
+  // Batched flush: < 32 slabs written -> 0 blocking fsync flushes during mid-pass prefetch!
+  assert.equal(flushCalls, 0);
+
+  // Verify bit-exact readback across all 8 slabs
+  const readBack = new Uint8Array(8 * slabBytes);
+  assert.equal(store.readRange(0, readBack, 0, readBack.byteLength), readBack.byteLength);
+  assert.deepEqual(readBack, remoteFile.subarray(0, 8 * slabBytes));
+
+  // Explicit flush persists cleanly once
+  store.flush();
+  assert.equal(flushCalls, 1);
+  store.close();
 });

@@ -582,15 +582,23 @@ export function derivePerformanceContract(
         : Math.max(2 * avgLayerBytes, Math.min(physicalWeightBudgetBytes, Math.floor(bodyWeightBytes * 0.25)));
 
       const maxSlotsByBudget = Math.max(1, Math.floor(frameBudgetBytes / Math.max(1, avgLayerBytes)));
+      // On `opfs-demand` with `auto` residency, allow pinning up to ALL `hp.blockCount` layers in
+      // WASM linear memory when they fit so every layer restored on token 1 incurs 0 OPFS reads on
+      // subsequent tokens! Keep forced `weightResidencyPolicy === 'paged'` strictly bounded (< L).
+      const allowFullDemandPinning =
+        backingKind === 'opfs-demand' && weightResidencyPolicy === 'auto';
+      const maxSlotsForMode = allowFullDemandPinning
+        ? Math.max(1, hp.blockCount)
+        : Math.max(1, hp.blockCount - 1);
       // Cap forced-paged mode to <= 4 slots (when L > 4) so bounded-RAM compression is exercised clearly
       const forcedCap =
         !mustPageWeights && hp.blockCount > 4
           ? Math.min(4, Math.max(2, Math.floor(hp.blockCount / 4)))
-          : Math.max(1, hp.blockCount - 1);
+          : maxSlotsForMode;
       const hardCap = options?.maxLayerFrameSlotsCap ?? Number.POSITIVE_INFINITY;
       weightLayerFrameSlots = Math.max(
         1,
-        Math.min(Math.max(1, hp.blockCount - 1), maxSlotsByBudget, forcedCap, hardCap),
+        Math.min(maxSlotsForMode, maxSlotsByBudget, forcedCap, hardCap),
       );
       projectedResidentWeightBytes = Math.round(
         hotNormsEstimate + weightLayerFrameSlots * avgLayerBytes + lmTileEstimate + 64 * 1024,

@@ -1067,8 +1067,12 @@ test('OPFS SyncAccessHandle reload lock recovery, read-only committed reads, and
       store.prefetchRanges([{ fileOffset: 8192, byteLength: 16384 }]),
       store.prefetchRanges([{ fileOffset: 24576, byteLength: 16384 }]),
     ]);
-    // Slabs 0, 1, 2 -> exactly 3 fetches (NOT 4!)
-    assert.equal(fetchCount, 3, `Expected shared boundary slab 1 to be deduplicated (got ${fetchCount} fetches)`);
+    // Slabs 0, 1, 2 -> coalesced into <= 3 fetches (2 with multi-slab coalescing!) and exactly 3 slabs of bytes (0 duplicate boundary slab 1!)
+    assert.ok(
+      fetchCount <= 3,
+      `Expected shared boundary slab 1 to be deduplicated & coalesced (got ${fetchCount} fetches)`,
+    );
+    assert.equal(store.getStats().bytesFetched, slabBytes * 3);
     assert.equal(store.hasSlab(0), true);
     assert.equal(store.hasSlab(1), true);
     assert.equal(store.hasSlab(2), true);

@@ -4,6 +4,7 @@ import type { AppInitializationView, InitStepItem } from '../engine/appInitializ
 
 interface AppInitializingScreenProps {
   readonly view: AppInitializationView;
+  readonly onAcceptConsent: () => void;
   readonly onRetry: () => void;
   readonly onUseOfflineOnly: () => void;
 }
@@ -26,16 +27,18 @@ const StepIcon: FC<{ readonly status: InitStepItem['status'] }> = ({ status }) =
  * startup) until VerdantUI's workspace and browser capabilities are ready to use.
  */
 export const AppInitializingScreen: FC<AppInitializingScreenProps> = memo(
-  ({ view, onRetry, onUseOfflineOnly }) => {
+  ({ view, onAcceptConsent, onRetry, onUseOfflineOnly }) => {
     if (!view.visible) return null;
 
+    const isConsent = view.phase === 'consent';
     const isError = view.phase === 'error';
 
     return (
       <div
-        role="status"
-        aria-live="polite"
-        aria-busy={!isError}
+        role={isConsent ? 'dialog' : 'status'}
+        aria-modal={isConsent || undefined}
+        aria-live={isConsent ? undefined : 'polite'}
+        aria-busy={!isConsent && !isError}
         data-testid="app-initializing-screen"
         data-init-phase={view.phase}
         className="fixed inset-0 z-50 flex items-center justify-center bg-[#F8F9FA] px-4 py-8 text-slate-900 dark:bg-[#0B0F14] dark:text-slate-100"
@@ -46,14 +49,18 @@ export const AppInitializingScreen: FC<AppInitializingScreenProps> = memo(
             <div className="flex items-center gap-2.5">
               <span
                 className={`inline-flex h-2.5 w-2.5 rounded-full ${
-                  isError ? 'bg-red-500' : 'animate-pulse bg-emerald-600 dark:bg-emerald-400'
+                  isError
+                    ? 'bg-red-500'
+                    : isConsent
+                      ? 'bg-[#0F5132] dark:bg-emerald-400'
+                      : 'animate-pulse bg-emerald-600 dark:bg-emerald-400'
                 }`}
               />
               <span className="font-display text-sm font-bold tracking-tight text-slate-950 dark:text-white">
                 VerdantUI
               </span>
             </div>
-            {!isError && (
+            {!isConsent && !isError && (
               <span
                 data-testid="app-init-percent"
                 className="font-mono text-xs font-medium tabular-nums text-emerald-800 dark:text-emerald-300"
@@ -75,15 +82,17 @@ export const AppInitializingScreen: FC<AppInitializingScreenProps> = memo(
             {view.statusLine}
           </p>
 
-          {/* Progress track */}
-          <div className="mt-5 h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800/90">
-            <div
-              className={`h-full rounded-full transition-all duration-300 ease-out ${
-                isError ? 'bg-red-500' : 'bg-[#0F5132] dark:bg-emerald-500'
-              }`}
-              style={{ width: `${Math.max(4, Math.min(100, view.overallPercent))}%` }}
-            />
-          </div>
+          {/* Progress track (shown during initialization and error recovery) */}
+          {!isConsent && (
+            <div className="mt-5 h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800/90">
+              <div
+                className={`h-full rounded-full transition-all duration-300 ease-out ${
+                  isError ? 'bg-red-500' : 'bg-[#0F5132] dark:bg-emerald-500'
+                }`}
+                style={{ width: `${Math.max(4, Math.min(100, view.overallPercent))}%` }}
+              />
+            </div>
+          )}
 
           {/* Step checklist */}
           {view.steps.length > 0 && (
@@ -123,8 +132,34 @@ export const AppInitializingScreen: FC<AppInitializingScreenProps> = memo(
             </ul>
           )}
 
-          {/* Actions */}
-          {(view.canRetry || view.canSwitchOffline) && (
+          {/* Consent splash actions */}
+          {isConsent && (
+            <div
+              data-testid="streaming-consent-banner"
+              className="mt-6 flex flex-wrap items-center justify-end gap-2"
+            >
+              <button
+                type="button"
+                data-testid="streaming-consent-offline"
+                onClick={onUseOfflineOnly}
+                className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#141B26] dark:text-slate-200 dark:hover:bg-slate-800 transition-colors"
+              >
+                <WifiOff className="h-3.5 w-3.5" />
+                <span>Use Offline Only</span>
+              </button>
+              <button
+                type="button"
+                data-testid="streaming-consent-accept"
+                onClick={onAcceptConsent}
+                className="inline-flex h-9 items-center rounded-lg bg-[#0F5132] px-4 text-xs font-medium text-white hover:bg-[#0B3D25] transition-colors"
+              >
+                Continue
+              </button>
+            </div>
+          )}
+
+          {/* Initialization / error recovery actions */}
+          {!isConsent && (view.canRetry || view.canSwitchOffline) && (
             <div className="mt-6 flex flex-wrap items-center justify-end gap-2">
               {view.canSwitchOffline && (
                 <button
