@@ -316,6 +316,16 @@ export const VTensorInspector: FC<VTensorInspectorProps> = ({
                           {engineState.lastRouteCertificate.escalatedFromRetry ? ' · retry↑' : ''}
                         </dd>
                       </div>
+                      <div className="flex items-center justify-between gap-2 px-3 py-1.5">
+                        <dt className="whitespace-nowrap text-slate-500 dark:text-slate-400">
+                          Sensed quality budget
+                        </dt>
+                        <dd className="whitespace-nowrap font-mono text-[11px] tabular-nums text-slate-900 dark:text-slate-100">
+                          {engineState.lastRouteCertificate.qualityBudget.featureRichness} · Q
+                          {engineState.lastRouteCertificate.qualityBudget.demandedQualityQ10} · Lod
+                          {engineState.lastRouteCertificate.qualityBudget.targetLodRank}
+                        </dd>
+                      </div>
                       <div className="px-3 py-1.5 text-[11px] leading-relaxed text-slate-600 dark:text-slate-400">
                         {engineState.lastRouteCertificate.rationale}
                       </div>

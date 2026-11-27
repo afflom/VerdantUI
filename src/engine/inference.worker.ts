@@ -955,6 +955,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       for (const ctrl of activeControllers.values()) ctrl.abort();
       activeControllers.clear();
       await drainBackgroundOpfsPersist();
+      await getSharedOpfsCasStore().flushLedger().catch(() => undefined);
       disposeResidentNeuralImageWeights();
       runtime.unload();
       runtime.disposeThreadPool();
@@ -1047,6 +1048,13 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         });
 
         const preStorage = await inspectOpfsVramStorage();
+        if (preStorage.quotaBytes > 0) {
+          getSharedOpfsCasStore().setCapacityCeiling(
+            2 * 1024 * 1024 * 1024,
+            Math.max(256 * 1024 * 1024, Math.floor(preStorage.quotaBytes * 0.45)),
+            preStorage.quotaBytes,
+          );
+        }
         committedToRuntime = true;
         const summary = await runtime.loadFromBackingAsync(
           req.id,

@@ -312,7 +312,17 @@ function openStreamsDb(): Promise<IDBDatabase> {
         db.createObjectStore(STREAMS_IDB_STORE);
       }
     };
-    req.onsuccess = () => resolve(req.result);
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onclose = () => {
+        cachedStreamsDb = null;
+      };
+      db.onversionchange = () => {
+        db.close();
+        cachedStreamsDb = null;
+      };
+      resolve(db);
+    };
     req.onerror = () => {
       cachedStreamsDb = null;
       reject(req.error);
@@ -404,6 +414,8 @@ export class ContentStreamCatalogStore {
   private readonly listeners = new Set<() => void>();
   private snapshotCache: ContentStreamsSnapshot;
   private hydrated = false;
+  private persistDirty = false;
+  private persistFlushPromise: Promise<void> | null = null;
 
   constructor() {
     for (const s of BUILTIN_CONTENT_STREAMS) {
@@ -429,10 +441,28 @@ export class ContentStreamCatalogStore {
     };
   }
 
+  private schedulePersist(): void {
+    if (typeof indexedDB === 'undefined') return;
+    this.persistDirty = true;
+    if (this.persistFlushPromise) return;
+    this.persistFlushPromise = (async () => {
+      await Promise.resolve();
+      while (this.persistDirty) {
+        this.persistDirty = false;
+        await this.persist();
+      }
+    })().finally(() => {
+      this.persistFlushPromise = null;
+      if (this.persistDirty) {
+        this.schedulePersist();
+      }
+    });
+  }
+
   private notify(): void {
     this.snapshotCache = this.buildSnapshot();
     for (const fn of this.listeners) fn();
-    void this.persist();
+    this.schedulePersist();
   }
 
   subscribe(listener: () => void): () => void {

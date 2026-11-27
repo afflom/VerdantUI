@@ -226,8 +226,16 @@ export class OpfsCasStore {
   private readonly backend: CasStorageBackend;
   private readonly entries = new Map<string, CasEntryRecord>();
   private readonly extentMap = new Map<string, string>();
+  private readonly inFlightExtents = new Map<
+    string,
+    Promise<{ readonly bytes: Uint8Array; readonly kappa: string; readonly hit: boolean; readonly dedupLinked: boolean }>
+  >();
   private budgetBytes: number;
+  private residentBytes = 0;
   private hydrated = false;
+  private hydratePromise: Promise<void> | null = null;
+  private ledgerDirty = false;
+  private ledgerFlushPromise: Promise<void> | null = null;
   private slabHits = 0;
   private slabMisses = 0;
   private dedupLinks = 0;
@@ -249,37 +257,71 @@ export class OpfsCasStore {
 
   async hydrate(): Promise<void> {
     if (this.hydrated) return;
-    this.hydrated = true;
-    const ledger = await this.backend.readLedger().catch(() => null);
-    if (!ledger) return;
-    this.entries.clear();
-    this.extentMap.clear();
-    for (const e of ledger.entries) {
-      this.entries.set(e.kappa, e);
+    if (this.hydratePromise) return this.hydratePromise;
+    this.hydratePromise = (async () => {
+      const ledger = await this.backend.readLedger().catch(() => null);
+      this.hydrated = true;
+      if (!ledger) return;
+      this.entries.clear();
+      this.extentMap.clear();
+      this.residentBytes = 0;
+      for (const e of ledger.entries) {
+        this.entries.set(e.kappa, e);
+        this.residentBytes += e.byteLength;
+      }
+      for (const [extKey, kappa] of Object.entries(ledger.extentMap)) {
+        if (this.entries.has(kappa)) {
+          this.extentMap.set(extKey, kappa);
+        }
+      }
+    })();
+    try {
+      await this.hydratePromise;
+    } finally {
+      this.hydratePromise = null;
     }
-    for (const [extKey, kappa] of Object.entries(ledger.extentMap)) {
-      if (this.entries.has(kappa)) {
-        this.extentMap.set(extKey, kappa);
+  }
+
+  private schedulePersistLedger(): void {
+    this.ledgerDirty = true;
+    if (this.ledgerFlushPromise) return;
+    this.ledgerFlushPromise = (async () => {
+      // Yield one microtask so burst writes (e.g. parallel Sparse MoE slab prefetch) coalesce into 1 OPFS write!
+      await Promise.resolve();
+      while (this.ledgerDirty) {
+        this.ledgerDirty = false;
+        const extentObj: Record<string, string> = {};
+        for (const [k, v] of this.extentMap) extentObj[k] = v;
+        await this.backend
+          .writeLedger({
+            version: 1,
+            entries: Array.from(this.entries.values()),
+            extentMap: extentObj,
+          })
+          .catch(() => {});
+      }
+    })().finally(() => {
+      this.ledgerFlushPromise = null;
+      if (this.ledgerDirty) {
+        this.schedulePersistLedger();
+      }
+    });
+  }
+
+  /** Flushes any pending coalesced CAS ledger write cleanly (call on shutdown or in tests). */
+  async flushLedger(): Promise<void> {
+    while (this.ledgerDirty || this.ledgerFlushPromise) {
+      if (!this.ledgerFlushPromise && this.ledgerDirty) {
+        this.schedulePersistLedger();
+      }
+      if (this.ledgerFlushPromise) {
+        await this.ledgerFlushPromise;
       }
     }
   }
 
-  private async persistLedger(): Promise<void> {
-    const extentObj: Record<string, string> = {};
-    for (const [k, v] of this.extentMap) extentObj[k] = v;
-    await this.backend
-      .writeLedger({
-        version: 1,
-        entries: Array.from(this.entries.values()),
-        extentMap: extentObj,
-      })
-      .catch(() => {});
-  }
-
   getResidentBytes(): number {
-    let sum = 0;
-    for (const e of this.entries.values()) sum += e.byteLength;
-    return sum;
+    return this.residentBytes;
   }
 
   getEntry(kappa: string): CasEntryRecord | undefined {
@@ -324,31 +366,53 @@ export class OpfsCasStore {
             salienceQ10: Math.max(prev.salienceQ10, params.salienceQ10 ?? prev.salienceQ10),
             lastAccessedAt: Date.now(),
           });
+          if (owners.length !== prev.refOwners.length) {
+            this.schedulePersistLedger();
+          }
         }
         return { bytes: cached, kappa: knownKappa, hit: true, dedupLinked: false };
       }
       this.extentMap.delete(extKey);
     }
 
-    this.slabMisses += 1;
-    const fetched = await params.fetchFn();
-    const putRes = await this.putObject({
-      kind: 'weight-slab',
-      bytes: fetched,
-      ownerId: params.ownerModelId,
-      salienceQ10: params.salienceQ10 ?? 512,
-      sourceUrl: params.sourceUrl,
-      etag: params.etag,
-      protectedKappas: params.protectedKappas,
-    });
-    this.extentMap.set(extKey, putRes.kappa);
-    await this.persistLedger();
-    return {
-      bytes: fetched,
-      kappa: putRes.kappa,
-      hit: false,
-      dedupLinked: putRes.dedupLinked,
-    };
+    // Deduplicate concurrent fetches for the exact same (contentFingerprint, slabIndex)
+    const inFlight = this.inFlightExtents.get(extKey);
+    if (inFlight) {
+      const shared = await inFlight;
+      this.slabHits += 1;
+      this.bytesSaved += shared.bytes.byteLength;
+      return { bytes: shared.bytes, kappa: shared.kappa, hit: true, dedupLinked: shared.dedupLinked };
+    }
+
+    const task = (async () => {
+      this.slabMisses += 1;
+      const fetched = await params.fetchFn();
+      const putRes = await this.putObject({
+        kind: 'weight-slab',
+        bytes: fetched,
+        ownerId: params.ownerModelId,
+        salienceQ10: params.salienceQ10 ?? 512,
+        sourceUrl: params.sourceUrl,
+        etag: params.etag,
+        protectedKappas: params.protectedKappas,
+      });
+      this.extentMap.set(extKey, putRes.kappa);
+      this.schedulePersistLedger();
+      return {
+        bytes: fetched,
+        kappa: putRes.kappa,
+        hit: false,
+        dedupLinked: putRes.dedupLinked,
+      };
+    })();
+    this.inFlightExtents.set(extKey, task);
+    try {
+      return await task;
+    } finally {
+      if (this.inFlightExtents.get(extKey) === task) {
+        this.inFlightExtents.delete(extKey);
+      }
+    }
   }
 
   /**
@@ -380,11 +444,11 @@ export class OpfsCasStore {
       });
       this.dedupLinks += 1;
       this.bytesSaved += params.bytes.byteLength;
-      await this.persistLedger();
+      this.schedulePersistLedger();
       return { kappa, dedupLinked: true };
     }
 
-    const projected = this.getResidentBytes() + params.bytes.byteLength;
+    const projected = this.residentBytes + params.bytes.byteLength;
     if (projected > this.budgetBytes) {
       await this.evictToBudget(
         Math.max(0, this.budgetBytes - params.bytes.byteLength),
@@ -404,7 +468,8 @@ export class OpfsCasStore {
       sourceUrl: params.sourceUrl,
       etag: params.etag,
     });
-    await this.persistLedger();
+    this.residentBytes += params.bytes.byteLength;
+    this.schedulePersistLedger();
     return { kappa, dedupLinked: false };
   }
 
@@ -415,6 +480,8 @@ export class OpfsCasStore {
     const data = await this.backend.readObject(kappa);
     if (!data) {
       this.entries.delete(kappa);
+      this.residentBytes = Math.max(0, this.residentBytes - entry.byteLength);
+      this.schedulePersistLedger();
       return null;
     }
     this.slabHits += 1;
@@ -434,8 +501,7 @@ export class OpfsCasStore {
     protectedKappas?: ReadonlySet<string>,
   ): Promise<number> {
     await this.hydrate();
-    let resident = this.getResidentBytes();
-    if (resident <= targetMaxBytes) return 0;
+    if (this.residentBytes <= targetMaxBytes) return 0;
 
     const candidates = Array.from(this.entries.values())
       .filter((e) => !protectedKappas?.has(e.kappa))
@@ -447,18 +513,18 @@ export class OpfsCasStore {
 
     let reclaimed = 0;
     for (const entry of candidates) {
-      if (resident <= targetMaxBytes) break;
+      if (this.residentBytes <= targetMaxBytes) break;
       await this.backend.deleteObject(entry.kappa);
       this.entries.delete(entry.kappa);
       for (const [extKey, k] of this.extentMap) {
         if (k === entry.kappa) this.extentMap.delete(extKey);
       }
-      resident -= entry.byteLength;
+      this.residentBytes = Math.max(0, this.residentBytes - entry.byteLength);
       reclaimed += entry.byteLength;
       this.evictions += 1;
     }
     if (reclaimed > 0) {
-      await this.persistLedger();
+      this.schedulePersistLedger();
     }
     return reclaimed;
   }
@@ -467,12 +533,15 @@ export class OpfsCasStore {
   async releaseOwner(ownerId: string): Promise<number> {
     await this.hydrate();
     let freed = 0;
+    let mutated = false;
     for (const [kappa, entry] of Array.from(this.entries.entries())) {
       if (!entry.refOwners.includes(ownerId)) continue;
+      mutated = true;
       const remaining = entry.refOwners.filter((o) => o !== ownerId);
       if (remaining.length === 0) {
         await this.backend.deleteObject(kappa);
         this.entries.delete(kappa);
+        this.residentBytes = Math.max(0, this.residentBytes - entry.byteLength);
         for (const [extKey, k] of this.extentMap) {
           if (k === kappa) this.extentMap.delete(extKey);
         }
@@ -481,8 +550,8 @@ export class OpfsCasStore {
         this.entries.set(kappa, { ...entry, refOwners: remaining });
       }
     }
-    if (freed > 0) {
-      await this.persistLedger();
+    if (mutated) {
+      this.schedulePersistLedger();
     }
     return freed;
   }
@@ -494,7 +563,9 @@ export class OpfsCasStore {
     }
     this.entries.clear();
     this.extentMap.clear();
-    await this.persistLedger();
+    this.residentBytes = 0;
+    this.schedulePersistLedger();
+    await this.flushLedger();
   }
 
   getTelemetry(): CasTelemetrySnapshot {

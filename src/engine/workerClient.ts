@@ -1319,6 +1319,10 @@ export class LlamaVTensorWorkerClient {
 
     if (msg.type === 'error') {
       this.pending.delete(msg.requestId);
+      const removedActivePart = this.activeGenerationPartByReq.delete(msg.requestId);
+      const remainingParts = removedActivePart
+        ? Array.from(new Set(this.activeGenerationPartByReq.values()))
+        : this.state.activePartTaskIds;
       if (this.activeLoadRequestId === msg.requestId) {
         this.activeLoadRequestId = null;
       }
@@ -1326,9 +1330,17 @@ export class LlamaVTensorWorkerClient {
       const nextModel = msg.modelUnloaded ? null : this.state.model;
       this.patchState({
         model: nextModel,
-        status: nextModel ? 'ready' : isCancelled ? 'idle' : 'error',
+        status:
+          remainingParts.length > 0
+            ? 'generating'
+            : nextModel
+              ? 'ready'
+              : isCancelled
+                ? 'idle'
+                : 'error',
         progressPercent: 0,
         prefillProgress: null,
+        activePartTaskIds: remainingParts,
         errorMessage: isCancelled ? null : msg.message,
         statusDetail: isCancelled ? 'Download paused' : 'Model error',
         ...(msg.opfsStorage
@@ -1357,7 +1369,17 @@ export class LlamaVTensorWorkerClient {
 
   async loadCatalogModel(model: CatalogModel): Promise<LoadedModelSummary> {
     this.lastRequestedCatalogModel = model;
-    if (model.id !== INTERNAL_BOOTSTRAP_MODEL.id && !this.state.modelStreamEnabled) {
+    const isCachedLocally = this.state.cachedModelIds.includes(model.id);
+    if (
+      model.id !== INTERNAL_BOOTSTRAP_MODEL.id &&
+      !isCachedLocally &&
+      this.state.streamingConsent === 'paused'
+    ) {
+      throw new Error(
+        'Offline-only mode is active. Turn off Offline-Only Mode in Settings → Content Streams to stream new capabilities.',
+      );
+    }
+    if (model.id !== INTERNAL_BOOTSTRAP_MODEL.id && this.state.streamingConsent === 'pending') {
       saveStreamingConsent('accepted');
       this.cognitiveObserver.grants.reset('network-weights');
       this.cognitiveObserver.grants.grant('network-weights');
@@ -1522,6 +1544,7 @@ export class LlamaVTensorWorkerClient {
     const requestId = this.nextRequestId('gen');
     const partId = opts?.partId ?? threadId ?? 'verdant-part-home';
     const queue: TokenStreamEvent[] = [];
+    let queueHead = 0;
     let notifyNext: (() => void) | null = null;
     let done = false;
     let cancelSent = false;
@@ -1597,9 +1620,14 @@ export class LlamaVTensorWorkerClient {
     this.worker.postMessage(req);
 
     try {
-      while (!done || queue.length > 0) {
-        if (queue.length > 0) {
-          yield queue.shift()!;
+      while (!done || queueHead < queue.length) {
+        if (queueHead < queue.length) {
+          const item = queue[queueHead++]!;
+          if (queueHead >= queue.length) {
+            queue.length = 0;
+            queueHead = 0;
+          }
+          yield item;
         } else if (!done) {
           await new Promise<void>((resolve) => {
             notifyNext = resolve;

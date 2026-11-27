@@ -1260,7 +1260,20 @@ export class PrismStore {
 
   private getDb(): Promise<IDBDatabase | null> {
     if (!this.dbPromise) {
-      this.dbPromise = openStudioDb();
+      this.dbPromise = openStudioDb().then((db) => {
+        if (db) {
+          db.onclose = () => {
+            this.dbPromise = null;
+          };
+          db.onversionchange = () => {
+            db.close();
+            this.dbPromise = null;
+          };
+        } else {
+          this.dbPromise = null;
+        }
+        return db;
+      });
     }
     return this.dbPromise;
   }

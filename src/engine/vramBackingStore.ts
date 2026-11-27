@@ -902,16 +902,31 @@ export class OpfsDemandVramBackingStore implements VramBackingStore {
       note: 'Preparing on-demand model cache',
     });
 
-    const res = await fetchImpl(this.url, {
-      headers: { Range: `bytes=0-${slab0Len - 1}` },
-      signal,
-    });
-    if (!res.ok && res.status !== 206) {
-      throw new Error(`HTTP ${res.status} while initializing on-demand cache for ${this.modelId}.`);
-    }
-    const ab = await res.arrayBuffer();
-    const raw = new Uint8Array(ab);
-    const slabData = raw.byteLength >= slab0Len ? raw.subarray(0, slab0Len) : raw;
+    const fetchSlab0 = async (): Promise<Uint8Array> => {
+      const res = await fetchImpl(this.url, {
+        headers: { Range: `bytes=0-${slab0Len - 1}` },
+        signal,
+      });
+      if (!res.ok && res.status !== 206) {
+        throw new Error(`HTTP ${res.status} while initializing on-demand cache for ${this.modelId}.`);
+      }
+      const ab = await res.arrayBuffer();
+      const raw = new Uint8Array(ab);
+      return raw.byteLength >= slab0Len ? raw.subarray(0, slab0Len) : raw;
+    };
+
+    const slabData = this.casStore
+      ? (
+          await this.casStore.resolveOrStoreSlab({
+            contentFingerprint: this.contentFingerprintKey,
+            slabIndex: 0,
+            ownerModelId: this.modelId,
+            sourceUrl: this.url,
+            etag: this.etag,
+            fetchFn: fetchSlab0,
+          })
+        ).bytes
+      : await fetchSlab0();
     if (slabData.byteLength < Math.min(24, slab0Len)) {
       throw new Error(`Incomplete GGUF header fetched for ${this.modelId}.`);
     }
@@ -2347,6 +2362,7 @@ export async function openOpfsDemandModelBacking(
     expectedEtag?: string;
     signal?: AbortSignal;
     retryDelaysMs?: readonly number[];
+    casStore?: DemandCasStoreLike;
   },
 ): Promise<OpfsDemandVramBackingStore | null> {
   if (!options?.dirOverride && !isOpfsSyncSupported()) return null;
@@ -2416,6 +2432,7 @@ export async function openOpfsDemandModelBacking(
       asyncRangeFetcher: options?.asyncRangeFetcher,
       fetchFn: options?.fetchFn,
       onPersistIndex: (nextMeta) => writeDemandIndexSync(syncIdx, nextMeta),
+      casStore: options?.casStore,
     });
 
     const originalClose = store.close.bind(store);
@@ -2530,6 +2547,7 @@ export async function streamUrlToVramBacking(
         fetchFn: fetchImpl,
         upgradeLegacyOversizedSlabs: options?.demandSlabBytesOverride === undefined,
         signal: options?.signal,
+        casStore: options?.casStore,
       });
       if (existingDemand) {
         await existingDemand.prewarmHeader(fetchImpl, options?.signal, options?.onProgress);

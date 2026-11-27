@@ -102,10 +102,15 @@ export function selectRelevantEnabledStreams(
   const scored = enabledStreams.map((stream) => {
     let score = 10;
     // Direct URL match on a custom stream wins decisively
-    for (const u of urlsInQuery) {
-      if (u.includes(new URL(stream.endpointUrl).hostname.toLowerCase())) {
-        score += 100;
+    try {
+      const host = new URL(stream.endpointUrl).hostname.toLowerCase();
+      for (const u of urlsInQuery) {
+        if (u.includes(host)) {
+          score += 100;
+        }
       }
+    } catch {
+      // Ignore malformed URL safely
     }
     if (!stream.builtIn) score += 22; // User-added custom streams have explicit personal relevance
     for (const tag of stream.tags) {
@@ -199,7 +204,40 @@ async function fetchFromStreamProvider(
       query?: { search?: Array<{ title?: string; snippet?: string; pageid?: number }> };
     };
     const host = new URL(stream.endpointUrl).origin;
-    return (data.query?.search ?? []).slice(0, 2).map((hit) => ({
+    const hits = (data.query?.search ?? []).slice(0, 2);
+    if (stream.providerKind === 'wikipedia' && hits.length > 0 && hits[0]?.title) {
+      const topTitle = hits[0].title;
+      try {
+        const sumRes = await fetchWithTimeout(
+          `${host}/api/rest_v1/page/summary/${encodeURIComponent(topTitle.replace(/\s+/g, '_'))}`,
+          fetchImpl,
+          signal,
+        );
+        if (sumRes.ok) {
+          const sum = (await sumRes.json()) as {
+            title?: string;
+            extract?: string;
+            description?: string;
+            content_urls?: { desktop?: { page?: string } };
+          };
+          if (sum.extract && sum.extract.trim().length >= 16) {
+            return [
+              {
+                title: sum.title ?? topTitle,
+                sourceUrl:
+                  sum.content_urls?.desktop?.page ??
+                  `${host}/wiki/${encodeURIComponent(topTitle.replace(/\s+/g, '_'))}`,
+                rawText: sum.extract,
+                attributes: sum.description ? [sum.description] : undefined,
+              },
+            ];
+          }
+        }
+      } catch {
+        // Fall back seamlessly to search snippets below
+      }
+    }
+    return hits.map((hit) => ({
       title: hit.title ?? topic,
       sourceUrl: `${host}/wiki/${encodeURIComponent((hit.title ?? topic).replace(/\s+/g, '_'))}`,
       rawText: `${hit.title ?? ''}: ${hit.snippet ?? ''}`,
@@ -356,8 +394,18 @@ async function fetchFromStreamProvider(
   }
 
   if (stream.providerKind === 'open-meteo') {
+    const locMatch = topic.match(
+      /\b(?:in|for|at|near)\s+([a-z][a-z\s,.-]{1,48}?)(?:\s+(?:today|tomorrow|right\s+now|now|this\s+week|tonight|currently)\b|[?!.]|$)/i,
+    );
+    const cleanLoc = (
+      locMatch?.[1] ??
+      topic.replace(/\b(weather|forecast|temperature|rain|snow|wind|humidity|current|live|today|tomorrow|right\s+now|now|the)\b/gi, ' ')
+    )
+      .replace(/\s+/g, ' ')
+      .trim();
+    const geoQuery = encodeURIComponent(cleanLoc || topic);
     const geoRes = await fetchWithTimeout(
-      `https://geocoding-api.open-meteo.com/v1/search?name=${q}&count=1&language=en&format=json`,
+      `https://geocoding-api.open-meteo.com/v1/search?name=${geoQuery}&count=1&language=en&format=json`,
       fetchImpl,
       signal,
     );

@@ -152,3 +152,37 @@ test('parseRssOrAtomXml, canonicalizeStreamText, and custom RSS stream ingestion
   assert.equal(res.foldedNovelChunks, 1);
   assert.ok(res.promptContextBlock?.includes('Verdant WASM SIMD Release'));
 });
+
+test('Open-Meteo weather stream extracts clean city name from conversational queries and Wikipedia prefers rich REST summaries', async () => {
+  const catalogStore = new ContentStreamCatalogStore();
+  catalogStore.toggleStream('stream:open-meteo', true);
+  const registry = new UnifiedExpertRegistry();
+
+  const requestedUrls: string[] = [];
+  const res = await streamRealtimeWeightsToPrism({
+    query: 'What is the weather in Tokyo right now?',
+    catalogStore,
+    registry,
+    fetchFn: async (input) => {
+      const url = String(input);
+      requestedUrls.push(url);
+      if (url.includes('geocoding-api.open-meteo.com')) {
+        assert.ok(url.includes('name=Tokyo'), `Expected clean city name=Tokyo, got ${url}`);
+        return makeJsonResponse({
+          results: [{ name: 'Tokyo', country: 'Japan', latitude: 35.6895, longitude: 139.6917 }],
+        });
+      }
+      if (url.includes('api.open-meteo.com')) {
+        return makeJsonResponse({
+          current: { temperature_2m: 18.4, relative_humidity_2m: 54, wind_speed_10m: 11.2 },
+        });
+      }
+      return new Response('Not found', { status: 404 });
+    },
+  });
+
+  assert.equal(requestedUrls.length, 2);
+  assert.equal(res.foldedNovelChunks, 1);
+  assert.ok(res.promptContextBlock?.includes('Tokyo, Japan'));
+  assert.ok(res.promptContextBlock?.includes('18.4°C'));
+});

@@ -258,14 +258,45 @@ export class LivingTrainingBasis {
   private readonly knowledgeByKappa = new Map<string, BasisKnowledgeEntry>();
   private readonly listeners = new Set<(snap: LivingBasisSnapshot) => void>();
   private hydrated = false;
+  private persistDirty = false;
+  private persistFlushPromise: Promise<void> | null = null;
   readonly semantics = new UnifiedSemanticAssociator();
 
   constructor() {
     this.semantics.setMutationHook(() => {
       this.updatedAt = Date.now();
       this.emit();
-      void this.persist();
+      this.schedulePersist();
     });
+  }
+
+  private schedulePersist(): void {
+    if (typeof indexedDB === 'undefined') return;
+    this.persistDirty = true;
+    if (this.persistFlushPromise) return;
+    this.persistFlushPromise = (async () => {
+      await Promise.resolve();
+      while (this.persistDirty) {
+        this.persistDirty = false;
+        await this.persist();
+      }
+    })().finally(() => {
+      this.persistFlushPromise = null;
+      if (this.persistDirty) {
+        this.schedulePersist();
+      }
+    });
+  }
+
+  async flushPersist(): Promise<void> {
+    while (this.persistDirty || this.persistFlushPromise) {
+      if (!this.persistFlushPromise && this.persistDirty) {
+        this.schedulePersist();
+      }
+      if (this.persistFlushPromise) {
+        await this.persistFlushPromise;
+      }
+    }
   }
 
   subscribe(listener: (snap: LivingBasisSnapshot) => void): () => void {
@@ -373,7 +404,7 @@ export class LivingTrainingBasis {
     this.adaptationSteps += 1;
     this.updatedAt = Date.now();
     this.emit();
-    void this.persist();
+    this.schedulePersist();
     return this.snapshot();
   }
 
@@ -389,6 +420,7 @@ export class LivingTrainingBasis {
       fetchedAt: nowMs,
       updatedAt: nowMs,
     });
+    this.schedulePersist();
   }
 
   /**
@@ -439,7 +471,7 @@ export class LivingTrainingBasis {
     this.adaptationSteps += 1;
     this.updatedAt = entry.fetchedAt;
     this.emit();
-    void this.persist();
+    this.schedulePersist();
     return true;
   }
 

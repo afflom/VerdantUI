@@ -156,3 +156,76 @@ test('Model catalog marks Sparse MoE and large models for demand-first streaming
   assert.ok(getModelCapacityQ10(qwen4b) < getModelCapacityQ10(qwen8b));
   assert.ok(getModelCapacityQ10(qwen8b) < getModelCapacityQ10(moe30b));
 });
+
+test('OpfsCasStore coalesces burst ledger writes without overlap, deduplicates concurrent in-flight slab misses, and persists partial releaseOwner', async () => {
+  const inner = new MemoryCasBackend();
+  let ledgerWriteCalls = 0;
+  let activeLedgerWrites = 0;
+  let maxConcurrentLedgerWrites = 0;
+
+  const instrumentedBackend = {
+    readObject: (k: string) => inner.readObject(k),
+    writeObject: (k: string, b: Uint8Array) => inner.writeObject(k, b),
+    deleteObject: (k: string) => inner.deleteObject(k),
+    readLedger: () => inner.readLedger(),
+    writeLedger: async (ledger: Parameters<MemoryCasBackend['writeLedger']>[0]) => {
+      ledgerWriteCalls += 1;
+      activeLedgerWrites += 1;
+      maxConcurrentLedgerWrites = Math.max(maxConcurrentLedgerWrites, activeLedgerWrites);
+      await Promise.resolve();
+      await inner.writeLedger(ledger);
+      activeLedgerWrites -= 1;
+    },
+  };
+
+  const cas = new OpfsCasStore({ backend: instrumentedBackend, budgetBytes: 4 * 1024 * 1024 });
+
+  // 1. Concurrent in-flight misses for the exact same slab invoke fetchFn ONLY once
+  let concurrentFetches = 0;
+  const slabBytes = makeSlab(42, 4096);
+  const parallel = await Promise.all(
+    [0, 1, 2, 3].map(() =>
+      cas.resolveOrStoreSlab({
+        contentFingerprint: 'fp-concurrent',
+        slabIndex: 7,
+        ownerModelId: 'moe-a',
+        fetchFn: async () => {
+          concurrentFetches += 1;
+          await new Promise((r) => setTimeout(r, 15));
+          return slabBytes;
+        },
+      }),
+    ),
+  );
+  assert.equal(concurrentFetches, 1, 'Concurrent misses on identical extent must deduplicate to 1 fetch');
+  assert.equal(parallel[0]!.kappa, parallel[3]!.kappa);
+
+  // 2. Burst of 12 distinct puts coalesces into minimal serialized ledger writes with 0 concurrent overlap
+  ledgerWriteCalls = 0;
+  await Promise.all(
+    Array.from({ length: 12 }, (_, i) =>
+      cas.putObject({
+        kind: 'weight-slab',
+        bytes: makeSlab(100 + i, 2048),
+        ownerId: 'burst-model',
+      }),
+    ),
+  );
+  await cas.flushLedger();
+  assert.equal(maxConcurrentLedgerWrites, 1, 'Ledger writes must NEVER overlap concurrently');
+  assert.ok(ledgerWriteCalls <= 2, `Expected coalesced ledger writes (<=2), got ${ledgerWriteCalls}`);
+  assert.equal(cas.getResidentBytes(), 4096 + 12 * 2048);
+
+  // 3. Partial releaseOwner (refOwners 2 -> 1) persists into ledger across reload
+  const sharedData = makeSlab(77, 1024);
+  const putA = await cas.putObject({ kind: 'boot-header', bytes: sharedData, ownerId: 'owner-1' });
+  await cas.putObject({ kind: 'boot-header', bytes: sharedData, ownerId: 'owner-2' });
+  await cas.releaseOwner('owner-1');
+  await cas.flushLedger();
+
+  const reloaded = new OpfsCasStore({ backend: instrumentedBackend, budgetBytes: 4 * 1024 * 1024 });
+  await reloaded.hydrate();
+  const reloadedEntry = reloaded.getEntry(putA.kappa);
+  assert.ok(reloadedEntry);
+  assert.deepEqual(reloadedEntry.refOwners, ['owner-2']);
+});
