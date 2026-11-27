@@ -161,6 +161,31 @@
         "VUI-FEAT-013"
       ],
       "summary": "Coherent Multi-Facet Synthesis, SVG Logo/Cover Art, Mastered WAV+MIDI & Decluttered Media Prisms"
+    },
+    {
+      "version": "0.9.0",
+      "tag": "v0.9.0",
+      "releasedAt": "2026-11-27T12:10:29.909Z",
+      "commit": "2e6fc8817d1e4fc32e62f81e0997fb4ae882e052",
+      "engineTag": "v2.22.4",
+      "studioCommit": "85dc9880c955d084c47624107ecb2971daef93f2",
+      "activeFeatureIds": [
+        "VUI-FEAT-001",
+        "VUI-FEAT-002",
+        "VUI-FEAT-003",
+        "VUI-FEAT-004",
+        "VUI-FEAT-005",
+        "VUI-FEAT-006",
+        "VUI-FEAT-007",
+        "VUI-FEAT-008",
+        "VUI-FEAT-009",
+        "VUI-FEAT-010",
+        "VUI-FEAT-011",
+        "VUI-FEAT-012",
+        "VUI-FEAT-013",
+        "VUI-FEAT-014"
+      ],
+      "summary": "OPFS SDXS GGUF Loader, Worker Auto-Recovery, Compact Thumbnails, Editorial Research/Utility Organs & Deterministic Publish"
     }
   ]
 }
