@@ -233,12 +233,16 @@ function formatCleanMathText(raw: string): string {
     expr
       .replace(/\\times\b/g, '×')
       .replace(/\\cdot\b/g, '·')
+      .replace(/\\cdots\b/g, '⋯')
+      .replace(/\\l?dots\b/g, '…')
       .replace(/\\approx\b/g, '≈')
       .replace(/\\leq?\b/g, '≤')
       .replace(/\\geq?\b/g, '≥')
       .replace(/\\neq?\b/g, '≠')
       .replace(/\\pm\b/g, '±')
+      .replace(/\\sqrt\{([^}]+)\}/g, '√($1)')
       .replace(/\\frac\{([^}]+)\}\{([^}]+)\}/g, '($1)/($2)')
+      .replace(/\\([{}])/g, '$1')
       .replace(/\s*\\\\\s*/g, '  |  ')
       .replace(/\s+\\\s+/g, '  |  ')
       .trim();
@@ -247,7 +251,7 @@ function formatCleanMathText(raw: string): string {
   let out = raw.replace(/\$\$\s*([^$\n][\s\S]{0,240}?)\s*\$\$/g, (_m, inner: string) => cleanExpr(inner));
   // Inline math $ x $ / $ 2x + 1 = 1.10 $ — never matches currency like "$1.10" or "$0.05"
   out = out.replace(
-    /(?<![\w$])\$\s*([a-zA-Z\\][^$\n]{0,80}?|[0-9]+[a-zA-Z][^$\n]{0,80}?)\s*\$(?!\d)/g,
+    /(?<![\w$])\$\s*([a-zA-Z\\{][^$\n]{0,80}?|[0-9]+[a-zA-Z][^$\n]{0,80}?)\s*\$(?!\d)/g,
     (_m, inner: string) => cleanExpr(inner),
   );
   return out;

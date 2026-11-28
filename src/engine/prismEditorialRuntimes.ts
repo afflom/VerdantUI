@@ -419,18 +419,22 @@ let state = {
       ],
   calcInputs: (W.metrics || []).map((m) => m.target || 10),
   scenarios: [],
-  cards: [
-    { id: 'c1', front: 'Core concept of ' + (W.rulesSummary || 'this study deck').slice(0, 48), back: 'Review the key definition, mechanism, and example.', mastered: false },
-    { id: 'c2', front: 'How does active recall improve retention?', back: 'Retrieving answers from memory strengthens recall pathways far more than passive re-reading.', mastered: false },
-    { id: 'c3', front: 'How can you add a custom card here?', back: 'Type "Add card: Question | Answer" in the prompt bar below.', mastered: false },
-  ],
+  cards: Array.isArray(W.cards) && W.cards.length > 0
+    ? W.cards.map((c) => ({ ...c }))
+    : [
+        { id: 'c1', front: 'Core concept of ' + (W.rulesSummary || 'this study deck').slice(0, 48), back: 'Review the key definition, mechanism, and example.', mastered: false },
+        { id: 'c2', front: 'How does active recall improve retention?', back: 'Retrieving answers from memory strengthens recall pathways far more than passive re-reading.', mastered: false },
+        { id: 'c3', front: 'How can you add a custom card here?', back: 'Type "Add card: Question | Answer" in the prompt bar below.', mastered: false },
+      ],
   cardIdx: 0,
   cardFlipped: false,
   monthlyBudget: Number(W.monthlyBudget) || 2000,
-  expenses: [
-    { id: 'e1', label: 'Groceries', category: 'Essentials', amount: 145, at: 'Today' },
-    { id: 'e2', label: 'Utilities', category: 'Home', amount: 95, at: 'Today' },
-  ],
+  expenses: Array.isArray(W.expenses) && W.expenses.length > 0
+    ? W.expenses.map((e) => ({ ...e }))
+    : [
+        { id: 'e1', label: 'Groceries', category: 'Essentials', amount: 145, at: 'Today' },
+        { id: 'e2', label: 'Utilities', category: 'Home', amount: 95, at: 'Today' },
+      ],
 };
 
 function persist() { try { window.verdant?.storage?.set('utilityState', state); } catch (_) {} }
