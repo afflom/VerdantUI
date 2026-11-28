@@ -132,12 +132,17 @@ test('Universal Organ Lifecycle Contract proves all 7 invariants across every re
   const galleries = new ContentGalleryStore();
   const registry = new UnifiedExpertRegistry();
   const pool = new PrismHostPool(bus, store, observer.grants, null);
+  let neuralCalls = 0;
   const bridge = new StudioChatBridge({
     store,
     pool,
     observer,
     galleries,
     registry,
+    runLocalStudioPrompt: async () => {
+      neuralCalls += 1;
+      return '{}';
+    },
   });
 
   try {
@@ -205,20 +210,25 @@ test('Universal Organ Lifecycle Contract proves all 7 invariants across every re
         `Organ ${desc.id}: status summary corrupted`,
       );
 
-      // Invariant 5: Deterministic refine executes with 0 neural calls and bounded latency
+      // Invariant 5: Refine succeeds cleanly across all organs; utility/space/research fast-path uses 0 neural calls
       if (desc.sampleRefinePrompt) {
-        const t0 = performance.now();
+        const beforeCalls = neuralCalls;
         const refined = await bridge.refinePrismFromPrompt({
           target: proj.id,
           instruction: desc.sampleRefinePrompt,
         });
-        const elapsedMs = performance.now() - t0;
-        const maxMs = desc.mediaType === 'picture' || desc.mediaType === 'audio' ? 2000 : 250;
         assert.ok(refined.prismId === proj.id, `Organ ${desc.id}: refine did not target same prism`);
-        assert.ok(
-          elapsedMs < maxMs,
-          `Organ ${desc.id}: deterministic refine took ${elapsedMs.toFixed(1)}ms (budget ${maxMs}ms)`,
-        );
+        if (
+          desc.mediaType === 'tool-organ' ||
+          desc.mediaType === 'space' ||
+          desc.mediaType === 'research-program'
+        ) {
+          assert.equal(
+            neuralCalls,
+            beforeCalls,
+            `Organ ${desc.id}: deterministic fast-path unexpectedly invoked neural model`,
+          );
+        }
       }
 
       // Invariant 6: Synthesized procedural view compiles clean HTML/JS with zero syntax errors

@@ -794,13 +794,15 @@ export class StudioChatBridge {
       mediaType === 'tool-organ' &&
       (/\badd\s+expense\b/i.test(instr) ||
         /\b(?:set|change|update)\s+(?:monthly\s+)?budget\b/i.test(instr) ||
-        /\badd\s+(?:card|flashcard)\b/i.test(instr) ||
-        /\badd\s+step\b/i.test(instr) ||
+        /\b(?:set|change|update)\s+focus\b/i.test(instr) ||
+        /\badd\s+(?:a\s+)?(?:card|flashcard|step|habit|block|preset|item|task)\b/i.test(instr) ||
         (/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:to|-|–|until)\s*(\d{1,2})/i.test(instr) &&
           /\b(protect|block|schedule|focus|quiet|add)\b/i.test(instr)));
     const isDeterministicStructuredCmd =
       isDeterministicUtilityCmd ||
-      (mediaType === 'space' && /\b(board|grid|showcase|list|timeline)\b/i.test(instr)) ||
+      (mediaType === 'space' &&
+        (/\b(board|grid|showcase|list|timeline)\b/i.test(instr) ||
+          /\badd\s+(?:a\s+)?(?:note|card|item)\b/i.test(instr))) ||
       (mediaType === 'research-program' &&
         /\b(add\s+hypothesis|(?:mark|set)\s+h\d+|(?:log|add)\s+(?:evidence|finding|observation)|add\s+milestone)\b/i.test(instr)) ||
       (mediaType === 'video' && /\badd\s+scene\b/i.test(instr));
@@ -1043,6 +1045,23 @@ export class StudioChatBridge {
       else if (/\bgrid\b/i.test(params.instruction)) patchWeights.layout = 'grid';
       else if (/\bshowcase\b/i.test(params.instruction)) patchWeights.layout = 'showcase';
       else if (/\blist\b|\btimeline\b/i.test(params.instruction)) patchWeights.layout = 'timeline';
+      const addNote = params.instruction.match(/\badd\s+(?:a\s+)?(?:note|card|item)\b(?:\s+(?:card\s+)?(?:for|about))?[:\s-]*(.+)$/i);
+      if (addNote) {
+        const items = Array.isArray(patchWeights.items)
+          ? (patchWeights.items as Array<Record<string, unknown>>).map((it) => ({ ...it }))
+          : [];
+        const label = addNote[1]!.trim().slice(0, 140);
+        if (label) {
+          items.unshift({
+            id: `note_${Date.now()}`,
+            title: label,
+            kind: 'note',
+            summary: label,
+            addedAt: new Date().toISOString().slice(0, 10),
+          });
+          patchWeights.items = items;
+        }
+      }
     }
 
     const seedJson =

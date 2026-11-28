@@ -1,0 +1,71 @@
+{
+  "schema": "verdant-ui/held-out-evals/1",
+  "honestyLevel": "open",
+  "description": "Versioned held-out evaluation suite for VerdantUI (never referenced in routing regexes). Measures real browser invariants and honest open telemetry via Chrome CDP + window.__VERDANT_OBSERVER__.",
+  "holoRefusalProbes": [
+    {
+      "id": "REFUSE-CONSENT",
+      "command": "verdant\tconsent\tbogus\t1\t1\t1",
+      "expectedResponse": "refused: unknown consent state"
+    },
+    {
+      "id": "REFUSE-FK07",
+      "command": "verdant\tgrant\ttool-organ\tstorage\t0\t1",
+      "expectedResponse": "refused: denied by FK-07"
+    },
+    {
+      "id": "REFUSE-OFFLINE-NET",
+      "command": "verdant\tgrant\ttool-organ\tnetwork\t1\t0",
+      "expectedResponse": "refused: offline mode denies network"
+    },
+    {
+      "id": "REFUSE-COMPARTMENT",
+      "command": "verdant\tcompartment\tunknown-space\tpersonal\tprivate",
+      "expectedResponse": "refused: unknown compartment"
+    },
+    {
+      "id": "REFUSE-EMPTY-CELL",
+      "command": "verdant\tcells\ttune\t",
+      "expectedResponse": "refused: empty cell target"
+    },
+    {
+      "id": "REFUSE-UNKNOWN-ROUTE",
+      "command": "not-a-verdant-command",
+      "expectedResponse": "refused: unknown verdant command"
+    }
+  ],
+  "chatPrompts": [
+    {
+      "id": "FACT-01",
+      "category": "factual-concise",
+      "thinkingPolicy": "off",
+      "prompt": "What is the chemical symbol for tungsten and its atomic number?"
+    },
+    {
+      "id": "REASON-01",
+      "category": "deductive-proof",
+      "thinkingPolicy": "on",
+      "prompt": "Prove concisely that the sum of two odd integers is always even."
+    },
+    {
+      "id": "CODE-01",
+      "category": "coding-algorithm",
+      "thinkingPolicy": "on",
+      "prompt": "Write a TypeScript function to check whether two strings are anagrams in O(n) time."
+    },
+    {
+      "id": "STUDIO-01",
+      "category": "studio-utility-lifecycle",
+      "mediaType": "tool-organ",
+      "prompt": "Build a monthly budget tracker utility",
+      "refinePrompt": "Add expense $19 coffee"
+    },
+    {
+      "id": "STUDIO-02",
+      "category": "studio-space-lifecycle",
+      "mediaType": "space",
+      "prompt": "Create a Weekend Reading space",
+      "refinePrompt": "Add a note card for sci-fi classics"
+    }
+  ]
+}
