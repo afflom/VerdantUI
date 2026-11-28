@@ -1437,6 +1437,7 @@ export function createLlamaVTensorAdapter(
       let lastPrefillTokensPerSec: number | undefined;
       let lastGeneratedTokens = 0;
       let lastTokensPerSecond = 0;
+      let hitThinkCap = false;
       const turnTtftObjId = `turn:ttft:${threadId}`;
       const generateStartMs = Date.now();
       client.cognitiveObserver.chronology.beginObject({
@@ -1540,8 +1541,72 @@ export function createLlamaVTensorAdapter(
           }
 
           if (completedToolCall || runawayThinkLoop) {
+            if (runawayThinkLoop && !completedToolCall) {
+              hitThinkCap = true;
+            }
             runController.abort();
             break;
+          }
+        }
+
+        // Graceful thinking-budget continuation: if `<think>` hit its token cap or repetition
+        // guard without closing `</think>`, inject `</think>\n\n` and stream the final visible
+        // answer immediately (reusing ~100% of live KV cache in < 200 ms — NEVER leave an empty answer!).
+        if (hitThinkCap && !abortSignal.aborted) {
+          const closedThink = `${latestText.trimEnd()}\n</think>\n\n`;
+          latestText = closedThink;
+          const answerController = new AbortController();
+          const onAnswerAbort = () => answerController.abort();
+          abortSignal.addEventListener('abort', onAnswerAbort, { once: true });
+          const baseGenerated = lastGeneratedTokens;
+          const answerSampling = {
+            ...effectiveSampling,
+            maxTokens: Math.min(effectiveSampling.maxTokens, 320),
+          };
+          try {
+            for await (const contEvent of client.streamGenerate(
+              `${prompt}${closedThink}`,
+              answerController.signal,
+              answerSampling,
+              threadId,
+              sensory.visualKappa,
+            )) {
+              totalChunks += 1;
+              latestText = `${closedThink}${contEvent.accumulatedText}`;
+              lastGeneratedTokens = baseGenerated + contEvent.generatedTokens;
+              if (contEvent.tokensPerSecond > 0) {
+                lastTokensPerSecond = contEvent.tokensPerSecond;
+              }
+              const parts = parseAssistantStreamParts(latestText, false, {
+                startsInReasoning,
+                parseToolCalls,
+                idPrefix: stepIdPrefix,
+              });
+              const completedToolCall = parseToolCalls && hasCompleteToolCallTag(latestText);
+              const toolCallCount = parts.filter((p) => p.type === 'tool-call').length;
+              if (parts.length > 0 && !completedToolCall) {
+                yield {
+                  content: parts,
+                  metadata: {
+                    custom: { prismRoute: certificate },
+                    timing: {
+                      streamStartTime,
+                      firstTokenTime,
+                      tokenCount: lastGeneratedTokens,
+                      tokensPerSecond: lastTokensPerSecond,
+                      totalChunks,
+                      toolCallCount,
+                    },
+                  },
+                };
+              }
+              if (completedToolCall) {
+                answerController.abort();
+                break;
+              }
+            }
+          } finally {
+            abortSignal.removeEventListener('abort', onAnswerAbort);
           }
         }
       } finally {

@@ -907,7 +907,12 @@ export function observeInputSensoryState(
 
   // Axis 6: Output elaboration expected
   let elaboration = 320;
-  if (/\b(brief|short|concise|one[\s-]line|tl;?dr|quick|just\s+the)\b/.test(lower)) {
+  if (
+    /\b(brief|short|concise|crisp|one[\s-]line|tl;?dr|quick|just\s+the)\b/.test(lower) ||
+    /\bin\s+(?:a\s+few|one|two|three|four|five|\d+)\s+(?:crisp\s+|short\s+|brief\s+)?sentences?\b/.test(
+      lower,
+    )
+  ) {
     elaboration = 128;
   } else if (/\b(detailed|comprehensive|thorough|deep\s+dive|full|complete|walkthrough|explain)\b/.test(lower)) {
     elaboration = 832;

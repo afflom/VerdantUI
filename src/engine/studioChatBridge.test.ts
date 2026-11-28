@@ -122,8 +122,10 @@ test('StudioChatBridge creates inline PNG Pictures, Stereo WAV Audio, Games, Spa
     prompt: 'Build a monthly budget tracker for household expenses',
     forcedMediaType: 'tool-organ',
   });
-  const budgetWeights = store.get(budgetRes.prismId)?.declaration?.view?.proceduralOrgan?.weights;
+  const budgetProj = store.get(budgetRes.prismId)!;
+  const budgetWeights = budgetProj.declaration?.view?.proceduralOrgan?.weights;
   assert.equal(budgetWeights?.mediaType === 'tool-organ' ? budgetWeights.role : null, 'budget-tracker');
+  assert.equal(budgetProj.draft.grants.storage, true, 'Stateful tool-organ Prisms must have scoped local storage enabled (FK-07)');
 
   pool.dispose();
 });

@@ -909,6 +909,19 @@ export function assembleProceduralPrismOps(
     citation: { kind: 'req', requirementId: primaryReqId },
   });
 
+  // Stateful procedural organs require scoped private on-device storage (FK-07) and browser export
+  if (
+    spec.mediaType === 'tool-organ' ||
+    spec.mediaType === 'written-work' ||
+    spec.mediaType === 'research-program' ||
+    spec.mediaType === 'interactive-game'
+  ) {
+    applyLocal({
+      op: 'set-capabilities',
+      capabilities: { storage: true, browser: true },
+    });
+  }
+
   // Reconcile remaining Core 3 (Security) & applicable standards cleanly
   const reconciled = reconcileAllRemainingFacets(working);
   for (const op of reconciled.ops) {

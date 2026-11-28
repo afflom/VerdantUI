@@ -585,11 +585,39 @@ export function descriptorForUserPrism(project: VerdantPrismProject): VerdantSys
       'Synthesize current evidence and milestones',
       'Add a validation milestone for next week',
     ],
-    'tool-organ': [
-      'Protect 5pm to 6pm daily for focused time',
-      'Add a daily check-in goal',
-      'Refine the rules summary',
-    ],
+    'tool-organ': (() => {
+      const tw = project.declaration?.view?.proceduralOrgan?.weights;
+      const role = tw && tw.mediaType === 'tool-organ' ? tw.role : null;
+      if (role === 'focus-timer') {
+        return [
+          'Start a 25 minute focus session',
+          'Switch to a 5 minute short break',
+          'Reset the timer',
+        ];
+      }
+      if (role === 'flashcards') {
+        return [
+          'Add card: Alkene | Hydrocarbon containing a carbon-carbon double bond',
+          'Flip the current card',
+          'Move to the next card',
+        ];
+      }
+      if (role === 'budget-tracker') {
+        return [
+          'Add expense $18 lunch',
+          'Add expense $45 transit pass',
+          'Review remaining monthly budget',
+        ];
+      }
+      if (role === 'calculator') {
+        return ['Save current scenario', 'Compare adjusted totals', 'Reset values'];
+      }
+      return [
+        'Protect 5pm to 6pm daily for focused time',
+        'Add a daily check-in goal',
+        'Refine the rules summary',
+      ];
+    })(),
     space: [
       'Switch layout to editorial showcase',
       'Switch layout to grouped board view',

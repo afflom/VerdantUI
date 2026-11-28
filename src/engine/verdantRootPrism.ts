@@ -1380,6 +1380,16 @@ export class VerdantRootPrismRuntime {
         );
         healedSummaries += 1;
       }
+      if (
+        (mt === 'tool-organ' || mt === 'written-work' || mt === 'research-program' || mt === 'interactive-game') &&
+        !p.draft.grants.storage
+      ) {
+        void this.prismStore.applyStudioOp(
+          p.id,
+          { op: 'set-capabilities', capabilities: { storage: true, browser: true } },
+          { pushRevision: false },
+        );
+      }
     }
     this.galleryStore.syncFromPrisms(this.prismStore.list());
     this.expertRegistry.syncPrismsAsExperts(this.prismStore.list());
