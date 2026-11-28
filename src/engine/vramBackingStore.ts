@@ -848,6 +848,11 @@ export class OpfsDemandVramBackingStore implements VramBackingStore {
     return slabId >= 0 && slabId < this.totalSlabs && this.slabToSlot[slabId] !== -1;
   }
 
+  /** Returns true when every slab of the backing file is cached locally in OPFS (0 network reads possible). */
+  isFullyCached(): boolean {
+    return this.totalSlabs > 0 && this.usedSlots >= this.totalSlabs;
+  }
+
   /** Exports the current MRU->LRU slab directory for sidecar persistence. */
   exportIndex(): DemandSlabIndexMeta {
     const slots: [number, number][] = [];

@@ -1586,10 +1586,31 @@ export class LlamaVTensorWorkerClient {
   private buildBootSpeculativePrompt(modelId: string): string | undefined {
     if (isInternalBootstrapModel(modelId)) return undefined;
     const bootSystem = this.state.importedHarness?.system ?? UNIFIED_VERDANT_SYSTEM_PROMPT;
+    const loaded = this.state.model?.id === modelId ? this.state.model : undefined;
+    let modelHint: Pick<LoadedModelSummary, 'id' | 'hparams'> | string = loaded ?? modelId;
+    if (!loaded) {
+      const lower = modelId.toLowerCase();
+      let inferredTemplate: string | undefined;
+      if (/(qwen|smollm|chatml|hermes|deepseek|qwq)/.test(lower)) {
+        inferredTemplate = '<|im_start|>';
+      } else if (lower.includes('gemma')) {
+        inferredTemplate = '<start_of_turn>';
+      } else if (/phi-?[34]/.test(lower)) {
+        inferredTemplate = '<|user|>\n<|end|>';
+      } else if (/llama-?3/.test(lower)) {
+        inferredTemplate = '<|start_header_id|>';
+      }
+      if (inferredTemplate) {
+        modelHint = {
+          id: modelId,
+          hparams: { name: modelId, chatTemplate: inferredTemplate } as LoadedModelSummary['hparams'],
+        };
+      }
+    }
     const prompt = formatSpeculativePrefixForLlama(
       [],
       '',
-      modelId,
+      modelHint,
       this.state.importedHarness?.promptMode ?? this.state.promptMode,
       bootSystem,
     );

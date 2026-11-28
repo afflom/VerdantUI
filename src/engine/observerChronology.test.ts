@@ -243,3 +243,17 @@ test('Cognitive Observer, LivingTrainingBasis, and MultimodalCoherenceCoordinato
   assert.ok(snapAfter.modalityCoherenceQ10.audio !== undefined);
   assert.ok(snapAfter.modalityCoherenceQ10.video !== undefined);
 });
+
+test('ObserverChronology.deriveTurnBudgetMs keeps SLA floor before calibration and scales smoothly on slow CPU hardware', () => {
+  const chrono = new ObserverChronology({
+    initialThroughput: { prefillTokensPerSec: 10, decodeTokensPerSec: 3, turnSamples: 0 },
+  });
+  // Before any completed turns, preserve the interactive SLA floor
+  assert.equal(chrono.deriveTurnBudgetMs(12_000, 2_500), 2_500);
+  // Once calibrated, grade on-pace hardware execution fairly while still capping at 60s
+  chrono.recordInferenceThroughput({ prefillTokSec: 10, decodeTokSec: 3 });
+  const calibrated = chrono.deriveTurnBudgetMs(10_000, 2_500);
+  assert.equal(calibrated, 16_000);
+  assert.equal(chrono.deriveTurnBudgetMs(500, 2_500), 2_500);
+  assert.equal(chrono.deriveTurnBudgetMs(100_000, 2_500), 60_000);
+});

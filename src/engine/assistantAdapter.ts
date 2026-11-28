@@ -1349,12 +1349,10 @@ export function createLlamaVTensorAdapter(
         const opfsReadMBs = Math.round(tp.opfsReadBytesPerSec / (1024 * 1024));
         const netMBs = Number((tp.networkBytesPerSec / (1024 * 1024)).toFixed(1));
         observerSelfReportBlock = [
-          '[Live Observer Self-Report — Grounded Telemetry]',
-          `Model: ${state.model.displayName} (${state.model.hparams.primaryQuantization}, ${state.model.backingKind}, ${state.model.maxContextWindow} ctx) on ${state.telemetry.kernelAcceleration} (${workers} browser workers, 100% client-side, zero servers).`,
-          `Measured Speeds: prefill ${tp.prefillTokensPerSec} tok/s, decode ${tp.decodeTokensPerSec} tok/s, OPFS read ${opfsReadMBs} MB/s, stream ${netMBs} MB/s.`,
-          `Storage & Chronology: ${opfsMb} MB cached in OPFS, timeliness health ${Math.round((chronoSnap.coherenceQ10 / 1024) * 100)}% (100% = all tasks within budget), cadence=${chronoSnap.userCadence}, overdue tasks=${chronoSnap.overdueCount}${recentTurn ? `, last turn=${recentTurn.durationMs} ms` : ''}.`,
-          `Built-in Capabilities: <50 ms LOD0 math/conversions, instant Verdant Studio organs (Pictures, Audio, Video, Games, Documents, Research, Spaces), W3C OTEL trace bus.`,
-          'Ground your answer honestly in these real measurements — highlight real strengths and genuine bottlenecks without generic chatbot clichés.',
+          '[Live Observer Telemetry]',
+          `Runtime: ${state.model.displayName} (${state.model.hparams.primaryQuantization}, ${state.model.backingKind}, ${state.model.maxContextWindow} ctx), ${state.telemetry.kernelAcceleration}, ${workers} workers, 100% client-side.`,
+          `Measured: prefill ${tp.prefillTokensPerSec} tok/s, decode ${tp.decodeTokensPerSec} tok/s, OPFS ${opfsReadMBs} MB/s (${opfsMb} MB cached), stream ${netMBs} MB/s, timeliness health ${Math.round((chronoSnap.coherenceQ10 / 1024) * 100)}% (overdue=${chronoSnap.overdueCount}, cadence=${chronoSnap.userCadence}${recentTurn ? `, lastTurn=${recentTurn.durationMs}ms` : ''}).`,
+          'Capabilities: <50ms LOD0 tools, instant Verdant Studio organs, W3C OTEL bus. Answer honestly from these measurements.',
         ].join('\n');
       }
 

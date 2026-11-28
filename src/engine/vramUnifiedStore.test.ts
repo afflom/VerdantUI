@@ -200,6 +200,31 @@ test('VramUnifiedStore OPFS UKV1 binary persist and hydrate round-trips exactly 
   // Stale/mismatched geometry must be safely ignored
   const mismatched = new VramUnifiedStore({ ...geometry, numLayers: 99 }, plan, 4 * 1024 * 1024);
   assert.equal(await mismatched.hydrateFromOpfs(opfsDir), 0);
+
+  // Chained prefix persistence: pinned early system-prompt pages 0..13 MUST survive OPFS persistence
+  // even when 30 newer tail pages are added afterwards (never evicted in favor of orphan tail pages!)
+  const bigPlan = { ...plan, maxKvPrefixBlocks: 64, kvPrefixSlabBudgetBytes: 64 * 1024 * 1024 };
+  const chainedStore = new VramUnifiedStore(geometry, bigPlan, 64 * 1024 * 1024);
+  chainedStore.setPinnedPrefixPages(14);
+  const allTokens: number[] = [];
+  for (let i = 0; i < 40 * geometry.pageTokens; i++) allTokens.push((i % 250) + 1);
+  const allKeys = chainedStore.computePrefixKeys(allTokens);
+  for (const k of allKeys) {
+    chainedStore.putBlock(
+      k.key,
+      k.pageIndex,
+      k.slice,
+      makeMockBlock(k.pageIndex + 1, geometry.q8BytesPerHalfPage, geometry.scaleFloatsPerHalfPage),
+    );
+  }
+  const snapBytes = chainedStore.serializeSnapshotBytes(24);
+  const reloaded = new VramUnifiedStore(geometry, bigPlan, 64 * 1024 * 1024);
+  assert.equal(reloaded.hydrateFromBytes(snapBytes), 24);
+  const restoredChain = reloaded.lookupPrefixChain(allTokens);
+  assert.ok(
+    restoredChain.length >= 14,
+    `Expected all 14 pinned boot prefix pages to survive OPFS persistence, got ${restoredChain.length}`,
+  );
 });
 
 test('trimToStableSpeculativePrefix trims cleanly to word boundaries while typing and preserves full draft on pause', () => {

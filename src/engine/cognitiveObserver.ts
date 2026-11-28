@@ -1802,13 +1802,17 @@ export class VerdantCognitiveObserver {
     }
 
     const winnerProjectedTtftMs = winner.projectedTtftMs ?? 0;
+    const effectiveTurnBudgetMs =
+      winner.kind === 'lod0-verified'
+        ? turnBudgetMs
+        : this.chronology.deriveTurnBudgetMs(winnerProjectedTtftMs, turnBudgetMs);
     const temporalAnchor: RouteTemporalAnchor = {
       wallClockMs: chronoInstant.wallClockMs,
       projectedTtftMs: winnerProjectedTtftMs,
-      turnBudgetMs,
+      turnBudgetMs: effectiveTurnBudgetMs,
       streamTimeoutMs: this.chronology.deriveAdaptiveStreamTimeoutMs(qualityBudget.featureRichness),
       timelinessQ10: clampQ10(
-        1024 - computeTimelinessPressureQ10(winnerProjectedTtftMs, turnBudgetMs),
+        1024 - computeTimelinessPressureQ10(winnerProjectedTtftMs, effectiveTurnBudgetMs),
       ),
       userCadence,
       circadianPhaseQ10: chronoInstant.circadianPhaseQ10,

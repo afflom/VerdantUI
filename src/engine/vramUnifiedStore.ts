@@ -214,7 +214,7 @@ const UNIFIED_KV_MAGIC = 0x31564b55; // "UKV1" (legacy raw blocks)
 const UNIFIED_KV_MAGIC_V2 = 0x32564b55; // "UKV2" (Theorem T7 exact lossless factored blocks)
 const UNIFIED_KV_MAGIC_V3 = 0x33564b55; // "UKV3" (Theorem T7 factored blocks + 64-bit integrity trailer)
 const UNIFIED_KV_TRAILER_BYTES = 8;
-const MAX_PERSISTED_OPFS_BLOCKS = 16;
+const MAX_PERSISTED_OPFS_BLOCKS = 24;
 
 /**
  * Zero-allocation dual-lane 64-bit integrity digest (extrapolated from verdant-engine's
@@ -513,10 +513,16 @@ export class VramUnifiedStore {
       .sort((a, b) => {
         const pinA = a.isSystemSink || this.isPinnedPrefixPage(a.pageIndex);
         const pinB = b.isSystemSink || this.isPinnedPrefixPage(b.pageIndex);
-        const boostA = pinA ? 10_000 + Math.max(0, this.pinnedPrefixPages - a.pageIndex) : 0;
-        const boostB = pinB ? 10_000 + Math.max(0, this.pinnedPrefixPages - b.pageIndex) : 0;
-        const sa = a.lastTouch + a.hitCount * 4 + boostA;
-        const sb = b.lastTouch + b.hitCount * 4 + boostB;
+        // Hash-chained KV prefix blocks require contiguous pages 0..N; NEVER drop an early pinned
+        // system-prompt page in favor of an unreachable high-pageIndex tail block!
+        const boostA = pinA
+          ? 100_000 - a.pageIndex * 16
+          : Math.max(0, 10_000 - a.pageIndex * 64);
+        const boostB = pinB
+          ? 100_000 - b.pageIndex * 16
+          : Math.max(0, 10_000 - b.pageIndex * 64);
+        const sa = a.lastTouch + a.hitCount * 8 + boostA;
+        const sb = b.lastTouch + b.hitCount * 8 + boostB;
         return sb - sa;
       })
       .slice(0, maxBlocks);

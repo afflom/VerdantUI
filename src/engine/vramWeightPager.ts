@@ -1323,6 +1323,11 @@ export class VramWeightPager {
     return hydrated;
   }
 
+  /** Returns true when streamed LM-head stripes are cached permanently in WASM RAM on first pass. */
+  isLmHeadLazyPinned(): boolean {
+    return this.lmHeadLazyPinned;
+  }
+
   /**
    * Returns a single full-vocab WASM LM-head handle once all lazy-pinned stripes have been cached
    * in WASM RAM (enabling 0 OPFS reads and 1× thread-pool dispatch per decode token!).

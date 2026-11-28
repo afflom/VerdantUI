@@ -440,6 +440,19 @@ export class ObserverChronology {
   }
 
   /**
+   * Derives a realistic turn TTFT deadline budget (ms) that preserves the interactive SLA floor
+   * while calibrating to measured host hardware speed once at least one turn has completed, so
+   * healthy on-pace CPU-only runs grade `'on-time'` while genuine stalls still flag `'overdue'`.
+   */
+  deriveTurnBudgetMs(projectedTtftMs: number, slaFloorMs: number): number {
+    if (this.throughput.turnSamples < 1 || projectedTtftMs <= 0) {
+      return Math.max(1, slaFloorMs);
+    }
+    const calibrated = Math.round(projectedTtftMs * 1.45) + 1_500;
+    return Math.min(60_000, Math.max(slaFloorMs, calibrated));
+  }
+
+  /**
    * Derives an adaptive wall-clock timeout (ms) for external Realtime Content Streams based on
    * user cadence (`rapid` vs `deliberative`) and the turn's TTFT budget.
    */

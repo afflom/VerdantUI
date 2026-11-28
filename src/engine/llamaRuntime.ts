@@ -300,8 +300,8 @@ interface Batch4ScratchTensors {
 }
 
 const PREFILL_BATCH_SIZE = SPILL_FREE_BATCH_WIDTH;
-/** Up to 8 Batch-4 micro-batches (32 tokens) per OPFS layer acquire during Layer-Major Chunked Prefill. */
-const PREFILL_LAYER_MAJOR_MAX_MICROBATCHES = 8;
+/** Up to 16 Batch-4 micro-batches (64 tokens) per OPFS layer acquire during Layer-Major Chunked Prefill. */
+const PREFILL_LAYER_MAJOR_MAX_MICROBATCHES = 16;
 
 function alignUp32(n: number): number {
   const rem = n % 32;
@@ -874,8 +874,9 @@ export class LlamaVTensorRuntime {
     }
 
     // 2. Pre-populate lazy-pinned full-vocab LM-head WASM cache from local OPFS (0 OPFS reads on decode!)
+    //    Skip when `isLmHeadLazyPinned()` is false so we never read & discard 300 MB of LM-head tiles!
     let lmHeadCached = wp.getCachedFullLmHead() !== null;
-    if (!lmHeadCached && wp.streamLmHead) {
+    if (!lmHeadCached && wp.streamLmHead && wp.isLmHeadLazyPinned()) {
       const stripes = wp.getLmHeadStripeSpecs();
       const allStripesOnDisk =
         !(this.backingStore instanceof OpfsDemandVramBackingStore) ||
@@ -898,6 +899,14 @@ export class LlamaVTensorRuntime {
     if (bootPrompt && this.tokenizer && this.kvPager) {
       const encoded = this.tokenizer.encode(bootPrompt, this.tokenizer.addBosToken);
       if (encoded.length > 0) {
+        // Pin every full 16-token page of the boot system prompt so `.unified.kv` ALWAYS retains
+        // the complete hash-chained boot prefix across multi-turn sessions and browser reloads!
+        const bootPages = Math.max(
+          this.kvPager.getPinnedPrefixPages(),
+          Math.min(20, Math.floor(encoded.length / VRAM_KV_PAGE_TOKENS)),
+        );
+        this.kvPager.setPinnedPrefixPages(bootPages);
+        this.unifiedStore?.setPinnedPrefixPages(bootPages);
         const embdMissing = wp.getEmbeddingMissingRanges(encoded);
         if (embdMissing.length > 0 && this.backingStore?.prefetchRanges) {
           await this.backingStore.prefetchRanges(embdMissing, { signal, concurrency: 6 });
@@ -5479,30 +5488,36 @@ export class LlamaVTensorRuntime {
     this.singleExec.pos = pos;
     this.singleExec.seqLen = pos + 1;
 
-    const embdMissing = wp.getEmbeddingMissingRanges([tokenId]);
-    if (embdMissing.length > 0) {
-      await backing.prefetchRanges(embdMissing, { signal });
+    const allCached =
+      backing instanceof OpfsDemandVramBackingStore && backing.isFullyCached();
+
+    if (!allCached) {
+      const embdMissing = wp.getEmbeddingMissingRanges([tokenId]);
+      if (embdMissing.length > 0) {
+        await backing.prefetchRanges(embdMissing, { signal });
+      }
+      LlamaVTensorRuntime.throwIfAborted(signal);
     }
-    LlamaVTensorRuntime.throwIfAborted(signal);
     plan.embedNode.execute();
 
     const layerCount = plan.layers.length;
     const demandStats =
-      backing instanceof OpfsDemandVramBackingStore ? backing.getStats() : null;
+      !allCached && backing instanceof OpfsDemandVramBackingStore ? backing.getStats() : null;
     const poolBytes = demandStats ? demandStats.maxSlots * demandStats.slabBytes : 0;
     const estLayerBytes = Math.max(
       1,
       (this.modelSpec?.activeWeightBytes ?? 0) / Math.max(1, layerCount),
     );
-    const lookaheadDepth =
-      !demandStats || poolBytes >= estLayerBytes * 5
+    const lookaheadDepth = allCached
+      ? 0
+      : !demandStats || poolBytes >= estLayerBytes * 5
         ? 3
         : poolBytes >= estLayerBytes * 3
           ? 1
           : 0;
-    const inflightLayers = new Map<number, Promise<void>>();
+    const inflightLayers = allCached ? null : new Map<number, Promise<void>>();
     const scheduleLayerLookahead = (startIdx: number) => {
-      if (lookaheadDepth <= 0) return;
+      if (lookaheadDepth <= 0 || !inflightLayers) return;
       for (let ahead = startIdx; ahead < Math.min(layerCount, startIdx + lookaheadDepth); ahead++) {
         if (inflightLayers.has(ahead) || plan.layers[ahead]?.moe) continue;
         const nextMissing = wp.getLayerMissingRanges(ahead);
@@ -5518,23 +5533,27 @@ export class LlamaVTensorRuntime {
         LlamaVTensorRuntime.throwIfAborted(signal);
         const tLayer0 = performance.now();
         const layerPlan = plan.layers[l];
-        const pendingThisLayer = inflightLayers.get(l);
-        if (pendingThisLayer) {
-          inflightLayers.delete(l);
-          await pendingThisLayer;
-        }
-        const layerMissing = wp.getLayerMissingRanges(l);
-        if (layerMissing.length > 0) {
+        if (!allCached) {
+          const pendingThisLayer = inflightLayers?.get(l);
+          if (pendingThisLayer) {
+            inflightLayers?.delete(l);
+            await pendingThisLayer;
+          }
+          const layerMissing = wp.getLayerMissingRanges(l);
+          if (layerMissing.length > 0) {
+            onDetail?.(`Layer ${l + 1}/${layerCount}`);
+            await backing.prefetchRanges(layerMissing, { signal });
+          } else if (l === 0 || (l + 1) % 4 === 0 || l === layerCount - 1) {
+            onDetail?.(`Layer ${l + 1}/${layerCount}`);
+          }
+          LlamaVTensorRuntime.throwIfAborted(signal);
+        } else if (l === 0 || (l + 1) % 8 === 0 || l === layerCount - 1) {
           onDetail?.(`Layer ${l + 1}/${layerCount}`);
-          await backing.prefetchRanges(layerMissing, { signal });
-        } else if (l === 0 || (l + 1) % 4 === 0 || l === layerCount - 1) {
-          onDetail?.(`Layer ${l + 1}/${layerCount}`);
         }
-        LlamaVTensorRuntime.throwIfAborted(signal);
 
         layerPlan.acquireNode?.execute();
         // Keep a rolling prefetch pipeline saturated AFTER layer `l` is safely in WASM RAM
-        if (!layerPlan.moe && l + 1 < layerCount) {
+        if (!allCached && !layerPlan.moe && l + 1 < layerCount) {
           scheduleLayerLookahead(l + 1);
         }
 
@@ -5544,12 +5563,14 @@ export class LlamaVTensorRuntime {
 
         if (layerPlan.moe) {
           const routed = layerPlan.moe.routeAndGetExperts();
-          const expMissing = wp.getExpertMissingRanges(l, routed.expertIds);
-          if (expMissing.length > 0) {
-            onDetail?.(`Layer ${l + 1}/${layerCount} · loading experts`);
-            await backing.prefetchRanges(expMissing, { signal });
+          if (!allCached) {
+            const expMissing = wp.getExpertMissingRanges(l, routed.expertIds);
+            if (expMissing.length > 0) {
+              onDetail?.(`Layer ${l + 1}/${layerCount} · loading experts`);
+              await backing.prefetchRanges(expMissing, { signal });
+            }
+            LlamaVTensorRuntime.throwIfAborted(signal);
           }
-          LlamaVTensorRuntime.throwIfAborted(signal);
           layerPlan.moe.executeRouted(routed.count);
           layerPlan.moe.residualNode.execute();
         } else {
@@ -5563,10 +5584,12 @@ export class LlamaVTensorRuntime {
         }
       }
     } finally {
-      for (const p of inflightLayers.values()) {
-        p.catch(() => {});
+      if (inflightLayers) {
+        for (const p of inflightLayers.values()) {
+          p.catch(() => {});
+        }
+        inflightLayers.clear();
       }
-      inflightLayers.clear();
     }
 
     if (computeLogits) {
@@ -5584,11 +5607,14 @@ export class LlamaVTensorRuntime {
         } else {
           const stripes = wp.getLmHeadStripeSpecs();
           const stripeBytesEst = stripes[0]?.byteLength ?? 0;
-          const stripeLookahead =
-            !demandStats || poolBytes >= stripeBytesEst * 3 ? 2 : 0;
-          const inflightStripes = new Map<number, Promise<void>>();
+          const stripeLookahead = allCached
+            ? 0
+            : !demandStats || poolBytes >= stripeBytesEst * 3
+              ? 2
+              : 0;
+          const inflightStripes = allCached ? null : new Map<number, Promise<void>>();
           const scheduleStripes = (startIdx: number) => {
-            if (stripeLookahead <= 0) return;
+            if (stripeLookahead <= 0 || !inflightStripes) return;
             for (let s = startIdx; s < Math.min(stripes.length, startIdx + stripeLookahead); s++) {
               if (inflightStripes.has(s)) continue;
               const p = backing.prefetchRanges!([stripes[s]], { signal });
@@ -5603,21 +5629,23 @@ export class LlamaVTensorRuntime {
               const spec = stripes[sIdx];
               const pct = Math.min(99, Math.max(1, Math.round(((sIdx + 1) / stripes.length) * 100)));
               onDetail?.(`Computing logits (${pct}%)`);
-              const pendingStripe = inflightStripes.get(sIdx);
-              if (pendingStripe) {
-                inflightStripes.delete(sIdx);
-                await pendingStripe;
+              if (!allCached) {
+                const pendingStripe = inflightStripes?.get(sIdx);
+                if (pendingStripe) {
+                  inflightStripes?.delete(sIdx);
+                  await pendingStripe;
+                }
+                if (
+                  !(backing instanceof OpfsDemandVramBackingStore) ||
+                  !backing.isRangeCached(spec.fileOffset, spec.byteLength)
+                ) {
+                  await backing.prefetchRanges([spec], { signal });
+                }
+                LlamaVTensorRuntime.throwIfAborted(signal);
               }
-              if (
-                !(backing instanceof OpfsDemandVramBackingStore) ||
-                !backing.isRangeCached(spec.fileOffset, spec.byteLength)
-              ) {
-                await backing.prefetchRanges([spec], { signal });
-              }
-              LlamaVTensorRuntime.throwIfAborted(signal);
               const weightStripe = wp.acquireLmHeadStripe(spec.rowStart, spec.rowCount);
               // Keep upcoming LM-head stripes prefetching concurrently with WASM SIMD projection
-              if (sIdx + 1 < stripes.length) {
+              if (!allCached && sIdx + 1 < stripes.length) {
                 scheduleStripes(sIdx + 1);
               }
               plan.executeLmHeadStripe(weightStripe, spec.rowStart, spec.rowCount);
@@ -5626,10 +5654,12 @@ export class LlamaVTensorRuntime {
               }
             }
           } finally {
-            for (const p of inflightStripes.values()) {
-              p.catch(() => {});
+            if (inflightStripes) {
+              for (const p of inflightStripes.values()) {
+                p.catch(() => {});
+              }
+              inflightStripes.clear();
             }
-            inflightStripes.clear();
           }
         }
       }
@@ -5683,11 +5713,15 @@ export class LlamaVTensorRuntime {
     this.batchExec.tokens[3] = batchToks[3];
     this.batchExec.startPos = startPos;
 
-    const embdMissing = wp.getEmbeddingMissingRanges(batchToks);
-    if (embdMissing.length > 0) {
-      await backing.prefetchRanges(embdMissing, { signal });
+    const allCached =
+      backing instanceof OpfsDemandVramBackingStore && backing.isFullyCached();
+    if (!allCached) {
+      const embdMissing = wp.getEmbeddingMissingRanges(batchToks);
+      if (embdMissing.length > 0) {
+        await backing.prefetchRanges(embdMissing, { signal });
+      }
+      LlamaVTensorRuntime.throwIfAborted(signal);
     }
-    LlamaVTensorRuntime.throwIfAborted(signal);
     plan.embedNode.execute();
 
     const layerCount = plan.layers.length;
@@ -5697,21 +5731,25 @@ export class LlamaVTensorRuntime {
         LlamaVTensorRuntime.throwIfAborted(signal);
         const tLayer0 = performance.now();
         const layerPlan = plan.layers[l];
-        if (pendingNextLayerPrefetch) {
-          await pendingNextLayerPrefetch;
-          pendingNextLayerPrefetch = null;
-        }
-        const layerMissing = wp.getLayerMissingRanges(l);
-        if (layerMissing.length > 0) {
+        if (!allCached) {
+          if (pendingNextLayerPrefetch) {
+            await pendingNextLayerPrefetch;
+            pendingNextLayerPrefetch = null;
+          }
+          const layerMissing = wp.getLayerMissingRanges(l);
+          if (layerMissing.length > 0) {
+            onDetail?.(`Layer ${l + 1}/${layerCount}`);
+            await backing.prefetchRanges(layerMissing, { signal });
+          } else if (l === 0 || (l + 1) % 4 === 0 || l === layerCount - 1) {
+            onDetail?.(`Layer ${l + 1}/${layerCount}`);
+          }
+          LlamaVTensorRuntime.throwIfAborted(signal);
+        } else if (l === 0 || (l + 1) % 8 === 0 || l === layerCount - 1) {
           onDetail?.(`Layer ${l + 1}/${layerCount}`);
-          await backing.prefetchRanges(layerMissing, { signal });
-        } else if (l === 0 || (l + 1) % 4 === 0 || l === layerCount - 1) {
-          onDetail?.(`Layer ${l + 1}/${layerCount}`);
         }
-        LlamaVTensorRuntime.throwIfAborted(signal);
 
         layerPlan.acquireNode?.execute();
-        if (!layerPlan.moe && l + 1 < layerCount) {
+        if (!allCached && !layerPlan.moe && l + 1 < layerCount) {
           const nextMissing = wp.getLayerMissingRanges(l + 1);
           if (nextMissing.length > 0) {
             pendingNextLayerPrefetch = backing.prefetchRanges(nextMissing, { signal });
@@ -5723,12 +5761,14 @@ export class LlamaVTensorRuntime {
         }
         if (layerPlan.moe) {
           const routed = layerPlan.moe.routeAndGetExperts();
-          const expMissing = wp.getExpertMissingRanges(l, routed.expertIds);
-          if (expMissing.length > 0) {
-            onDetail?.(`Layer ${l + 1}/${layerCount} · loading experts`);
-            await backing.prefetchRanges(expMissing, { signal });
+          if (!allCached) {
+            const expMissing = wp.getExpertMissingRanges(l, routed.expertIds);
+            if (expMissing.length > 0) {
+              onDetail?.(`Layer ${l + 1}/${layerCount} · loading experts`);
+              await backing.prefetchRanges(expMissing, { signal });
+            }
+            LlamaVTensorRuntime.throwIfAborted(signal);
           }
-          LlamaVTensorRuntime.throwIfAborted(signal);
           layerPlan.moe.executeRouted(routed.count);
           layerPlan.moe.residualNode.execute();
         } else {
@@ -5780,16 +5820,20 @@ export class LlamaVTensorRuntime {
     }
 
     LlamaVTensorRuntime.throwIfAborted(signal);
-    const chunkTokensCount = microBatches * PREFILL_BATCH_SIZE;
-    const chunkTokenIds: number[] = new Array(chunkTokensCount);
-    for (let k = 0; k < chunkTokensCount; k++) {
-      chunkTokenIds[k] = tokens[offset + k];
+    const allCached =
+      backing instanceof OpfsDemandVramBackingStore && backing.isFullyCached();
+    if (!allCached) {
+      const chunkTokensCount = microBatches * PREFILL_BATCH_SIZE;
+      const chunkTokenIds: number[] = new Array(chunkTokensCount);
+      for (let k = 0; k < chunkTokensCount; k++) {
+        chunkTokenIds[k] = tokens[offset + k];
+      }
+      const embdMissing = wp.getEmbeddingMissingRanges(chunkTokenIds);
+      if (embdMissing.length > 0) {
+        await backing.prefetchRanges(embdMissing, { signal });
+      }
+      LlamaVTensorRuntime.throwIfAborted(signal);
     }
-    const embdMissing = wp.getEmbeddingMissingRanges(chunkTokenIds);
-    if (embdMissing.length > 0) {
-      await backing.prefetchRanges(embdMissing, { signal });
-    }
-    LlamaVTensorRuntime.throwIfAborted(signal);
 
     const batchFloats = PREFILL_BATCH_SIZE * hp.embeddingLength;
     const bsXView = bs.x.buffer.f32View(bs.x);
@@ -5806,21 +5850,22 @@ export class LlamaVTensorRuntime {
 
     const layerCount = plan.layers.length;
     const demandStats =
-      backing instanceof OpfsDemandVramBackingStore ? backing.getStats() : null;
+      !allCached && backing instanceof OpfsDemandVramBackingStore ? backing.getStats() : null;
     const poolBytes = demandStats ? demandStats.maxSlots * demandStats.slabBytes : 0;
     const estLayerBytes = Math.max(
       1,
       (this.modelSpec?.activeWeightBytes ?? 0) / Math.max(1, layerCount),
     );
-    const lookaheadDepth =
-      !demandStats || poolBytes >= estLayerBytes * 5
+    const lookaheadDepth = allCached
+      ? 0
+      : !demandStats || poolBytes >= estLayerBytes * 5
         ? 3
         : poolBytes >= estLayerBytes * 3
           ? 1
           : 0;
-    const inflightLayers = new Map<number, Promise<void>>();
+    const inflightLayers = allCached ? null : new Map<number, Promise<void>>();
     const scheduleLayerLookahead = (startIdx: number) => {
-      if (lookaheadDepth <= 0) return;
+      if (lookaheadDepth <= 0 || !inflightLayers) return;
       for (let ahead = startIdx; ahead < Math.min(layerCount, startIdx + lookaheadDepth); ahead++) {
         if (inflightLayers.has(ahead) || plan.layers[ahead]?.moe) continue;
         const nextMissing = wp.getLayerMissingRanges(ahead);
@@ -5836,23 +5881,27 @@ export class LlamaVTensorRuntime {
         LlamaVTensorRuntime.throwIfAborted(signal);
         const tLayer0 = performance.now();
         const layerPlan = plan.layers[l];
-        const pendingThisLayer = inflightLayers.get(l);
-        if (pendingThisLayer) {
-          inflightLayers.delete(l);
-          await pendingThisLayer;
-        }
-        const layerMissing = wp.getLayerMissingRanges(l);
-        if (layerMissing.length > 0) {
+        if (!allCached) {
+          const pendingThisLayer = inflightLayers?.get(l);
+          if (pendingThisLayer) {
+            inflightLayers?.delete(l);
+            await pendingThisLayer;
+          }
+          const layerMissing = wp.getLayerMissingRanges(l);
+          if (layerMissing.length > 0) {
+            onDetail?.(`Layer ${l + 1}/${layerCount}`);
+            await backing.prefetchRanges(layerMissing, { signal });
+          } else if (l === 0 || (l + 1) % 4 === 0 || l === layerCount - 1) {
+            onDetail?.(`Layer ${l + 1}/${layerCount}`);
+          }
+          LlamaVTensorRuntime.throwIfAborted(signal);
+        } else if (l === 0 || (l + 1) % 8 === 0 || l === layerCount - 1) {
           onDetail?.(`Layer ${l + 1}/${layerCount}`);
-          await backing.prefetchRanges(layerMissing, { signal });
-        } else if (l === 0 || (l + 1) % 4 === 0 || l === layerCount - 1) {
-          onDetail?.(`Layer ${l + 1}/${layerCount}`);
         }
-        LlamaVTensorRuntime.throwIfAborted(signal);
 
         layerPlan.acquireNode?.execute();
         // Overlap rolling OPFS/network prefetch across ALL `microBatches` AFTER layer `l` is in WASM RAM
-        if (!layerPlan.moe && l + 1 < layerCount) {
+        if (!allCached && !layerPlan.moe && l + 1 < layerCount) {
           scheduleLayerLookahead(l + 1);
         }
 
@@ -5867,12 +5916,14 @@ export class LlamaVTensorRuntime {
           }
           if (layerPlan.moe) {
             const routed = layerPlan.moe.routeAndGetExperts();
-            const expMissing = wp.getExpertMissingRanges(l, routed.expertIds);
-            if (expMissing.length > 0) {
-              onDetail?.(`Layer ${l + 1}/${layerCount} · loading experts`);
-              await backing.prefetchRanges(expMissing, { signal });
+            if (!allCached) {
+              const expMissing = wp.getExpertMissingRanges(l, routed.expertIds);
+              if (expMissing.length > 0) {
+                onDetail?.(`Layer ${l + 1}/${layerCount} · loading experts`);
+                await backing.prefetchRanges(expMissing, { signal });
+              }
+              LlamaVTensorRuntime.throwIfAborted(signal);
             }
-            LlamaVTensorRuntime.throwIfAborted(signal);
             layerPlan.moe.executeRouted(routed.count);
             layerPlan.moe.residualNode.execute();
           } else {
@@ -5888,10 +5939,12 @@ export class LlamaVTensorRuntime {
         }
       }
     } finally {
-      for (const p of inflightLayers.values()) {
-        p.catch(() => {});
+      if (inflightLayers) {
+        for (const p of inflightLayers.values()) {
+          p.catch(() => {});
+        }
+        inflightLayers.clear();
       }
-      inflightLayers.clear();
     }
 
     const b4 = this.prismBatch4Tally;
