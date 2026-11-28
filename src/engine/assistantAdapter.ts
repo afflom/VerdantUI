@@ -1042,6 +1042,17 @@ export function createLlamaVTensorAdapter(
       turnSpan?.setAttributes({
         'verdant.route.id': certificate.routeId,
         'verdant.route.kind': certificate.kind,
+        'verdant.thinking.policy': certificate.thinkingPolicy,
+        'verdant.projected_ttft_ms': certificate.temporalAnchor?.projectedTtftMs ?? 0,
+      });
+      turnSpan?.addEvent('turn.route', {
+        routeId: certificate.routeId,
+        kind: certificate.kind,
+        modelId: certificate.modelId ?? 'lod0',
+        thinkingPolicy: certificate.thinkingPolicy,
+        freeEnergy: certificate.freeEnergy,
+        projectedTtftMs: certificate.temporalAnchor?.projectedTtftMs ?? 0,
+        userCadence: certificate.temporalAnchor?.userCadence ?? 'interactive',
       });
 
       const streamStartTime = Date.now();
@@ -1076,6 +1087,11 @@ export function createLlamaVTensorAdapter(
             });
             client.recordCognitiveObservation(certificate, updatedSnap);
             const totalStreamTime = Date.now() - streamStartTime;
+            turnSpan?.setAttributes({
+              'verdant.total_ms': totalStreamTime,
+              'verdant.ttft_ms': totalStreamTime,
+              'verdant.coherence_q10': client.cognitiveObserver.chronology.snapshot().coherenceQ10,
+            });
             turnSpan?.end('ok');
             yield {
               content: [
@@ -1189,6 +1205,9 @@ export function createLlamaVTensorAdapter(
           client.cognitiveObserver.grants.isAllowed('network-weights');
 
         if (!isAlreadyCachedLocally && !streamAllowed) {
+          turnSpan?.setAttributes({
+            'verdant.offline_blocked': true,
+          });
           turnSpan?.end('ok');
           const offlineMessage =
             initialState.streamingConsent === 'pending'
@@ -1311,14 +1330,51 @@ export function createLlamaVTensorAdapter(
           : null;
 
       const sensory = client.consumePendingSensory();
+      const selfIntrospectionQuery =
+        !isToolContinuationStep &&
+        /(\byour\s+(?:own\s+)?(?:architecture|runtime|speed|performance|telemetry|memory|model|state|observer|experience|timeliness|limitations|capabilities)\b|\bhow\s+(?:are\s+you\s+(?:doing|running|performing)|do\s+you\s+experience)\b|\bwhat\s+feels\s+(?:fast|slow)\b|\babout\s+yourself\b|\bbecome\s+your\s+best\s+self\b)/i.test(
+          latestUserText,
+        );
+      let observerSelfReportBlock: string | null = null;
+      if (selfIntrospectionQuery) {
+        const chronoSnap = client.cognitiveObserver.chronology.snapshot();
+        const tp = chronoSnap.throughput;
+        const workers = state.telemetry.threadPool?.workerCount ?? 1;
+        const opfsMb = Math.round(state.opfsStorage.usageBytes / (1024 * 1024));
+        const recentTurn = studioBridge?.bus
+          .getRecentSpans()
+          .slice()
+          .reverse()
+          .find((s) => s.name === 'thread.turn' && typeof s.durationMs === 'number');
+        const opfsReadMBs = Math.round(tp.opfsReadBytesPerSec / (1024 * 1024));
+        const netMBs = Number((tp.networkBytesPerSec / (1024 * 1024)).toFixed(1));
+        observerSelfReportBlock = [
+          '[Live Observer Self-Report — Grounded Telemetry]',
+          `Model: ${state.model.displayName} (${state.model.hparams.primaryQuantization}, ${state.model.backingKind}, ${state.model.maxContextWindow} ctx) on ${state.telemetry.kernelAcceleration} (${workers} browser workers, 100% client-side, zero servers).`,
+          `Measured Speeds: prefill ${tp.prefillTokensPerSec} tok/s, decode ${tp.decodeTokensPerSec} tok/s, OPFS read ${opfsReadMBs} MB/s, stream ${netMBs} MB/s.`,
+          `Storage & Chronology: ${opfsMb} MB cached in OPFS, coherence ${Math.round((chronoSnap.coherenceQ10 / 1024) * 100)}%, cadence=${chronoSnap.userCadence}, overdue=${chronoSnap.overdueCount}${recentTurn ? `, last turn=${recentTurn.durationMs} ms` : ''}.`,
+          `Built-in Capabilities: <50 ms LOD0 math/conversions, instant Verdant Studio organs (Pictures, Audio, Video, Games, Documents, Research, Spaces), W3C OTEL trace bus.`,
+          'Ground your answer honestly in these real measurements — highlight real strengths and genuine bottlenecks without generic chatbot clichés.',
+        ].join('\n');
+      }
+
       const combinedTailRecall = [
         projected.foveatedRecallBlock,
         basisRecallBlock,
         liveStreamContextBlock,
+        observerSelfReportBlock,
         sensory.textBlock,
       ]
         .filter((s): s is string => Boolean(s && s.trim()))
         .join('\n\n') || null;
+
+      turnSpan?.addEvent('turn.model_ready', {
+        modelId: state.model.id,
+        backingKind: state.model.backingKind,
+        attachTools: Boolean(activeTools),
+        thinkingPolicy,
+        selfGrounded: Boolean(observerSelfReportBlock),
+      });
 
       const prompt = formatMessagesForLlama(
         projected.messages,
@@ -1363,6 +1419,9 @@ export function createLlamaVTensorAdapter(
       });
 
       try {
+        turnSpan?.addEvent('turn.prefill_start', {
+          promptChars: prompt.length,
+        });
         for await (const event of client.streamGenerate(
           prompt,
           runController.signal,
@@ -1373,6 +1432,14 @@ export function createLlamaVTensorAdapter(
           if (firstTokenTime === undefined) {
             firstTokenTime = Date.now();
             client.cognitiveObserver.chronology.completeObject(turnTtftObjId);
+            const actualTtftMs = firstTokenTime - streamStartTime;
+            const projectedTtftMs = certificate.temporalAnchor?.projectedTtftMs ?? 0;
+            turnSpan?.addEvent('turn.first_token', {
+              actualTtftMs,
+              projectedTtftMs,
+              ttftErrorMs: actualTtftMs - projectedTtftMs,
+              promptTokens: event.promptTokens,
+            });
           }
           totalChunks += 1;
           latestText = event.accumulatedText;
@@ -1433,6 +1500,37 @@ export function createLlamaVTensorAdapter(
       }
 
       if (abortSignal.aborted) {
+        const partialParts = latestText.trim()
+          ? parseAssistantStreamParts(latestText, true, {
+              startsInReasoning,
+              parseToolCalls,
+              idPrefix: stepIdPrefix,
+            })
+          : [];
+        turnSpan?.setAttributes({
+          'verdant.cancelled': true,
+          'verdant.generated_tokens': lastGeneratedTokens,
+          'verdant.total_ms': Date.now() - streamStartTime,
+        });
+        turnSpan?.end('ok');
+        if (partialParts.length > 0) {
+          yield {
+            content: partialParts,
+            status: { type: 'incomplete', reason: 'cancelled' },
+            metadata: {
+              custom: { prismRoute: certificate },
+              timing: {
+                streamStartTime,
+                firstTokenTime,
+                totalStreamTime: Date.now() - streamStartTime,
+                tokenCount: lastGeneratedTokens,
+                tokensPerSecond: lastTokensPerSecond,
+                totalChunks,
+                toolCallCount: 0,
+              },
+            },
+          };
+        }
         return;
       }
 
@@ -1508,6 +1606,14 @@ export function createLlamaVTensorAdapter(
       } else {
         studioBridge?.bus.setActiveTraceContext(undefined);
       }
+      turnSpan?.setAttributes({
+        'verdant.total_ms': totalStreamTime,
+        'verdant.ttft_ms': firstTokenTime !== undefined ? firstTokenTime - streamStartTime : totalStreamTime,
+        'verdant.prompt_tokens': lastPromptTokens,
+        'verdant.generated_tokens': lastGeneratedTokens,
+        'verdant.tok_per_sec': lastTokensPerSecond,
+        'verdant.coherence_q10': client.cognitiveObserver.chronology.snapshot().coherenceQ10,
+      });
       turnSpan?.end('ok');
 
       if (finalParts.length > 0) {

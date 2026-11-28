@@ -1074,7 +1074,7 @@ export default function App() {
             {/* Keep Home Thread mounted persistently so navigating to Galleries, Settings, or Prisms NEVER interrupts active streaming */}
             <div
               className={activeView.kind === 'thread' ? 'h-full w-full' : 'hidden'}
-              aria-hidden={activeView.kind !== 'thread'}
+              inert={activeView.kind !== 'thread'}
             >
               <PrismSurfaceShell
                 frame={observerFrame}

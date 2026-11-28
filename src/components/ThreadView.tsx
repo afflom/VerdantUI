@@ -243,6 +243,7 @@ const ReasoningPart: FC<ReasoningMessagePartProps> = ({ text, status }) => {
   const [expanded, setExpanded] = useState(false);
 
   if (!text.trim()) return null;
+  const wordCount = text.trim().split(/\s+/).length;
 
   return (
     <div
@@ -266,7 +267,9 @@ const ReasoningPart: FC<ReasoningMessagePartProps> = ({ text, status }) => {
           ) : (
             <Brain className="h-3.5 w-3.5 shrink-0 text-emerald-700 dark:text-emerald-400" />
           )}
-          <span>{isStreaming ? 'Thinking...' : 'Thought process'}</span>
+          <span>
+            {isStreaming ? `Thinking… · ${wordCount} words` : 'Thought process'}
+          </span>
         </span>
         <span className="font-mono text-[11px] text-slate-400 dark:text-slate-500 tabular-nums">
           {expanded ? 'Hide' : 'Show'}
@@ -967,9 +970,15 @@ export const ThreadView: FC<ThreadViewProps> = ({
       ? importedHarness.suggestions
       : UNIFIED_VERDANT_SUGGESTIONS;
 
+  const liveStatusDetail = engineState.prefillProgress
+    ? engineState.prefillProgress.totalTokens > 0
+      ? `Reading prompt · ${Math.min(engineState.prefillProgress.completedTokens, engineState.prefillProgress.totalTokens)}/${engineState.prefillProgress.totalTokens}`
+      : 'Reading prompt…'
+    : engineState.statusDetail;
+
   const assistantContextValue = useMemo<AssistantMessageContextValue>(
     () => ({
-      statusDetail: engineState.statusDetail,
+      statusDetail: liveStatusDetail,
       onInspectRoute: onToggleInspector,
       onOpenPrism,
       onEditPrism,
@@ -980,7 +989,7 @@ export const ThreadView: FC<ThreadViewProps> = ({
       bridgeRuntime,
       darkMode,
     }),
-    [engineState.statusDetail, onToggleInspector, onOpenPrism, onEditPrism, getPrismById, spaces, onAssignToSpace, observerBus, bridgeRuntime, darkMode],
+    [liveStatusDetail, onToggleInspector, onOpenPrism, onEditPrism, getPrismById, spaces, onAssignToSpace, observerBus, bridgeRuntime, darkMode],
   );
 
   return (
@@ -1230,6 +1239,8 @@ export const ThreadView: FC<ThreadViewProps> = ({
                   <Paperclip className="h-3.5 w-3.5" />
                 </ComposerPrimitive.AddAttachment>
                 <input
+                  id="verdant-image-upload"
+                  name="imageUpload"
                   ref={imageInputRef}
                   type="file"
                   accept="image/*"

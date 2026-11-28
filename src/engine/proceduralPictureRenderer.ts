@@ -248,12 +248,12 @@ export function inferPictureWeightsFromPrompt(
     generator = 'constellation-atlas';
   } else if (/\b(city|skyline|architecture|building|greenhouse|cathedral|temple|bridge|arch|monolith|cyberpunk\s+street)\b/.test(lower)) {
     generator = 'architectural-scene';
-  } else if (/\b(flower|garden|botanical|tree|fern|blossom|orchard|leaf|foliage|bonsai|ivy)\b/.test(lower)) {
-    generator = 'botanical-garden';
   } else if (/\b(ocean|sea|seascape|waves?|coast|beach|lighthouse|surf|aurora\s+water)\b/.test(lower)) {
     generator = 'ocean-seascape';
-  } else if (/\b(mountain|lake|valley|forest|alpine|meadow|canyon|desert|sunset|sunrise|landscape|vista|horizon|hills?)\b/.test(lower)) {
+  } else if (/\b(mountain|lake|stream|river|creek|waterfall|brook|pond|valley|forest|bioluminescent|alpine|meadow|canyon|desert|sunset|sunrise|landscape|vista|horizon|hills?)\b/.test(lower)) {
     generator = 'landscape-vista';
+  } else if (/\b(flower|garden|botanical|tree|fern|blossom|orchard|leaf|foliage|bonsai|ivy)\b/.test(lower)) {
+    generator = 'botanical-garden';
   } else if (/\b(poster|editorial|bauhaus|swiss|cover|flyer|banner|minimalist\s+graphic)\b/.test(lower)) {
     generator = 'poster-editorial';
   } else if (/\b(pixel|8-?bit|16-?bit|retro\s+art|sprite)\b/.test(lower)) {
@@ -283,7 +283,9 @@ export function inferPictureWeightsFromPrompt(
 
   // Cohesive, high-contrast 4-color palettes tuned to prompt semantics
   let palette: [string, string, string, string];
-  if (/\b(sunset|golden|amber|autumn|fire|desert|mars|crimson|warm)\b/.test(lower)) {
+  if (/\b(bioluminescen|glowing\s+(?:stream|river|forest|water)|firefl)/i.test(lower)) {
+    palette = ['#06131f', '#0e7490', '#22d3ee', '#a7f3d0'];
+  } else if (/\b(sunset|golden|amber|autumn|fire|desert|mars|crimson|warm)\b/.test(lower)) {
     palette = ['#1b1126', '#d95d39', '#f59e0b', '#fef3c7'];
   } else if (/\b(emerald|forest|pine|jade|verdant|moss|botanical|green)\b/.test(lower)) {
     palette = ['#071916', '#0f766e', '#34d399', '#ecfdf5'];
@@ -539,6 +541,44 @@ export function renderPictureToRgba(
         rgba[idx + 1] = clamp255(col[1]);
         rgba[idx + 2] = clamp255(col[2]);
         rgba[idx + 3] = 255;
+      }
+    }
+
+    // Winding luminous stream & twilight fireflies when prompt calls for stream/river/bioluminescence
+    const promptMeta = `${weights.caption ?? ''}`.toLowerCase();
+    const isBiolum = /\b(bioluminescen|glow|firefl|luminous|magic)/i.test(promptMeta);
+    const hasStream = /\b(stream|river|creek|brook|waterfall)/i.test(promptMeta);
+    if (hasStream || isBiolum) {
+      const streamCol: Rgb = isBiolum ? [34, 224, 240] : mixRgb(cAcc, cHi, 0.55);
+      for (let y = horizonY; y < h; y++) {
+        const t = (y - horizonY) / Math.max(1, h - horizonY);
+        const centerX = w * (0.5 + Math.sin(t * 4.2 + seed * 0.01) * (0.08 + t * 0.14));
+        const halfWidth = w * (0.025 + t * 0.18);
+        const x0 = Math.max(0, Math.floor(centerX - halfWidth * 1.4));
+        const x1 = Math.min(w - 1, Math.ceil(centerX + halfWidth * 1.4));
+        for (let x = x0; x <= x1; x++) {
+          const dist = Math.abs(x - centerX) / Math.max(1, halfWidth);
+          if (dist > 1.35) continue;
+          const core = Math.exp(-dist * dist * 2.1);
+          const shimmer = 0.65 + 0.35 * Math.sin(y * 0.45 + x * 0.09);
+          const idx = (y * w + x) * 4;
+          const base: Rgb = [rgba[idx]!, rgba[idx + 1]!, rgba[idx + 2]!];
+          const lit = addGlow(base, streamCol, core * shimmer * (isBiolum ? 0.92 : 0.45));
+          rgba[idx] = clamp255(lit[0]);
+          rgba[idx + 1] = clamp255(lit[1]);
+          rgba[idx + 2] = clamp255(lit[2]);
+        }
+      }
+      if (isBiolum) {
+        const motes = Math.max(48, Math.round(weights.density * 1.1));
+        for (let i = 0; i < motes; i++) {
+          const mx = rng() * w;
+          const my = h * (0.25 + rng() * 0.68);
+          const mr = 1.4 + rng() * 2.8;
+          const mCol: Rgb = i % 3 === 0 ? [167, 243, 208] : [56, 228, 248];
+          drawDisc(rgba, w, h, mx, my, mr * 2.4, mCol, 0.22, 0.85);
+          drawDisc(rgba, w, h, mx, my, mr, cHi, 0.85, 0.4);
+        }
       }
     }
   } else if (gen === 'cosmic-nebula') {

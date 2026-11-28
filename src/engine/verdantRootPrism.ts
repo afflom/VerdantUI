@@ -711,8 +711,9 @@ export class VerdantRootPrismRuntime {
           store: this.prismStore,
           galleries: this.galleryStore,
           registry: this.expertRegistry,
-          runLocalLanguagePrompt: (sys, usr, maxTok) =>
-            this.runLocalLanguageHelper(sys, usr, maxTok, job.prismId, job.controller.signal),
+          // Keep background LOD1..LOD3 visual/audio reconciliation strictly non-blocking:
+          // never contend with or wipe the active chat thread's KV cache on the single worker!
+          runLocalLanguagePrompt: undefined,
           synthesizeImageLayer: (p) => this.workerClient.synthesizeImageLayer(p),
           evaluateVisualQa: (p) => this.workerClient.evaluateVisualSemanticQa(p),
           runWithDeterministicPrecision: (fn) =>
@@ -1014,6 +1015,88 @@ export class VerdantRootPrismRuntime {
     return this.workerClient.getState();
   }
 
+  /**
+   * Produces a unified, live OTEL + Chronology + Observer + Substrate self-report for direct
+   * introspection and second-order cybernetic evaluation (`window.__VERDANT_OBSERVER__`).
+   */
+  getObserverFieldReport() {
+    const engine = this.workerClient.getState();
+    const chrono = this.chronology.snapshot();
+    const obs = this.workerClient.cognitiveObserver;
+    const threadSnap = obs.getThreadSnapshot(this.workerClient.getActiveThreadId());
+    const activeModel =
+      engine.model && !isInternalBootstrapModel(engine.model.id) ? engine.model : null;
+    const recentSpans = this.observerBus
+      .getRecentSpans()
+      .slice(-24)
+      .map((s) => ({
+        name: s.name,
+        endpointKind: s.endpointKind,
+        endpointId: s.endpointId,
+        status: s.status,
+        startTimeMs: s.startTimeMs,
+        durationMs: s.durationMs ?? null,
+        attributes: s.attributes,
+        events: s.events.map((e) => ({
+          name: e.name,
+          timestampMs: e.timestampMs,
+          status: e.status,
+          attributes: e.attributes,
+        })),
+      }));
+    return {
+      timestampMs: chrono.instant.wallClockMs,
+      runtime: {
+        status: engine.status,
+        statusDetail: engine.statusDetail,
+        model: activeModel
+          ? {
+              id: activeModel.id,
+              displayName: activeModel.displayName,
+              backingKind: activeModel.backingKind,
+              quantization: activeModel.hparams.primaryQuantization,
+              contextWindow: activeModel.maxContextWindow,
+            }
+          : null,
+        kernelAcceleration: engine.telemetry.kernelAcceleration,
+        workers: engine.telemetry.threadPool?.workerCount ?? 1,
+        lastTokensPerSec: engine.lastTokensPerSec,
+        opfsUsageBytes: engine.opfsStorage.usageBytes,
+        opfsQuotaBytes: engine.opfsStorage.quotaBytes,
+        cachedModels: engine.opfsStorage.storedModels.map((m) => ({
+          modelId: m.modelId,
+          byteLength: m.byteLength,
+          storageMode: m.storageMode ?? 'full',
+        })),
+      },
+      chronology: chrono,
+      observer: {
+        activeSpace: obs.possession.getActiveCompartmentId(),
+        publishedPrismCount: this.prismStore.listPublishedSummaries().length,
+        turnCount: threadSnap.turnCount,
+        lastSurpriseQ10: threadSnap.lastSurpriseQ10,
+        lastCertificate: threadSnap.lastCertificate
+          ? {
+              routeId: threadSnap.lastCertificate.routeId,
+              label: threadSnap.lastCertificate.label,
+              kind: threadSnap.lastCertificate.kind,
+              modelId: threadSnap.lastCertificate.modelId,
+              thinkingPolicy: threadSnap.lastCertificate.thinkingPolicy,
+              attachTools: threadSnap.lastCertificate.attachTools,
+              freeEnergy: threadSnap.lastCertificate.freeEnergy,
+              qualityBudget: threadSnap.lastCertificate.qualityBudget,
+              temporalAnchor: threadSnap.lastCertificate.temporalAnchor,
+              rationale: threadSnap.lastCertificate.rationale,
+            }
+          : null,
+      },
+      otel: {
+        spanCount: recentSpans.length,
+        recentSpans,
+      },
+    };
+  }
+
   listGalleryArtifacts(): readonly ContentArtifactRecord[] {
     return this.galleryStore.listAll();
   }
@@ -1034,6 +1117,19 @@ let singletonRootPrism: VerdantRootPrismRuntime | null = null;
 export function getVerdantRootPrismRuntime(): VerdantRootPrismRuntime {
   if (!singletonRootPrism) {
     singletonRootPrism = new VerdantRootPrismRuntime();
+    if (typeof window !== 'undefined') {
+      const root = singletonRootPrism;
+      (window as unknown as Record<string, unknown>).__VERDANT_OBSERVER__ = Object.freeze({
+        fieldReport: () => root.getObserverFieldReport(),
+        chronology: () => root.getTemporalCoherenceSnapshot(),
+        recentSpans: () => root.observerBus.getRecentSpans(),
+        otlpJson: () => root.observerBus.toOtlpJson(),
+        routeCertificate: () =>
+          root.workerClient.cognitiveObserver.getThreadSnapshot(
+            root.workerClient.getActiveThreadId(),
+          ).lastCertificate,
+      });
+    }
   }
   return singletonRootPrism;
 }

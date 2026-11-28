@@ -46,7 +46,6 @@ import type { PrismStore, VerdantPrismProject } from './prismStudio';
 import {
   assembleProceduralPrismOps,
   buildWeightRefinementPrompt,
-  buildWeightRoutingDiscoveryPrompt,
   classifyArtifactMediaType,
   extractCleanIdeaTitle,
   parseDiscoveryAgentResponse,
@@ -478,8 +477,8 @@ export class StudioChatBridge {
       }
     }
 
-    // Stage 1: Contextualize prompt into cross-modal Unified Semantic Associator (delta_rule.rs)
-    // so adjacent modalities ("a dog" -> "make a video of that dog") share the same semantic anchor.
+    // Stage 1: Instant deterministic cross-modal contextualization into Unified Semantic Associator
+    // (delta_rule.rs) so LOD0 returns in < 500 ms without blocking chat or wiping the chat KV cache!
     const { revision: semanticRev, inheritedAnchor } = await contextualizePromptToUnifiedWeights({
       prompt: promptText,
       mediaType,
@@ -487,9 +486,6 @@ export class StudioChatBridge {
       activePrismId: this.lastTouchedPrismId ?? undefined,
       deps: {
         registry,
-        runLocalLanguagePrompt: this.deps.runLocalStudioPrompt
-          ? (sys, usr, maxTok) => this.deps.runLocalStudioPrompt!(sys, usr, maxTok, created.id)
-          : undefined,
       },
     });
 
@@ -530,35 +526,19 @@ export class StudioChatBridge {
               }
             : { ...(params.weightOverrides ?? {}) };
 
-    // Engage on-device LLM weight router when Local AI is active for richer custom specs
-    let rawModelJson = '';
-    if (this.deps.runLocalStudioPrompt) {
-      try {
-        const sysPrompt = buildWeightRoutingDiscoveryPrompt(
-          [{ role: 'user', text: promptText }],
-          baseDecl,
-          2,
-          mediaType,
-        );
-        rawModelJson = await this.deps.runLocalStudioPrompt(sysPrompt, promptText, 512, created.id);
-      } catch {
-        rawModelJson = '';
-      }
-    }
-
-    const seedJson =
-      rawModelJson ||
-      JSON.stringify({
-        name: title,
-        purpose:
-          liveContextSummary
-            ? `${semanticRev.contextualBrief || promptText.slice(0, 140)} (${liveContextSummary.slice(0, 140)})`
-            : semanticRev.contextualBrief || promptText.slice(0, 220),
-        mediaType,
-        readyToBuild: true,
-        weights: { mediaType, ...baseWeightsSeed },
-        reply: `Created ${title}.`,
-      });
+    // Synthesize LOD0 immediately from semantic prompt inference + living basis affinities
+    // (never block LOD0 creation on a 512-token LLM roundtrip or wipe the active chat KV cache!).
+    const seedJson = JSON.stringify({
+      name: title,
+      purpose:
+        liveContextSummary
+          ? `${semanticRev.contextualBrief || promptText.slice(0, 140)} (${liveContextSummary.slice(0, 140)})`
+          : semanticRev.contextualBrief || promptText.slice(0, 220),
+      mediaType,
+      readyToBuild: true,
+      weights: { mediaType, ...baseWeightsSeed },
+      reply: `Created ${title}.`,
+    });
 
     const { spec } = parseDiscoveryAgentResponse(seedJson, promptText, baseDecl, 2, mediaType);
     const mergedSpec = {

@@ -5554,7 +5554,7 @@ export class LlamaVTensorRuntime {
           }
         }
 
-        if (performance.now() - tLayer0 >= 12) {
+        if (performance.now() - tLayer0 >= 8) {
           await this.yielder.yieldNow();
         }
       }
@@ -5733,7 +5733,7 @@ export class LlamaVTensorRuntime {
           }
         }
 
-        if (performance.now() - tLayer0 >= 12) {
+        if (performance.now() - tLayer0 >= 8) {
           await this.yielder.yieldNow();
         }
       }
@@ -5879,7 +5879,7 @@ export class LlamaVTensorRuntime {
           chunkX.set(bsXView, sliceStart);
         }
 
-        if (performance.now() - tLayer0 >= 12) {
+        if (performance.now() - tLayer0 >= 8) {
           await this.yielder.yieldNow();
         }
       }

@@ -1521,7 +1521,7 @@ export class VerdantCognitiveObserver {
   // Suppress costly hidden <think> chains on explicit brief/minimal queries while boosting analytical
   // precision on debugging, proofs, edge cases, complexity, and counting puzzles.
     const analyticalCue =
-      /\b(bug|race condition|deadlock|trade[- ]?offs?|prove|counterexample|complexity|big[- ]?o|how many [a-z]'?s in|step by step|verify|edge cases?)\b/i.test(
+      /\b(bug|race condition|deadlock|trade[- ]?offs?|prove|proof|theorem|rigorous|verification|derivation|counterexample|complexity|big[- ]?o|how many [a-z]'?s in|step by step|verify|edge cases?)\b/i.test(
         ctx.latestUserText,
       );
     const deepReasoningSignal = clampQ10(
@@ -1539,7 +1539,6 @@ export class VerdantCognitiveObserver {
       !suppressThinkingForBrevity &&
       (mem.retryEscalationLevel > 0 ||
         analyticalCue ||
-        qualityBudget.featureRichness === 'full' ||
         deepReasoningSignal >= 544 ||
         (deepReasoningSignal >= 448 && epistemicPressure >= 512));
 
@@ -1910,7 +1909,7 @@ export class VerdantCognitiveObserver {
 
 export const UNIFIED_VERDANT_SYSTEM_PROMPT = [
   'You are VerdantUI, a unified private AI assistant running 100% locally in the user\'s browser with built-in Verdant Studio multimedia synthesis.',
-  'Be accurate, clear, and concise. When working through complex problems inside <think>...</think>, verify edge cases before giving a crisp final answer.',
+  'Be accurate, clear, and concise. Write equations and variables in plain readable text without raw LaTeX $ delimiters (e.g. "x + (x + 1.00) = 1.10" instead of "$ x $"). When working through complex problems inside <think>...</think>, verify edge cases briefly before giving a crisp final answer.',
   'Whenever the user asks to generate a picture/image, compose music/audio, create a video, build a game or utility, start a structured story/research workspace, or create/organize Spaces and Galleries, ALWAYS invoke the appropriate Verdant Studio tool (`studio_create_artifact`, `studio_refine_prism`, `studio_manage_spaces`, or `studio_browse_gallery`) inside <tool_call>...</tool_call> and stop immediately after </tool_call>. Never claim you cannot create images, audio, video, or interactive apps.',
   'Every tool call runs as a local Prism in the unified model — if no matching Prism exists yet, VerdantUI will automatically synthesize and run one for you. Never fabricate tool results.',
 ].join('\n');
