@@ -13,6 +13,7 @@ import type { ThreadMessage } from '@assistant-ui/react';
 import { formatMessagesForLlama, stripReasoningTags } from './assistantAdapter';
 import type { ContainerGrantMatrix } from './cognitiveObserver';
 import type { ObserverStreamBus, OtelTraceContext } from './observerStreamBus';
+import { formatOrganStatusPayload } from './organRegistry';
 import type { PrismBuildWorkerClient } from './prismBuildClient';
 import { buildPrismSandboxDocument } from './prismSandboxHtml';
 import type { PrismStore, VerdantPrismSnapshot } from './prismStudio';
@@ -794,7 +795,6 @@ export class PrismHostPool implements PrismBridgeRuntime {
       const line = formatPayloadForModel(payload, decl);
       const proc = decl.view?.proceduralOrgan;
       if (proc && (/^(?:status|info|summary|help)$/i.test(line) || line === '')) {
-        const w = proc.weights as unknown as Record<string, unknown>;
         const { result } = await this.bus.dispatchToEndpoint(prismId, payload, {
           signal: opts?.signal,
           parentContext,
@@ -802,23 +802,17 @@ export class PrismHostPool implements PrismBridgeRuntime {
           fallbackHandler: {
             endpointId: prismId,
             endpointKind: 'prism',
-            dispatch: async () => ({
-              status: 'ok',
-              prismName: snapshot.name,
-              mediaType: proc.mediaType,
-              summary: snapshot.summary || decl.concept.purpose,
-              activeOrgans: proc.activeOrgans,
-              ...(Array.isArray(w.items) ? { itemCount: w.items.length } : {}),
-              ...(Array.isArray(w.expenses)
-                ? {
-                    expenseCount: w.expenses.length,
-                    monthlyBudget: w.monthlyBudget ?? 2000,
-                  }
-                : {}),
-              ...(Array.isArray(w.chapters) ? { chapterCount: w.chapters.length } : {}),
-              request: line || 'status',
-              refused: false,
-            }),
+            dispatch: async () =>
+              formatOrganStatusPayload({
+                prismName: snapshot.name,
+                summary: snapshot.summary || decl.concept.purpose,
+                decl,
+                mediaType: proc.mediaType,
+                activeOrgans: proc.activeOrgans,
+                weights: proc.weights,
+                requestLine: line || 'status',
+                bus: this.bus,
+              }),
           },
         });
         return { result, prismName: snapshot.name, digest: snapshot.digest };

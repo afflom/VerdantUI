@@ -86,8 +86,8 @@ export interface StreamFilter {
 export type StreamListener = (event: OtelEvent) => void;
 export type SpanListener = (span: OtelSpan) => void;
 
-const MAX_EVENTS = 128;
-const MAX_SPANS = 64;
+const MAX_EVENTS = 512;
+const MAX_SPANS = 256;
 
 let fallbackCounter = 1;
 
@@ -486,6 +486,97 @@ export class ObserverStreamBus {
     }
   }
 
+  /**
+   * Returns a lightweight `@opentelemetry/api`-compatible tracer (`startActiveSpan`)
+   * backed directly by this `ObserverStreamBus` with zero external SDK dependencies.
+   * Plugs directly into `prism-code`'s `experimental_tracing({ tracer })` middleware.
+   */
+  asOtelTracer(opts?: {
+    readonly endpointKind?: StreamEndpointKind;
+    readonly endpointId?: string;
+  }): {
+    startActiveSpan<T>(
+      name: string,
+      options: { kind?: number; attributes?: Record<string, unknown> },
+      fn: (span: {
+        setAttributes(attrs: Record<string, unknown>): void;
+        setAttribute(key: string, value: unknown): void;
+        recordException(err: unknown): void;
+        setStatus(status: { code: number; message?: string }): void;
+        end(): void;
+      }) => T,
+    ): T;
+  } {
+    const endpointKind = opts?.endpointKind ?? 'prism';
+    const endpointId = opts?.endpointId ?? 'verdant-ui-holo';
+    return {
+      startActiveSpan: <T>(
+        name: string,
+        options: { kind?: number; attributes?: Record<string, unknown> },
+        fn: (span: {
+          setAttributes(attrs: Record<string, unknown>): void;
+          setAttribute(key: string, value: unknown): void;
+          recordException(err: unknown): void;
+          setStatus(status: { code: number; message?: string }): void;
+          end(): void;
+        }) => T,
+      ): T => {
+        const handle = this.startSpan(name, {
+          endpointKind,
+          endpointId,
+          parentContext: this.activeTraceContext,
+          attributes: options?.attributes as OtelAttributes | undefined,
+        });
+        let status: OtelStatusCode = 'ok';
+        let errMessage: string | undefined;
+        let ended = false;
+        const adapter = {
+          setAttributes: (attrs: Record<string, unknown>) =>
+            handle.setAttributes(attrs as OtelAttributes),
+          setAttribute: (key: string, value: unknown) =>
+            handle.setAttributes({ [key]: value } as OtelAttributes),
+          recordException: (err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            status = 'error';
+            errMessage = msg;
+            handle.addEvent('exception', { 'exception.message': msg }, undefined, 'error');
+          },
+          setStatus: (st: { code: number; message?: string }) => {
+            if (st.code === 2) {
+              status = 'error';
+              errMessage = st.message ?? errMessage;
+            }
+          },
+          end: () => {
+            if (!ended) {
+              ended = true;
+              handle.end(status, errMessage);
+            }
+          },
+        };
+        const prev = this.activeTraceContext;
+        this.activeTraceContext = handle.context;
+        try {
+          const out = fn(adapter);
+          if (out && typeof (out as unknown as PromiseLike<unknown>).then === 'function') {
+            return Promise.resolve(out).finally(() => {
+              this.activeTraceContext = prev;
+              adapter.end();
+            }) as unknown as T;
+          }
+          this.activeTraceContext = prev;
+          adapter.end();
+          return out;
+        } catch (err) {
+          adapter.recordException(err);
+          this.activeTraceContext = prev;
+          adapter.end();
+          throw err;
+        }
+      },
+    };
+  }
+
   /** Exports recent spans and events in standard OTLP/JSON 1.x format. */
   toOtlpJson(endpointId?: string): {
     readonly resourceSpans: readonly unknown[];
@@ -494,7 +585,7 @@ export class ObserverStreamBus {
     const resource = {
       attributes: toOtlpAttributes({
         'service.name': 'verdant-ui',
-        'service.version': '0.1.0',
+        'service.version': '0.13.3',
       }),
     };
     const scope = { name: 'verdant-ui.observer-bus', version: '1.0.0' };

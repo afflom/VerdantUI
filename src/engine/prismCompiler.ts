@@ -30,7 +30,7 @@ import {
 } from './verdantStudioApi';
 import { evaluateVerdantRouting, isPrismSynthesizable } from './verdantStandardsRouter';
 import { synthesizeProceduralOrganView } from './prismMediaOrgans';
-import { sha256HexSync } from './prismStudio';
+export { instantiateAppFoundation } from './prismFoundation';
 
 const enc = new TextEncoder();
 
@@ -1095,46 +1095,7 @@ evaluateCurrent();
  * to the Prism's own slug/module name and re-stamps `lexlean.lock` SHA-256 digests so
  * `buildFromFiles` accepts the workspace identically to `prism-code init --name <slug>`.
  */
-export function instantiateAppFoundation(
-  foundationFiles: Readonly<Record<string, string>>,
-  slug: string,
-): Record<string, string> {
-  const mod = pascalModuleName(slug);
-  const crate = `prism-${slug}`;
-  const forms: readonly [string, string][] = [
-    ['prism-template', crate],
-    ['PrismTemplate', mod],
-    ['"template"', JSON.stringify(slug)],
-  ];
-  const named = new Set(['lexlean.toml', 'lakefile.toml', 'lake-manifest.json', 'prismpm.toml']);
-  const out: Record<string, string> = {};
-
-  for (const [rel, content] of Object.entries(foundationFiles)) {
-    let text = content;
-    if (named.has(rel)) {
-      for (const [from, to] of forms) {
-        text = text.split(from).join(to);
-      }
-    }
-    out[rel] = text;
-  }
-
-  if (out['lexlean.lock']) {
-    const digest = (rel: string) => sha256HexSync(out[rel] ?? '');
-    let lock = out['lexlean.lock'];
-    lock = lock.replace(
-      /^project_config_sha256 = "[0-9a-f]{64}"$/m,
-      () => `project_config_sha256 = "${digest('lexlean.toml')}"`,
-    );
-    lock = lock.replace(
-      /(\[\[workspace_file\]\]\npath = "([^"\n]+)"\nsha256 = ")[0-9a-f]{64}"/g,
-      (all, head: string, file: string) => (out[file] !== undefined ? `${head}${digest(file)}"` : all),
-    );
-    out['lexlean.lock'] = lock;
-  }
-
-  return out;
-}
+// `instantiateAppFoundation` lives in `./prismFoundation` and is re-exported above.
 
 const COMPILE_CACHE = new WeakMap<PrismDeclaration, CompiledPrismWorkspace | null>();
 

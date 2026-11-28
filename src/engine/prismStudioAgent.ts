@@ -15,6 +15,7 @@
  *      purely by routing updated declarative weight patches — instant, deterministic, zero syntax errors.
  */
 
+import { lookupOrganDescriptor } from './organRegistry';
 import {
   checkDeclaration,
   deriveRepairOp,
@@ -908,12 +909,7 @@ export function assembleProceduralPrismOps(
   });
 
   // Stateful procedural organs require scoped private on-device storage (FK-07) and browser export
-  if (
-    spec.mediaType === 'tool-organ' ||
-    spec.mediaType === 'written-work' ||
-    spec.mediaType === 'research-program' ||
-    spec.mediaType === 'interactive-game'
-  ) {
+  if (lookupOrganDescriptor(spec.mediaType).requiredGrants.includes('prism-storage')) {
     applyLocal({
       op: 'set-capabilities',
       capabilities: { storage: true, browser: true },

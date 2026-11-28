@@ -156,6 +156,8 @@ export class VerdantRootPrismRuntime {
   private buildClientInstance: PrismBuildWorkerClient | null = null;
   private buildClientPromise: Promise<PrismBuildWorkerClient> | null = null;
   private studioBridgePromise: Promise<StudioChatBridge> | null = null;
+  private holoHostPromise: Promise<import('../host/verdantHoloHost').VerdantHoloHost> | null = null;
+  private holoHostInstance: import('../host/verdantHoloHost').VerdantHoloHost | null = null;
   private onOpenHomeCallback: (() => void) | null = null;
   private onOpenSettingsCallback: (() => void) | null = null;
   private onOpenPrismCallback: ((prismId: string, mode?: 'app' | 'studio') => void) | null = null;
@@ -215,6 +217,44 @@ export class VerdantRootPrismRuntime {
       this.workerClient,
       undefined,
       () => this.getPrismBuildClient(),
+    );
+    if (typeof window !== 'undefined' && typeof fetch === 'function') {
+      void this.ensureHoloHostVerified().catch(() => {
+        // Refusal is recorded explicitly on holoHostInstance.getSnapshot() and observerBus error span.
+      });
+    }
+  }
+
+  /** Lazily loads & verifies the Lean-proved `verdant-ui.holo` Core-Wasm governance guest. */
+  async ensureHoloHostVerified(
+    url = './holos/verdant-ui.holo',
+  ): Promise<import('../host/verdantHoloHost').VerdantHoloHost> {
+    if (this.holoHostInstance?.isVerified()) return this.holoHostInstance;
+    if (!this.holoHostPromise) {
+      this.holoHostPromise = (async () => {
+        const { VerdantHoloHost } = await import('../host/verdantHoloHost');
+        const host = new VerdantHoloHost(this.observerBus);
+        this.holoHostInstance = host;
+        await host.loadFromUrl(url);
+        return host;
+      })();
+    }
+    return this.holoHostPromise;
+  }
+
+  getHoloHostSnapshot() {
+    return (
+      this.holoHostInstance?.getSnapshot() ?? {
+        loaded: false,
+        verified: false,
+        address: null,
+        bytes: 0,
+        vectorCount: 0,
+        vectorsPassed: 0,
+        dispatchCount: 0,
+        refusalCount: 0,
+        loadError: null,
+      }
     );
   }
 
@@ -1199,6 +1239,7 @@ export class VerdantRootPrismRuntime {
         enabledIds: enabledStreams.map((s) => s.id),
       },
       activeTasks,
+      holo: this.getHoloHostSnapshot(),
       runtime: field.runtime,
       chronology: field.chronology,
       observer: field.observer,
@@ -1571,6 +1612,11 @@ export function getVerdantRootPrismRuntime(): VerdantRootPrismRuntime {
         chronology: () => root.getTemporalCoherenceSnapshot(),
         recentSpans: () => root.observerBus.getRecentSpans(),
         otlpJson: () => root.observerBus.toOtlpJson(),
+        holoStatus: () => root.getHoloHostSnapshot(),
+        holoDispatch: async (command: string) => {
+          const host = await root.ensureHoloHostVerified();
+          return host.dispatchRaw(command);
+        },
         routeCertificate: () =>
           root.workerClient.cognitiveObserver.getThreadSnapshot(
             root.workerClient.getActiveThreadId(),

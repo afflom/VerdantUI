@@ -188,14 +188,46 @@ declare module '@prism-code-internal/journey/model-kernel-pins.mjs' {
 declare module '@prism-code-internal/journey/lexlean-core.mjs' {
   export function lexleanCheck(module: WebAssembly.Module, files: Map<string, Uint8Array>): Promise<{
     readonly success: boolean;
-    readonly diagnostics?: readonly unknown[];
+    readonly diagnostics?: readonly {
+      readonly severity?: string;
+      readonly code?: string;
+      readonly message?: string;
+      readonly primary?: { readonly path?: string; readonly line_start?: number; readonly column_start?: number } | null;
+    }[];
     readonly ms: number;
   }>;
   export function lexleanSnapshot(module: WebAssembly.Module, files: Map<string, Uint8Array>): Promise<{
     readonly ok: boolean;
     readonly bytes?: Uint8Array;
-    readonly snapshot?: unknown;
+    readonly snapshot?: { readonly semantic_id: string; [k: string]: unknown };
+    readonly check?: {
+      readonly diagnostics?: readonly {
+        readonly severity?: string;
+        readonly code?: string;
+        readonly message?: string;
+        readonly primary?: { readonly path?: string; readonly line_start?: number; readonly column_start?: number } | null;
+      }[];
+    };
     readonly ms: number;
+  }>;
+}
+
+declare module '@prism-code-internal/journey/model-holo.mjs' {
+  export function buildHolo(
+    snapshot: unknown,
+    opts: {
+      readonly evaluator: Uint8Array;
+      readonly snapshotBytes?: Uint8Array | null;
+      readonly sources?: ReadonlyArray<{ readonly path: string; readonly bytes: Uint8Array }> | null;
+      readonly proof?: { readonly kernel: string; readonly library: string; [k: string]: unknown } | null;
+      readonly page?: Map<string, Uint8Array> | null;
+    },
+  ): Promise<{
+    readonly bytes: Uint8Array;
+    readonly label: string;
+    readonly name: string;
+    readonly carries: { readonly snapshot: boolean; readonly sources: boolean; readonly proof: boolean };
+    readonly page: string;
   }>;
 }
 
@@ -204,9 +236,79 @@ declare module '@prism-code-internal/blake3.mjs' {
   export function kappa(bytes: Uint8Array): string;
 }
 
+declare module '@prism-code-internal/sha256.mjs' {
+  export function sha256HexSync(bytes: Uint8Array): string;
+}
+
 declare module '@prism-code-internal/view.mjs' {
   export function decodeHoloview(bytes: Uint8Array): {
     readonly entry: string;
     readonly files: Map<string, Uint8Array>;
   };
+}
+
+declare module '@prism-code-internal/archive.mjs' {
+  export function asBytes(value: Uint8Array | ArrayBuffer | string): Uint8Array;
+  export function parseArchive(bytes: Uint8Array): {
+    readonly format: number;
+    readonly kappa?: string;
+    readonly fingerprint?: string;
+    readonly extensions?: ReadonlyArray<{ readonly name: string }>;
+    readonly verification: { readonly footer?: boolean; readonly seal?: boolean };
+  };
+  export function resolveArchive(parsed: ReturnType<typeof parseArchive>): {
+    readonly modelDocument: {
+      readonly application?: {
+        readonly name?: string;
+        readonly version?: string;
+        readonly cargo_version?: string;
+        readonly request_maximum?: number;
+        readonly requestMaximum?: number;
+        readonly acceptance_vectors?: ReadonlyArray<{ readonly request: ArrayLike<number>; readonly response: ArrayLike<number> }>;
+        readonly acceptanceVectors?: ReadonlyArray<{ readonly request: ArrayLike<number>; readonly response: ArrayLike<number> }>;
+      };
+    };
+    readonly guest: { readonly content: Uint8Array };
+    readonly view?: { readonly content?: Uint8Array };
+    readonly provenance?: { readonly semantic_id?: string };
+    readonly identities: { readonly ok?: boolean; readonly verified?: boolean; readonly problems?: readonly string[] };
+  };
+}
+
+declare module '@prism-code-internal/core.mjs' {
+  export const CORE_CONTRACT: string;
+  export function compileGuest(
+    wasmBytes: Uint8Array,
+    grant?: unknown,
+    contract?: string,
+  ): Promise<WebAssembly.Module>;
+  export function checkRequest(request: Uint8Array, limits?: { readonly request?: number; readonly guestAllocation?: number }): void;
+  export function instantiateGuest(
+    module: WebAssembly.Module,
+    imports?: Record<string, Record<string, unknown>>,
+  ): WebAssembly.Instance;
+  export function runInstance(instance: WebAssembly.Instance, request: Uint8Array): Uint8Array;
+  export function runAcceptance(
+    vectors: ReadonlyArray<{ readonly request: Uint8Array; readonly response: Uint8Array }>,
+    dispatch: (request: Uint8Array) => Promise<Uint8Array> | Uint8Array,
+  ): Promise<{ readonly passed: number; readonly total: number; readonly failed: readonly unknown[] }>;
+}
+
+declare module '@prism-code-internal/middleware.mjs' {
+  export interface MiddlewareStack {
+    use(pluggable: unknown): unknown;
+    resolve(
+      step: string,
+      terminal: (args: Record<string, unknown>) => Promise<unknown> | unknown,
+      context: Record<string, unknown>,
+    ): (args: Record<string, unknown>) => Promise<unknown>;
+  }
+  export function createMiddlewareStack(): MiddlewareStack;
+}
+
+declare module '@prism-code-internal/tracing.mjs' {
+  export function experimental_tracing(options: {
+    readonly tracer: unknown;
+    readonly steps?: readonly string[];
+  }): unknown;
 }
