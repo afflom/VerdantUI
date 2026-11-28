@@ -1352,6 +1352,17 @@ export class VerdantRootPrismRuntime {
       });
     }
 
+    const holoSnap = this.getHoloHostSnapshot();
+    if (holoSnap.loadError !== null) {
+      score -= 256;
+      findings.push({
+        severity: 'error',
+        subsystem: 'holo',
+        message: `verdant-ui.holo failed verification: ${holoSnap.loadError}`,
+        recommendedAction: 'Rebuild and redeploy dist/holos/verdant-ui.holo via npm run prism:build.',
+      });
+    }
+
     const galleryCounts = this.galleryStore.galleryCounts();
     const prisms = this.prismStore.list();
     const spacesCount = prisms.filter(
@@ -1524,14 +1535,38 @@ export class VerdantRootPrismRuntime {
           this.onSetDarkModeCallback?.(action.dark);
           result = { darkMode: action.dark };
           break;
-        case 'set_space':
+        case 'set_space': {
+          if (this.holoHostInstance?.isVerified()) {
+            const verdict = await this.holoHostInstance.dispatchCompartment(
+              action.spaceId,
+              action.spaceId,
+              'private',
+            );
+            if (verdict.refused) {
+              throw new Error(verdict.raw);
+            }
+          }
           this.workerClient.cognitiveObserver.possession.setActiveCompartment(action.spaceId);
           result = { activeSpace: this.workerClient.cognitiveObserver.possession.getActiveCompartmentId() };
           break;
-        case 'set_streaming_consent':
+        }
+        case 'set_streaming_consent': {
+          if (this.holoHostInstance?.isVerified()) {
+            const st = this.workerClient.getState();
+            const verdict = await this.holoHostInstance.dispatchConsent(
+              action.consent,
+              Boolean(st.model),
+              true,
+              true,
+            );
+            if (verdict.refused) {
+              throw new Error(verdict.raw);
+            }
+          }
           this.onSetStreamingConsentCallback?.(action.consent);
           result = { streamingConsent: action.consent };
           break;
+        }
         case 'toggle_content_stream':
           this.contentStreams.toggleStream(action.streamId, action.enabled);
           result = { streamId: action.streamId, enabled: action.enabled };

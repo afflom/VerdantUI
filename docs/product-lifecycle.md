@@ -2,7 +2,7 @@
 
 > Generated mechanically by `npm run studio:publish` from `model/features.json` and `model/release-ledger.json`.
 
-- **Active Features:** 19
+- **Active Features:** 21
 - **Proposed / Planned Features:** 0
 - **Recorded Releases:** 16
 
@@ -29,6 +29,8 @@
 | `VUI-FEAT-017` | **active** | `v0.11.0` | `VUI-SIMD-01` | Zero-Churn Scoped UI Subscriptions, 64-Token KV Checkpoint/Resume, 100% Neural Picture Sandbox, Live VLM QA & Native F16/Q8_0 SIMD SDXS-512 Graph |
 | `VUI-FEAT-018` | **active** | `v0.13.0` | `VUI-DEDUP-01` | Regimented 3-Tier Content-Addressed OPFS Slab CAS & Demand-First Sparse Expert Streaming |
 | `VUI-FEAT-019` | **active** | `v0.13.0` | `VUI-OBSERVER-01` | Hidden Unmanaged System Stream, Continuous Observer Quality Sensing, Opt-In Content Stream Catalogs & Zero-Cutoff Prism Ingestion |
+| `VUI-FEAT-020` | **active** | `v0.14.0` | `VUI-HOLO-01` | Lean-Proved VerdantUI Root Prism (verdant-ui.holo), Thin OTEL-Traced Host Substrate & Studio.Telemetry W3C Trace Parity |
+| `VUI-FEAT-021` | **active** | `v0.14.0` | `VUI-PARTS-01` | Unified Declarative Organ Registry, Mechanical MCP/WCAG/Facet Acceptance Gates & Zero-Dependency Chrome CDP Eval Harness |
 
 ## Release Ledger
 

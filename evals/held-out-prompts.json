@@ -29,6 +29,21 @@
       "expectedResponse": "refused: empty cell target"
     },
     {
+      "id": "REFUSE-TRACEPARENT-FF",
+      "command": "verdant\ttelemetry\ttraceparent\tff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+      "expectedResponse": "refused: traceparent version ff invalid"
+    },
+    {
+      "id": "REFUSE-TRACEPARENT-ZERO",
+      "command": "verdant\ttelemetry\ttraceparent\t00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+      "expectedResponse": "refused: traceparent zero trace or parent id"
+    },
+    {
+      "id": "REFUSE-SPAN-TIMING",
+      "command": "verdant\ttelemetry\ttiming\t1250\t1000",
+      "expectedResponse": "refused: span end before start"
+    },
+    {
       "id": "REFUSE-UNKNOWN-ROUTE",
       "command": "not-a-verdant-command",
       "expectedResponse": "refused: unknown verdant command"

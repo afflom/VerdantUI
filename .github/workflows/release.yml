@@ -84,6 +84,7 @@ jobs:
           fi
           BUMP="${{ inputs.bump || 'auto' }}"
           npm run studio:release -- "--bump=${BUMP}" --write --notes-out /tmp/release-notes.md
+          npm run prism:build
           npm run ratchet
           npm run studio:check
           git config user.name "verdant-studio-bot"

@@ -1,7 +1,7 @@
 {
   "schema": "verdant-ui/gui-resources/1",
-  "holoAddress": "blake3:856f6531bbc4400f4352b9ff26c0646eb01cbb40f1d2a6de4646c91c6b142246",
-  "vectorsVerified": "24/24",
+  "holoAddress": "blake3:1412741d3a3be7da0a8bb199960ce5cd06ac8cf7efb83d2f079c9dc459c136c7",
+  "vectorsVerified": "29/29",
   "surfaces": [
     "home",
     "gallery",

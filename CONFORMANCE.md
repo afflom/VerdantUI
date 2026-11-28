@@ -93,6 +93,15 @@ The three honesty levels (R2):
 | `VUI-CELLS-01` | `build` | Natural-language tune actions route onto non-empty Prism cell targets (Studio.Gui.Generation parity) | `VerdantUI.Cells.tune_routes_valid_cell` |
 | `VUI-CELLS-REFUSE-01` | `build` | Empty Prism cell targets are explicitly refused by name | `VerdantUI.Cells.empty_cell_refused`, refuses with `refused: empty cell target` |
 
+## telemetry
+
+| ID | Level | Statement | Evidence |
+| --- | --- | --- | --- |
+| `VUI-TELEMETRY-01` | `build` | Valid W3C traceparent headers and monotonic span timings are accepted (afflom/verdant-studio Studio.Telemetry parity) | `VerdantUI.Telemetry.valid_w3c_traceparent_accepted`, `VerdantUI.Telemetry.monotonic_span_timing_accepted` |
+| `VUI-TELEMETRY-VER-REFUSE-01` | `build` | W3C traceparent version ff is explicitly refused by name | `VerdantUI.Telemetry.version_ff_refused`, refuses with `refused: traceparent version ff invalid` |
+| `VUI-TELEMETRY-ZERO-REFUSE-01` | `build` | W3C traceparent with all-zero trace-id or parent-id is explicitly refused by name | `VerdantUI.Telemetry.zero_trace_or_parent_refused`, refuses with `refused: traceparent zero trace or parent id` |
+| `VUI-TELEMETRY-TIMING-REFUSE-01` | `build` | OTEL spans whose end timestamp precedes their start timestamp are explicitly refused by name | `VerdantUI.Telemetry.end_before_start_refused`, refuses with `refused: span end before start` |
+
 ## Cited authorities
 
 An authority is cited, never re-derived: what it states is not claimed as established here, so the claim that reproduces it stays `some-true`.
@@ -100,7 +109,7 @@ An authority is cited, never re-derived: what it states is not claimed as establ
 | Authority | Citation | Realized by |
 | --- | --- | --- |
 | `VERDANT-ENGINE` | afflom/verdant-engine v2.22.4 — exclusive browser WASM SIMD compute substrate, multi-core SharedArrayBuffer pool, and bounded memory governors | `VUI-ENGINE-01`, `VUI-MOE-01`, `VUI-SIMD-01` |
-| `VERDANT-STUDIO` | afflom/verdant-studio — closed-API product/feature lifecycle, well-founded Req/Std/Der admission, monotone locks, and Prism-first verification | `VUI-STUDIO-02`, `VUI-LIFECYCLE-01` |
+| `VERDANT-STUDIO` | afflom/verdant-studio — closed-API product/feature lifecycle, well-founded Req/Std/Der admission, monotone locks, Prism-first verification, and Studio.Telemetry OTEL bindings | `VUI-STUDIO-02`, `VUI-LIFECYCLE-01`, `VUI-TELEMETRY-01` |
 | `PRISM-CODE` | UOR Foundation prism-code 0.11.5 — LexLean 1.2 compilation, Lean 4.32.2 kernel proofs, template/2 contract ratchet, and prism/holo/6 archives | `VUI-HOLO-01`, `VUI-STUDIO-03` |
 | `AFFLOM-ME` | afflom/me — owner-centric possession hierarchy, compartment isolation, and regulated boundary controls | `VUI-OBSERVER-01` |
 | `APACHE-2.0-PUBLIC-BENEFIT` | Apache License 2.0 — free public benefit AI service with zero paywalls, zero ad/tracking SDKs, and 100% client-side execution | `VUI-CLIENT-01`, `VUI-PUBLIC-BENEFIT-01` |
@@ -111,6 +120,8 @@ An authority is cited, never re-derived: what it states is not claimed as establ
 | `W3C-PROV-O` | W3C PROV-O — stakeholder producer/consumer provenance and content-addressed artifact lineage | `VUI-STUDIO-01` |
 | `JSON-SCHEMA-2020-12` | JSON Schema Draft 2020-12 — typed declarative weight schemas and Prism tool stream contracts | `VUI-STUDIO-01` |
 | `DORA-METRICS` | DORA 2024 — fast automated CI/CD (~60s GitHub Pages publish), automated upstream tracking, and deterministic semantic releases | `VUI-PAGES-01`, `VUI-LIFECYCLE-01` |
+| `W3C-TRACE-CONTEXT-1` | W3C Trace Context 1.0 — 55-byte lowercase hex traceparent (version-trace-id-parent-id-flags), rejecting version ff and all-zero trace/parent IDs | `VUI-TELEMETRY-01`, `VUI-TELEMETRY-VER-REFUSE-01`, `VUI-TELEMETRY-ZERO-REFUSE-01` |
+| `OTEL-SEMCONV-1.37.0` | OpenTelemetry Semantic Conventions 1.37.0 + OTLP 1.11.1 — standard service.*, error.type, and monotonic span timing export | `VUI-TELEMETRY-01`, `VUI-TELEMETRY-TIMING-REFUSE-01` |
 
 ## Claims that are not conformance IDs
 

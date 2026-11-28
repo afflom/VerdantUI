@@ -18,11 +18,11 @@ realized_by = ["VUI-ENGINE-01", "VUI-MOE-01", "VUI-SIMD-01"]
 [[authority]]
 id = "VERDANT-STUDIO"
 name = "Verdant Studio Lifecycle Management Model"
-edition = "main@afee10ede538"
+edition = "main@77a336569643"
 source = "https://github.com/afflom/verdant-studio"
-citation = "afflom/verdant-studio — closed-API product/feature lifecycle, well-founded Req/Std/Der admission, monotone locks, and Prism-first verification"
+citation = "afflom/verdant-studio — closed-API product/feature lifecycle, well-founded Req/Std/Der admission, monotone locks, Prism-first verification, and Studio.Telemetry OTEL bindings"
 scope = "Closed-API product/feature lifecycle, well-founded Req/Std/Der admission, monotone locks, and automated upstream tracking"
-realized_by = ["VUI-STUDIO-02", "VUI-LIFECYCLE-01"]
+realized_by = ["VUI-STUDIO-02", "VUI-LIFECYCLE-01", "VUI-TELEMETRY-01"]
 
 [[authority]]
 id = "PRISM-CODE"
@@ -113,3 +113,21 @@ source = "https://dora.dev/"
 citation = "DORA 2024 — fast automated CI/CD (~60s GitHub Pages publish), automated upstream tracking, and deterministic semantic releases"
 scope = "Fast automated CI/CD (~60s GitHub Pages publish), automated upstream upgrade PRs, and deterministic semantic releases"
 realized_by = ["VUI-PAGES-01", "VUI-LIFECYCLE-01"]
+
+[[authority]]
+id = "W3C-TRACE-CONTEXT-1"
+name = "W3C Trace Context Level 1"
+edition = "REC-trace-context-1-20211123"
+source = "https://www.w3.org/TR/trace-context-1/"
+citation = "W3C Trace Context 1.0 — 55-byte lowercase hex traceparent (version-trace-id-parent-id-flags), rejecting version ff and all-zero trace/parent IDs"
+scope = "End-to-end causal traceparent propagation across VerdantUI Observer, verdant-ui.holo guest, and browser evals"
+realized_by = ["VUI-TELEMETRY-01", "VUI-TELEMETRY-VER-REFUSE-01", "VUI-TELEMETRY-ZERO-REFUSE-01"]
+
+[[authority]]
+id = "OTEL-SEMCONV-1.37.0"
+name = "OpenTelemetry Semantic Conventions & OTLP 1.11.1"
+edition = "1.37.0 / OTLP 1.11.1"
+source = "https://opentelemetry.io/docs/specs/semconv/"
+citation = "OpenTelemetry Semantic Conventions 1.37.0 + OTLP 1.11.1 — standard service.*, error.type, and monotonic span timing export"
+scope = "Zero-dependency W3C OTLP/JSON 1.x span and log export in ObserverStreamBus and prism-code experimental_tracing"
+realized_by = ["VUI-TELEMETRY-01", "VUI-TELEMETRY-TIMING-REFUSE-01"]

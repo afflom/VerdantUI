@@ -127,6 +127,13 @@ export function formatTraceparent(ctx: OtelTraceContext): string {
   return `00-${ctx.traceId}-${ctx.spanId}-${flags}`;
 }
 
+export function isValidW3cTraceparent(tp: string): boolean {
+  if (!/^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/.test(tp)) return false;
+  if (tp.startsWith('ff-')) return false;
+  const [, traceId, parentId] = tp.split('-');
+  return traceId !== '00000000000000000000000000000000' && parentId !== '0000000000000000';
+}
+
 export function createTraceContext(parent?: OtelTraceContext): OtelTraceContext {
   return {
     traceId: parent?.traceId ?? createTraceId(),
@@ -327,7 +334,10 @@ export class ObserverStreamBus {
         Object.assign(mutableAttrs, sanitizeAttributes(attrs));
       },
       end: (status = 'ok', errorMessage) => {
-        const endTimeMs = Date.now();
+        const endTimeMs = Math.max(startTimeMs, Date.now());
+        if (status === 'error' && !mutableAttrs['error.type']) {
+          mutableAttrs['error.type'] = errorMessage?.startsWith('refused:') ? 'refusal' : 'runtime_error';
+        }
         const finalSpan: OtelSpan = {
           traceId: context.traceId,
           spanId: context.spanId,
@@ -585,7 +595,7 @@ export class ObserverStreamBus {
     const resource = {
       attributes: toOtlpAttributes({
         'service.name': 'verdant-ui',
-        'service.version': '0.13.3',
+        'service.version': '0.14.0',
       }),
     };
     const scope = { name: 'verdant-ui.observer-bus', version: '1.0.0' };

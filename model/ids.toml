@@ -139,6 +139,40 @@ failure = "refused: empty cell target"
 negative = "VUI-CELLS-REFUSE-01"
 
 [[id]]
+id = "VUI-TELEMETRY-01"
+level = "build"
+suite = "telemetry"
+statement = "Valid W3C traceparent headers and monotonic span timings are accepted (afflom/verdant-studio Studio.Telemetry parity)"
+theorems = ["VerdantUI.Telemetry.valid_w3c_traceparent_accepted", "VerdantUI.Telemetry.monotonic_span_timing_accepted"]
+
+[[id]]
+id = "VUI-TELEMETRY-VER-REFUSE-01"
+level = "build"
+suite = "telemetry"
+statement = "W3C traceparent version ff is explicitly refused by name"
+theorems = ["VerdantUI.Telemetry.version_ff_refused"]
+failure = "refused: traceparent version ff invalid"
+negative = "VUI-TELEMETRY-VER-REFUSE-01"
+
+[[id]]
+id = "VUI-TELEMETRY-ZERO-REFUSE-01"
+level = "build"
+suite = "telemetry"
+statement = "W3C traceparent with all-zero trace-id or parent-id is explicitly refused by name"
+theorems = ["VerdantUI.Telemetry.zero_trace_or_parent_refused"]
+failure = "refused: traceparent zero trace or parent id"
+negative = "VUI-TELEMETRY-ZERO-REFUSE-01"
+
+[[id]]
+id = "VUI-TELEMETRY-TIMING-REFUSE-01"
+level = "build"
+suite = "telemetry"
+statement = "OTEL spans whose end timestamp precedes their start timestamp are explicitly refused by name"
+theorems = ["VerdantUI.Telemetry.end_before_start_refused"]
+failure = "refused: span end before start"
+negative = "VUI-TELEMETRY-TIMING-REFUSE-01"
+
+[[id]]
 id = "VUI-CLIENT-01"
 level = "open"
 suite = "verdant-ui"

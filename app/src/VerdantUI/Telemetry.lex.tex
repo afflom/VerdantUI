@@ -1,0 +1,206 @@
+\begin{lexlean}{VerdantUI.Telemetry}
+\useglossary{lexlean.std.bool@1.2.0}
+\useglossary{lexlean.std.nat@1.2.0}
+\useglossary{prism.arch@1.0.0}
+\importmodule{VerdantUI.Protocol}
+\title{Text application model}
+\begin{semanticmodule}
+definition{
+  name: decideTraceparent,
+  parameters: [versionOk : Nat, traceNonZero : Nat, parentNonZero : Nat, formatOk : Nat],
+  result: Nat,
+  body: (if (formatOk =? 0) then 90 else (if (versionOk =? 0) then 91 else (if ((traceNonZero =? 0) || (parentNonZero =? 0)) then 92 else 1)))
+}
+
+definition{
+  name: breaks_valid_w3c_traceparent_accepted,
+  parameters: [],
+  result: Bool,
+  body: (not ((decideTraceparent 1 1 1 1) =? 1))
+}
+
+theorem{
+  name: valid_w3c_traceparent_accepted,
+  parameters: [],
+  statement: ((breaks_valid_w3c_traceparent_accepted) = false),
+  proof: linear_arithmetic{
+    definitions: [breaks_valid_w3c_traceparent_accepted, decideTraceparent]
+  },
+  axioms: [Quot.sound, propext]
+}
+
+definition{
+  name: breaks_version_ff_refused,
+  parameters: [traceNonZero : Nat, parentNonZero : Nat],
+  result: Bool,
+  body: (not ((decideTraceparent 0 traceNonZero parentNonZero 1) =? 91))
+}
+
+theorem{
+  name: version_ff_refused,
+  parameters: [traceNonZero : Nat, parentNonZero : Nat],
+  statement: ((breaks_version_ff_refused traceNonZero parentNonZero) = false),
+  proof: linear_arithmetic{
+    definitions: [breaks_version_ff_refused, decideTraceparent]
+  },
+  axioms: [Quot.sound, propext]
+}
+
+definition{
+  name: breaks_zero_trace_or_parent_refused,
+  parameters: [traceNonZero : Nat, parentNonZero : Nat],
+  result: Bool,
+  body: (((traceNonZero =? 0) || (parentNonZero =? 0)) && (not ((decideTraceparent 1 traceNonZero parentNonZero 1) =? 92)))
+}
+
+theorem{
+  name: zero_trace_or_parent_refused,
+  parameters: [traceNonZero : Nat, parentNonZero : Nat],
+  statement: ((breaks_zero_trace_or_parent_refused traceNonZero parentNonZero) = false),
+  proof: linear_arithmetic{
+    definitions: [breaks_zero_trace_or_parent_refused, decideTraceparent]
+  },
+  axioms: [Quot.sound, propext]
+}
+
+definition{
+  name: decideSpanTiming,
+  parameters: [startMs : Nat, endMs : Nat],
+  result: Nat,
+  body: (if (startMs <=? endMs) then 1 else 93)
+}
+
+definition{
+  name: breaks_monotonic_span_timing_accepted,
+  parameters: [startMs : Nat, endMs : Nat],
+  result: Bool,
+  body: ((startMs <=? endMs) && (not ((decideSpanTiming startMs endMs) =? 1)))
+}
+
+theorem{
+  name: monotonic_span_timing_accepted,
+  parameters: [startMs : Nat, endMs : Nat],
+  statement: ((breaks_monotonic_span_timing_accepted startMs endMs) = false),
+  proof: linear_arithmetic{
+    definitions: [breaks_monotonic_span_timing_accepted, decideSpanTiming]
+  },
+  axioms: [Quot.sound, propext]
+}
+
+definition{
+  name: breaks_end_before_start_refused,
+  parameters: [startMs : Nat, endMs : Nat],
+  result: Bool,
+  body: ((endMs <? startMs) && (not ((decideSpanTiming startMs endMs) =? 93)))
+}
+
+theorem{
+  name: end_before_start_refused,
+  parameters: [startMs : Nat, endMs : Nat],
+  statement: ((breaks_end_before_start_refused startMs endMs) = false),
+  proof: linear_arithmetic{
+    definitions: [breaks_end_before_start_refused, decideSpanTiming]
+  },
+  axioms: [Quot.sound, propext]
+}
+
+definition{
+  name: isHexLower,
+  parameters: [c : Nat],
+  result: Bool,
+  body: (((48 <=? c) && (c <=? 57)) || ((97 <=? c) && (c <=? 102)))
+}
+
+definition{
+  name: hexSpanOk,
+  parameters: [bs : Bytes, pos : Nat, rem : Nat],
+  result: Bool,
+  body: (match rem
+    | Nat.zero => true
+    | Nat.succ rest => (match (prim index bs pos : (Option UInt8))
+      | Option.none => false
+      | Option.some b => ((isHexLower (prim to_nat b : Nat)) && (hexSpanOk bs (pos + 1) rest)))),
+  recursive_argument: rem
+}
+
+definition{
+  name: allZeroSpan,
+  parameters: [bs : Bytes, pos : Nat, rem : Nat],
+  result: Bool,
+  body: (match rem
+    | Nat.zero => true
+    | Nat.succ rest => (match (prim index bs pos : (Option UInt8))
+      | Option.none => false
+      | Option.some b => (((prim to_nat b : Nat) =? 48) && (allZeroSpan bs (pos + 1) rest)))),
+  recursive_argument: rem
+}
+
+definition{
+  name: byteCodeIs,
+  parameters: [bs : Bytes, pos : Nat, code : Nat],
+  result: Bool,
+  body: (match (prim index bs pos : (Option UInt8))
+    | Option.none => false
+    | Option.some b => ((prim to_nat b : Nat) =? code))
+}
+
+definition{
+  name: parseDigitsNat,
+  parameters: [bs : Bytes, pos : Nat, len : Nat, acc : Nat, fuel : Nat],
+  result: (Option Nat),
+  body: (match fuel
+    | Nat.zero => (if (len <=? pos) then (ctor Option.some [Nat] acc) else (ctor Option.none [Nat]))
+    | Nat.succ rest => (if (len <=? pos) then (ctor Option.some [Nat] acc) else (match (prim index bs pos : (Option UInt8))
+      | Option.none => (ctor Option.none [Nat])
+      | Option.some b => (let c : Nat := (prim to_nat b : Nat); (if ((48 <=? c) && (c <=? 57)) then (parseDigitsNat bs (pos + 1) len ((prim multiply acc 10 : Nat) + (prim subtract c 48 : Nat)) rest) else (ctor Option.none [Nat])))))),
+  recursive_argument: fuel
+}
+
+definition{
+  name: parseNatBytes,
+  parameters: [bs : Bytes],
+  result: (Option Nat),
+  body: (let len : Nat := (prim length bs : Nat); (if (len =? 0) then (ctor Option.none [Nat]) else (parseDigitsNat bs 0 len 0 24)))
+}
+
+definition{
+  name: handleTraceparent,
+  parameters: [tp : Bytes],
+  result: Bytes,
+  body: (let len : Nat := (prim length tp : Nat);
+    (let fmtOk : Bool := ((len =? 55) && ((hexSpanOk tp 0 2) && ((byteCodeIs tp 2 45) && ((hexSpanOk tp 3 32) && ((byteCodeIs tp 35 45) && ((hexSpanOk tp 36 16) && ((byteCodeIs tp 52 45) && (hexSpanOk tp 53 2))))))));
+    (let verFF : Bool := ((byteCodeIs tp 0 102) && (byteCodeIs tp 1 102));
+    (let trNz : Nat := (if (allZeroSpan tp 3 32) then 0 else 1);
+    (let paNz : Nat := (if (allZeroSpan tp 36 16) then 0 else 1);
+    (let code : Nat := (decideTraceparent (if verFF then 0 else 1) trNz paNz (if fmtOk then 1 else 0));
+    (if (code =? 1) then 0x6f6b097472616365706172656e74 else
+      (if (code =? 91) then 0x726566757365643a207472616365706172656e742076657273696f6e20666620696e76616c6964 else
+      (if (code =? 92) then 0x726566757365643a207472616365706172656e74207a65726f207472616365206f7220706172656e74206964 else
+      0x726566757365643a20696e76616c696420573343207472616365706172656e74)))))))))
+}
+
+definition{
+  name: handleTiming,
+  parameters: [args : Bytes],
+  result: Bytes,
+  body: (let sTok : Bytes := (VerdantUI.Protocol::field0 args);
+    (let eTok : Bytes := (VerdantUI.Protocol::afterField0 args);
+    (match (parseNatBytes sTok)
+      | Option.none => 0x726566757365643a20696e76616c6964207370616e2074696d696e67
+      | Option.some sMs => (match (parseNatBytes eTok)
+        | Option.none => 0x726566757365643a20696e76616c6964207370616e2074696d696e67
+        | Option.some eMs => (if ((decideSpanTiming sMs eMs) =? 1) then 0x6f6b0974696d696e67 else 0x726566757365643a207370616e20656e64206265666f7265207374617274)))))
+}
+
+definition{
+  name: handleTelemetry,
+  parameters: [args : Bytes],
+  result: Bytes,
+  body: (let verb : Bytes := (VerdantUI.Protocol::field0 args);
+    (let rest : Bytes := (VerdantUI.Protocol::afterField0 args);
+    (if (VerdantUI.Protocol::bytesEq verb 0x7472616365706172656e74) then (handleTraceparent rest) else
+    (if (VerdantUI.Protocol::bytesEq verb 0x74696d696e67) then (handleTiming rest) else
+    0x726566757365643a20756e6b6e6f776e2074656c656d657472792076657262))))
+}
+\end{semanticmodule}
+\end{lexlean}

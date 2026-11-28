@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { VerdantHoloHost } from '../host/verdantHoloHost';
-import { ObserverStreamBus } from './observerStreamBus';
+import { ObserverStreamBus, formatTraceparent, isValidW3cTraceparent } from './observerStreamBus';
 import { ORGAN_REGISTRY, lookupOrganDescriptor, formatOrganStatusPayload } from './organRegistry';
 import { VerdantCognitiveObserver } from './cognitiveObserver';
 import { PrismStore } from './prismStudio';
@@ -100,6 +100,36 @@ test('VerdantHoloHost loads, verifies, traces via OTEL, and dispatches all 7 Lea
   const cellEmpty = await host.dispatchCellTune('');
   assert.equal(cellEmpty.refused, true);
   assert.equal(cellEmpty.raw, 'refused: empty cell target');
+
+  // 6b. W3C Trace Context & OTEL span timing (afflom/verdant-studio Studio.Telemetry parity)
+  const liveSpan = bus.startSpan('telemetry.check', {
+    endpointKind: 'observer',
+    endpointId: 'verdant-ui-root',
+  });
+  const liveTp = formatTraceparent(liveSpan.context);
+  liveSpan.end('ok');
+  assert.equal(isValidW3cTraceparent(liveTp), true);
+  const tpOk = await host.dispatchTelemetryTraceparent(liveTp);
+  assert.equal(tpOk.ok, true);
+  assert.equal(tpOk.refused, false);
+
+  const tpFf = await host.dispatchTelemetryTraceparent(
+    'ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+  );
+  assert.equal(tpFf.refused, true);
+  assert.equal(tpFf.raw, 'refused: traceparent version ff invalid');
+
+  const tpZero = await host.dispatchTelemetryTraceparent(
+    '00-00000000000000000000000000000000-00f067aa0ba902b7-01',
+  );
+  assert.equal(tpZero.refused, true);
+  assert.equal(tpZero.raw, 'refused: traceparent zero trace or parent id');
+
+  const timingOk = await host.dispatchTelemetryTiming(1000, 1250);
+  assert.equal(timingOk.ok, true);
+  const timingBad = await host.dispatchTelemetryTiming(1250, 1000);
+  assert.equal(timingBad.refused, true);
+  assert.equal(timingBad.raw, 'refused: span end before start');
 
   // 7. W3C OTEL observability: holo.load, holo.verify, holo.dispatch, and prism.dispatch recorded in OTLP JSON
   const spans = bus.getRecentSpans();

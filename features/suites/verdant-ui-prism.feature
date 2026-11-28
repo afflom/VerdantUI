@@ -92,3 +92,27 @@ Feature: verdant-ui-prism
     Given VerdantUI.Cells
     When a tune command supplies an empty cell target
     Then the holo refuses with "refused: empty cell target"
+
+  @VUI-TELEMETRY-01 @build
+  Scenario: Valid W3C traceparent and monotonic OTEL span timing are accepted
+    Given VerdantUI.Telemetry in app/src/VerdantUI/Telemetry.lex.tex
+    When prism-code check proves valid_w3c_traceparent_accepted and monotonic_span_timing_accepted
+    Then well-formed traceparent headers and monotonic span timings succeed
+
+  @VUI-TELEMETRY-VER-REFUSE-01 @build @rejects
+  Scenario: W3C traceparent version ff is refused by name
+    Given VerdantUI.Telemetry
+    When a telemetry command supplies a version ff traceparent
+    Then the holo refuses with "refused: traceparent version ff invalid"
+
+  @VUI-TELEMETRY-ZERO-REFUSE-01 @build @rejects
+  Scenario: All-zero W3C trace-id or parent-id is refused by name
+    Given VerdantUI.Telemetry
+    When a telemetry command supplies an all-zero trace-id or parent-id
+    Then the holo refuses with "refused: traceparent zero trace or parent id"
+
+  @VUI-TELEMETRY-TIMING-REFUSE-01 @build @rejects
+  Scenario: Span ending before it starts is refused by name
+    Given VerdantUI.Telemetry
+    When a telemetry timing command supplies endMs less than startMs
+    Then the holo refuses with "refused: span end before start"

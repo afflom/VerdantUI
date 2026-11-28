@@ -359,4 +359,24 @@ export class VerdantHoloHost {
       raw,
     };
   }
+
+  async dispatchTelemetryTraceparent(traceparent: string): Promise<HoloPartResult> {
+    const { raw, refused } = await this.dispatchRaw(`verdant\ttelemetry\ttraceparent\t${traceparent}`);
+    return {
+      ok: !refused && raw === 'ok\ttraceparent',
+      refused,
+      raw,
+    };
+  }
+
+  async dispatchTelemetryTiming(startMs: number, endMs: number): Promise<HoloPartResult> {
+    const s = Math.max(0, Math.floor(startMs));
+    const e = Math.max(0, Math.floor(endMs));
+    const { raw, refused } = await this.dispatchRaw(`verdant\ttelemetry\ttiming\t${s}\t${e}`);
+    return {
+      ok: !refused && raw === 'ok\ttiming',
+      refused,
+      raw,
+    };
+  }
 }

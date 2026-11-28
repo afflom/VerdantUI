@@ -101,3 +101,8 @@
 
 - **Requirements:** `REQ-DEDUP-CAS`, `REQ-UNBOUNDED-OBSERVER-STREAMING`, `REQ-USER-CONTENT-STREAMS`, `REQ-OFFLINE-ONLY-MODE`
 - **Decision:** "VerdantUI is not bound by any intelligence or cognitive ceiling: replace arbitrary upfront 4B downloads and Local AI buttons with a first-visit browser-streaming acknowledgment, a hidden unmanaged demand-first System Stream with regimented 3-tier CAS deduplication, continuous Observer intent and quality-budget sensing from immediate and global user context, uncluttered catalog-organized opt-in Content Streams with user-added streams and zero-cutoff Prism ingestion, and an Offline-Only Mode toggle in Settings."
+
+## DEC-021 (2026-11-28)
+
+- **Requirements:** `REQ-PRISM-REBASE`, `REQ-EXPLICIT-REFUSAL-ONLY`, `REQ-HIGH-OTEL-LOW-DEPS`, `REQ-DIRECT-MAIN`
+- **Decision:** "Rebase VerdantUI directly on main onto afflom/verdant-studio's Prism-first discipline so VerdantUI and all its parts are Lean-verified Verdant Prisms (verdant-ui.holo) with zero silent fallbacks, high W3C OTEL observability, zero added dependencies, mechanical surface/WCAG/facet gates, and automated browser evaluation."

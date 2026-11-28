@@ -16,7 +16,17 @@
     "VUI-STUDIO-03",
     "VUI-LIFECYCLE-01",
     "VUI-PUBLIC-BENEFIT-01",
-    "VUI-UX-JARGON-01"
+    "VUI-UX-JARGON-01",
+    "VUI-HOLO-01",
+    "VUI-CONSENT-01",
+    "VUI-GRANT-01",
+    "VUI-COMPARTMENT-01",
+    "VUI-PARTS-01",
+    "VUI-OBSERVER-PURE-01",
+    "VUI-GUI-PARITY-01",
+    "VUI-A11Y-WCAG-01",
+    "VUI-CELLS-01",
+    "VUI-TELEMETRY-01"
   ],
   "admissions": [
     { "construct": "VUI-CLIENT-01", "citation": { "kind": "req", "decisionId": "DEC-001" } },
@@ -34,6 +44,16 @@
     { "construct": "VUI-STUDIO-03", "citation": { "kind": "std", "authorityId": "PRISM-CODE" } },
     { "construct": "VUI-LIFECYCLE-01", "citation": { "kind": "req", "decisionId": "DEC-008" } },
     { "construct": "VUI-PUBLIC-BENEFIT-01", "citation": { "kind": "req", "decisionId": "DEC-007" } },
-    { "construct": "VUI-UX-JARGON-01", "citation": { "kind": "req", "decisionId": "DEC-011" } }
+    { "construct": "VUI-UX-JARGON-01", "citation": { "kind": "req", "decisionId": "DEC-011" } },
+    { "construct": "VUI-HOLO-01", "citation": { "kind": "req", "decisionId": "DEC-021" } },
+    { "construct": "VUI-CONSENT-01", "citation": { "kind": "req", "decisionId": "DEC-021" } },
+    { "construct": "VUI-GRANT-01", "citation": { "kind": "std", "authorityId": "OWASP-ASVS-5.0.0" } },
+    { "construct": "VUI-COMPARTMENT-01", "citation": { "kind": "std", "authorityId": "AFFLOM-ME" } },
+    { "construct": "VUI-PARTS-01", "citation": { "kind": "req", "decisionId": "DEC-021" } },
+    { "construct": "VUI-OBSERVER-PURE-01", "citation": { "kind": "std", "authorityId": "VERDANT-STUDIO" } },
+    { "construct": "VUI-GUI-PARITY-01", "citation": { "kind": "std", "authorityId": "VERDANT-STUDIO" } },
+    { "construct": "VUI-A11Y-WCAG-01", "citation": { "kind": "std", "authorityId": "WCAG-2.2-AA" } },
+    { "construct": "VUI-CELLS-01", "citation": { "kind": "std", "authorityId": "VERDANT-STUDIO" } },
+    { "construct": "VUI-TELEMETRY-01", "citation": { "kind": "std", "authorityId": "W3C-TRACE-CONTEXT-1" } }
   ]
 }

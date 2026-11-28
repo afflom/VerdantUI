@@ -209,6 +209,28 @@
       "invariantId": "VUI-OBSERVER-01",
       "citation": { "kind": "req", "decisionId": "DEC-020" },
       "publicBenefitImpact": "Replaces contrived thresholds and Local AI buttons with plain-language browser-streaming consent, continuous Observer intent/quality sensing across immediate and global user context, uncluttered opt-in Content Stream catalogs with custom streams and Offline-Only Mode, and two-stage deduplicated realtime ingestion into VerdantUI Prisms with no training cutoff."
+    },
+    {
+      "id": "VUI-FEAT-020",
+      "title": "Lean-Proved VerdantUI Root Prism (verdant-ui.holo), Thin OTEL-Traced Host Substrate & Studio.Telemetry W3C Trace Parity",
+      "stage": "active",
+      "introducedIn": "0.14.0",
+      "ownerFile": "src/host/verdantHoloHost.ts",
+      "testFile": "src/engine/organLifecycleContract.test.ts",
+      "invariantId": "VUI-HOLO-01",
+      "citation": { "kind": "req", "decisionId": "DEC-021" },
+      "publicBenefitImpact": "Compiles VerdantUI's consent, FK-07 grant, compartment, part, observer purity, GUI parity, WCAG 2.2, cell-tuning, and W3C Trace Context rules into a 23-theorem Lean-proved zero-capability Core-Wasm archive (verdant-ui.holo) with explicit named refusals, zero silent fallbacks, and full W3C OTLP tracing at zero added npm dependencies."
+    },
+    {
+      "id": "VUI-FEAT-021",
+      "title": "Unified Declarative Organ Registry, Mechanical MCP/WCAG/Facet Acceptance Gates & Zero-Dependency Chrome CDP Eval Harness",
+      "stage": "active",
+      "introducedIn": "0.14.0",
+      "ownerFile": "src/engine/organRegistry.ts",
+      "testFile": "src/engine/organLifecycleContract.test.ts",
+      "invariantId": "VUI-PARTS-01",
+      "citation": { "kind": "req", "decisionId": "DEC-021" },
+      "publicBenefitImpact": "Eliminates whack-a-mole drift across all 8 MediaTypes and 7 utility roles through one declarative OrganRegistry, 7 universal property invariants, mechanical MCP-SCHEMA-2026-07-28 + WCAG 2.2 + physical WAV/PNG/SVG/HTML acceptance gates, and a zero-dependency Node 22 Chrome CDP evaluation harness while reducing total dist JS by >250 KiB."
     }
   ]
 }

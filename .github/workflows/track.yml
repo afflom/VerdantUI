@@ -1,7 +1,7 @@
 # Automated Upstream Engine & Studio Release Tracker (`.github/workflows/track.yml`)
 # Modeled on `afflom/verdant-studio/.github/workflows/track.yml` (REQ-ENGINE-TRACKING / REQ-STUDIO-TRACKING).
 # Periodically checks `afflom/verdant-engine` and `afflom/verdant-studio` for new releases/registers,
-# verifies all VerdantUI ratchets, tests, benchmarks, and Pages budgets, and opens an upgrade PR.
+# runs the full Prism + ratchet + surface + physical facet + test + Pages gate, and syncs directly on `main`.
 
 name: track
 
@@ -12,7 +12,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 concurrency:
   group: track-upstream
@@ -26,6 +25,8 @@ jobs:
     steps:
       - name: Check out main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: main
 
       - name: Install Node 22
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
@@ -45,6 +46,7 @@ jobs:
           set -euo pipefail
           npm run track:engine -- --write || true
           npm run track:studio -- --write || true
+          npm run prism:build
           npm run studio:publish
 
       - name: Check for staged changes
@@ -57,32 +59,28 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Verify full VerdantUI suite before proposing upgrade PR
+      - name: Verify full VerdantUI suite before committing pin sync on main
         if: steps.diff.outputs.changed == 'true'
         shell: bash
         run: |
           set -euo pipefail
+          npm run prism:check
+          npm run prism:vectors
+          npm run eval:surface
+          npm run eval:facets
+          npm run ratchet
           npm run studio:check
           npm run lint
           npm test
           npm run build:pages
 
-      - name: Open automated upgrade pull request
+      - name: Commit verified upstream pin sync directly on main
         if: steps.diff.outputs.changed == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          BRANCH="automation/track-upstream-$(date -u +%Y%m%d%H%M)"
           git config user.name "verdant-studio-bot"
           git config user.email "verdant-studio-bot@users.noreply.github.com"
-          git checkout -b "$BRANCH"
-          git add model/ CONFORMANCE.md CHANGELOG.md docs/
+          git add model/ CONFORMANCE.md CHANGELOG.md docs/ surface/
           git commit -m "chore(lifecycle): sync upstream verdant-engine & verdant-studio pins"
-          git push -u origin "$BRANCH"
-          gh pr create \
-            --base main \
-            --head "$BRANCH" \
-            --title "chore(lifecycle): sync upstream verdant-engine & verdant-studio registers" \
-            --body "Automated upgrade staged by \`.github/workflows/track.yml\` after passing \`studio:check\`, \`lint\`, \`test\`, and \`build:pages\`."
+          git push origin main
