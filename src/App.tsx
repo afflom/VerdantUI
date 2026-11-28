@@ -10,6 +10,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   useSyncExternalStore,
   type ComponentProps,
@@ -582,11 +583,35 @@ export default function App() {
     }
   }, [appShellSummary.model, appShellSummary.opfsStorage, expertRegistry]);
 
+  const uiStateRef = useRef({
+    activeView: 'thread',
+    surfaceMode: 'preview' as PrismSurfaceMode,
+    darkMode: false,
+    storesHydrated: false,
+  });
+  uiStateRef.current = {
+    activeView:
+      activeView.kind === 'prism'
+        ? `prism:${activeView.prismId}`
+        : activeView.kind === 'gallery'
+          ? `gallery:${activeView.mediaType}`
+          : activeView.kind,
+    surfaceMode,
+    darkMode,
+    storesHydrated,
+  };
+
   useEffect(() => {
     let toastTimer: ReturnType<typeof setTimeout> | null = null;
     rootPrism.setNavigationCallbacks({
-      onOpenPrism: (prismId) => setActiveView({ kind: 'prism', prismId, mode: 'app' }),
+      onOpenHome: () => setActiveView({ kind: 'thread' }),
+      onOpenSettings: () => setActiveView({ kind: 'settings' }),
+      onOpenPrism: (prismId, mode) => setActiveView({ kind: 'prism', prismId, mode: mode ?? 'app' }),
       onOpenGallery: (mediaType) => setActiveView({ kind: 'gallery', mediaType }),
+      onSetSurfaceMode: (mode) => setSurfaceMode(mode),
+      onSetDarkMode: (dark) => setDarkMode(dark),
+      onSetStreamingConsent: (next) => workerClient.setStreamingConsent(next),
+      onGetUiState: () => uiStateRef.current,
     });
     prismPool.setCallbacks({
       onNotify: ({ title, body }) => {
@@ -1145,6 +1170,7 @@ export default function App() {
                   onDeleteArtifact={handleDeletePrism}
                   onAssignToSpace={handleAssignToSpace}
                   onOpenSpace={(spaceId) => setActiveView({ kind: 'prism', prismId: spaceId, mode: 'app' })}
+                  getPrismById={(id) => prismStore.get(id)}
                 />
               </Suspense>
             )}

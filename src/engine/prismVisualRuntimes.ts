@@ -137,6 +137,33 @@ function drawArtwork(canvas) {
       ctx.moveTo(sunX - span * (0.4 + rng() * 0.6), y);
       ctx.lineTo(sunX + span * (0.4 + rng() * 0.6), y); ctx.stroke();
     }
+    const hay = String((W.prompt || '') + ' ' + (W.title || '')).toLowerCase();
+    const isBiolum = /biolum|glow|stream|river|creek|brook|forest|firefl|twilight/.test(hay);
+    if (isBiolum) {
+      // Winding glowing stream from horizon toward foreground with soft outer halo
+      ctx.save();
+      for (const [lw, col, alpha] of [[w * 0.085, cAcc, 0.22], [w * 0.042, cAcc, 0.45], [w * 0.016, cHi, 0.85]]) {
+        ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.lineCap = 'round'; ctx.globalAlpha = alpha;
+        ctx.beginPath();
+        for (let step = 0; step <= 24; step++) {
+          const t = step / 24;
+          const sy = horizon + t * (h - horizon);
+          const sx = w * 0.5 + Math.sin(t * Math.PI * 1.9 + 0.4) * w * (0.04 + t * 0.14);
+          if (step === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+        }
+        ctx.stroke();
+      }
+      // Floating twilight fireflies / luminous spores near canopy & stream banks
+      const flies = Math.max(18, Math.round(density * 0.55));
+      for (let f = 0; f < flies; f++) {
+        const fx = w * (0.08 + rng() * 0.84), fy = h * (0.34 + rng() * 0.58), fr = 2.5 + rng() * 6;
+        const fg = ctx.createRadialGradient(fx, fy, 0.3, fx, fy, fr * 2.4);
+        fg.addColorStop(0, cHi); fg.addColorStop(0.4, cAcc); fg.addColorStop(1, 'transparent');
+        ctx.fillStyle = fg; ctx.globalAlpha = 0.72;
+        ctx.beginPath(); ctx.arc(fx, fy, fr * 2.4, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.restore();
+    }
     ctx.globalAlpha = 1;
   } else if (generator === 'cosmic-nebula') {
     ctx.fillStyle = cBg; ctx.fillRect(0, 0, w, h);

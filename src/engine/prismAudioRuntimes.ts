@@ -194,8 +194,41 @@ function exportWav() {
       const arpIdx = (chordDeg + (st % 5) * 2) % scale.length;
       addNote(t0, stepSec * 1.6, midiToHz(W.rootMidi + scale[arpIdx]), 0.18, Math.sin(st * 0.9) * 0.48, [{ ratio: 1, amp: 1, damp: 2.2 }, { ratio: 2, amp: 0.36, damp: 4.2 }]);
     }
-    if (tracks.rhythm && st % 4 === 0) addNote(t0, 0.2, 62, 0.32, 0, [{ ratio: 1, amp: 1, damp: 12 }]);
+    if (tracks.rhythm) {
+      if (st % 4 === 0) addNote(t0, 0.2, 62, 0.34, 0, [{ ratio: 1, amp: 1, damp: 12 }]);
+      if (st % 4 === 2) {
+        const s0 = Math.max(0, Math.floor(t0 * sr)), s1 = Math.min(total, Math.floor((t0 + 0.12) * sr));
+        let seedN = (st * 2654435761) >>> 0;
+        for (let i = s0; i < s1; i++) {
+          seedN = (Math.imul(seedN, 1664525) + 1013904223) >>> 0;
+          const n = ((seedN / 4294967296) * 2 - 1) * Math.exp(-(i - s0) / (sr * 0.032)) * 0.16;
+          left[i] += n; right[i] += n * 0.94;
+        }
+      }
+      const h0 = Math.max(0, Math.floor(t0 * sr)), h1 = Math.min(total, Math.floor((t0 + 0.04) * sr));
+      let seedH = ((st + 17) * 2246822519) >>> 0;
+      for (let i = h0; i < h1; i++) {
+        seedH = (Math.imul(seedH, 1664525) + 1013904223) >>> 0;
+        const n = ((seedH / 4294967296) * 2 - 1) * Math.exp(-(i - h0) / (sr * 0.012)) * 0.065;
+        left[i] += n * 0.85; right[i] += n * 1.05;
+      }
+    }
   }
+  // Gentle cross-channel stereo reverb + EBU R128 / peak-safe mastering
+  const delayL = Math.floor(sr * 0.071), delayR = Math.floor(sr * 0.097);
+  for (let i = Math.max(delayL, delayR); i < total; i++) {
+    left[i] += right[i - delayL] * 0.16;
+    right[i] += left[i - delayR] * 0.16;
+  }
+  let sumSq = 0, peak = 0;
+  for (let i = 0; i < total; i++) {
+    const al = Math.abs(left[i]), ar = Math.abs(right[i]);
+    if (al > peak) peak = al; if (ar > peak) peak = ar;
+    sumSq += left[i] * left[i] + right[i] * right[i];
+  }
+  const rms = Math.sqrt(sumSq / Math.max(1, total * 2));
+  const targetGain = rms > 1e-4 ? Math.min(2.2, 0.18 / rms) : 1;
+  const gain = peak * targetGain > 0.92 ? 0.92 / Math.max(1e-4, peak) : targetGain;
   const dataBytes = total * 4, buf = new ArrayBuffer(44 + dataBytes), dv = new DataView(buf);
   const ws = (off, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
   ws(0, 'RIFF'); dv.setUint32(4, 36 + dataBytes, true); ws(8, 'WAVE'); ws(12, 'fmt '); dv.setUint32(16, 16, true);
@@ -203,8 +236,8 @@ function exportWav() {
   dv.setUint16(32, 4, true); dv.setUint16(34, 16, true); ws(36, 'data'); dv.setUint32(40, dataBytes, true);
   let p = 44;
   for (let i = 0; i < total; i++) {
-    dv.setInt16(p, Math.max(-32767, Math.min(32767, Math.round(Math.tanh(left[i]) * 32767))), true); p += 2;
-    dv.setInt16(p, Math.max(-32767, Math.min(32767, Math.round(Math.tanh(right[i]) * 32767))), true); p += 2;
+    dv.setInt16(p, Math.max(-32767, Math.min(32767, Math.round(Math.tanh(left[i] * gain) * 32767))), true); p += 2;
+    dv.setInt16(p, Math.max(-32767, Math.min(32767, Math.round(Math.tanh(right[i] * gain) * 32767))), true); p += 2;
   }
   const url = URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
   const a = document.createElement('a'); a.href = url; a.download = (W.title || 'verdant-audio').toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.wav'; a.click();
@@ -222,9 +255,18 @@ function exportMidi() {
       const n = Math.max(0, Math.min(127, W.rootMidi - 12 + scale[(chordDeg + off) % scale.length]));
       msgs.push([t, [0x90, n, 64]], [t + ppqn * 3, [0x80, n, 0]]);
     }
+    if (tracks.bass && st % 2 === 0) {
+      const bn = Math.max(0, Math.min(127, W.rootMidi - 24 + scale[chordDeg % scale.length] + (st % 4 === 2 ? 7 : 0)));
+      msgs.push([t, [0x92, bn, 76]], [t + ppqn, [0x82, bn, 0]]);
+    }
     if (tracks.lead && (W.style !== 'ambient-pad' || st % 2 === 0)) {
       const n = Math.max(0, Math.min(127, W.rootMidi + scale[(chordDeg + (st % 5) * 2) % scale.length]));
       msgs.push([t, [0x91, n, 82]], [t + (ppqn >> 1), [0x81, n, 0]]);
+    }
+    if (tracks.rhythm) {
+      if (st % 4 === 0) msgs.push([t, [0x99, 36, 96]], [t + 120, [0x89, 36, 0]]);
+      if (st % 4 === 2) msgs.push([t, [0x99, 38, 86]], [t + 120, [0x89, 38, 0]]);
+      msgs.push([t, [0x99, 42, 62]], [t + 80, [0x89, 42, 0]]);
     }
   }
   msgs.sort((a, b) => a[0] - b[0]);
@@ -254,7 +296,18 @@ function render() {
   }
   root.appendChild(seq);
 
-  const foot = document.createElement('div'); foot.className = 'doc-footer'; foot.style.marginTop = '14px';
+  const stems = document.createElement('div'); stems.className = 'organ-row'; stems.style.marginTop = '10px'; stems.style.gap = '6px';
+  for (const [key, label] of [['pad', 'Pad'], ['bass', 'Bass'], ['lead', 'Lead'], ['rhythm', 'Drums']]) {
+    const tb = document.createElement('button'); tb.type = 'button';
+    tb.className = 'organ-btn ' + (tracks[key] ? 'primary' : 'ghost');
+    tb.style.fontSize = '11px'; tb.style.padding = '4px 10px';
+    tb.textContent = label;
+    tb.onclick = () => { tracks[key] = !tracks[key]; render(); };
+    stems.appendChild(tb);
+  }
+  root.appendChild(stems);
+
+  const foot = document.createElement('div'); foot.className = 'doc-footer'; foot.style.marginTop = '12px';
   const left = document.createElement('div'); left.className = 'organ-row';
   const playBtn = document.createElement('button'); playBtn.className = 'organ-btn primary'; playBtn.textContent = playing ? 'Stop' : 'Play Stereo';
   playBtn.onclick = () => (playing ? stopPlay() : startPlay());

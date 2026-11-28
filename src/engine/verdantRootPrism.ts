@@ -156,8 +156,19 @@ export class VerdantRootPrismRuntime {
   private buildClientInstance: PrismBuildWorkerClient | null = null;
   private buildClientPromise: Promise<PrismBuildWorkerClient> | null = null;
   private studioBridgePromise: Promise<StudioChatBridge> | null = null;
-  private onOpenPrismCallback: ((prismId: string) => void) | null = null;
+  private onOpenHomeCallback: (() => void) | null = null;
+  private onOpenSettingsCallback: (() => void) | null = null;
+  private onOpenPrismCallback: ((prismId: string, mode?: 'app' | 'studio') => void) | null = null;
   private onOpenGalleryCallback: ((mediaType: GalleryMediaType) => void) | null = null;
+  private onSetSurfaceModeCallback: ((mode: PrismSurfaceMode) => void) | null = null;
+  private onSetDarkModeCallback: ((dark: boolean) => void) | null = null;
+  private onSetStreamingConsentCallback: ((next: 'accepted' | 'paused') => void) | null = null;
+  private onGetUiStateCallback: (() => {
+    readonly activeView: string;
+    readonly surfaceMode: PrismSurfaceMode;
+    readonly darkMode: boolean;
+    readonly storesHydrated: boolean;
+  }) | null = null;
 
   // Live Observer focus & kernel10 salience state
   private activePartId: string = VERDANT_HOME_PRISM_ID;
@@ -208,11 +219,28 @@ export class VerdantRootPrismRuntime {
   }
 
   setNavigationCallbacks(cbs: {
-    readonly onOpenPrism?: (prismId: string) => void;
+    readonly onOpenHome?: () => void;
+    readonly onOpenSettings?: () => void;
+    readonly onOpenPrism?: (prismId: string, mode?: 'app' | 'studio') => void;
     readonly onOpenGallery?: (mediaType: GalleryMediaType) => void;
+    readonly onSetSurfaceMode?: (mode: PrismSurfaceMode) => void;
+    readonly onSetDarkMode?: (dark: boolean) => void;
+    readonly onSetStreamingConsent?: (next: 'accepted' | 'paused') => void;
+    readonly onGetUiState?: () => {
+      readonly activeView: string;
+      readonly surfaceMode: PrismSurfaceMode;
+      readonly darkMode: boolean;
+      readonly storesHydrated: boolean;
+    };
   }): void {
+    this.onOpenHomeCallback = cbs.onOpenHome ?? null;
+    this.onOpenSettingsCallback = cbs.onOpenSettings ?? null;
     this.onOpenPrismCallback = cbs.onOpenPrism ?? null;
     this.onOpenGalleryCallback = cbs.onOpenGallery ?? null;
+    this.onSetSurfaceModeCallback = cbs.onSetSurfaceMode ?? null;
+    this.onSetDarkModeCallback = cbs.onSetDarkMode ?? null;
+    this.onSetStreamingConsentCallback = cbs.onSetStreamingConsent ?? null;
+    this.onGetUiStateCallback = cbs.onGetUiState ?? null;
   }
 
   /** Unified wall-clock + monotonic chronological spine shared with the Cognitive Observer. */
@@ -1024,7 +1052,11 @@ export class VerdantRootPrismRuntime {
     const engine = this.workerClient.getState();
     const chrono = this.chronology.snapshot();
     const obs = this.workerClient.cognitiveObserver;
-    const threadSnap = obs.getThreadSnapshot(this.workerClient.getActiveThreadId());
+    const activeThreadId =
+      typeof this.workerClient.getActiveThreadId === 'function'
+        ? this.workerClient.getActiveThreadId()
+        : 'default';
+    const threadSnap = obs.getThreadSnapshot(activeThreadId);
     const activeModel =
       engine.model && !isInternalBootstrapModel(engine.model.id) ? engine.model : null;
     const recentSpans = this.observerBus
@@ -1059,12 +1091,23 @@ export class VerdantRootPrismRuntime {
               contextWindow: activeModel.maxContextWindow,
             }
           : null,
-        kernelAcceleration: engine.telemetry.kernelAcceleration,
-        workers: engine.telemetry.threadPool?.workerCount ?? 1,
-        lastTokensPerSec: engine.lastTokensPerSec,
-        opfsUsageBytes: engine.opfsStorage.usageBytes,
-        opfsQuotaBytes: engine.opfsStorage.quotaBytes,
-        cachedModels: engine.opfsStorage.storedModels.map((m) => ({
+        kernelAcceleration: engine.telemetry?.kernelAcceleration ?? 'WASM SIMD',
+        workers: engine.telemetry?.threadPool?.workerCount ?? 1,
+        lastTokensPerSec: engine.lastTokensPerSec ?? 0,
+        opfsUsageBytes: engine.opfsStorage?.usageBytes ?? 0,
+        opfsQuotaBytes: engine.opfsStorage?.quotaBytes ?? 0,
+        unifiedStore: engine.telemetry?.unifiedStore
+          ? {
+              kvPrefixBlocks: engine.telemetry.unifiedStore.kvPrefixBlocks,
+              kvPrefixMaxBlocks: engine.telemetry.unifiedStore.kvPrefixMaxBlocks,
+              kvPrefixPersistedOpfs: engine.telemetry.unifiedStore.kvPrefixPersistedOpfs,
+              unifiedRestoredTokens: engine.telemetry.unifiedStore.unifiedRestoredTokens,
+              speculativeReadyTokens: engine.telemetry.unifiedStore.speculativeReadyTokens,
+              lastTurnPrefillHitRatePct: engine.telemetry.unifiedStore.lastTurnPrefillHitRatePct,
+              estimatedTtftSavedMs: engine.telemetry.unifiedStore.estimatedTtftSavedMs,
+            }
+          : null,
+        cachedModels: (engine.opfsStorage?.storedModels ?? []).map((m) => ({
           modelId: m.modelId,
           byteLength: m.byteLength,
           storageMode: m.storageMode ?? 'full',
@@ -1098,6 +1141,327 @@ export class VerdantRootPrismRuntime {
     };
   }
 
+  /**
+   * Active Observer GUI Perception (`Studio.Gui.Perception` · `REQ-AGENT-USERS` · `REQ-AGENT-OBSERVER`).
+   * Lets an agent perceive the exact same parts, views, galleries, spaces, streams, tasks, and
+   * layout compliance as a human user, recording a traced perception event on `observerBus`.
+   */
+  perceiveGuiState() {
+    const span = this.observerBus.startSpan('observer.perceive', {
+      endpointKind: 'observer',
+      endpointId: this.activePartId,
+    });
+    const uiState = this.onGetUiStateCallback?.() ?? {
+      activeView: this.activePartId,
+      surfaceMode: 'preview' as PrismSurfaceMode,
+      darkMode: false,
+      storesHydrated: true,
+    };
+    const allPrisms = this.prismStore.list();
+    const galleryCounts = this.galleryStore.galleryCounts();
+    const allStreams = this.contentStreams.listAll();
+    const enabledStreams = allStreams.filter((s) => s.enabled);
+    const activeTasks = this.getActiveBusyPartIds().map((id) => this.getPartTask(id));
+    const field = this.getObserverFieldReport();
+    span.setAttributes({
+      'verdant.active_part': this.activePartId,
+      'verdant.prism_count': allPrisms.length,
+      'verdant.enabled_streams': enabledStreams.length,
+    });
+    span.end('ok');
+    return {
+      ui: {
+        ...uiState,
+        activePartId: this.activePartId,
+        layoutCompliant: this.cachedLayout ? this.cachedLayout.certificate.ok : true,
+        layoutSolveCount: this.layoutSolveCount,
+      },
+      parts: this.systemPartPrisms.map((p) => ({
+        id: p.id,
+        name: p.name,
+        kind: p.kind,
+        subtitle: p.subtitle,
+      })),
+      galleries: galleryCounts,
+      prisms: allPrisms.map((p) => ({
+        id: p.id,
+        name: p.published?.name ?? p.draft.name,
+        mediaType: p.declaration?.view?.proceduralOrgan?.mediaType ?? p.declaration?.concept.mediaType ?? 'tool-organ',
+        published: Boolean(p.published),
+        spaceIds: this.galleryStore.get(p.id)?.spaceIds ?? [],
+        task: this.getPartTask(p.id),
+      })),
+      contentStreams: {
+        total: allStreams.length,
+        enabled: enabledStreams.length,
+        enabledIds: enabledStreams.map((s) => s.id),
+      },
+      activeTasks,
+      runtime: field.runtime,
+      chronology: field.chronology,
+      observer: field.observer,
+    };
+  }
+
+  /**
+   * Active Observer Self-Diagnosis (`REQ-SELF-HEALING` · `REQ-AGENT-OBSERVER`).
+   * Delegates system-wide health and feature-completeness evaluation directly to the Observer.
+   */
+  diagnoseSystemHealth(): {
+    readonly overallHealthQ10: number;
+    readonly status: 'healthy' | 'attention' | 'degraded';
+    readonly featureCoverage: Readonly<Record<string, number>>;
+    readonly findings: ReadonlyArray<{
+      readonly severity: 'info' | 'warn' | 'error';
+      readonly subsystem: string;
+      readonly message: string;
+      readonly recommendedAction?: string;
+    }>;
+  } {
+    const span = this.observerBus.startSpan('observer.diagnose', {
+      endpointKind: 'observer',
+      endpointId: 'verdant-ui-root',
+    });
+    const findings: Array<{
+      readonly severity: 'info' | 'warn' | 'error';
+      readonly subsystem: string;
+      readonly message: string;
+      readonly recommendedAction?: string;
+    }> = [];
+    const field = this.getObserverFieldReport();
+    const chrono = field.chronology;
+    const uStore = field.runtime.unifiedStore;
+    let score = 1024;
+
+    if (chrono.overdueCount > 0) {
+      score -= Math.min(320, chrono.overdueCount * 160);
+      findings.push({
+        severity: 'error',
+        subsystem: 'chronology',
+        message: `${chrono.overdueCount} active chronological object(s) overdue (coherence ${chrono.coherenceQ10}/1024).`,
+        recommendedAction: 'Run observer.enact({ type: "self_heal" }) or inspect overdue task spans.',
+      });
+    } else if (chrono.coherenceQ10 < 512) {
+      score -= 128;
+      findings.push({
+        severity: 'warn',
+        subsystem: 'chronology',
+        message: `Global timeliness coherence is ${chrono.coherenceQ10}/1024 across modalities.`,
+        recommendedAction: 'Review recent turn TTFT vs calibrated throughput budgets.',
+      });
+    }
+
+    if (field.runtime.model && uStore && !uStore.kvPrefixPersistedOpfs && uStore.kvPrefixBlocks > 0) {
+      score -= 96;
+      findings.push({
+        severity: 'warn',
+        subsystem: 'kv-cache',
+        message: 'Unified KV prefix blocks exist in RAM but have not yet persisted to OPFS.',
+        recommendedAction: 'Run observer.enact({ type: "self_heal" }) to flush unified KV persistence.',
+      });
+    }
+
+    const recentErrors = this.observerBus
+      .getRecentSpans()
+      .filter((s) => s.status === 'error');
+    if (recentErrors.length > 0) {
+      score -= Math.min(256, recentErrors.length * 96);
+      findings.push({
+        severity: 'error',
+        subsystem: 'otel',
+        message: `${recentErrors.length} recent OTEL error span(s) recorded (latest: ${recentErrors[recentErrors.length - 1]!.name}).`,
+        recommendedAction: 'Inspect recentSpans() error attributes and reconcile the failing part.',
+      });
+    }
+
+    if (this.cachedLayout && !this.cachedLayout.certificate.ok) {
+      score -= 192;
+      findings.push({
+        severity: 'error',
+        subsystem: 'ui-layout',
+        message: 'Synthesized UI layout certificate failed verification.',
+        recommendedAction: 'Re-solve layout tree on resize or inspect PrismSurfaceShell bounds.',
+      });
+    }
+
+    const galleryCounts = this.galleryStore.galleryCounts();
+    const prisms = this.prismStore.list();
+    const spacesCount = prisms.filter(
+      (p) => (p.declaration?.view?.proceduralOrgan?.mediaType ?? p.declaration?.concept.mediaType) === 'space',
+    ).length;
+    const featureCoverage: Record<string, number> = {
+      ...galleryCounts,
+      spaces: spacesCount,
+      publishedPrisms: this.prismStore.listPublishedSummaries().length,
+      enabledContentStreams: this.contentStreams.listAll().filter((s) => s.enabled).length,
+      cachedModels: field.runtime.cachedModels.length,
+    };
+
+    const unindexedPrisms = prisms.filter((p) => {
+      const mt = p.declaration?.view?.proceduralOrgan?.mediaType ?? p.declaration?.concept.mediaType;
+      return mt && mt !== 'space' && !this.galleryStore.get(p.id);
+    });
+    if (unindexedPrisms.length > 0) {
+      score -= 96;
+      findings.push({
+        severity: 'warn',
+        subsystem: 'galleries',
+        message: `${unindexedPrisms.length} Prism(s) missing from Gallery index.`,
+        recommendedAction: 'Run observer.enact({ type: "self_heal" }) to synchronize gallery & expert indexes.',
+      });
+    }
+
+    if (findings.length === 0) {
+      findings.push({
+        severity: 'info',
+        subsystem: 'root',
+        message: 'All monitored subsystems (runtime, OPFS, KV cache, chronology, galleries, UI layout) are healthy.',
+      });
+    }
+
+    const overallHealthQ10 = Math.max(0, Math.min(1024, Math.round(score)));
+    const status =
+      overallHealthQ10 >= 768 ? 'healthy' : overallHealthQ10 >= 448 ? 'attention' : 'degraded';
+    span.setAttributes({
+      'verdant.health_q10': overallHealthQ10,
+      'verdant.findings': findings.length,
+    });
+    span.end('ok');
+    return { overallHealthQ10, status, featureCoverage, findings };
+  }
+
+  /**
+   * Self-healing reconciliation (`REQ-SELF-HEALING`): synchronizes Gallery and Expert Basis
+   * indexes from authoritative Prism storage and clears stale errored tasks.
+   */
+  reconcileSelfHeal(): { readonly syncedPrisms: number; readonly clearedErrors: number } {
+    const prisms = this.prismStore.list();
+    this.galleryStore.syncFromPrisms(prisms);
+    this.expertRegistry.syncPrismsAsExperts(prisms);
+    let clearedErrors = 0;
+    for (const [partId, task] of this.partTasks.entries()) {
+      if (task.status === 'error' && !task.busy) {
+        this.setPartTask(partId, { status: 'idle', busy: false, label: '', banner: null });
+        clearedErrors += 1;
+      }
+    }
+    return { syncedPrisms: prisms.length, clearedErrors };
+  }
+
+  /**
+   * Guarded GUI Action Enactment (`Studio.Gui.Enactment` · `REQ-AGENT-USERS` · `REQ-AGENT-OBSERVER`).
+   * Executes the exact same actions available to human users under `ContainerGrantMatrix` (FK-07)
+   * and records every enactment on the W3C OTEL `observerBus`.
+   */
+  async enactGuiAction(
+    action:
+      | { readonly type: 'open_home' }
+      | { readonly type: 'open_settings' }
+      | { readonly type: 'open_gallery'; readonly mediaType: GalleryMediaType }
+      | { readonly type: 'open_prism'; readonly prismId: string; readonly mode?: 'app' | 'studio' }
+      | { readonly type: 'set_surface_mode'; readonly mode: PrismSurfaceMode }
+      | { readonly type: 'set_dark_mode'; readonly dark: boolean }
+      | { readonly type: 'set_space'; readonly spaceId: string }
+      | { readonly type: 'set_streaming_consent'; readonly consent: 'accepted' | 'paused' }
+      | { readonly type: 'toggle_content_stream'; readonly streamId: string; readonly enabled: boolean }
+      | { readonly type: 'create_artifact'; readonly prompt: string; readonly mediaType?: GalleryMediaType; readonly spaceName?: string }
+      | { readonly type: 'refine_prism'; readonly prismId: string; readonly instruction: string }
+      | { readonly type: 'publish_prism'; readonly prismId: string }
+      | { readonly type: 'delete_prism'; readonly prismId: string }
+      | { readonly type: 'self_heal' },
+  ): Promise<{ readonly ok: boolean; readonly action: string; readonly result?: unknown; readonly error?: string }> {
+    const span = this.observerBus.startSpan('observer.enact', {
+      endpointKind: 'observer',
+      endpointId: this.activePartId,
+      attributes: { 'verdant.action': action.type },
+    });
+    try {
+      let result: unknown;
+      switch (action.type) {
+        case 'open_home':
+          this.onOpenHomeCallback?.();
+          result = { view: 'thread' };
+          break;
+        case 'open_settings':
+          this.onOpenSettingsCallback?.();
+          result = { view: 'settings' };
+          break;
+        case 'open_gallery':
+          this.onOpenGalleryCallback?.(action.mediaType);
+          result = { view: 'gallery', mediaType: action.mediaType };
+          break;
+        case 'open_prism': {
+          const p = this.prismStore.get(action.prismId);
+          if (!p) throw new Error(`Prism "${action.prismId}" not found.`);
+          this.onOpenPrismCallback?.(action.prismId, action.mode ?? 'app');
+          result = { view: 'prism', prismId: action.prismId, mode: action.mode ?? 'app' };
+          break;
+        }
+        case 'set_surface_mode':
+          this.onSetSurfaceModeCallback?.(action.mode);
+          result = { surfaceMode: action.mode };
+          break;
+        case 'set_dark_mode':
+          this.onSetDarkModeCallback?.(action.dark);
+          result = { darkMode: action.dark };
+          break;
+        case 'set_space':
+          this.workerClient.cognitiveObserver.possession.setActiveCompartment(action.spaceId);
+          result = { activeSpace: this.workerClient.cognitiveObserver.possession.getActiveCompartmentId() };
+          break;
+        case 'set_streaming_consent':
+          this.onSetStreamingConsentCallback?.(action.consent);
+          result = { streamingConsent: action.consent };
+          break;
+        case 'toggle_content_stream':
+          this.contentStreams.toggleStream(action.streamId, action.enabled);
+          result = { streamId: action.streamId, enabled: action.enabled };
+          break;
+        case 'create_artifact': {
+          if (!this.workerClient.cognitiveObserver.grants.isAllowed('prism-runtime')) {
+            throw new Error('Prism creation denied by ContainerGrantMatrix (FK-07).');
+          }
+          const bridge = await this.getStudioChatBridge();
+          result = await bridge.createArtifactFromPrompt({
+            prompt: action.prompt,
+            forcedMediaType: action.mediaType,
+            spaceName: action.spaceName,
+          });
+          break;
+        }
+        case 'refine_prism': {
+          if (!this.workerClient.cognitiveObserver.grants.isAllowed('prism-runtime')) {
+            throw new Error('Prism refinement denied by ContainerGrantMatrix (FK-07).');
+          }
+          const bridge = await this.getStudioChatBridge();
+          result = await bridge.refinePrismFromPrompt({
+            target: action.prismId,
+            instruction: action.instruction,
+          });
+          break;
+        }
+        case 'publish_prism':
+          result = await this.publishPrism(action.prismId);
+          break;
+        case 'delete_prism':
+          this.cancelPartTask(action.prismId);
+          await this.prismStore.delete(action.prismId);
+          this.galleryStore.syncFromPrisms(this.prismStore.list());
+          result = { deleted: action.prismId };
+          break;
+        case 'self_heal':
+          result = this.reconcileSelfHeal();
+          break;
+      }
+      span.end('ok');
+      return { ok: true, action: action.type, result };
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      span.end('error', error);
+      return { ok: false, action: action.type, error };
+    }
+  }
+
   listGalleryArtifacts(): readonly ContentArtifactRecord[] {
     return this.galleryStore.listAll();
   }
@@ -1122,6 +1486,10 @@ export function getVerdantRootPrismRuntime(): VerdantRootPrismRuntime {
       const root = singletonRootPrism;
       (window as unknown as Record<string, unknown>).__VERDANT_OBSERVER__ = Object.freeze({
         fieldReport: () => root.getObserverFieldReport(),
+        perceive: () => root.perceiveGuiState(),
+        diagnose: () => root.diagnoseSystemHealth(),
+        enact: (action: Parameters<VerdantRootPrismRuntime['enactGuiAction']>[0]) =>
+          root.enactGuiAction(action),
         chronology: () => root.getTemporalCoherenceSnapshot(),
         recentSpans: () => root.observerBus.getRecentSpans(),
         otlpJson: () => root.observerBus.toOtlpJson(),

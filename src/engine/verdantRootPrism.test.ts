@@ -314,3 +314,61 @@ test('64-token KV page-boundary checkpoint yields long background part cleanly f
     false,
   );
 });
+
+test('Active Observer perceive(), diagnose(), and guarded enact() work under FK-07 and emit OTEL spans', async () => {
+  const { client } = createStubWorkerClient();
+  const root = new VerdantRootPrismRuntime({ workerClient: client });
+  let currentView = 'thread';
+  let currentDark = false;
+  root.setNavigationCallbacks({
+    onOpenHome: () => { currentView = 'thread'; },
+    onOpenSettings: () => { currentView = 'settings'; },
+    onOpenGallery: (mt) => { currentView = `gallery:${mt}`; },
+    onOpenPrism: (id) => { currentView = `prism:${id}`; },
+    onSetDarkMode: (d) => { currentDark = d; },
+    onGetUiState: () => ({
+      activeView: currentView,
+      surfaceMode: 'preview',
+      darkMode: currentDark,
+      storesHydrated: true,
+    }),
+  });
+
+  const p0 = root.perceiveGuiState();
+  assert.equal(p0.ui.activeView, 'thread');
+  assert.ok(p0.parts.length >= 4);
+
+  const navRes = await root.enactGuiAction({ type: 'open_gallery', mediaType: 'audio' });
+  assert.equal(navRes.ok, true);
+  assert.equal(currentView, 'gallery:audio');
+
+  const createRes = await root.enactGuiAction({
+    type: 'create_artifact',
+    prompt: 'Compose a calm ambient synth track at 82 BPM',
+    mediaType: 'audio',
+  });
+  assert.equal(createRes.ok, true);
+
+  const diag = root.diagnoseSystemHealth();
+  assert.equal(diag.status, 'healthy');
+  assert.ok(diag.overallHealthQ10 >= 768);
+  assert.equal(diag.featureCoverage.audio, 1);
+
+  const healRes = await root.enactGuiAction({ type: 'self_heal' });
+  assert.equal(healRes.ok, true);
+
+  // FK-07 guard: denying prism-runtime must block create_artifact cleanly
+  client.cognitiveObserver.grants.deny('prism-runtime');
+  const blocked = await root.enactGuiAction({
+    type: 'create_artifact',
+    prompt: 'Create a picture of a mountain',
+  });
+  assert.equal(blocked.ok, false);
+  assert.match(blocked.error ?? '', /ContainerGrantMatrix/i);
+
+  const spanNames = root.observerBus.getRecentSpans().map((s) => s.name);
+  assert.ok(spanNames.includes('observer.perceive'));
+  assert.ok(spanNames.includes('observer.diagnose'));
+  assert.ok(spanNames.includes('observer.enact'));
+  root.dispose();
+});

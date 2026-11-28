@@ -25,12 +25,20 @@ function safeJsonForScript(obj: unknown): string {
 
 const SHARED_GAME_SFX_SNIPPET = `
 let sfxEnabled = true, sfxCtx = null;
+function disposeGameAudio() {
+  if (sfxCtx && sfxCtx.state !== 'closed') {
+    try { void sfxCtx.close(); } catch (_) {}
+  }
+  sfxCtx = null;
+}
+window.addEventListener('pagehide', disposeGameAudio);
+window.addEventListener('beforeunload', disposeGameAudio);
 function playSfx(freq, dur = 0.08, type = 'triangle', gain = 0.08) {
   if (!sfxEnabled) return;
   try {
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return;
-    if (!sfxCtx) sfxCtx = new AC();
+    if (!sfxCtx || sfxCtx.state === 'closed') sfxCtx = new AC();
     if (sfxCtx.state === 'suspended') void sfxCtx.resume();
     const osc = sfxCtx.createOscillator(), g = sfxCtx.createGain();
     osc.type = type; osc.frequency.setValueAtTime(freq, sfxCtx.currentTime);

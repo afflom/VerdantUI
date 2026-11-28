@@ -573,6 +573,11 @@ export class ObserverChronology {
     const prev = this.objects.get(objectId);
     if (!prev) return null;
     const mono = this.clock.monoNow();
+    // Idempotent: once completed, preserve the true completion duration instead of overwriting it
+    // if a later status event (e.g., background prewarm resume) calls completeObject() again!
+    if (prev.completed) {
+      return this.toObservation(prev, mono);
+    }
     const wall = this.clock.wallNow();
     const durationMs = Math.max(0, mono - prev.startedMonoMs);
     const next: TemporalObjectRecord = {

@@ -742,15 +742,17 @@ function detectDirectOperator(text: string, hasAttachment: boolean): DirectRoute
     };
   }
 
-  // 2. Live Verdant / vTensor runtime & OPFS inspection
+  // 2. Live Verdant / vTensor runtime & OPFS inspection (direct status queries only — never hijack reflective prose)
   if (
     !hasAttachment &&
-    trimmed.length <= 180 &&
+    trimmed.length <= 140 &&
     /\b(inspect|check|show|status|diagnostics?|telemetry)\b/.test(lower) &&
     /\b(runtime|verdant|vtensor|engine|opfs|storage|thread\s*pool|workers?|cached\s+models?)\b/.test(
       lower,
     ) &&
-    !/\b(write|code|implement|refactor|design|explain\s+how)\b/.test(lower)
+    !/\b(write|code|implement|refactor|design|explain\s+how|tell\s+me|honestly|limitations?|what\s+feels|how\s+do\s+you|why\b|experience|opinion|improve)\b/.test(
+      lower,
+    )
   ) {
     return {
       toolName: 'inspect_runtime',

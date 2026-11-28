@@ -18,11 +18,18 @@ test('detectStudioChatIntent recognizes creation, refinement, Space curation, an
   assert.equal(detectStudioChatIntent('Update that picture to midnight with stars')?.toolName, 'studio_refine_prism');
   assert.equal(detectStudioChatIntent('List my Prisms')?.toolName, 'studio_manage_spaces');
 
-  // Informational questions must NEVER be hijacked
+  // Informational questions & ordinary English sentences must NEVER be hijacked
   assert.equal(detectStudioChatIntent('What is a nebula?'), null);
   assert.equal(detectStudioChatIntent('Explain how Minesweeper works'), null);
   assert.equal(detectStudioChatIntent('How do video codecs work?'), null);
   assert.equal(detectStudioChatIntent('Write a Python function to sort a list'), null);
+  assert.equal(detectStudioChatIntent('Open a savings account'), null);
+  assert.equal(detectStudioChatIntent('Delete duplicate rows in SQL'), null);
+
+  // Extended REQ-PRISM-WORKS natural-language creation intents
+  assert.equal(detectStudioChatIntent('Create a research report on battery recycling')?.toolName, 'studio_create_artifact');
+  assert.equal(detectStudioChatIntent('Build a pomodoro timer app')?.toolName, 'studio_create_artifact');
+  assert.equal(detectStudioChatIntent('Open my prism Mars Mission')?.toolName, 'studio_manage_spaces');
 });
 
 test('StudioChatBridge creates inline PNG Pictures, Stereo WAV Audio, Games, Spaces-as-Prisms, refines, and deletes cleanly', async () => {

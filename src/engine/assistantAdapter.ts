@@ -1619,6 +1619,10 @@ export function createLlamaVTensorAdapter(
         'verdant.total_ms': totalStreamTime,
         'verdant.ttft_ms': firstTokenTime !== undefined ? firstTokenTime - streamStartTime : totalStreamTime,
         'verdant.prompt_tokens': lastPromptTokens,
+        'verdant.prefill_tokens': lastPrefillTokensEvaluated,
+        ...(lastPrefillTokensPerSec !== undefined
+          ? { 'verdant.prefill_tok_s': Number(lastPrefillTokensPerSec.toFixed(2)) }
+          : {}),
         'verdant.generated_tokens': lastGeneratedTokens,
         'verdant.tok_per_sec': lastTokensPerSecond,
         'verdant.coherence_q10': client.cognitiveObserver.chronology.snapshot().coherenceQ10,

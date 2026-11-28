@@ -3,26 +3,26 @@
   "requirement": "REQ-STUDIO-TRACKING",
   "repository": "afflom/verdant-studio",
   "branch": "main",
-  "commit": "85dc9880c955d084c47624107ecb2971daef93f2",
-  "pinnedAt": "2026-11-27T12:04:03.953Z",
+  "commit": "b037b426925a6230dae1ce89ec33ad1d631fcc69",
+  "pinnedAt": "2026-11-28T01:35:50.228Z",
   "registers": [
     {
       "idPrefix": "VERDANT-STUDIO-AUTHORITIES-",
       "path": "model/authorities.toml",
       "mediaType": "application/toml",
-      "sha256": "42fe2ca195a2331163fc700f03964a3315d665cb6e997157fdbcc19441afa22d"
+      "sha256": "d0dccd1a01d27c55331bb92bf4110d95c4b36cf7d8d3d1eca2217e391b87086e"
     },
     {
       "idPrefix": "VERDANT-STUDIO-IDS-",
       "path": "model/ids.toml",
       "mediaType": "application/toml",
-      "sha256": "40feeeae511c94051ee0e3603b44d3139a98452a74baa2411223092ada04b93b"
+      "sha256": "ced81e92ea29f183d96d166cc3f8362fe272370e222b4f8b28c04e1fb52d1b26"
     },
     {
       "idPrefix": "VERDANT-STUDIO-ADMISSIONS-",
       "path": "model/admissions.json",
       "mediaType": "application/json",
-      "sha256": "686810cab628055a21c693f43da91cdab8b912fe5da07c39a8d64cb05dcaf1a3"
+      "sha256": "c0c71ce187fd3c47006cbb94658b66cf0d73bee4cb46fb2b1bd604be07d7eeee"
     }
   ]
 }

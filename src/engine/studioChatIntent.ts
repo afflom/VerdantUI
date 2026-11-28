@@ -107,9 +107,9 @@ export function detectStudioChatIntent(
     };
   }
 
-  // 4. Open / Delete / Publish a Prism or Space by name
+  // 4. Open / Delete / Publish a Prism or Space by explicit workspace noun (never hijack generic English like "open a bank account")
   const manageMatch = trimmed.match(
-    /^(?:please\s+)?(open|delete|remove|publish)\s+(?:(?:my|the)\s+)?(?:prism|space|app|game|picture|track|document)?\s*["'“]?([^"'”?!.]{2,56})["'”]?[?.!]*$/i,
+    /^(?:please\s+)?(open|delete|remove|publish)\s+(?:(?:my|the)\s+)?(?:prism|space|app|game|picture|image|artwork|track|audio|song|video|document|story|research|utility|creation)\s+["'“]?([^"'”?!.]{2,56})["'”]?[?.!]*$/i,
   );
   if (manageMatch && !/\bnotes?\b/i.test(trimmed)) {
     const verb = manageMatch[1]!.toLowerCase();
@@ -164,7 +164,7 @@ export function detectStudioChatIntent(
   if (!isCreationVerb && !isDirectMediaSeed) return null;
 
   const explicitMedia =
-    /\b(picture|image|artwork|logo|brand\s*mark|emblem|cover\s+art|book\s+cover|album\s+cover|album\s+art|game\s+cover|painting|illustration|poster|wallpaper|portrait|landscape|nebula|seascape|pixel\s+art|mosaic|constellation|audio|music|song|soundtrack|soundscape|beat|lo-?fi|melody|synth|sound\s+effects?|video|animation|motion\s+graphic|storyboard|reel|trailer|game|minesweeper|breakout|pong|snake|2048|memory\s+match|lights?\s+out|connect\s*4|tic[\s-]?tac[\s-]?toe|gomoku|game\s+of\s+life|rule\s*30|novel|book|short\s+story|essay|manuscript|chapter|research\s+program|study\s+plan|habit\s+tracker|habit\s+guardian|schedule\s+guard|workflow\s+checklist|calculator\s+app)\b/i.test(
+    /\b(picture|image|artwork|logo|brand\s*mark|emblem|cover\s+art|book\s+cover|album\s+cover|album\s+art|game\s+cover|painting|illustration|poster|wallpaper|portrait|landscape|nebula|seascape|pixel\s+art|mosaic|constellation|audio|music|song|soundtrack|soundscape|beat|lo-?fi|melody|synth|sound\s+effects?|video|animation|motion\s+graphic|storyboard|reel|trailer|game|minesweeper|breakout|pong|snake|2048|memory\s+match|lights?\s+out|connect\s*4|tic[\s-]?tac[\s-]?toe|gomoku|game\s+of\s+life|rule\s*30|novel|book|short\s+story|essay|manuscript|chapter|screenplay|research\s+(?:program|report|brief|notebook)|study\s+(?:plan|guide)|literature\s+review|habit\s+tracker|habit\s+guardian|schedule\s+guard|workflow\s+checklist|calculator\s+app|pomodoro(?:\s+timer)?|timer\s+app|budget\s+tracker|flashcards(?:\s+app)?|tracker\s+app|planner\s+app|converter\s+app|dashboard\s+app)\b/i.test(
       trimmed,
     );
 

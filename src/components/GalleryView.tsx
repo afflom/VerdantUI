@@ -35,6 +35,7 @@ import type {
   PrismSurfaceMode,
   SynthesizedPrismFrame,
 } from '../engine/observerUiSynthesizer';
+import type { AudioWeights } from '../engine/prismMediaOrgans';
 import type { VerdantPrismProject } from '../engine/prismStudio';
 import { PrismSurfaceShell, type PrismSurfaceMessage } from './PrismSurfaceShell';
 
@@ -54,6 +55,7 @@ interface GalleryViewProps {
   onDeleteArtifact: (id: string) => void;
   onAssignToSpace: (artifactId: string, spaceId: string) => void;
   onOpenSpace: (spaceId: string) => void;
+  getPrismById?: (id: string) => VerdantPrismProject | null | undefined;
 }
 
 function galleryIcon(mt: GalleryMediaType) {
@@ -91,6 +93,7 @@ export const GalleryView: FC<GalleryViewProps> = ({
   onDeleteArtifact,
   onAssignToSpace,
   onOpenSpace,
+  getPrismById,
 }) => {
   const [activeCategory, setActiveCategory] = useState<string>('all');
   const [spaceFilter, setSpaceFilter] = useState<string>('all');
@@ -101,22 +104,33 @@ export const GalleryView: FC<GalleryViewProps> = ({
 
   const handleQuickPlayAudio = async (item: ContentArtifactRecord) => {
     if (playingAudioUrl[item.id]) return;
-    const { composeMultiTrackArrangement, synthesizeCompositionStereoPcm, encodeStereoWav, encodeStereoWavDataUrl } =
-      await import('../engine/audioSynthesisEngine');
+    const {
+      composeMultiTrackArrangement,
+      synthesizeCompositionStereoPcm,
+      masterStereoPcm,
+      encodeStereoWav,
+      encodeStereoWavDataUrl,
+    } = await import('../engine/audioSynthesisEngine');
+    const organ = getPrismById?.(item.id)?.declaration?.view?.proceduralOrgan;
+    const aw: AudioWeights | null =
+      organ?.mediaType === 'audio' ? (organ.weights as AudioWeights) : null;
     const comp = composeMultiTrackArrangement({
-      title: item.title,
-      style: item.categories.includes('Beats & Rhythm')
-        ? 'rhythm-pulse'
-        : item.categories.includes('Melodic')
-          ? 'melodic-arpeggio'
-          : 'ambient-pad',
-      bpm: 92,
-      rootMidi: 60,
-      scale: 'pentatonic',
-      durationSec: Math.min(8, item.audioDurationSec ?? 6),
+      title: aw?.title ?? item.title,
+      style:
+        aw?.style ??
+        (item.categories.includes('Beats & Rhythm')
+          ? 'rhythm-pulse'
+          : item.categories.includes('Melodic')
+            ? 'melodic-arpeggio'
+            : 'ambient-pad'),
+      bpm: aw?.bpm ?? 92,
+      rootMidi: aw?.rootMidi ?? 60,
+      scale: aw?.scale ?? 'pentatonic',
+      durationSec: Math.min(10, aw?.durationSec ?? item.audioDurationSec ?? 6),
     });
-    const pcm = synthesizeCompositionStereoPcm(comp, 22_050);
-    const wav = encodeStereoWav(pcm.left, pcm.right, pcm.sampleRate);
+    const raw = synthesizeCompositionStereoPcm(comp, 22_050);
+    const mastered = masterStereoPcm(raw.left, raw.right, raw.sampleRate);
+    const wav = encodeStereoWav(mastered.left, mastered.right, raw.sampleRate);
     setPlayingAudioUrl((prev) => ({ ...prev, [item.id]: encodeStereoWavDataUrl(wav) }));
   };
 

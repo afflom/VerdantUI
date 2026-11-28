@@ -256,4 +256,17 @@ test('ObserverChronology.deriveTurnBudgetMs keeps SLA floor before calibration a
   assert.equal(calibrated, 16_000);
   assert.equal(chrono.deriveTurnBudgetMs(500, 2_500), 2_500);
   assert.equal(chrono.deriveTurnBudgetMs(100_000, 2_500), 60_000);
+
+  // Idempotent completeObject(): calling completeObject() again later must NOT overwrite original duration
+  let mono = 1_000;
+  const clk = { wallNow: () => 1_700_000_000_000 + mono, monoNow: () => mono };
+  const c2 = new ObserverChronology({ clock: clk });
+  c2.beginObject({ objectId: 'app:init', modality: 'system', kind: 'app-init', label: 'Boot', budgetMs: 25_000 });
+  mono = 4_000;
+  const first = c2.completeObject('app:init')!;
+  assert.equal(first.elapsedMs, 3_000);
+  mono = 180_000;
+  const second = c2.completeObject('app:init')!;
+  assert.equal(second.elapsedMs, 3_000, 'Second completeObject call must preserve initial completion duration');
+  assert.equal(c2.snapshot().modalityCoherenceQ10.system, first.timelinessQ10);
 });
