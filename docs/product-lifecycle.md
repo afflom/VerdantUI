@@ -4,7 +4,7 @@
 
 - **Active Features:** 21
 - **Proposed / Planned Features:** 0
-- **Recorded Releases:** 16
+- **Recorded Releases:** 17
 
 ## Feature Register
 
@@ -52,3 +52,4 @@
 | `v0.13.1` | `v2.22.4` | `b037b42692` | 19 | Maintenance & upstream pin release (v2.22.4) |
 | `v0.13.2` | `v2.22.4` | `611d75170d` | 19 | Maintenance & upstream pin release (v2.22.4) |
 | `v0.13.3` | `v2.22.4` | `afee10ede5` | 19 | Maintenance & upstream pin release (v2.22.4) |
+| `v0.14.0` | `v2.22.4` | `77a3365696` | 21 | Lean-Proved VerdantUI Root Prism (verdant-ui.holo), Thin OTEL-Traced Host Substrate & Studio.Telemetry W3C Trace Parity; Unified Declarative Organ Registry, Mechanical MCP/WCAG/Facet Acceptance Gates & Zero-Dependency Chrome CDP Eval Harness |

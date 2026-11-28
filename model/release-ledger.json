@@ -387,6 +387,38 @@
         "VUI-FEAT-019"
       ],
       "summary": "Maintenance & upstream pin release (v2.22.4)"
+    },
+    {
+      "version": "0.14.0",
+      "tag": "v0.14.0",
+      "releasedAt": "2026-11-28T14:19:47.340Z",
+      "commit": "c66094ce8b58fe732a930efbadad43f50db35aa5",
+      "engineTag": "v2.22.4",
+      "studioCommit": "77a336569643eb51316d31cdfa6d34bc176b53bd",
+      "activeFeatureIds": [
+        "VUI-FEAT-001",
+        "VUI-FEAT-002",
+        "VUI-FEAT-003",
+        "VUI-FEAT-004",
+        "VUI-FEAT-005",
+        "VUI-FEAT-006",
+        "VUI-FEAT-007",
+        "VUI-FEAT-008",
+        "VUI-FEAT-009",
+        "VUI-FEAT-010",
+        "VUI-FEAT-011",
+        "VUI-FEAT-012",
+        "VUI-FEAT-013",
+        "VUI-FEAT-014",
+        "VUI-FEAT-015",
+        "VUI-FEAT-016",
+        "VUI-FEAT-017",
+        "VUI-FEAT-018",
+        "VUI-FEAT-019",
+        "VUI-FEAT-020",
+        "VUI-FEAT-021"
+      ],
+      "summary": "Lean-Proved VerdantUI Root Prism (verdant-ui.holo), Thin OTEL-Traced Host Substrate & Studio.Telemetry W3C Trace Parity; Unified Declarative Organ Registry, Mechanical MCP/WCAG/Facet Acceptance Gates & Zero-Dependency Chrome CDP Eval Harness"
     }
   ]
 }

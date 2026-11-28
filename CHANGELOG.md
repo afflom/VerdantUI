@@ -2,6 +2,14 @@
 
 > Generated mechanically by `npm run studio:publish` from `model/release-ledger.json` and `model/features.json`.
 
+## v0.14.0 (2026-11-28)
+
+Lean-Proved VerdantUI Root Prism (verdant-ui.holo), Thin OTEL-Traced Host Substrate & Studio.Telemetry W3C Trace Parity; Unified Declarative Organ Registry, Mechanical MCP/WCAG/Facet Acceptance Gates & Zero-Dependency Chrome CDP Eval Harness
+
+- **Engine Pin:** `afflom/verdant-engine@v2.22.4`
+- **Studio Pin:** `afflom/verdant-studio@77a336569643`
+- **Active Features:** `VUI-FEAT-001`, `VUI-FEAT-002`, `VUI-FEAT-003`, `VUI-FEAT-004`, `VUI-FEAT-005`, `VUI-FEAT-006`, `VUI-FEAT-007`, `VUI-FEAT-008`, `VUI-FEAT-009`, `VUI-FEAT-010`, `VUI-FEAT-011`, `VUI-FEAT-012`, `VUI-FEAT-013`, `VUI-FEAT-014`, `VUI-FEAT-015`, `VUI-FEAT-016`, `VUI-FEAT-017`, `VUI-FEAT-018`, `VUI-FEAT-019`, `VUI-FEAT-020`, `VUI-FEAT-021`
+
 ## v0.13.3 (2026-11-28)
 
 Maintenance & upstream pin release (v2.22.4)
