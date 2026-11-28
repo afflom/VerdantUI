@@ -166,3 +166,67 @@ test('GgufTokenizer GPT-2 byte-level BPE handles atomic special tokens, merges, 
   const decoded = tok.decode(encoded);
   assert.equal(decoded, 'user\nHi caf\u00E9');
 });
+
+test('GgufTokenizer preserves structural <think>/<tool_call> tokens on encode and stream decode even when token_type=3', () => {
+  const vocab = [
+    '<|endoftext|>', // 0 (control)
+    '<|im_start|>',  // 1 (control)
+    '<|im_end|>',    // 2 (control)
+    '<think>',       // 3 (marked control=3 in some GGUFs!)
+    '</think>',      // 4 (marked control=3 in some GGUFs!)
+    '<tool_call>',   // 5 (marked normal=1 in some GGUFs!)
+    '</tool_call>',  // 6 (marked user-defined=4)
+    'o', 'k', 'ok', '\u010A',
+  ];
+  const tokenTypes = [3, 3, 3, 3, 3, 1, 4, 1, 1, 1, 1];
+  const mockModel: ParsedGgufModel = {
+    version: 3,
+    alignment: 32,
+    dataOffset: 0,
+    fileByteLength: 0,
+    metadata: {
+      'tokenizer.ggml.tokens': vocab,
+      'tokenizer.ggml.token_type': tokenTypes,
+      'tokenizer.ggml.merges': ['o k'],
+      'tokenizer.ggml.add_bos_token': false,
+    },
+    tensors: [],
+    tensorMap: new Map(),
+    rawBytes: new Uint8Array(0),
+    hparams: {
+      architecture: 'qwen3',
+      name: 'mock-qwen3',
+      contextLength: 256,
+      embeddingLength: 64,
+      blockCount: 1,
+      feedForwardLength: 128,
+      headCount: 4,
+      headCountKv: 4,
+      headDim: 16,
+      rmsNormEps: 1e-5,
+      ropeFreqBase: 100000,
+      ropeFreqScale: 1.0,
+      ropeDimensionCount: 16,
+      ropeType: 'norm',
+      vocabSize: vocab.length,
+      bosTokenId: 1,
+      eosTokenId: 2,
+      unkTokenId: 0,
+      addBosToken: false,
+      tokenizerModel: 'gpt2',
+      preTokenizer: 'qwen2',
+      chatTemplate: '<|im_start|>',
+      primaryQuantization: 'Q4_K',
+    },
+  };
+
+  const tok = new GgufTokenizer(mockModel);
+  const encoded = tok.encode('<think>\nok</think>\n<tool_call>ok</tool_call>');
+  assert.ok(encoded.includes(3), '<think> must encode atomically');
+  assert.ok(encoded.includes(4), '</think> must encode atomically');
+  assert.ok(encoded.includes(5), '<tool_call> must encode atomically even with token_type=1');
+  assert.ok(encoded.includes(6), '</tool_call> must encode atomically');
+
+  const decoded = tok.decode(encoded);
+  assert.equal(decoded, '<think>\nok</think>\n<tool_call>ok</tool_call>');
+});

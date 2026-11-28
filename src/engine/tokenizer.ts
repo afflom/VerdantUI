@@ -66,6 +66,23 @@ const KNOWN_EOG_PIECES = new Set<string>([
   '</s>',
 ]);
 
+/**
+ * Structural reasoning & tool-call XML tokens that MUST always be encoded atomically
+ * and NEVER suppressed during stream decoding (even when a GGUF marks them `token_type = 3`).
+ */
+const STRUCTURAL_SEMANTIC_TOKENS = new Set<string>([
+  '<think>',
+  '</think>',
+  '<thought>',
+  '</thought>',
+  '<|thought|>',
+  '<|/thought|>',
+  '<tool_call>',
+  '</tool_call>',
+  '<tool_response>',
+  '</tool_response>',
+]);
+
 export class GgufTokenizer {
   readonly vocab: readonly string[];
   readonly scores: readonly number[];
@@ -157,8 +174,9 @@ export class GgufTokenizer {
       }
 
       const tType = tokenTypes ? tokenTypes[i] : 1;
-      if (tType === 3 || tType === 4) {
-        if (tType === 3) {
+      const isStructuralSemantic = STRUCTURAL_SEMANTIC_TOKENS.has(piece);
+      if (tType === 3 || tType === 4 || isStructuralSemantic) {
+        if (tType === 3 && !isStructuralSemantic) {
           this.controlTokenIds.add(i);
         }
         if (piece.length > 0) {

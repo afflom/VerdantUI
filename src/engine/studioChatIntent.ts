@@ -92,7 +92,7 @@ export function detectStudioChatIntent(
 
   // 3. Add an artifact to a Space
   const addToSpaceMatch = trimmed.match(
-    /^(?:please\s+)?(?:add|put|save|move)\s+(?:(?:that|this|it|the\s+(?:last|latest)\s+\w+)|["'“]?([^"'”]{2,48})["'”]?)\s+(?:to|into|in)\s+(?:(?:my|the)\s+)?["'“]?([^"'”?!.]{2,48})["'”]?(?:\s+space)?[?.!]*$/i,
+    /^(?:please\s+)?(?:add|put|save|move)\s+(?:(?:(?:that|this|the\s+(?:last|latest))(?:\s+(?:picture|image|artwork|audio|song|track|video|game|document|story|research|utility|tool|prism|item|artifact|budget\s+tracker|flashcards|timer))?|it)|["'“]?([^"'”]{2,48})["'”]?)\s+(?:to|into|in)\s+(?:(?:my|the)\s+)?["'“]?([^"'”?!.]{2,48})["'”]?(?:\s+space)?[?.!]*$/i,
   );
   if (addToSpaceMatch) {
     return {

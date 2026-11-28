@@ -13,7 +13,17 @@ test('detectStudioChatIntent recognizes creation, refinement, Space curation, an
   assert.equal(detectStudioChatIntent('Compose a calm ambient dorian synth track at 84 BPM')?.toolName, 'studio_create_artifact');
   assert.equal(detectStudioChatIntent('Build a playable Breakout arcade game')?.toolName, 'studio_create_artifact');
   assert.equal(detectStudioChatIntent('Create a Space called Mars Mission')?.toolName, 'studio_manage_spaces');
-  assert.equal(detectStudioChatIntent('Add that picture to Mars Mission')?.toolName, 'studio_manage_spaces');
+  const addLatestPic = detectStudioChatIntent('Add that picture to Mars Mission');
+  assert.equal(addLatestPic?.toolName, 'studio_manage_spaces');
+  assert.equal(addLatestPic?.args.artifact, 'latest');
+  assert.equal(addLatestPic?.args.space, 'Mars Mission');
+  const addBudget = detectStudioChatIntent('Add that budget tracker to Science Lab');
+  assert.equal(addBudget?.toolName, 'studio_manage_spaces');
+  assert.equal(addBudget?.args.artifact, 'latest');
+  assert.equal(addBudget?.args.space, 'Science Lab');
+  const addNamed = detectStudioChatIntent('Add "Budget Guard" to Science Lab');
+  assert.equal(addNamed?.args.artifact, 'Budget Guard');
+  assert.equal(addNamed?.args.space, 'Science Lab');
   assert.equal(detectStudioChatIntent('Show my Pictures gallery')?.toolName, 'studio_browse_gallery');
   assert.equal(detectStudioChatIntent('Update that picture to midnight with stars')?.toolName, 'studio_refine_prism');
   assert.equal(detectStudioChatIntent('List my Prisms')?.toolName, 'studio_manage_spaces');
