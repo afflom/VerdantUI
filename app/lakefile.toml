@@ -1,0 +1,6 @@
+name = "PrismTemplate"
+version = "0.1.0"
+defaultTargets = ["PrismTemplate"]
+
+[[lean_lib]]
+name = "PrismTemplate"

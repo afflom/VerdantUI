@@ -60,6 +60,8 @@ export interface OwnerDecisionEntry {
 export interface InvariantIdEntry {
   readonly code: string;
   readonly title: string;
+  readonly level: string;
+  readonly suite: string;
   readonly owner: string;
   readonly evidence: string;
 }
@@ -206,10 +208,12 @@ export function loadStudioLifecycleModel(cwd = process.cwd()): StudioLifecycleMo
   }));
 
   const ids: InvariantIdEntry[] = parseTomlBlocks(idsRaw, 'id').map((b) => ({
-    code: b.code ?? '',
-    title: b.title ?? '',
-    owner: b.owner ?? '',
-    evidence: b.evidence ?? '',
+    code: b.id ?? b.code ?? '',
+    title: b.statement ?? b.title ?? '',
+    level: b.level ?? 'open',
+    suite: b.suite ?? 'verdant-ui',
+    owner: b.owner ?? 'app/src/App.lex.tex',
+    evidence: b.evidence ?? 'model/ids.toml',
   }));
 
   return {
@@ -262,30 +266,6 @@ function validateCitation(
 export function renderGeneratedDocs(model: StudioLifecycleModel): Readonly<Record<string, string>> {
   const activeFeatures = model.features.filter((f) => f.stage === 'active');
   const proposedFeatures = model.features.filter((f) => f.stage === 'proposed');
-
-  const conformance = [
-    '# VerdantUI Conformance & Standards Register',
-    '',
-    '> Generated mechanically by `npm run studio:publish` from `model/` (Rule R1). Do not edit by hand.',
-    '',
-    `- **Service Charter:** Free Public Benefit AI Service (Apache-2.0, 100% client-side, zero servers, zero tracking, zero paywalls)`,
-    `- **Compute Substrate:** \`${model.enginePin.repository}@${model.enginePin.tag}\` (\`${model.enginePin.commit.slice(0, 12)}\`)`,
-    `- **Lifecycle Authority:** \`${model.studioPin.repository}@${model.studioPin.commit.slice(0, 12)}\``,
-    `- **Performance Budgets:** Turn OPFS stall \`<= ${model.performanceBudgets.budgets.turnCompletionOpfsStallMsMax} ms\`, Frame yield KPI \`<= ${model.performanceBudgets.budgets.frameYieldBudgetUsMax} us\`, JS bundle \`<= ${model.performanceBudgets.budgets.totalDistJsKiBMax} KiB\``,
-    '',
-    '## Locked Architectural & Performance Invariants',
-    '',
-    '| ID | Owner | Evidence | Statement |',
-    '| --- | --- | --- | --- |',
-    ...model.ids.map((id) => `| \`${id.code}\` | \`${id.owner}\` | \`${id.evidence}\` | ${id.title} |`),
-    '',
-    '## Pinned Authorities',
-    '',
-    '| Authority | Edition | Scope |',
-    '| --- | --- | --- |',
-    ...model.authorities.map((a) => `| \`${a.id}\` | ${a.edition} | ${a.scope} |`),
-    '',
-  ].join('\n');
 
   const ownerDecisionsDoc = [
     '# VerdantUI Owner Decisions',
@@ -347,7 +327,6 @@ export function renderGeneratedDocs(model: StudioLifecycleModel): Readonly<Recor
   ].join('\n');
 
   return {
-    'CONFORMANCE.md': conformance,
     'docs/owner-decisions.md': ownerDecisionsDoc,
     'docs/product-lifecycle.md': productLifecycleDoc,
     'CHANGELOG.md': changelog,

@@ -1,91 +1,115 @@
-# VerdantUI Authoritative Standards & Upstream Register (`verdant-ui/authorities/1`)
-# Modeled on afflom/verdant-studio `model/authorities.toml`.
-# Every `Std` citation in `model/admissions.json` and `model/features.json` resolves here.
+# model/authorities.toml --- VerdantUI Authoritative Standards & Upstream Register (`spec = "template/2"`).
+#
+# Single source of truth cited by both `prism-code check` / `prism-code build` and
+# `scripts/studio-lifecycle.ts`. Every `Std` citation in `model/admissions.json` and
+# `model/features.json` resolves here.
 
-schema = "verdant-ui/authorities/1"
+spec = "template/2"
 
 [[authority]]
 id = "VERDANT-ENGINE"
 name = "Verdant Engine & vTensor WASM SIMD"
 edition = "v2.22.4"
 source = "https://github.com/afflom/verdant-engine"
-pinFile = "model/engine-pin.json"
+citation = "afflom/verdant-engine v2.22.4 — exclusive browser WASM SIMD compute substrate, multi-core SharedArrayBuffer pool, and bounded memory governors"
 scope = "Exclusive browser WASM SIMD compute substrate, multi-core SharedArrayBuffer pool, and bounded memory governors"
+realized_by = ["VUI-ENGINE-01", "VUI-MOE-01", "VUI-SIMD-01"]
 
 [[authority]]
 id = "VERDANT-STUDIO"
 name = "Verdant Studio Lifecycle Management Model"
-edition = "main@da5083b5ee22"
+edition = "main@afee10ede538"
 source = "https://github.com/afflom/verdant-studio"
-pinFile = "model/studio-pin.json"
+citation = "afflom/verdant-studio — closed-API product/feature lifecycle, well-founded Req/Std/Der admission, monotone locks, and Prism-first verification"
 scope = "Closed-API product/feature lifecycle, well-founded Req/Std/Der admission, monotone locks, and automated upstream tracking"
+realized_by = ["VUI-STUDIO-02", "VUI-LIFECYCLE-01"]
 
 [[authority]]
 id = "PRISM-CODE"
 name = "UOR Foundation prism-code & LexLean 1.2"
 edition = "0.11.5"
 source = "https://www.npmjs.com/package/prism-code"
+citation = "UOR Foundation prism-code 0.11.5 — LexLean 1.2 compilation, Lean 4.32.2 kernel proofs, template/2 contract ratchet, and prism/holo/6 archives"
 scope = "Browser-native LexLean 1.2 compilation, Lean 4.32.2 kernel proofs, prism.design/1 compilation, and prism/holo/6 archives"
+realized_by = ["VUI-HOLO-01", "VUI-STUDIO-03"]
 
 [[authority]]
 id = "AFFLOM-ME"
 name = "Owner Possession & Non-Leaking Boundary Reference (afflom/me)"
 edition = "main"
 source = "https://github.com/afflom/me"
+citation = "afflom/me — owner-centric possession hierarchy, compartment isolation, and regulated boundary controls"
 scope = "Owner-centric possession hierarchy, kill switch, regulated detector hashonly/deny boundary, and seen-bytes outbound approval"
+realized_by = ["VUI-OBSERVER-01"]
 
 [[authority]]
 id = "APACHE-2.0-PUBLIC-BENEFIT"
 name = "Apache-2.0 Free Public Benefit Service Charter"
 edition = "2.0"
 source = "https://www.apache.org/licenses/LICENSE-2.0"
+citation = "Apache License 2.0 — free public benefit AI service with zero paywalls, zero ad/tracking SDKs, and 100% client-side execution"
 scope = "Open, free-to-use public benefit AI service with zero paywalls, zero ad/tracking SDKs, and 100% browser-local execution"
+realized_by = ["VUI-CLIENT-01", "VUI-PUBLIC-BENEFIT-01"]
 
 [[authority]]
 id = "ISO-25010"
 name = "ISO/IEC 25010 Software Product Quality & Performance Efficiency"
 edition = "2023"
 source = "https://www.iso.org/standard/78176.html"
+citation = "ISO/IEC 25010:2023 — frame budget KPI (<= 16,666 us), zero turn-completion storage stalls, bounded memory, and multi-core throughput scaling"
 scope = "Frame budget KPI (<= 16,666 us), zero turn-completion storage stalls, bounded memory, and multi-core throughput scaling"
+realized_by = ["VUI-OPFS-01", "VUI-PREFETCH-01", "VUI-DEDUP-01"]
 
 [[authority]]
 id = "ISO-42010"
 name = "ISO/IEC/IEEE 42010 Architecture Description"
 edition = "2022"
 source = "https://www.iso.org/standard/74393.html"
+citation = "ISO/IEC/IEEE 42010:2022 — stakeholder-traceable viewpoints and deterministic separation of model authority from rendered view"
 scope = "Stakeholder-traceable viewpoints and deterministic separation of model authority from rendered view"
+realized_by = ["VUI-STUDIO-02"]
 
 [[authority]]
 id = "OWASP-ASVS-5.0.0"
 name = "OWASP Application Security Verification Standard"
 edition = "5.0.0"
 source = "https://owasp.org/www-project-application-security-verification-standard/"
+citation = "OWASP ASVS 5.0.0 — strict CSP sandboxing, zero raw cross-context leakage, FK-07 denial-wins grants, and integrity-verified local persistence"
 scope = "Strict CSP sandboxing, zero raw cross-context leakage, FK-07 denial-wins grants, and integrity-verified local persistence"
+realized_by = ["VUI-STUDIO-01", "VUI-OBSERVER-01"]
 
 [[authority]]
 id = "WCAG-2.2-AA"
 name = "W3C Web Content Accessibility Guidelines"
 edition = "2.2 Level AA"
 source = "https://www.w3.org/TR/WCAG22/"
+citation = "W3C WCAG 2.2 Level AA — accessible public-benefit interface with plain-language copy and zero internal engineering jargon"
 scope = "Accessible public-benefit interface with plain-language copy and zero internal engineering jargon"
+realized_by = ["VUI-UX-JARGON-01"]
 
 [[authority]]
 id = "W3C-PROV-O"
 name = "W3C Provenance Ontology"
 edition = "REC-20130430"
 source = "https://www.w3.org/TR/prov-o/"
+citation = "W3C PROV-O — stakeholder producer/consumer provenance and content-addressed artifact lineage"
 scope = "Stakeholder producer/consumer provenance and content-addressed artifact lineage"
+realized_by = ["VUI-STUDIO-01"]
 
 [[authority]]
 id = "JSON-SCHEMA-2020-12"
 name = "JSON Schema Draft 2020-12"
 edition = "2020-12"
 source = "https://json-schema.org/draft/2020-12/schema"
+citation = "JSON Schema Draft 2020-12 — typed declarative weight schemas and Prism tool stream contracts"
 scope = "Typed declarative weight schemas and Prism tool stream contracts"
+realized_by = ["VUI-STUDIO-01"]
 
 [[authority]]
 id = "DORA-METRICS"
 name = "DORA Software Delivery & Operational Performance Standards"
 edition = "2024"
 source = "https://dora.dev/"
+citation = "DORA 2024 — fast automated CI/CD (~60s GitHub Pages publish), automated upstream tracking, and deterministic semantic releases"
 scope = "Fast automated CI/CD (~60s GitHub Pages publish), automated upstream upgrade PRs, and deterministic semantic releases"
+realized_by = ["VUI-PAGES-01", "VUI-LIFECYCLE-01"]

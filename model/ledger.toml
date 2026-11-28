@@ -1,0 +1,27 @@
+# model/ledger.toml --- VerdantUI honesty ledger for measured runtime claims (R2).
+#
+# Conformance IDs live solely in `model/ids.toml` (R1). This ledger holds `open`
+# measured quantities (boot latency, token throughput, KV prefix hit rate, bundle KiB,
+# held-out browser eval scores) that are measured and reported, never falsely asserted.
+
+spec = "template/2"
+
+[[claim]]
+id = "MEAS-BUNDLE-JS"
+level = "open"
+statement = "Total assembled dist/assets/*.js bundle size stays within the 3,600 KiB ISO-25010 budget (baseline v0.13.3: 3,590.6 KiB)"
+
+[[claim]]
+id = "MEAS-BOOT-WARM"
+level = "open"
+statement = "Returning-visitor warm boot latency from page load to ready chat input measured via W3C OTEL app:init span"
+
+[[claim]]
+id = "MEAS-INFERENCE-THROUGHPUT"
+level = "open"
+statement = "On-device Qwen3 WASM SIMD TTFT, prefill tok/s, decode tok/s, and KV prefix hit rate measured via W3C OTEL inference.turn spans"
+
+[[claim]]
+id = "MEAS-BROWSER-EVAL"
+level = "open"
+statement = "Automated held-out browser evaluation scorecard measured by scripts/eval-browser.ts over Chrome CDP + window.__VERDANT_OBSERVER__.otlpJson()"

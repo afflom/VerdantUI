@@ -5,3 +5,8 @@ coverage/
 .DS_Store
 *.log
 .env*
+app/.prism/
+app/.lexlean/
+app/.lake/
+evals/last-otlp.json
+evals/last-report.json

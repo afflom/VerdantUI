@@ -142,9 +142,9 @@ test('Semantic release planner derives exact minor/patch/none bumps and determin
   assert.ok(agenda.some((item) => item.kind === 'release-ready'));
 
   const docs = renderGeneratedDocs(model);
-  assert.ok(docs['CONFORMANCE.md'].includes('Free Public Benefit AI Service'));
   assert.ok(docs['docs/owner-decisions.md'].includes('DEC-011'));
   assert.ok(docs['docs/product-lifecycle.md'].includes('VUI-FEAT-005'));
+  assert.ok(docs['CHANGELOG.md'].includes('# Changelog'));
 });
 
 test('Permanent ratchet enforces planted-defect gates including Free Public Benefit & universal zero UI jargon', () => {

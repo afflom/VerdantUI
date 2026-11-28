@@ -421,23 +421,23 @@ export function evaluateVerdantRatchet(snapshot: RatchetSnapshot): RatchetReport
     });
   }
 
-  // 9. Verdant Studio invariant ID register (`model/ids.toml`)
-  const idsSchema = snapshot.idsTomlRaw.match(/^\s*schema\s*=\s*"([^"]+)"/m)?.[1];
-  const codeMatches = Array.from(snapshot.idsTomlRaw.matchAll(/^\s*code\s*=\s*"([^"]+)"/gm)).map((m) => m[1]);
+  // 9. Verdant Studio / UOR template/2 conformance ID register (`model/ids.toml`)
+  const idsSpec = snapshot.idsTomlRaw.match(/^\s*spec\s*=\s*"([^"]+)"/m)?.[1];
+  const codeMatches = Array.from(snapshot.idsTomlRaw.matchAll(/^\s*id\s*=\s*"([^"]+)"/gm)).map((m) => m[1]);
   const seenCodes = new Set<string>();
   const dupCodes: string[] = [];
   for (const code of codeMatches) {
     if (seenCodes.has(code)) dupCodes.push(code);
     seenCodes.add(code);
   }
-  if (idsSchema !== 'verdant-ui/ids/1' || codeMatches.length < 6 || dupCodes.length > 0) {
+  if (idsSpec !== 'template/2' || codeMatches.length < 6 || dupCodes.length > 0) {
     violations.push({
       category: 'ids-register',
       path: 'model/ids.toml',
       detail:
         dupCodes.length > 0
           ? `Duplicate invariant IDs in model/ids.toml: ${dupCodes.join(', ')}`
-          : `model/ids.toml must carry schema verdant-ui/ids/1 with >= 6 unique invariant IDs (found ${codeMatches.length})`,
+          : `model/ids.toml must carry spec "template/2" with >= 6 unique conformance IDs (found ${codeMatches.length})`,
     });
   }
 
@@ -623,7 +623,7 @@ export function verifyPlantedDefects(cleanSnapshot: RatchetSnapshot): {
       expectedCategory: 'ids-register',
       mutate: (s) => ({
         ...s,
-        idsTomlRaw: `${s.idsTomlRaw}\n[[id]]\ncode = "VUI-CLIENT-01"\ntitle = "duplicate"\n`,
+        idsTomlRaw: `${s.idsTomlRaw}\n[[id]]\nid = "VUI-CLIENT-01"\nlevel = "open"\nsuite = "verdant-ui"\nstatement = "duplicate"\n`,
       }),
     },
     {
