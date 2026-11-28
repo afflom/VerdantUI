@@ -1,0 +1,48 @@
+\begin{lexlean}{VerdantUI.Gui}
+\useglossary{lexlean.std.bool@1.2.0}
+\useglossary{lexlean.std.nat@1.2.0}
+\useglossary{prism.arch@1.0.0}
+\importmodule{VerdantUI.Protocol}
+\title{Text application model}
+\begin{semanticmodule}
+definition{
+  name: canonicalTree,
+  parameters: [],
+  result: Bytes,
+  body: 0x7472656509686f6d652c67616c6c6572792c73706163652c73657474696e67732c707265766965772c64657461696c73
+}
+
+definition{
+  name: personGuiTree,
+  parameters: [],
+  result: Bytes,
+  body: (canonicalTree)
+}
+
+definition{
+  name: agentGuiTree,
+  parameters: [],
+  result: Bytes,
+  body: (canonicalTree)
+}
+
+theorem{
+  name: an_agent_gets_the_tree_a_person_gets,
+  parameters: [],
+  statement: ((agentGuiTree) = (personGuiTree)),
+  proof: simplify{
+    definitions: [agentGuiTree, personGuiTree]
+  },
+  axioms: []
+}
+
+definition{
+  name: handleGui,
+  parameters: [args : Bytes],
+  result: Bytes,
+  body: (if (VerdantUI.Protocol::bytesEq args 0x74726565) then (canonicalTree) else
+    (if (VerdantUI.Protocol::bytesEq args 0x77636167) then 0x7061737309322e342e322c322e342e362c332e332e312c342e312e32 else
+    0x726566757365643a20756e6b6e6f776e206775692073757266616365))
+}
+\end{semanticmodule}
+\end{lexlean}

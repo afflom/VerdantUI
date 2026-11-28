@@ -20,7 +20,7 @@ The three honesty levels (R2):
 
 | ID | Level | Statement | Evidence |
 | --- | --- | --- | --- |
-| `VUI-HOLO-01` | `build` | VerdantUI compiles as a verified zero-capability prism/holo/6 Core-Wasm guest whose bootstrap dispatch is proved by Lean's kernel | `App.answers_with_the_request` |
+| `VUI-HOLO-01` | `build` | VerdantUI compiles as a verified zero-capability prism/holo/6 Core-Wasm guest whose command router refuses unknown routes explicitly | `App.unknown_route_refused`, refuses with `refused: unknown verdant command` |
 | `VUI-CLIENT-01` | `open` | 100% client-side runtime with zero external server or backend API dependencies |  |
 | `VUI-ENGINE-01` | `open` | Exclusive afflom/verdant-engine vTensor WASM SIMD substrate (zero WebGPU/foreign processor APIs) |  |
 | `VUI-MT-01` | `open` | Multi-threaded SharedArrayBuffer WASM SIMD pool with COOP/COEP isolation, watchdog failover, and saturation-safe worker sizing |  |
@@ -37,6 +37,61 @@ The three honesty levels (R2):
 | `VUI-LIFECYCLE-01` | `open` | Verdant Studio Product & Feature Lifecycle Governance: authoritative model/ registers, closed studio:* CLI, automated upstream engine/studio tracking, and deterministic semantic releases |  |
 | `VUI-PUBLIC-BENEFIT-01` | `open` | Free Public Benefit Service Charter: Apache-2.0 open service with zero tracking/analytics SDKs, zero paywalls, zero server telemetry, and enforced ISO-25010 performance budgets |  |
 | `VUI-UX-JARGON-01` | `open` | Plain-Language User Surface Invariant: zero exposure of internal Verdant constructs (Observer, OpenTelemetry, vTensor, LexLean, Holon, FK-07, Q10, REQ-D*) in user-facing UI surfaces |  |
+
+## consent
+
+| ID | Level | Statement | Evidence |
+| --- | --- | --- | --- |
+| `VUI-CONSENT-01` | `build` | Paused or accepted consent with a ready model always unlocks the session (zero Splash deadlock), while pending consent always presents the consent screen | `VerdantUI.Consent.paused_to_accepted_never_locks`, `VerdantUI.Consent.pending_requires_consent` |
+| `VUI-CONSENT-REFUSE-01` | `build` | Unknown streaming consent states are explicitly refused by name | `VerdantUI.Consent.unknown_consent_refused`, refuses with `refused: unknown consent state` |
+
+## grants
+
+| ID | Level | Statement | Evidence |
+| --- | --- | --- | --- |
+| `VUI-GRANT-01` | `build` | Stateful organs admit local storage grants even offline, and FK-07 explicit denial always dominates any grant | `VerdantUI.Grants.stateful_organ_admits_storage`, `VerdantUI.Grants.denial_dominates_grant` |
+| `VUI-GRANT-REFUSE-01` | `build` | Explicitly denied FK-07 capabilities are refused by name | `VerdantUI.Grants.denial_dominates_grant`, refuses with `refused: denied by FK-07` |
+| `VUI-GRANT-OFFLINE-01` | `build` | Offline mode explicitly refuses network capability requests for every registered organ | `VerdantUI.Grants.offline_denies_network`, refuses with `refused: offline mode denies network` |
+
+## compartment
+
+| ID | Level | Statement | Evidence |
+| --- | --- | --- | --- |
+| `VUI-COMPARTMENT-01` | `build` | Personal-compartment Prisms are always visible in the active personal space, while private work Prisms remain hidden from personal | `VerdantUI.Compartment.default_personal_visible`, `VerdantUI.Compartment.private_work_hidden_in_personal` |
+| `VUI-COMPARTMENT-REFUSE-01` | `build` | Unknown possession compartments are refused by name | `VerdantUI.Compartment.unknown_compartment_refused`, refuses with `refused: unknown compartment` |
+
+## parts
+
+| ID | Level | Statement | Evidence |
+| --- | --- | --- | --- |
+| `VUI-PARTS-01` | `build` | Every registered VerdantUI MediaType organ and Space answers structured status dispatch cleanly | `VerdantUI.Parts.all_registered_parts_answer_status` |
+| `VUI-PARTS-REFUSE-01` | `build` | Unregistered Prism part identifiers are explicitly refused by name | `VerdantUI.Parts.unknown_part_refused`, refuses with `refused: unknown part` |
+| `VUI-PARTS-VERB-REFUSE-01` | `build` | Unrecognized dispatch verbs on registered parts are explicitly refused by name | `VerdantUI.Parts.unknown_verb_refused`, refuses with `refused: unknown part verb` |
+
+## observer
+
+| ID | Level | Statement | Evidence |
+| --- | --- | --- | --- |
+| `VUI-OBSERVER-PURE-01` | `build` | Observing VerdantUI never changes what a participant experiences (Studio.Observer parity) | `VerdantUI.Observer.observing_never_changes_what_a_participant_experiences` |
+
+## gui
+
+| ID | Level | Statement | Evidence |
+| --- | --- | --- | --- |
+| `VUI-GUI-PARITY-01` | `build` | An observing agent gets the exact same view tree that a human participant gets (Studio.Gui.View parity) | `VerdantUI.Gui.an_agent_gets_the_tree_a_person_gets` |
+
+## accessibility
+
+| ID | Level | Statement | Evidence |
+| --- | --- | --- | --- |
+| `VUI-A11Y-WCAG-01` | `build` | Every registered VerdantUI surface view satisfies the WCAG 2.2 AA audit profile (2.4.2, 2.4.6, 3.3.1, 4.1.2) | `VerdantUI.Accessibility.every_part_view_passes_wcag_2_2_audit` |
+
+## cells
+
+| ID | Level | Statement | Evidence |
+| --- | --- | --- | --- |
+| `VUI-CELLS-01` | `build` | Natural-language tune actions route onto non-empty Prism cell targets (Studio.Gui.Generation parity) | `VerdantUI.Cells.tune_routes_valid_cell` |
+| `VUI-CELLS-REFUSE-01` | `build` | Empty Prism cell targets are explicitly refused by name | `VerdantUI.Cells.empty_cell_refused`, refuses with `refused: empty cell target` |
 
 ## Cited authorities
 

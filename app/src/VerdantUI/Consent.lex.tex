@@ -1,0 +1,93 @@
+\begin{lexlean}{VerdantUI.Consent}
+\useglossary{lexlean.std.bool@1.2.0}
+\useglossary{lexlean.std.nat@1.2.0}
+\useglossary{prism.arch@1.0.0}
+\importmodule{VerdantUI.Protocol}
+\title{Text application model}
+\begin{semanticmodule}
+definition{
+  name: decideConsent,
+  parameters: [consentCode : Nat, modelLoaded : Nat, storesHydrated : Nat, contextWarmed : Nat],
+  result: Nat,
+  body: (if (3 <=? consentCode) then 99 else (if (consentCode =? 0) then 0 else (if (modelLoaded =? 1) then 2 else (if ((storesHydrated =? 1) && (contextWarmed =? 1)) then 1 else 1))))
+}
+
+definition{
+  name: breaks_paused_to_accepted_never_locks,
+  parameters: [consentCode : Nat, storesHydrated : Nat, contextWarmed : Nat],
+  result: Bool,
+  body: (((consentCode =? 1) || (consentCode =? 2)) && (not ((decideConsent consentCode 1 storesHydrated contextWarmed) =? 2)))
+}
+
+theorem{
+  name: paused_to_accepted_never_locks,
+  parameters: [consentCode : Nat, storesHydrated : Nat, contextWarmed : Nat],
+  statement: ((breaks_paused_to_accepted_never_locks consentCode storesHydrated contextWarmed) = false),
+  proof: linear_arithmetic{
+    definitions: [breaks_paused_to_accepted_never_locks, decideConsent]
+  },
+  axioms: [Quot.sound, propext]
+}
+
+definition{
+  name: breaks_pending_requires_consent,
+  parameters: [modelLoaded : Nat, storesHydrated : Nat, contextWarmed : Nat],
+  result: Bool,
+  body: (not ((decideConsent 0 modelLoaded storesHydrated contextWarmed) =? 0))
+}
+
+theorem{
+  name: pending_requires_consent,
+  parameters: [modelLoaded : Nat, storesHydrated : Nat, contextWarmed : Nat],
+  statement: ((breaks_pending_requires_consent modelLoaded storesHydrated contextWarmed) = false),
+  proof: linear_arithmetic{
+    definitions: [breaks_pending_requires_consent, decideConsent]
+  },
+  axioms: [Quot.sound, propext]
+}
+
+definition{
+  name: breaks_unknown_consent_refused,
+  parameters: [consentCode : Nat, modelLoaded : Nat, storesHydrated : Nat, contextWarmed : Nat],
+  result: Bool,
+  body: ((3 <=? consentCode) && (not ((decideConsent consentCode modelLoaded storesHydrated contextWarmed) =? 99)))
+}
+
+theorem{
+  name: unknown_consent_refused,
+  parameters: [consentCode : Nat, modelLoaded : Nat, storesHydrated : Nat, contextWarmed : Nat],
+  statement: ((breaks_unknown_consent_refused consentCode modelLoaded storesHydrated contextWarmed) = false),
+  proof: linear_arithmetic{
+    definitions: [breaks_unknown_consent_refused, decideConsent]
+  },
+  axioms: [Quot.sound, propext]
+}
+
+definition{
+  name: encodeConsentName,
+  parameters: [tok : Bytes],
+  result: Nat,
+  body: (if (VerdantUI.Protocol::bytesEq tok 0x70656e64696e67) then 0 else (if (VerdantUI.Protocol::bytesEq tok 0x6163636570746564) then 1 else (if (VerdantUI.Protocol::bytesEq tok 0x706175736564) then 2 else 3)))
+}
+
+definition{
+  name: formatConsentCode,
+  parameters: [code : Nat],
+  result: Bytes,
+  body: (if (code =? 0) then 0x636f6e73656e74096c6f636b6564 else (if (code =? 1) then 0x696e697469616c697a696e6709756e6c6f636b6564 else (if (code =? 2) then 0x726561647909756e6c6f636b6564 else 0x726566757365643a20756e6b6e6f776e20636f6e73656e74207374617465)))
+}
+
+definition{
+  name: handleConsent,
+  parameters: [args : Bytes],
+  result: Bytes,
+  body: (let cTok : Bytes := (VerdantUI.Protocol::field0 args);
+    (let r1 : Bytes := (VerdantUI.Protocol::afterField0 args);
+    (let mTok : Bytes := (VerdantUI.Protocol::field0 r1);
+    (let r2 : Bytes := (VerdantUI.Protocol::afterField0 r1);
+    (let sTok : Bytes := (VerdantUI.Protocol::field0 r2);
+    (let wTok : Bytes := (VerdantUI.Protocol::afterField0 r2);
+    (formatConsentCode (decideConsent (encodeConsentName cTok) (VerdantUI.Protocol::parseBoolBit mTok) (VerdantUI.Protocol::parseBoolBit sTok) (VerdantUI.Protocol::parseBoolBit wTok)))))))))
+}
+\end{semanticmodule}
+\end{lexlean}

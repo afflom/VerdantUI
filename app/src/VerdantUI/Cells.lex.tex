@@ -1,0 +1,62 @@
+\begin{lexlean}{VerdantUI.Cells}
+\useglossary{lexlean.std.bool@1.2.0}
+\useglossary{lexlean.std.nat@1.2.0}
+\useglossary{prism.arch@1.0.0}
+\importmodule{VerdantUI.Protocol}
+\title{Text application model}
+\begin{semanticmodule}
+definition{
+  name: decideCellTune,
+  parameters: [targetLen : Nat],
+  result: Nat,
+  body: (if (targetLen =? 0) then 90 else 1)
+}
+
+definition{
+  name: breaks_tune_routes_valid_cell,
+  parameters: [targetLen : Nat],
+  result: Bool,
+  body: ((1 <=? targetLen) && (not ((decideCellTune targetLen) =? 1)))
+}
+
+theorem{
+  name: tune_routes_valid_cell,
+  parameters: [targetLen : Nat],
+  statement: ((breaks_tune_routes_valid_cell targetLen) = false),
+  proof: linear_arithmetic{
+    definitions: [breaks_tune_routes_valid_cell, decideCellTune]
+  },
+  axioms: [Quot.sound, propext]
+}
+
+definition{
+  name: breaks_empty_cell_refused,
+  parameters: [],
+  result: Bool,
+  body: (not ((decideCellTune 0) =? 90))
+}
+
+theorem{
+  name: empty_cell_refused,
+  parameters: [],
+  statement: ((breaks_empty_cell_refused) = false),
+  proof: linear_arithmetic{
+    definitions: [breaks_empty_cell_refused, decideCellTune]
+  },
+  axioms: [Quot.sound, propext]
+}
+
+definition{
+  name: handleCells,
+  parameters: [args : Bytes],
+  result: Bytes,
+  body: (let verb : Bytes := (VerdantUI.Protocol::field0 args);
+    (let target : Bytes := (VerdantUI.Protocol::afterField0 args);
+    (if (VerdantUI.Protocol::bytesEq verb 0x74756e65) then
+      (if ((decideCellTune (prim length target : Nat)) =? 1) then
+        (prim append 0x726f7574656409 target : Bytes)
+      else 0x726566757365643a20656d7074792063656c6c20746172676574)
+    else 0x726566757365643a20756e6b6e6f776e2063656c6c2076657262)))
+}
+\end{semanticmodule}
+\end{lexlean}

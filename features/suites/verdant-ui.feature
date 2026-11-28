@@ -3,11 +3,12 @@ Feature: verdant-ui
   VerdantUI conformance scenarios mapping every registered ID in model/ids.toml
   to its honesty level (`build` proved by Lean's kernel, or `open` verified by host gates).
 
-  @VUI-HOLO-01 @build
-  Scenario: VerdantUI compiles as a verified zero-capability Core-Wasm holo archive
+  @VUI-HOLO-01 @build @rejects
+  Scenario: VerdantUI compiles as a verified zero-capability Core-Wasm holo archive and refuses unknown routes
     Given the LexLean model in app/src/App.lex.tex
-    When prism-code check has Lean's kernel prove App.answers_with_the_request
-    Then prism-code build emits a verified prism/holo/6 archive and replays its acceptance vectors
+    When prism-code check has Lean's kernel prove App.unknown_route_refused
+    Then unknown commands are refused with "refused: unknown verdant command"
+    And prism-code build replays all positive and refusal acceptance vectors
 
   @VUI-CLIENT-01 @open
   Scenario: 100% client-side runtime with zero external server or backend dependencies

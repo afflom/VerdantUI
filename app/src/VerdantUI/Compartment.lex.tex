@@ -1,0 +1,106 @@
+\begin{lexlean}{VerdantUI.Compartment}
+\useglossary{lexlean.std.bool@1.2.0}
+\useglossary{lexlean.std.nat@1.2.0}
+\useglossary{prism.arch@1.0.0}
+\importmodule{VerdantUI.Protocol}
+\title{Text application model}
+\begin{semanticmodule}
+definition{
+  name: decideCompartment,
+  parameters: [ownerCode : Nat, activeCode : Nat, visCode : Nat],
+  result: Nat,
+  body: (if ((5 <=? ownerCode) || (5 <=? activeCode)) then 90 else (if (2 <=? visCode) then 91 else (if ((ownerCode =? activeCode) || ((ownerCode =? 4) || (visCode =? 1))) then 1 else 0)))
+}
+
+definition{
+  name: breaks_default_personal_visible,
+  parameters: [visCode : Nat],
+  result: Bool,
+  body: ((visCode <=? 1) && (not ((decideCompartment 0 0 visCode) =? 1)))
+}
+
+theorem{
+  name: default_personal_visible,
+  parameters: [visCode : Nat],
+  statement: ((breaks_default_personal_visible visCode) = false),
+  proof: linear_arithmetic{
+    definitions: [breaks_default_personal_visible, decideCompartment]
+  },
+  axioms: [Quot.sound, propext]
+}
+
+definition{
+  name: breaks_private_work_hidden_in_personal,
+  parameters: [],
+  result: Bool,
+  body: (not ((decideCompartment 1 0 0) =? 0))
+}
+
+theorem{
+  name: private_work_hidden_in_personal,
+  parameters: [],
+  statement: ((breaks_private_work_hidden_in_personal) = false),
+  proof: linear_arithmetic{
+    definitions: [breaks_private_work_hidden_in_personal, decideCompartment]
+  },
+  axioms: [Quot.sound, propext]
+}
+
+definition{
+  name: breaks_unknown_compartment_refused,
+  parameters: [ownerCode : Nat, activeCode : Nat, visCode : Nat],
+  result: Bool,
+  body: (((5 <=? ownerCode) || (5 <=? activeCode)) && (not ((decideCompartment ownerCode activeCode visCode) =? 90)))
+}
+
+theorem{
+  name: unknown_compartment_refused,
+  parameters: [ownerCode : Nat, activeCode : Nat, visCode : Nat],
+  statement: ((breaks_unknown_compartment_refused ownerCode activeCode visCode) = false),
+  proof: linear_arithmetic{
+    definitions: [breaks_unknown_compartment_refused, decideCompartment]
+  },
+  axioms: [Quot.sound, propext]
+}
+
+definition{
+  name: encodeCompartment,
+  parameters: [tok : Bytes],
+  result: Nat,
+  body: (if (VerdantUI.Protocol::bytesEq tok 0x706572736f6e616c) then 0 else
+    (if (VerdantUI.Protocol::bytesEq tok 0x776f726b) then 1 else
+    (if (VerdantUI.Protocol::bytesEq tok 0x6865616c7468) then 2 else
+    (if (VerdantUI.Protocol::bytesEq tok 0x7265736561726368) then 3 else
+    (if (VerdantUI.Protocol::bytesEq tok 0x7075626c6963) then 4 else 5)))))
+}
+
+definition{
+  name: encodeVisibility,
+  parameters: [tok : Bytes],
+  result: Nat,
+  body: (if (VerdantUI.Protocol::bytesEq tok 0x70726976617465) then 0 else
+    (if (VerdantUI.Protocol::bytesEq tok 0x736861726564) then 1 else 2))
+}
+
+definition{
+  name: formatCompartmentCode,
+  parameters: [code : Nat],
+  result: Bytes,
+  body: (if (code =? 1) then 0x76697369626c65 else
+    (if (code =? 0) then 0x68696464656e else
+    (if (code =? 90) then 0x726566757365643a20756e6b6e6f776e20636f6d706172746d656e74 else
+    0x726566757365643a20756e6b6e6f776e20636f6d706172746d656e74207669736962696c697479)))
+}
+
+definition{
+  name: handleCompartment,
+  parameters: [args : Bytes],
+  result: Bytes,
+  body: (let oTok : Bytes := (VerdantUI.Protocol::field0 args);
+    (let r1 : Bytes := (VerdantUI.Protocol::afterField0 args);
+    (let aTok : Bytes := (VerdantUI.Protocol::field0 r1);
+    (let vTok : Bytes := (VerdantUI.Protocol::afterField0 r1);
+    (formatCompartmentCode (decideCompartment (encodeCompartment oTok) (encodeCompartment aTok) (encodeVisibility vTok)))))))
+}
+\end{semanticmodule}
+\end{lexlean}

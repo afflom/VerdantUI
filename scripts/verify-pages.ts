@@ -37,6 +37,7 @@ export function verifyPagesBundle(distArg = 'dist', cwd = process.cwd()): void {
     'app.json',
     'manifest.webmanifest',
     'models/stories260K.gguf',
+    'holos/verdant-ui.holo',
     'prism-toolchain/evaluator.wasm',
     'prism-toolchain/template-foundation.json',
   ];

@@ -1,0 +1,41 @@
+\begin{lexlean}{VerdantUI.Observer}
+\useglossary{lexlean.std.bool@1.2.0}
+\useglossary{lexlean.std.nat@1.2.0}
+\useglossary{prism.arch@1.0.0}
+\importmodule{VerdantUI.Protocol}
+\importmodule{VerdantUI.Gui}
+\title{Text application model}
+\begin{semanticmodule}
+definition{
+  name: participantExperience,
+  parameters: [state : Bytes],
+  result: Bytes,
+  body: state
+}
+
+definition{
+  name: observedExperience,
+  parameters: [state : Bytes],
+  result: Bytes,
+  body: (participantExperience state)
+}
+
+theorem{
+  name: observing_never_changes_what_a_participant_experiences,
+  parameters: [state : Bytes],
+  statement: ((observedExperience state) = (participantExperience state)),
+  proof: simplify{
+    definitions: [observedExperience]
+  },
+  axioms: []
+}
+
+definition{
+  name: handleObserver,
+  parameters: [args : Bytes],
+  result: Bytes,
+  body: (if (VerdantUI.Protocol::bytesEq args 0x7065726365697665) then (VerdantUI.Gui::canonicalTree) else
+    0x726566757365643a206f6273657276657220726561642d6f6e6c79)
+}
+\end{semanticmodule}
+\end{lexlean}

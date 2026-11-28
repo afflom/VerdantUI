@@ -14,8 +14,129 @@ spec = "template/2"
 id = "VUI-HOLO-01"
 level = "build"
 suite = "verdant-ui"
-statement = "VerdantUI compiles as a verified zero-capability prism/holo/6 Core-Wasm guest whose bootstrap dispatch is proved by Lean's kernel"
-theorems = ["App.answers_with_the_request"]
+statement = "VerdantUI compiles as a verified zero-capability prism/holo/6 Core-Wasm guest whose command router refuses unknown routes explicitly"
+theorems = ["App.unknown_route_refused"]
+failure = "refused: unknown verdant command"
+negative = "VUI-HOLO-01"
+
+[[id]]
+id = "VUI-CONSENT-01"
+level = "build"
+suite = "consent"
+statement = "Paused or accepted consent with a ready model always unlocks the session (zero Splash deadlock), while pending consent always presents the consent screen"
+theorems = ["VerdantUI.Consent.paused_to_accepted_never_locks", "VerdantUI.Consent.pending_requires_consent"]
+
+[[id]]
+id = "VUI-CONSENT-REFUSE-01"
+level = "build"
+suite = "consent"
+statement = "Unknown streaming consent states are explicitly refused by name"
+theorems = ["VerdantUI.Consent.unknown_consent_refused"]
+failure = "refused: unknown consent state"
+negative = "VUI-CONSENT-REFUSE-01"
+
+[[id]]
+id = "VUI-GRANT-01"
+level = "build"
+suite = "grants"
+statement = "Stateful organs admit local storage grants even offline, and FK-07 explicit denial always dominates any grant"
+theorems = ["VerdantUI.Grants.stateful_organ_admits_storage", "VerdantUI.Grants.denial_dominates_grant"]
+
+[[id]]
+id = "VUI-GRANT-REFUSE-01"
+level = "build"
+suite = "grants"
+statement = "Explicitly denied FK-07 capabilities are refused by name"
+theorems = ["VerdantUI.Grants.denial_dominates_grant"]
+failure = "refused: denied by FK-07"
+negative = "VUI-GRANT-REFUSE-01"
+
+[[id]]
+id = "VUI-GRANT-OFFLINE-01"
+level = "build"
+suite = "grants"
+statement = "Offline mode explicitly refuses network capability requests for every registered organ"
+theorems = ["VerdantUI.Grants.offline_denies_network"]
+failure = "refused: offline mode denies network"
+negative = "VUI-GRANT-OFFLINE-01"
+
+[[id]]
+id = "VUI-COMPARTMENT-01"
+level = "build"
+suite = "compartment"
+statement = "Personal-compartment Prisms are always visible in the active personal space, while private work Prisms remain hidden from personal"
+theorems = ["VerdantUI.Compartment.default_personal_visible", "VerdantUI.Compartment.private_work_hidden_in_personal"]
+
+[[id]]
+id = "VUI-COMPARTMENT-REFUSE-01"
+level = "build"
+suite = "compartment"
+statement = "Unknown possession compartments are refused by name"
+theorems = ["VerdantUI.Compartment.unknown_compartment_refused"]
+failure = "refused: unknown compartment"
+negative = "VUI-COMPARTMENT-REFUSE-01"
+
+[[id]]
+id = "VUI-PARTS-01"
+level = "build"
+suite = "parts"
+statement = "Every registered VerdantUI MediaType organ and Space answers structured status dispatch cleanly"
+theorems = ["VerdantUI.Parts.all_registered_parts_answer_status"]
+
+[[id]]
+id = "VUI-PARTS-REFUSE-01"
+level = "build"
+suite = "parts"
+statement = "Unregistered Prism part identifiers are explicitly refused by name"
+theorems = ["VerdantUI.Parts.unknown_part_refused"]
+failure = "refused: unknown part"
+negative = "VUI-PARTS-REFUSE-01"
+
+[[id]]
+id = "VUI-PARTS-VERB-REFUSE-01"
+level = "build"
+suite = "parts"
+statement = "Unrecognized dispatch verbs on registered parts are explicitly refused by name"
+theorems = ["VerdantUI.Parts.unknown_verb_refused"]
+failure = "refused: unknown part verb"
+negative = "VUI-PARTS-VERB-REFUSE-01"
+
+[[id]]
+id = "VUI-OBSERVER-PURE-01"
+level = "build"
+suite = "observer"
+statement = "Observing VerdantUI never changes what a participant experiences (Studio.Observer parity)"
+theorems = ["VerdantUI.Observer.observing_never_changes_what_a_participant_experiences"]
+
+[[id]]
+id = "VUI-GUI-PARITY-01"
+level = "build"
+suite = "gui"
+statement = "An observing agent gets the exact same view tree that a human participant gets (Studio.Gui.View parity)"
+theorems = ["VerdantUI.Gui.an_agent_gets_the_tree_a_person_gets"]
+
+[[id]]
+id = "VUI-A11Y-WCAG-01"
+level = "build"
+suite = "accessibility"
+statement = "Every registered VerdantUI surface view satisfies the WCAG 2.2 AA audit profile (2.4.2, 2.4.6, 3.3.1, 4.1.2)"
+theorems = ["VerdantUI.Accessibility.every_part_view_passes_wcag_2_2_audit"]
+
+[[id]]
+id = "VUI-CELLS-01"
+level = "build"
+suite = "cells"
+statement = "Natural-language tune actions route onto non-empty Prism cell targets (Studio.Gui.Generation parity)"
+theorems = ["VerdantUI.Cells.tune_routes_valid_cell"]
+
+[[id]]
+id = "VUI-CELLS-REFUSE-01"
+level = "build"
+suite = "cells"
+statement = "Empty Prism cell targets are explicitly refused by name"
+theorems = ["VerdantUI.Cells.empty_cell_refused"]
+failure = "refused: empty cell target"
+negative = "VUI-CELLS-REFUSE-01"
 
 [[id]]
 id = "VUI-CLIENT-01"

@@ -1,0 +1,80 @@
+\begin{lexlean}{VerdantUI.Protocol}
+\useglossary{lexlean.std.bool@1.2.0}
+\useglossary{lexlean.std.nat@1.2.0}
+\useglossary{prism.arch@1.0.0}
+\title{Bounded byte buffer}
+\begin{semanticmodule}
+definition{
+  name: bytesEqAt,
+  parameters: [left : Bytes, right : Bytes, pos : Nat, len : Nat, fuel : Nat],
+  result: Bool,
+  body: (match fuel
+    | Nat.zero => (len <=? pos)
+    | Nat.succ rest => (if (len <=? pos) then true else
+      (match (prim index left pos : (Option UInt8))
+        | Option.none => false
+        | Option.some lb => (match (prim index right pos : (Option UInt8))
+          | Option.none => false
+          | Option.some rb => (if ((prim to_nat lb : Nat) =? (prim to_nat rb : Nat)) then (bytesEqAt left right (pos + 1) len rest) else false))))),
+  recursive_argument: fuel
+}
+
+definition{
+  name: bytesEq,
+  parameters: [left : Bytes, right : Bytes],
+  result: Bool,
+  body: (let ll : Nat := (prim length left : Nat);
+    (let rl : Nat := (prim length right : Nat);
+    (if (ll =? rl) then (bytesEqAt left right 0 ll 128) else false)))
+}
+
+definition{
+  name: findTabLoop,
+  parameters: [bs : Bytes, pos : Nat, fuel : Nat],
+  result: Nat,
+  body: (match fuel
+    | Nat.zero => pos
+    | Nat.succ rest => (match (prim index bs pos : (Option UInt8))
+      | Option.none => pos
+      | Option.some b => (if ((prim to_nat b : Nat) =? 9) then pos else (findTabLoop bs (pos + 1) rest)))),
+  recursive_argument: fuel
+}
+
+definition{
+  name: findTab,
+  parameters: [bs : Bytes, start : Nat],
+  result: Nat,
+  body: (findTabLoop bs start 256)
+}
+
+definition{
+  name: sliceBetween,
+  parameters: [bs : Bytes, start : Nat, endPos : Nat],
+  result: Bytes,
+  body: (if (endPos <=? start) then 0x else (match (prim slice bs start (prim subtract endPos start : Nat) : (Option Bytes))
+    | Option.none => 0x
+    | Option.some out => out))
+}
+
+definition{
+  name: field0,
+  parameters: [bs : Bytes],
+  result: Bytes,
+  body: (let e0 : Nat := (findTab bs 0); (sliceBetween bs 0 e0))
+}
+
+definition{
+  name: afterField0,
+  parameters: [bs : Bytes],
+  result: Bytes,
+  body: (let e0 : Nat := (findTab bs 0); (let len : Nat := (prim length bs : Nat); (let s1 : Nat := (e0 + 1); (if (len <=? s1) then 0x else (sliceBetween bs s1 len)))))
+}
+
+definition{
+  name: parseBoolBit,
+  parameters: [bs : Bytes],
+  result: Nat,
+  body: (if (bytesEq bs 0x31) then 1 else 0)
+}
+\end{semanticmodule}
+\end{lexlean}

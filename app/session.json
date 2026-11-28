@@ -3,32 +3,32 @@
   "starter": null,
   "status": {
     "checked": {
-      "source": "blake3:8e2f470c10fa8b7a2f91f86de95bb2212005dad33e11fd8b1b3f87243033abfe",
-      "at": "2026-11-28T13:20:34.991Z",
+      "source": "blake3:81a39578bbb3bd2fcf56b741ad3038f8b543b1004410136a501cd61ca71f1878",
+      "at": "2026-11-28T13:26:16.944Z",
       "where": "wasm",
-      "ms": 96,
-      "semanticId": "sha256:7dbeed267ce91e738617c91894d46b3dcf7dfa05b638e3db6ee958afabca665c"
+      "ms": 142,
+      "semanticId": "sha256:115a0cffaf0bf9f15654b2af7258dd178bdef112123d68a7a9e7d4c81fc86c70"
     },
     "proved": {
-      "source": "blake3:8e2f470c10fa8b7a2f91f86de95bb2212005dad33e11fd8b1b3f87243033abfe",
-      "at": "2026-11-28T13:20:37.763Z",
+      "source": "blake3:81a39578bbb3bd2fcf56b741ad3038f8b543b1004410136a501cd61ca71f1878",
+      "at": "2026-11-28T13:26:20.246Z",
       "where": "kernel",
-      "seconds": 0.6,
-      "semanticId": "sha256:7dbeed267ce91e738617c91894d46b3dcf7dfa05b638e3db6ee958afabca665c"
+      "seconds": 0.7,
+      "semanticId": "sha256:115a0cffaf0bf9f15654b2af7258dd178bdef112123d68a7a9e7d4c81fc86c70"
     },
     "holo": "/home/alex/Desktop/VerdantUI/app/.prism/build/verdant-ui.holo",
     "built": {
-      "source": "blake3:8e2f470c10fa8b7a2f91f86de95bb2212005dad33e11fd8b1b3f87243033abfe",
+      "source": "blake3:81a39578bbb3bd2fcf56b741ad3038f8b543b1004410136a501cd61ca71f1878",
       "page": null,
       "pageKind": "generated",
       "path": "/home/alex/Desktop/VerdantUI/app/.prism/build/verdant-ui.holo",
       "site": "/home/alex/Desktop/VerdantUI/app/.prism/site",
-      "address": "blake3:eedaca66a5dbbee43a6be76d8853eefa332ce6a4c996c063aa5d6a570c9a7006",
-      "semanticId": "sha256:7dbeed267ce91e738617c91894d46b3dcf7dfa05b638e3db6ee958afabca665c",
-      "at": "2026-11-28T13:20:37.997Z",
-      "seconds": 0.8,
-      "passed": 1,
-      "total": 1,
+      "address": "blake3:856f6531bbc4400f4352b9ff26c0646eb01cbb40f1d2a6de4646c91c6b142246",
+      "semanticId": "sha256:115a0cffaf0bf9f15654b2af7258dd178bdef112123d68a7a9e7d4c81fc86c70",
+      "at": "2026-11-28T13:26:21.967Z",
+      "seconds": 2.3,
+      "passed": 24,
+      "total": 24,
       "builder": "evaluator-guest",
       "carries": {
         "snapshot": true,
@@ -37,10 +37,10 @@
       }
     },
     "lastBuild": {
-      "source": "blake3:8e2f470c10fa8b7a2f91f86de95bb2212005dad33e11fd8b1b3f87243033abfe",
+      "source": "blake3:81a39578bbb3bd2fcf56b741ad3038f8b543b1004410136a501cd61ca71f1878",
       "result": {
         "ok": true,
-        "address": "blake3:eedaca66a5dbbee43a6be76d8853eefa332ce6a4c996c063aa5d6a570c9a7006"
+        "address": "blake3:856f6531bbc4400f4352b9ff26c0646eb01cbb40f1d2a6de4646c91c6b142246"
       }
     }
   }

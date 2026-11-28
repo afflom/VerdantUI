@@ -32,6 +32,7 @@ function prismToolchainPlugin(rootDir: string): Plugin {
   const prismCodeRoot = path.resolve(rootDir, 'node_modules/prism-code');
   const evaluatorSrc = path.join(prismCodeRoot, 'src/journey/guest/evaluator.wasm');
   const pinnedRoot = path.join(prismCodeRoot, 'wasm/pinned');
+  const verdantHoloSrc = path.resolve(rootDir, 'app/.prism/build/verdant-ui.holo');
   let cachedFoundation: string | null = null;
 
   return {
@@ -39,6 +40,11 @@ function prismToolchainPlugin(rootDir: string): Plugin {
     configureServer(server) {
       server.middlewares.use((req, res, next) => {
         const cleanUrl = (req.url ?? '').split('?')[0];
+        if (cleanUrl.endsWith('/holos/verdant-ui.holo') && fs.existsSync(verdantHoloSrc)) {
+          res.setHeader('Content-Type', 'application/octet-stream');
+          res.end(fs.readFileSync(verdantHoloSrc));
+          return;
+        }
         const marker = '/prism-toolchain/';
         const idx = cleanUrl.indexOf(marker);
         if (idx === -1) return next();
@@ -78,6 +84,11 @@ function prismToolchainPlugin(rootDir: string): Plugin {
         path.join(outDir, 'template-foundation.json'),
         buildTemplateFoundationJson(prismCodeRoot),
       );
+      if (fs.existsSync(verdantHoloSrc)) {
+        const holosDir = path.join(distDir, 'holos');
+        fs.mkdirSync(holosDir, {recursive: true});
+        fs.copyFileSync(verdantHoloSrc, path.join(holosDir, 'verdant-ui.holo'));
+      }
     },
   };
 }

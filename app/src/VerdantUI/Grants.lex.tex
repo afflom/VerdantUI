@@ -1,0 +1,115 @@
+\begin{lexlean}{VerdantUI.Grants}
+\useglossary{lexlean.std.bool@1.2.0}
+\useglossary{lexlean.std.nat@1.2.0}
+\useglossary{prism.arch@1.0.0}
+\importmodule{VerdantUI.Protocol}
+\title{Text application model}
+\begin{semanticmodule}
+definition{
+  name: decideGrant,
+  parameters: [organCode : Nat, capCode : Nat, offlineMode : Nat, explicitDenied : Nat],
+  result: Nat,
+  body: (if (explicitDenied =? 1) then 90 else (if (8 <=? organCode) then 92 else (if (5 <=? capCode) then 93 else (if ((capCode =? 2) && (offlineMode =? 1)) then 91 else 1))))
+}
+
+definition{
+  name: breaks_denial_dominates_grant,
+  parameters: [organCode : Nat, capCode : Nat, offlineMode : Nat],
+  result: Bool,
+  body: (not ((decideGrant organCode capCode offlineMode 1) =? 90))
+}
+
+theorem{
+  name: denial_dominates_grant,
+  parameters: [organCode : Nat, capCode : Nat, offlineMode : Nat],
+  statement: ((breaks_denial_dominates_grant organCode capCode offlineMode) = false),
+  proof: linear_arithmetic{
+    definitions: [breaks_denial_dominates_grant, decideGrant]
+  },
+  axioms: [Quot.sound, propext]
+}
+
+definition{
+  name: breaks_offline_denies_network,
+  parameters: [organCode : Nat],
+  result: Bool,
+  body: ((organCode <=? 7) && (not ((decideGrant organCode 2 1 0) =? 91)))
+}
+
+theorem{
+  name: offline_denies_network,
+  parameters: [organCode : Nat],
+  statement: ((breaks_offline_denies_network organCode) = false),
+  proof: linear_arithmetic{
+    definitions: [breaks_offline_denies_network, decideGrant]
+  },
+  axioms: [Quot.sound, propext]
+}
+
+definition{
+  name: breaks_stateful_organ_admits_storage,
+  parameters: [organCode : Nat, offlineMode : Nat],
+  result: Bool,
+  body: (((3 <=? organCode) && (organCode <=? 6)) && (not ((decideGrant organCode 1 offlineMode 0) =? 1)))
+}
+
+theorem{
+  name: stateful_organ_admits_storage,
+  parameters: [organCode : Nat, offlineMode : Nat],
+  statement: ((breaks_stateful_organ_admits_storage organCode offlineMode) = false),
+  proof: linear_arithmetic{
+    definitions: [breaks_stateful_organ_admits_storage, decideGrant]
+  },
+  axioms: [Quot.sound, propext]
+}
+
+definition{
+  name: encodeOrgan,
+  parameters: [tok : Bytes],
+  result: Nat,
+  body: (if (VerdantUI.Protocol::bytesEq tok 0x70696374757265) then 0 else
+    (if (VerdantUI.Protocol::bytesEq tok 0x766964656f) then 1 else
+    (if (VerdantUI.Protocol::bytesEq tok 0x617564696f) then 2 else
+    (if (VerdantUI.Protocol::bytesEq tok 0x7772697474656e2d776f726b) then 3 else
+    (if (VerdantUI.Protocol::bytesEq tok 0x696e7465726163746976652d67616d65) then 4 else
+    (if (VerdantUI.Protocol::bytesEq tok 0x72657365617263682d70726f6772616d) then 5 else
+    (if (VerdantUI.Protocol::bytesEq tok 0x746f6f6c2d6f7267616e) then 6 else
+    (if (VerdantUI.Protocol::bytesEq tok 0x7370616365) then 7 else 8))))))))
+}
+
+definition{
+  name: encodeCapability,
+  parameters: [tok : Bytes],
+  result: Nat,
+  body: (if (VerdantUI.Protocol::bytesEq tok 0x7761736d) then 0 else
+    (if (VerdantUI.Protocol::bytesEq tok 0x73746f72616765) then 1 else
+    (if (VerdantUI.Protocol::bytesEq tok 0x6e6574776f726b) then 2 else
+    (if (VerdantUI.Protocol::bytesEq tok 0x72756e74696d65) then 3 else
+    (if (VerdantUI.Protocol::bytesEq tok 0x62726f77736572) then 4 else 5)))))
+}
+
+definition{
+  name: formatGrantCode,
+  parameters: [code : Nat, capTok : Bytes],
+  result: Bytes,
+  body: (if (code =? 1) then (prim append 0x616c6c6f7709 capTok : Bytes) else
+    (if (code =? 90) then 0x726566757365643a2064656e69656420627920464b2d3037 else
+    (if (code =? 91) then 0x726566757365643a206f66666c696e65206d6f64652064656e696573206e6574776f726b else
+    (if (code =? 92) then 0x726566757365643a20756e6b6e6f776e206772616e74206f7267616e else
+    0x726566757365643a20756e6b6e6f776e206772616e74206361706162696c697479))))
+}
+
+definition{
+  name: handleGrant,
+  parameters: [args : Bytes],
+  result: Bytes,
+  body: (let oTok : Bytes := (VerdantUI.Protocol::field0 args);
+    (let r1 : Bytes := (VerdantUI.Protocol::afterField0 args);
+    (let cTok : Bytes := (VerdantUI.Protocol::field0 r1);
+    (let r2 : Bytes := (VerdantUI.Protocol::afterField0 r1);
+    (let offTok : Bytes := (VerdantUI.Protocol::field0 r2);
+    (let denTok : Bytes := (VerdantUI.Protocol::afterField0 r2);
+    (formatGrantCode (decideGrant (encodeOrgan oTok) (encodeCapability cTok) (VerdantUI.Protocol::parseBoolBit offTok) (VerdantUI.Protocol::parseBoolBit denTok)) cTok)))))))
+}
+\end{semanticmodule}
+\end{lexlean}
