@@ -27,6 +27,7 @@ export interface RatchetViolation {
     | 'public-benefit-charter'
     | 'user-facing-jargon'
     | 'silent-fallback'
+    | 'prism-template-lock'
     | 'policy-config';
   readonly path: string;
   readonly line?: number;
@@ -519,6 +520,15 @@ export function evaluateVerdantRatchet(snapshot: RatchetSnapshot): RatchetReport
     }
   }
 
+  // 13. UOR Prism template/2 lock & root Prism presence (`template.lock` + `VUI-HOLO-01`)
+  if (!snapshot.rootFiles.includes('template.lock') || !snapshot.idsTomlRaw.includes('id = "VUI-HOLO-01"')) {
+    violations.push({
+      category: 'prism-template-lock',
+      path: 'template.lock',
+      detail: 'Missing UOR template.lock or VUI-HOLO-01 conformance registration in model/ids.toml',
+    });
+  }
+
   return {
     ok: violations.length === 0,
     schema,
@@ -666,6 +676,14 @@ export function verifyPlantedDefects(cleanSnapshot: RatchetSnapshot): {
           ...s.srcFiles,
           'src/engine/assistantAdapter.ts': `${s.srcFiles['src/engine/assistantAdapter.ts'] ?? ''}\nconst reasoningFallback = 'masked';`,
         },
+      }),
+    },
+    {
+      name: 'planted-missing-prism-template-lock',
+      expectedCategory: 'prism-template-lock',
+      mutate: (s) => ({
+        ...s,
+        rootFiles: s.rootFiles.filter((f) => f !== 'template.lock'),
       }),
     },
   ];

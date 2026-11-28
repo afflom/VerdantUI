@@ -62,6 +62,8 @@ jobs:
           npm run prism:build
           npm run prism:check
           npm run prism:vectors
+          npm run eval:surface
+          npm run eval:facets
           npm run ratchet
           npm run studio:check
           npm run lint

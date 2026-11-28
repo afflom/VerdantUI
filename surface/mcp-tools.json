@@ -1,0 +1,140 @@
+{
+  "schema": "MCP-SCHEMA-2026-07-28",
+  "server": {
+    "name": "verdant-ui-observer",
+    "version": "0.13.3",
+    "authority": "app/.prism/build/verdant-ui.holo"
+  },
+  "tools": [
+    {
+      "name": "verdant_perceive",
+      "description": "Perceive VerdantUI's live GUI state, parts, galleries, published Prisms, active tasks, and verified verdant-ui.holo status identically to a human participant.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "verdant_diagnose",
+      "description": "Run Observer self-diagnosis over chronology coherence, KV persistence, OTEL error spans, layout certificates, and holo integrity.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "verdant_holo_dispatch",
+      "description": "Dispatch a TAB-delimited governance command directly to the Lean-proved verdant-ui.holo Core-Wasm guest.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+            "description": "TAB-delimited command starting with verdant\\t<consent|grant|compartment|part|gui|observer|cells>\\t..."
+          }
+        },
+        "required": ["command"],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "verdant_create_prism",
+      "description": "Create a new Verdant Prism across any of the 8 MediaTypes (picture, audio, video, written-work, interactive-game, research-program, tool-organ, space) from natural language.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "prompt": { "type": "string", "minLength": 1 },
+          "mediaType": {
+            "type": "string",
+            "enum": [
+              "picture",
+              "audio",
+              "video",
+              "written-work",
+              "interactive-game",
+              "research-program",
+              "tool-organ",
+              "space"
+            ]
+          },
+          "spaceName": { "type": "string" }
+        },
+        "required": ["prompt"],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "verdant_refine_prism",
+      "description": "Route a natural-language refinement onto an existing Prism's declarative weights and state cells.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "prismId": { "type": "string", "minLength": 1 },
+          "instruction": { "type": "string", "minLength": 1 }
+        },
+        "required": ["prismId", "instruction"],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "verdant_publish_prism",
+      "description": "Formally seal a draft Prism into an immutable, digest-verified Published Prism (and binary prism/holo/6 archive when compiled).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "prismId": { "type": "string", "minLength": 1 }
+        },
+        "required": ["prismId"],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "verdant_otlp_export",
+      "description": "Export W3C OpenTelemetry OTLP/JSON 1.x resourceSpans and resourceLogs from VerdantUI's ObserverStreamBus.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    }
+  ]
+}

@@ -1,0 +1,183 @@
+{
+  "schema": "verdant-ui/gui-resources/1",
+  "holoAddress": "blake3:856f6531bbc4400f4352b9ff26c0646eb01cbb40f1d2a6de4646c91c6b142246",
+  "vectorsVerified": "24/24",
+  "surfaces": [
+    "home",
+    "gallery",
+    "space",
+    "settings",
+    "preview",
+    "details"
+  ],
+  "observerParity": true,
+  "wcag22Criteria": [
+    "2.4.2",
+    "2.4.6",
+    "3.3.1",
+    "4.1.2"
+  ],
+  "registeredMediaTypes": [
+    "picture",
+    "audio",
+    "video",
+    "written-work",
+    "interactive-game",
+    "research-program",
+    "space",
+    "tool-organ"
+  ],
+  "organDescriptors": [
+    {
+      "id": "picture",
+      "mediaType": "picture",
+      "role": "picture",
+      "defaultCompartment": "personal",
+      "requiredGrants": [
+        "prism-runtime",
+        "prism-browser"
+      ]
+    },
+    {
+      "id": "audio",
+      "mediaType": "audio",
+      "role": "audio",
+      "defaultCompartment": "personal",
+      "requiredGrants": [
+        "prism-runtime",
+        "prism-browser"
+      ]
+    },
+    {
+      "id": "video",
+      "mediaType": "video",
+      "role": "video",
+      "defaultCompartment": "personal",
+      "requiredGrants": [
+        "prism-runtime",
+        "prism-browser"
+      ]
+    },
+    {
+      "id": "written-work",
+      "mediaType": "written-work",
+      "role": "written-work",
+      "defaultCompartment": "personal",
+      "requiredGrants": [
+        "prism-runtime",
+        "prism-storage",
+        "prism-browser"
+      ]
+    },
+    {
+      "id": "interactive-game",
+      "mediaType": "interactive-game",
+      "role": "interactive-game",
+      "defaultCompartment": "personal",
+      "requiredGrants": [
+        "prism-runtime",
+        "prism-storage",
+        "prism-browser"
+      ]
+    },
+    {
+      "id": "research-program",
+      "mediaType": "research-program",
+      "role": "research-program",
+      "defaultCompartment": "personal",
+      "requiredGrants": [
+        "prism-runtime",
+        "prism-storage",
+        "prism-browser"
+      ]
+    },
+    {
+      "id": "space",
+      "mediaType": "space",
+      "role": "space",
+      "defaultCompartment": "personal",
+      "requiredGrants": [
+        "prism-runtime",
+        "prism-storage",
+        "prism-browser"
+      ]
+    },
+    {
+      "id": "tool-organ:budget-tracker",
+      "mediaType": "tool-organ",
+      "role": "budget-tracker",
+      "defaultCompartment": "personal",
+      "requiredGrants": [
+        "prism-runtime",
+        "prism-storage",
+        "prism-browser"
+      ]
+    },
+    {
+      "id": "tool-organ:flashcards",
+      "mediaType": "tool-organ",
+      "role": "flashcards",
+      "defaultCompartment": "personal",
+      "requiredGrants": [
+        "prism-runtime",
+        "prism-storage",
+        "prism-browser"
+      ]
+    },
+    {
+      "id": "tool-organ:focus-timer",
+      "mediaType": "tool-organ",
+      "role": "focus-timer",
+      "defaultCompartment": "personal",
+      "requiredGrants": [
+        "prism-runtime",
+        "prism-storage",
+        "prism-browser"
+      ]
+    },
+    {
+      "id": "tool-organ:habit-guardian",
+      "mediaType": "tool-organ",
+      "role": "habit-guardian",
+      "defaultCompartment": "personal",
+      "requiredGrants": [
+        "prism-runtime",
+        "prism-storage",
+        "prism-browser"
+      ]
+    },
+    {
+      "id": "tool-organ:schedule-guard",
+      "mediaType": "tool-organ",
+      "role": "schedule-guard",
+      "defaultCompartment": "personal",
+      "requiredGrants": [
+        "prism-runtime",
+        "prism-storage",
+        "prism-browser"
+      ]
+    },
+    {
+      "id": "tool-organ:calculator",
+      "mediaType": "tool-organ",
+      "role": "calculator",
+      "defaultCompartment": "personal",
+      "requiredGrants": [
+        "prism-runtime",
+        "prism-storage",
+        "prism-browser"
+      ]
+    },
+    {
+      "id": "tool-organ:workflow-helper",
+      "mediaType": "tool-organ",
+      "role": "workflow-helper",
+      "defaultCompartment": "personal",
+      "requiredGrants": [
+        "prism-runtime",
+        "prism-storage",
+        "prism-browser"
+      ]
+    }
+  ]
+}
