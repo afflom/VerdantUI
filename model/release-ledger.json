@@ -357,6 +357,36 @@
         "VUI-FEAT-019"
       ],
       "summary": "Maintenance & upstream pin release (v2.22.4)"
+    },
+    {
+      "version": "0.13.3",
+      "tag": "v0.13.3",
+      "releasedAt": "2026-11-28T03:12:39.565Z",
+      "commit": "74a5fd7ebb4826043a364bff4f1a67e6ba1f9d92",
+      "engineTag": "v2.22.4",
+      "studioCommit": "afee10ede53849d8adbaa6aecdee40993d8c7571",
+      "activeFeatureIds": [
+        "VUI-FEAT-001",
+        "VUI-FEAT-002",
+        "VUI-FEAT-003",
+        "VUI-FEAT-004",
+        "VUI-FEAT-005",
+        "VUI-FEAT-006",
+        "VUI-FEAT-007",
+        "VUI-FEAT-008",
+        "VUI-FEAT-009",
+        "VUI-FEAT-010",
+        "VUI-FEAT-011",
+        "VUI-FEAT-012",
+        "VUI-FEAT-013",
+        "VUI-FEAT-014",
+        "VUI-FEAT-015",
+        "VUI-FEAT-016",
+        "VUI-FEAT-017",
+        "VUI-FEAT-018",
+        "VUI-FEAT-019"
+      ],
+      "summary": "Maintenance & upstream pin release (v2.22.4)"
     }
   ]
 }
