@@ -257,7 +257,7 @@ async function main(): Promise<void> {
     // 4. Live Studio create -> refine -> perceive -> delete cleanup
     const studioRoundTrip = await cdp.evalJson<{ ok: boolean; refineMs: number; detail: string }>(`(async () => {
       const c = await window.__VERDANT_OBSERVER__.enact({
-        type: 'create_prism',
+        type: 'create_artifact',
         prompt: 'Build a monthly budget tracker utility',
         mediaType: 'tool-organ'
       });

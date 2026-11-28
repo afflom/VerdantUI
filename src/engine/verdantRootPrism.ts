@@ -1566,11 +1566,18 @@ export class VerdantRootPrismRuntime {
           this.cancelPartTask(action.prismId);
           await this.prismStore.delete(action.prismId);
           this.galleryStore.syncFromPrisms(this.prismStore.list());
+          if (this.activePartId === action.prismId) {
+            this.onOpenHomeCallback?.();
+          }
           result = { deleted: action.prismId };
           break;
         case 'self_heal':
           result = this.reconcileSelfHeal();
           break;
+        default:
+          throw new Error(
+            `refused: unknown observer enact action "${String((action as { type?: unknown }).type)}"`,
+          );
       }
       span.end('ok');
       return { ok: true, action: action.type, result };
