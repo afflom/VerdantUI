@@ -3,8 +3,8 @@
   "requirement": "REQ-STUDIO-TRACKING",
   "repository": "afflom/verdant-studio",
   "branch": "main",
-  "commit": "afee10ede53849d8adbaa6aecdee40993d8c7571",
-  "pinnedAt": "2026-11-28T03:07:42.405Z",
+  "commit": "901f7e09253dd7047be4545d61201b3ced4df21c",
+  "pinnedAt": "2026-11-28T06:26:45.750Z",
   "registers": [
     {
       "idPrefix": "VERDANT-STUDIO-AUTHORITIES-",
@@ -16,13 +16,13 @@
       "idPrefix": "VERDANT-STUDIO-IDS-",
       "path": "model/ids.toml",
       "mediaType": "application/toml",
-      "sha256": "f982d54ab47c2eb89f4137b5ccc4886bb06f0c269e70650657901b15845cb53f"
+      "sha256": "7ae582e8ca2618eb3dc9d7585852ee3fbe43094f7661eedb86cd332a5a475df2"
     },
     {
       "idPrefix": "VERDANT-STUDIO-ADMISSIONS-",
       "path": "model/admissions.json",
       "mediaType": "application/json",
-      "sha256": "d3f74f85973ede10717127836337b0338da60a21eb259f0e0aae845ccfea1adb"
+      "sha256": "b62e87105777050a8fdcf565bb05671a2475cd794aa11419e8b0586e19f0e880"
     }
   ]
 }
