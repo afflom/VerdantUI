@@ -378,7 +378,7 @@ export function sampleNextToken(
           return wasmBest;
         }
       }
-      let bestId = 0;
+      let bestId = -1;
       let bestVal = -Infinity;
       for (let i = 0; i < vocabSize; i++) {
         const v = logits[i];
@@ -386,6 +386,11 @@ export function sampleNextToken(
           bestVal = v;
           bestId = i;
         }
+      }
+      if (bestId < 0) {
+        throw new Error(
+          'refused: forward pass produced all non-finite logits during greedy sampling; refusing to substitute token 0',
+        );
       }
       return bestId;
     }
@@ -507,18 +512,10 @@ export function sampleNextToken(
       candCount = finiteIds.length;
     }
 
-    // Finite-logit fallback: if every logit was non-finite (e.g. numerical spike), pick deterministic argmax/0
     if (candCount === 0) {
-      let bestId = 0;
-      let bestVal = -Infinity;
-      for (let i = 0; i < vocabSize; i++) {
-        const v = logits[i];
-        if (Number.isFinite(v) && v > bestVal) {
-          bestVal = v;
-          bestId = i;
-        }
-      }
-      return bestId;
+      throw new Error(
+        'refused: forward pass produced all non-finite logits during Top-K sampling; refusing to substitute token 0',
+      );
     }
 
     const invTemp = 1.0 / config.temperature;

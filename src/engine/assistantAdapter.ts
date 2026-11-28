@@ -424,15 +424,23 @@ export function parseAssistantStreamParts(
       const closeIdx = lower.indexOf(TOOL_CALL_CLOSE, cursor);
       if (closeIdx === -1) {
         // Hold back incomplete `<tool_call>` JSON until `</tool_call>` arrives; on completion,
-        // parse valid JSON or fall back to visible text so malformed tags never vanish silently.
+        // parse valid JSON or emit an explicit named refusal (never silently drop or mask as prose).
         if (isComplete) {
-          const rawTail = workingText.slice(cursor);
-          const fallbackParsed = parseToolCallJson(rawTail, `${idPrefix}_${toolSeq}`);
-          if (fallbackParsed) {
+          const rawTail = workingText.slice(cursor).trim();
+          const parsedTail = parseToolCallJson(rawTail, `${idPrefix}_${toolSeq}`);
+          if (parsedTail) {
             toolSeq += 1;
-            parts.push(fallbackParsed);
-          } else if (rawTail.trim().length > 0) {
-            pushTextOrReasoning('text', rawTail);
+            parts.push(parsedTail);
+          } else if (rawTail.length > 0) {
+            parts.push({
+              type: 'tool-call',
+              toolCallId: `${idPrefix}_${toolSeq++}`,
+              toolName: 'invalid_tool_call',
+              args: {},
+              argsText: rawTail,
+              isError: true,
+              result: 'refused: malformed or unclosed <tool_call> JSON payload',
+            });
           }
         }
         break;
@@ -444,7 +452,15 @@ export function parseAssistantStreamParts(
         toolSeq += 1;
         parts.push(parsedCall);
       } else if (isComplete && inner.trim().length > 0) {
-        pushTextOrReasoning('text', inner);
+        parts.push({
+          type: 'tool-call',
+          toolCallId: `${idPrefix}_${toolSeq++}`,
+          toolName: 'invalid_tool_call',
+          args: {},
+          argsText: inner.trim(),
+          isError: true,
+          result: 'refused: malformed <tool_call> JSON payload',
+        });
       }
       cursor = closeIdx + TOOL_CALL_CLOSE.length;
       activeMode = 'text';
@@ -1559,79 +1575,9 @@ export function createLlamaVTensorAdapter(
           }
         }
 
-        // Graceful thinking-budget continuation: if `<think>` hit its token cap or repetition
-        // guard without closing `</think>`, inject `</think>\n\n` and stream the final visible
-        // answer immediately (reusing live KV cache). If Pass 2 produces no visible answer after
-        // 20 tokens (e.g. re-opened `<think>` or invisible control/whitespace tokens), abort early
-        // and run a clean `thinkingMode: 'off'` direct-answer pass so NO turn ever finishes blank!
-        let directFallbackAttempted = false;
-        async function* runDirectAnswerFallback(reasoningPrefix: string) {
-          if (directFallbackAttempted || abortSignal.aborted) return;
-          directFallbackAttempted = true;
-          const directPrompt = formatMessagesForLlama(
-            projected.messages,
-            state.model ?? undefined,
-            effectivePromptMode,
-            systemMessage,
-            {
-              thinkingMode: 'off',
-              tools: activeTools,
-              pendingAssistantMessage,
-              epochManifestBlock: projected.epochManifestBlock,
-              foveatedRecallBlock: combinedTailRecall,
-              preserveEmptyThinkPrefix: true,
-            },
-          );
-          const fbController = new AbortController();
-          const onFbAbort = () => fbController.abort();
-          abortSignal.addEventListener('abort', onFbAbort, { once: true });
-          const baseGen = lastGeneratedTokens;
-          const fbSampling = {
-            ...effectiveSampling,
-            maxTokens: Math.min(effectiveSampling.maxTokens, 320),
-          };
-          try {
-            for await (const fbEvent of client.streamGenerate(
-              directPrompt,
-              fbController.signal,
-              fbSampling,
-              threadId,
-              sensory.visualKappa,
-            )) {
-              totalChunks += 1;
-              const cleanAns = stripReasoningTags(fbEvent.accumulatedText);
-              latestText = `${reasoningPrefix}${cleanAns}`;
-              lastGeneratedTokens = baseGen + fbEvent.generatedTokens;
-              if (fbEvent.tokensPerSecond > 0) {
-                lastTokensPerSecond = fbEvent.tokensPerSecond;
-              }
-              const parts = parseAssistantStreamParts(latestText, false, {
-                startsInReasoning,
-                parseToolCalls: Boolean(activeTools),
-                idPrefix: stepIdPrefix,
-              });
-              if (parts.length > 0) {
-                yield {
-                  content: parts,
-                  metadata: {
-                    custom: { prismRoute: certificate },
-                    timing: {
-                      streamStartTime,
-                      firstTokenTime,
-                      tokenCount: lastGeneratedTokens,
-                      tokensPerSecond: lastTokensPerSecond,
-                      totalChunks,
-                      toolCallCount: 0,
-                    },
-                  },
-                };
-              }
-            }
-          } finally {
-            abortSignal.removeEventListener('abort', onFbAbort);
-          }
-        }
-
+        // Bounded thinking continuation: when `<think>` reaches its token budget or loops without
+        // closing `</think>`, inject `</think>\n\n` and continue streaming from live KV cache.
+        // Zero silent fallback passes: if Pass 2 still emits no visible answer, the turn refuses explicitly.
         if (hitThinkCap && !abortSignal.aborted) {
           const pass1Tokens = lastGeneratedTokens;
           const closedThink = `${latestText.trimEnd()}\n</think>\n\n`;
@@ -1647,7 +1593,6 @@ export function createLlamaVTensorAdapter(
           let contGenerated = 0;
           let contAccum = '';
           let contVisibleChars = 0;
-          let contAbortedEmpty = false;
           try {
             for await (const contEvent of client.streamGenerate(
               `${prompt}${closedThink}`,
@@ -1659,21 +1604,20 @@ export function createLlamaVTensorAdapter(
               totalChunks += 1;
               contGenerated = contEvent.generatedTokens;
               contAccum = contEvent.accumulatedText;
-              const strippedCont = contAccum.replace(/<\/?(?:think|thought|tool_call|tool_response)>/gi, '');
-              latestText = `${closedThink}${strippedCont}`;
+              latestText = `${closedThink}${contAccum}`;
               lastGeneratedTokens = baseGenerated + contGenerated;
               if (contEvent.tokensPerSecond > 0) {
                 lastTokensPerSecond = contEvent.tokensPerSecond;
               }
               const parts = parseAssistantStreamParts(latestText, false, {
                 startsInReasoning,
-                parseToolCalls: Boolean(activeTools),
+                parseToolCalls,
                 idPrefix: stepIdPrefix,
               });
               contVisibleChars = parts
                 .filter((p): p is TextMessagePart => p.type === 'text')
                 .reduce((acc, p) => acc + p.text.trim().length, 0);
-              const completedToolCall = Boolean(activeTools) && hasCompleteToolCallTag(latestText);
+              const completedToolCall = parseToolCalls && hasCompleteToolCallTag(latestText);
               const toolCallCount = parts.filter((p) => p.type === 'tool-call').length;
               if (parts.length > 0 && !completedToolCall) {
                 yield {
@@ -1695,43 +1639,16 @@ export function createLlamaVTensorAdapter(
                 answerController.abort();
                 break;
               }
-              if (contGenerated >= 20 && contVisibleChars === 0) {
-                contAbortedEmpty = true;
-                answerController.abort();
-                break;
-              }
             }
           } finally {
             abortSignal.removeEventListener('abort', onAnswerAbort);
           }
-          const needDirectFallback = (contAbortedEmpty || contVisibleChars === 0) && !abortSignal.aborted;
           turnSpan?.addEvent('turn.think_continuation', {
             pass1Tokens,
             pass2Tokens: contGenerated,
             pass2VisibleChars: contVisibleChars,
-            pass2Preview: contAccum.slice(0, 60),
-            fallbackUsed: needDirectFallback,
+            pass2Preview: contAccum.slice(0, 80),
           });
-          if (needDirectFallback) {
-            yield* runDirectAnswerFallback(closedThink);
-          }
-        } else if (!abortSignal.aborted) {
-          // Safety net: if natural generation ended with only reasoning and zero visible text/tool-call,
-          // close thinking and run the direct-answer fallback so the user never sees a blank reply.
-          const preCheck = parseAssistantStreamParts(latestText, true, {
-            startsInReasoning,
-            parseToolCalls,
-            idPrefix: stepIdPrefix,
-          });
-          const hasVisibleOrTool = preCheck.some(
-            (p) => (p.type === 'text' && p.text.trim().length > 0) || p.type === 'tool-call',
-          );
-          if (!hasVisibleOrTool && preCheck.some((p) => p.type === 'reasoning')) {
-            const closedThink = /<\/think>/i.test(latestText)
-              ? `${latestText.trimEnd()}\n\n`
-              : `${latestText.trimEnd()}\n</think>\n\n`;
-            yield* runDirectAnswerFallback(closedThink);
-          }
         }
       } finally {
         if (firstTokenTime === undefined) {
@@ -1862,20 +1779,6 @@ export function createLlamaVTensorAdapter(
         });
       }
 
-      if (
-        !hasUnresolvedToolCalls &&
-        !finalParts.some((p) => p.type === 'text' && p.text.trim().length > 0)
-      ) {
-        const reasoningFallback = finalParts
-          .filter((p): p is ReasoningMessagePart => p.type === 'reasoning')
-          .map((p) => p.text.trim())
-          .filter(Boolean)
-          .join('\n\n');
-        if (reasoningFallback) {
-          finalParts.push({ type: 'text', text: reasoningFallback });
-        }
-      }
-
       const totalStreamTime = Date.now() - streamStartTime;
       const toolCallsEmitted = finalParts.filter((p) => p.type === 'tool-call');
       const hasToolCalls = hasUnresolvedToolCalls;
@@ -1897,28 +1800,24 @@ export function createLlamaVTensorAdapter(
         'verdant.tok_per_sec': lastTokensPerSecond,
         'verdant.coherence_q10': client.cognitiveObserver.chronology.snapshot().coherenceQ10,
       });
-      turnSpan?.end('ok');
 
-      if (finalParts.length > 0) {
-        // Close the second-order cybernetic feedback loop for neural turns too
-        const visibleReply = finalParts
-          .filter((p): p is TextMessagePart => p.type === 'text')
-          .map((p) => p.text)
-          .join(' ')
-          .replace(/\s+/g, ' ')
-          .trim();
-        if (visibleReply && !hasToolCalls) {
-          const updatedSnap = client.cognitiveObserver.recordTurnOutcome(threadId, {
-            factKey: `turn_${snapshot.turnCount}`,
-            factSummary: visibleReply.slice(0, 140),
-          });
-          client.recordCognitiveObservation(certificate, updatedSnap);
-        }
+      const visibleReply = finalParts
+        .filter((p): p is TextMessagePart => p.type === 'text')
+        .map((p) => p.text)
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const settledToolParts = toolCallsEmitted.length > 0;
+
+      if (!hasToolCalls && !settledToolParts && !visibleReply) {
+        const refusal =
+          finalParts.length > 0
+            ? 'refused: model completed without emitting a visible answer after reasoning'
+            : 'refused: model emitted end-of-sequence without generating a response';
+        turnSpan?.end('error', refusal);
         yield {
           content: finalParts,
-          status: hasToolCalls
-            ? { type: 'requires-action', reason: 'tool-calls' }
-            : { type: 'complete', reason: 'stop' },
+          status: { type: 'incomplete', reason: 'error', error: refusal },
           metadata: {
             custom: { prismRoute: certificate },
             steps: [
@@ -1940,29 +1839,43 @@ export function createLlamaVTensorAdapter(
             },
           },
         };
-      } else {
-        yield {
-          content: [
+        return;
+      }
+
+      turnSpan?.end('ok');
+      if (visibleReply && !hasToolCalls) {
+        const updatedSnap = client.cognitiveObserver.recordTurnOutcome(threadId, {
+          factKey: `turn_${snapshot.turnCount}`,
+          factSummary: visibleReply.slice(0, 140),
+        });
+        client.recordCognitiveObservation(certificate, updatedSnap);
+      }
+      yield {
+        content: finalParts,
+        status: hasToolCalls
+          ? { type: 'requires-action', reason: 'tool-calls' }
+          : { type: 'complete', reason: 'stop' },
+        metadata: {
+          custom: { prismRoute: certificate },
+          steps: [
             {
-              type: 'text',
-              text: '(End of sequence token generated by model.)',
+              usage: {
+                inputTokens: lastPromptTokens,
+                outputTokens: lastGeneratedTokens,
+              },
             },
           ],
-          status: { type: 'complete', reason: 'stop' },
-          metadata: {
-            custom: { prismRoute: certificate },
-            timing: {
-              streamStartTime,
-              firstTokenTime,
-              totalStreamTime,
-              tokenCount: lastGeneratedTokens,
-              tokensPerSecond: lastTokensPerSecond,
-              totalChunks,
-              toolCallCount: 0,
-            },
+          timing: {
+            streamStartTime,
+            firstTokenTime,
+            totalStreamTime,
+            tokenCount: lastGeneratedTokens,
+            tokensPerSecond: lastTokensPerSecond,
+            totalChunks,
+            toolCallCount: toolCallsEmitted.length,
           },
-        };
-      }
+        },
+      };
     },
   };
 }

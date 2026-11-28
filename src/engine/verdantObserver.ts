@@ -18,7 +18,6 @@ import {
   type ModelCategoryInfo,
 } from './modelCatalog';
 import {
-  deriveHostMemoryBudgetBytes,
   derivePerformanceContract,
   INTEGER_DOT_COMPATIBLE_TYPES,
   type EnvironmentProfile,
@@ -118,22 +117,6 @@ export interface ObserverRuntimeInput {
   readonly weightResidencyPolicy: WeightResidencyPolicy;
   readonly opfsStorage: OpfsQuotaSnapshot;
   readonly backingBandwidthMBs?: number;
-}
-
-export function buildFallbackEnvironmentProfile(): EnvironmentProfile {
-  return {
-    simdTier: 'relaxed-vnni',
-    relaxedSimdSupported: true,
-    hardwareConcurrency: 4,
-    sharedMemorySupported: true,
-    effectiveWorkers: 4,
-    memoryBandwidthGBs: 12,
-    computeGops: 140,
-    ridgeIntensityOpsPerByte: 140 / 12,
-    workerSyncLatencyUs: 22,
-    memoryBudgetBytes: deriveHostMemoryBudgetBytes(),
-    calibrationMs: 0,
-  };
 }
 
 export function buildGeometrySpecForCatalogModel(model: CatalogModel): ModelGeometrySpec {
@@ -340,7 +323,12 @@ export function observeCatalogScaling(
   input: ObserverRuntimeInput,
   category: ModelCategory = 'all',
 ): VerdantObserverReport {
-  const env = input.env ?? buildFallbackEnvironmentProfile();
+  if (!input.env) {
+    throw new Error(
+      'refused: observeCatalogScaling requires a measured EnvironmentProfile; synthetic hardware assumptions are not permitted',
+    );
+  }
+  const env = input.env;
   const activeCategory = MODEL_CATEGORIES.find((c) => c.id === category) ?? MODEL_CATEGORIES[0];
   const bootstrapUnbound = isInternalBootstrapModel(input.activeModelId);
 

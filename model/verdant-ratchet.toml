@@ -20,6 +20,7 @@ root_absolute_bundled_asset_urls_max = 0
 tracking_or_analytics_sdks_max = 0
 paywall_or_auth_gate_dependencies_max = 0
 user_facing_internal_jargon_max = 0
+banned_fallback_coverups_max = 0
 
 [requirements]
 require_coop_coep_multithread_isolation = true
@@ -28,3 +29,4 @@ require_verdant_engine_pin_parity = true
 require_owner_decisions_register = true
 require_free_public_benefit_charter = true
 require_zero_user_facing_jargon = true
+require_explicit_refusal_no_fallbacks = true

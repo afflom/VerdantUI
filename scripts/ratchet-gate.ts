@@ -26,6 +26,7 @@ export interface RatchetViolation {
     | 'ids-register'
     | 'public-benefit-charter'
     | 'user-facing-jargon'
+    | 'silent-fallback'
     | 'policy-config';
   readonly path: string;
   readonly line?: number;
@@ -494,6 +495,30 @@ export function evaluateVerdantRatchet(snapshot: RatchetSnapshot): RatchetReport
     }
   }
 
+  // 12. Explicit-Refusal Discipline (afflom/verdant-studio parity): zero silent fallback cover-ups in src/engine/
+  const BANNED_FALLBACK_PATTERNS: readonly { readonly label: string; readonly regex: RegExp }[] = [
+    { label: 'runDirectAnswerFallback', regex: /\brunDirectAnswerFallback\b/ },
+    { label: 'reasoningFallback', regex: /\breasoningFallback\b/ },
+    { label: 'buildFallbackEnvironmentProfile', regex: /\bbuildFallbackEnvironmentProfile\b/ },
+    { label: 'CLIP hash-guessing tokenizer fallback', regex: /deterministic hash fallback offline/i },
+    { label: 'non-finite logit token-0 fallback', regex: /Finite-logit fallback/i },
+  ];
+  for (const relPath of srcPaths) {
+    if (!relPath.startsWith('src/engine/') || relPath.endsWith('.test.ts')) continue;
+    const content = snapshot.srcFiles[relPath];
+    if (!content) continue;
+    for (const pat of BANNED_FALLBACK_PATTERNS) {
+      if (pat.regex.test(content)) {
+        violations.push({
+          category: 'silent-fallback',
+          path: relPath,
+          line: findLineNumber(content, pat.regex),
+          detail: `Banned silent fallback cover-up "${pat.label}" — refuse explicitly by name instead of masking unfinished/failed work`,
+        });
+      }
+    }
+  }
+
   return {
     ok: violations.length === 0,
     schema,
@@ -629,6 +654,17 @@ export function verifyPlantedDefects(cleanSnapshot: RatchetSnapshot): {
         srcFiles: {
           ...s.srcFiles,
           'src/components/SettingsDrawer.tsx': `${s.srcFiles['src/components/SettingsDrawer.tsx'] ?? ''}\nexport const _bad2 = () => <span>Verdant Engine routing weights</span>;`,
+        },
+      }),
+    },
+    {
+      name: 'planted-silent-fallback-coverup',
+      expectedCategory: 'silent-fallback',
+      mutate: (s) => ({
+        ...s,
+        srcFiles: {
+          ...s.srcFiles,
+          'src/engine/assistantAdapter.ts': `${s.srcFiles['src/engine/assistantAdapter.ts'] ?? ''}\nconst reasoningFallback = 'masked';`,
         },
       }),
     },

@@ -32,6 +32,19 @@ function f32Slice(rows: number, cols: number, fill = 0.04): TensorSlice {
   return { bytes: new Uint8Array(arr.buffer), offset: 0, type: GgmlType.F32, rows, cols };
 }
 
+function makeTestClipBpeVocab(vocabSize: number) {
+  const tokens: Record<string, number> = {
+    '<|startoftext|>': Math.min(49406, vocabSize - 2),
+    '<|endoftext|>': Math.min(49407, vocabSize - 1),
+  };
+  let nextId = 1;
+  for (const ch of 'abcdefghijklmnopqrstuvwxyz ') {
+    if (nextId < vocabSize - 2) tokens[ch] = nextId++;
+    if (nextId < vocabSize - 2) tokens[`${ch}</w>`] = nextId++;
+  }
+  return parseClipBpeFromJsonAndMerges(JSON.stringify(tokens), '#version: 0.2\n', 'opfs-cache');
+}
+
 test('1-step distilled neural image synthesis (CLIP -> SDXS UNet -> TAESD) produces valid bounded RGBA8 pixels', () => {
   const clip: ClipTextWeights = {
     vocabSize: 32,
@@ -316,7 +329,13 @@ test('loadImageWeightsFromBacking selectively range-reads SDXS+TAESD GGUF with l
   assert.equal(loaded.clip.tokenEmbd, undefined, 'CLIP vocab must stay demand-paged via readTokenEmbeddingRow');
   assert.equal(typeof loaded.clip.readTokenEmbeddingRow, 'function');
 
-  const tokens = encodePromptToClipTokens('emerald alpine sunrise', loaded.clip.vocabSize, loaded.clip.maxSeqLen);
+  assert.throws(
+    () => encodePromptToClipTokens('emerald alpine sunrise', loaded.clip.vocabSize, loaded.clip.maxSeqLen, null),
+    /refused:.*CLIP BPE/i,
+    'encodePromptToClipTokens must refuse explicitly when CLIP BPE vocab is missing',
+  );
+  const testVocab = makeTestClipBpeVocab(loaded.clip.vocabSize);
+  const tokens = encodePromptToClipTokens('emerald alpine sunrise', loaded.clip.vocabSize, loaded.clip.maxSeqLen, testVocab);
   const scratch: ImageSynthesisScratch = {};
   const readsBefore = rangeReads;
   const img1 = synthesizeImageOneStep({ promptTokens: tokens, latentH: 4, latentW: 4, seed: 42, ...loaded, scratch });
@@ -385,7 +404,7 @@ test('synthesizeDistilledImageAsync streams multi-layer CLIP, cross-attention UN
   assert.ok(tEmb.every((v) => Number.isFinite(v)));
 
   const loaded = loadImageWeightsFromGguf(gguf);
-  const tokens = encodePromptToClipTokens('a golden dog sitting in sunlit grass', V, S);
+  const tokens = encodePromptToClipTokens('a golden dog sitting in sunlit grass', V, S, makeTestClipBpeVocab(V));
   let yields = 0;
 
   // Verify Lod0CoarseProxy (16 -> 128x128) and Lod3LosslessSource (64 -> 512x512)
@@ -676,7 +695,7 @@ test('Exact verified SDXS-512 UNet topology (input_blocks {0,1,3,4,6,7} -> outpu
   assert.deepEqual(loaded.streamGraph?.outputBlockIndices, [0, 1, 2, 3, 4, 5, 6, 7]);
   assert.equal(loaded.streamGraph?.taesdResidualIndices.length, 10);
 
-  const tokens = encodePromptToClipTokens('a golden dog', V, S);
+  const tokens = encodePromptToClipTokens('a golden dog', V, S, makeTestClipBpeVocab(V));
   const res = await synthesizeDistilledImageAsync({
     promptTokens: tokens,
     latentH: 8,

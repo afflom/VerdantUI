@@ -297,7 +297,7 @@ test('formatMessagesForLlama and formatSpeculativePrefixForLlama redact large ba
   assert.ok(prompt.includes('inline audio/wav artifact rendered in UI'));
 });
 
-test('parseAssistantStreamParts handles startsInReasoning continuation and falls back on malformed tool_call', () => {
+test('parseAssistantStreamParts handles startsInReasoning continuation and explicitly refuses malformed tool_call', () => {
   const withContinuation = parseAssistantStreamParts(
     'Assume sqrt(2) = a/b.\n</think>\n\nSuppose sqrt(2) is rational.',
     true,
@@ -314,6 +314,11 @@ test('parseAssistantStreamParts handles startsInReasoning continuation and falls
     { startsInReasoning: true, parseToolCalls: true },
   );
   assert.equal(malformedTool.length, 2);
-  assert.equal(malformedTool[1]?.type, 'text');
-  assert.ok(malformedTool[1]?.type === 'text' && malformedTool[1].text.includes('Not valid json answer text'));
+  assert.equal(malformedTool[1]?.type, 'tool-call');
+  assert.equal(malformedTool[1]?.type === 'tool-call' && malformedTool[1].isError, true);
+  assert.ok(
+    malformedTool[1]?.type === 'tool-call' &&
+      typeof malformedTool[1].result === 'string' &&
+      malformedTool[1].result.startsWith('refused:'),
+  );
 });

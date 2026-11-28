@@ -433,39 +433,21 @@ export async function ensureClipBpeVocabularyCached(
 }
 
 /**
- * CLIP prompt tokenizer: uses real byte-level CLIP BPE when `bpeVocab` is available
- * (mapping `"dog"` -> `1929`, `BOS=49406`, `EOS=49407`), with deterministic hash fallback offline.
+ * CLIP prompt tokenizer: requires a verified byte-level CLIP BPE vocabulary
+ * (`BOS=49406`, `EOS=49407`) and refuses explicitly when unavailable (zero hash guessing).
  */
 export function encodePromptToClipTokens(
   prompt: string,
-  vocabSize: number,
+  _vocabSize: number,
   maxSeqLen = 77,
   bpeVocab?: ClipBpeVocabulary | null,
 ): number[] {
-  if (bpeVocab) {
-    return encodeClipBpeTokens(prompt, bpeVocab, maxSeqLen);
+  if (!bpeVocab) {
+    throw new Error(
+      'refused: CLIP BPE vocabulary is required to encode image prompts; hash-based token guessing is not permitted',
+    );
   }
-  const safeVocab = Math.max(4, vocabSize);
-  const bos = Math.min(49406, safeVocab - 2);
-  const eos = Math.min(49407, safeVocab - 1);
-  const out: number[] = [bos];
-  const words = prompt
-    .toLowerCase()
-    .replace(/[^a-z0-9\s'-]+/g, ' ')
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
-  for (const w of words) {
-    if (out.length >= maxSeqLen - 1) break;
-    let h = 2166136261 >>> 0;
-    for (let i = 0; i < w.length; i++) {
-      h ^= w.charCodeAt(i);
-      h = Math.imul(h, 16777619) >>> 0;
-    }
-    out.push(256 + (h % Math.max(1, safeVocab - 260)));
-  }
-  out.push(eos);
-  return out;
+  return encodeClipBpeTokens(prompt, bpeVocab, maxSeqLen);
 }
 
 function findImageTensor(model: ParsedGgufModel, candidates: readonly string[]): GgufTensorInfo | null {

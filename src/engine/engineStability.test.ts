@@ -269,10 +269,16 @@ test('sampleNextToken guards greedy, Top-K/Top-P, large Top-K, and all-NaN logit
   largeLogits[777] = 3.5;
   assert.equal(sampleNextToken(largeLogits, [], { ...baseCfg, topK: 1050 }, () => 0.5), 777);
 
-  // All-NaN edge case falls back deterministically to token 0 without throwing
+  // All-NaN logits must be refused explicitly (never silently substitute token 0)
   const allNan = new Float32Array([Number.NaN, Number.NaN, Number.NaN]);
-  assert.equal(sampleNextToken(allNan, [], baseCfg, () => 0.5), 0);
-  assert.equal(sampleNextToken(allNan, [], { ...baseCfg, temperature: 0 }, () => 0.5), 0);
+  assert.throws(
+    () => sampleNextToken(allNan, [], baseCfg, () => 0.5),
+    /refused:.*non-finite logits/i,
+  );
+  assert.throws(
+    () => sampleNextToken(allNan, [], { ...baseCfg, temperature: 0 }, () => 0.5),
+    /refused:.*non-finite logits/i,
+  );
 });
 
 test('FrameBudgetProfiler maintains bounded O(1) state and exact 3-sample median across 10,500 steps', () => {

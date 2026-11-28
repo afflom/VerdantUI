@@ -9,7 +9,6 @@ import {
   isInternalBootstrapModel,
 } from './modelCatalog';
 import {
-  buildFallbackEnvironmentProfile,
   observeCatalogScaling,
   type ObserverRuntimeInput,
 } from './verdantObserver';
@@ -22,11 +21,17 @@ function makeBaseInput(overrides: Partial<ObserverRuntimeInput> = {}): ObserverR
     activeModelId: INTERNAL_BOOTSTRAP_MODEL.id,
     activeModelName: INTERNAL_BOOTSTRAP_MODEL.name,
     env: {
-      ...buildFallbackEnvironmentProfile(),
+      simdTier: 'relaxed-vnni',
+      relaxedSimdSupported: true,
+      hardwareConcurrency: 4,
+      sharedMemorySupported: true,
+      effectiveWorkers: 4,
       memoryBandwidthGBs: 28,
       computeGops: 320,
       ridgeIntensityOpsPerByte: 320 / 28,
+      workerSyncLatencyUs: 22,
       memoryBudgetBytes: Math.floor(3.25 * GIB),
+      calibrationMs: 12,
     },
     sampling: DEFAULT_SAMPLING_CONFIG,
     precisionMode: 'q8-vnni',
@@ -198,5 +203,12 @@ test('Verdant scaling evaluator handles OPFS demand-cache fallback, reclamation,
         r.action.policy === 'auto',
     ),
     'Expected continuous suggestion to restore auto residency when active 0.5B model fits in RAM',
+  );
+});
+
+test('observeCatalogScaling refuses explicitly when EnvironmentProfile is unmeasured', () => {
+  assert.throws(
+    () => observeCatalogScaling(makeBaseInput({ env: null }), 'all'),
+    /refused:.*EnvironmentProfile/i,
   );
 });

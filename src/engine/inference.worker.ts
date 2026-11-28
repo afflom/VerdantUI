@@ -1649,6 +1649,18 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       const bpeVocab =
         neuralWeights.streamGraph?.clipBpeVocab ??
         (await ensureClipBpeVocabularyCached(Boolean(req.allowAutoLoad)));
+      if (!bpeVocab) {
+        post({
+          type: 'image_synthesized',
+          requestId: req.requestId,
+          neuralAvailable: false,
+          width: 0,
+          height: 0,
+          rgbaBuffer: null,
+          multimodalTelemetry: multimodalCoordinator.getTelemetry(),
+        });
+        return;
+      }
       const promptTokens = encodePromptToClipTokens(
         req.prompt,
         neuralWeights.clip.vocabSize,
