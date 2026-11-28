@@ -930,13 +930,15 @@ export class UnifiedSemanticAssociator {
     if (exact) return exact;
 
     // 3. Cosine + lexical resonance across stored associative anchors + state matrix S readout
+    // Require either lexical subject match or strong cosine (>= 0.58) so unrelated creations never
+    // inherit an earlier Prism's brief!
     const qVec = encodeSemanticVector32([query]);
     let best: SemanticRevisionRecord | null = null;
-    let bestScore = 0.28;
+    let bestScore = 0.58;
     for (const rec of this.revisionsByConcept.values()) {
       const subj = rec.canonicalSubject.toLowerCase();
       let lexical = 0;
-      if (subj.length >= 2 && qLower.includes(subj)) lexical += 0.6;
+      if (subj.length >= 3 && qLower.includes(subj)) lexical += 0.65;
       let dot = 0;
       for (let i = 0; i < SEMANTIC_ASSOC_DIM; i++) {
         dot += qVec[i]! * (rec.semanticVector[i] ?? 0);

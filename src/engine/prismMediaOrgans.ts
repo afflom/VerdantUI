@@ -367,13 +367,16 @@ export interface ToolWorkflowStepWeight {
 
 export interface ToolOrganWeights {
   readonly mediaType: 'tool-organ';
-  readonly role: 'habit-guardian' | 'schedule-guard' | 'calculator' | 'workflow-helper';
+  readonly role: 'habit-guardian' | 'schedule-guard' | 'calculator' | 'workflow-helper' | 'focus-timer';
   readonly compartmentId: string;
   readonly emitsOpaqueConstraints: boolean;
   readonly rulesSummary: string;
   readonly scheduleWindows: readonly ScheduleWindowWeight[];
   readonly metrics: readonly ToolOrganMetricWeight[];
   readonly steps?: readonly ToolWorkflowStepWeight[];
+  readonly workMinutes?: number;
+  readonly shortBreakMinutes?: number;
+  readonly longBreakMinutes?: number;
 }
 
 export interface SpaceArtifactEntry {
@@ -643,10 +646,10 @@ export function normalizeOrganWeights(
           })
         : [
             {
-              title: 'Chapter 1: The Inciting Spark',
+              title: 'Chapter 1: Opening',
               beat: 'Opening',
-              summary: 'Introduce the protagonist, setting, and the central tension.',
-              body: '',
+              summary: `Introduce the setting, voice, and central tension of ${titleHint}.`,
+              body: `## ${titleHint}\n\n${hintText ? `Seed premise: ${hintText.trim()}` : `Opening scene for ${titleHint}.`}\n\nThe first light caught the edges of the scene before anyone spoke. Every detail was still—quiet enough to notice what had shifted overnight and what could no longer wait.\n\n- **Focus:** Establish atmosphere, protagonist intent, and the immediate stakes.\n- **Next beat:** Expand this scene directly here or ask the prompt bar below to continue drafting.`,
             },
             {
               title: 'Chapter 2: Rising Stakes',
@@ -891,20 +894,24 @@ export function normalizeOrganWeights(
     };
   }
 
-  // tool-organ (habit guardian, schedule guard, calculator, workflow helper)
+  // tool-organ (focus timer, habit guardian, schedule guard, calculator, workflow helper)
+  const isTimer = /\b(pomodoro|countdown|timer|stopwatch|focus\s+timer)\b/.test(lowerHint);
   const isHabit = /\b(habit|healthy|workout|exercise|meditat|sleep|walk|run|wellness|gym|hydrat)\b/.test(lowerHint);
-  const isSchedule = /\b(calendar|schedule|meeting|quiet|focus|pomodoro|block\s*time|protect)\b/.test(lowerHint);
+  const isSchedule = /\b(calendar|schedule|meeting|quiet|block\s*time|protect)\b/.test(lowerHint);
   const role: ToolOrganWeights['role'] =
+    p.role === 'focus-timer' ||
     p.role === 'habit-guardian' ||
     p.role === 'schedule-guard' ||
     p.role === 'calculator' ||
     p.role === 'workflow-helper'
       ? p.role
-      : isHabit
-        ? 'habit-guardian'
-        : isSchedule
-          ? 'schedule-guard'
-          : 'workflow-helper';
+      : isTimer
+        ? 'focus-timer'
+        : isHabit
+          ? 'habit-guardian'
+          : isSchedule
+            ? 'schedule-guard'
+            : 'workflow-helper';
 
   // Extract time window like "5pm to 6pm" or "17:00-18:00" if mentioned in natural language
   const timeMatch = lowerHint.match(

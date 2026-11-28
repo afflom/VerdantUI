@@ -918,9 +918,16 @@ export function observeInputSensoryState(
   // Axis 7: Multi-step tool composition (requires combining local tools + neural synthesis)
   let toolComp = 64;
   if (!directMatch) {
+    const isReflectiveProse =
+      /\b(tell\s+me|honestly|limitations?|what\s+feels|how\s+do\s+you|your\s+own|sharper|experience|opinion|about\s+yourself)\b/.test(
+        lower,
+      );
     const wantsCalc = /\b(calculate|compute|evaluate|sqrt|sum|product)\b/.test(lower);
     const wantsNote = /\b(note|notes|save|remember|bookmark)\b/.test(lower);
-    const wantsRuntime = /\b(inspect|runtime|opfs|vtensor|telemetry|workers?)\b/.test(lower);
+    const wantsRuntime =
+      !isReflectiveProse &&
+      /\b(inspect|check|show|diagnos|report)\b/.test(lower) &&
+      /\b(runtime|opfs|vtensor|telemetry|workers?)\b/.test(lower);
     const wantsTime = /\b(current\s+time|today'?s?\s+date|timezone)\b/.test(lower);
     const wantsJson = /\b(validate|parse|count\s+words|count\s+lines|search\s+text)\b/.test(lower);
     const hits = [wantsCalc, wantsNote, wantsRuntime, wantsTime, wantsJson].filter(Boolean).length;
@@ -1554,9 +1561,9 @@ export class VerdantCognitiveObserver {
       analyticalCue || escalatedObs[1] >= 512 || escalatedObs[2] >= 512;
     const isCreativeTask = !isAnalyticalTask && !needsTools && escalatedObs[5] >= 512;
     const recommendedSampling = needsTools
-      ? { temperature: 0.2, topP: 0.9, topK: 20, repeatPenalty: 1.05 }
+      ? { temperature: 0.25, topP: 0.9, topK: 20, repeatPenalty: 1.1 }
       : needsThinking
-        ? { temperature: isAnalyticalTask ? 0.35 : 0.55, topP: 0.92, topK: 20, repeatPenalty: 1.05 }
+        ? { temperature: isAnalyticalTask ? 0.35 : 0.55, topP: 0.92, topK: 20, repeatPenalty: 1.1 }
         : isCreativeTask
           ? { temperature: 0.72, topP: 0.92, topK: 30, repeatPenalty: 1.06 }
           : { temperature: isAnalyticalTask ? 0.35 : 0.6, topP: 0.88, topK: 20, repeatPenalty: 1.05 };

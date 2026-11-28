@@ -87,5 +87,29 @@ test('StudioChatBridge creates inline PNG Pictures, Stereo WAV Audio, Games, Spa
   assert.equal(delRes.action, 'delete');
   assert.equal(galleries.galleryCounts().audio, 0);
 
+  // 6. Media-aware summaries, Pomodoro focus-timer, Written-Work starter prose & clean naming
+  const synthRes = await bridge.createArtifactFromPrompt({
+    prompt: 'Compose an upbeat dorian synthwave soundtrack at 118 BPM with drums',
+    forcedMediaType: 'audio',
+  });
+  const synthProj = store.get(synthRes.prismId)!;
+  assert.ok(!synthProj.draft.summary.includes('clear focal silhouette'), 'Audio must not use picture brief template');
+  assert.ok(!/^n\s+upbeat/i.test(synthProj.draft.summary), 'Must not slice "an " into "n "');
+
+  const docRes = await bridge.createArtifactFromPrompt({
+    prompt: 'Write chapter 1 of a sci-fi novel about an orbital greenhouse',
+    forcedMediaType: 'written-work',
+  });
+  assert.ok(docRes.prismName.includes('1') && /sci-fi/i.test(docRes.prismName), `Expected clean numeric/hyphenated title, got "${docRes.prismName}"`);
+  const docWeights = store.get(docRes.prismId)?.declaration?.view?.proceduralOrgan?.weights;
+  assert.ok(docWeights?.mediaType === 'written-work' && docWeights.chapters[0]!.body.trim().length > 40, 'Written work Chapter 1 must start with real prose');
+
+  const pomoRes = await bridge.createArtifactFromPrompt({
+    prompt: 'Build a pomodoro timer app',
+    forcedMediaType: 'tool-organ',
+  });
+  const pomoWeights = store.get(pomoRes.prismId)?.declaration?.view?.proceduralOrgan?.weights;
+  assert.equal(pomoWeights?.mediaType === 'tool-organ' ? pomoWeights.role : null, 'focus-timer');
+
   pool.dispose();
 });

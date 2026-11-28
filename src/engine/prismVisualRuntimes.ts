@@ -488,6 +488,8 @@ function renderChrome() {
   root.innerHTML = '';
   const canvas = document.createElement('canvas'); canvas.id = 'vid-canvas';
   canvas.className = 'organ-canvas'; canvas.width = dims[0]; canvas.height = dims[1];
+  canvas.style.maxHeight = '54vh';
+  canvas.style.objectFit = 'contain';
   root.appendChild(canvas);
 
   const scrub = document.createElement('input'); scrub.id = 'vid-scrub'; scrub.type = 'range';

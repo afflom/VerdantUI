@@ -186,18 +186,35 @@ function derivePrismName(sentence: string): TaggedFact<string> {
 
   const stop = new Set([
     'a', 'an', 'the', 'my', 'our', 'to', 'for', 'of', 'in', 'on', 'by', 'with', 'and', 'or',
-    'that', 'which', 'help', 'me', 'us', 'let', 'make', 'build', 'create', 'app', 'prism',
-    'tool', 'check', 'if', 'when', 'is', 'are', 'be', 'can', 'should', 'will', 'alert', 'warn',
-    'refuse', 'reject', 'calculate', 'compute', 'track', 'interactive', 'please', 'generate',
-    'picture', 'image', 'photo', 'draw', 'paint', 'render', 'compose', 'video', 'audio', 'song',
-    'artwork', 'illustration', 'show', 'give', 'write',
+    'about', 'from', 'into', 'over', 'under', 'near', 'that', 'which', 'help', 'me', 'us', 'let',
+    'make', 'build', 'create', 'app', 'prism', 'tool', 'check', 'if', 'when', 'is', 'are', 'be',
+    'can', 'should', 'will', 'alert', 'warn', 'refuse', 'reject', 'calculate', 'compute', 'track',
+    'interactive', 'please', 'generate', 'picture', 'image', 'photo', 'draw', 'paint', 'render',
+    'compose', 'video', 'audio', 'song', 'artwork', 'illustration', 'show', 'give', 'write',
   ]);
-  const words = sentence
-    .replace(/[^a-zA-Z0-9\s]/g, ' ')
+  const rawTokens = sentence
+    .replace(/[^a-zA-Z0-9\s-]/g, ' ')
     .split(/\s+/)
-    .filter((w) => w.length > 2 && !stop.has(w.toLowerCase()));
-  if (words.length > 0) {
-    const picked = titleCase(words.slice(0, 4).join(' '));
+    .map((w) => w.replace(/^-+|-+$/g, ''))
+    .filter((w) => {
+      if (!w) return false;
+      const low = w.toLowerCase();
+      if (stop.has(low)) return false;
+      // Preserve numbers ("1", "2048") and hyphenated genre terms ("sci-fi")
+      if (/^\d+$/.test(w)) return true;
+      return w.length > 2 || w.includes('-');
+    });
+  if (rawTokens.length > 0) {
+    const picked = rawTokens
+      .slice(0, 5)
+      .map((w) =>
+        w.includes('-')
+          ? w.split('-').map((part) => (part ? part[0].toUpperCase() + part.slice(1).toLowerCase() : '')).join('-')
+          : /^\d+$/.test(w)
+            ? w
+            : w[0].toUpperCase() + w.slice(1).toLowerCase(),
+      )
+      .join(' ');
     return { value: picked, source: 'stated', reason: 'Derived from key terms in your idea.' };
   }
   return { value: 'My Prism', source: 'suggested', reason: 'Default working title (editable anytime).' };

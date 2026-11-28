@@ -450,6 +450,104 @@ function render() {
   summary.textContent = W.rulesSummary;
   root.appendChild(summary);
 
+  if (W.role === 'focus-timer') {
+    const workMin = Number(W.workMinutes) || 25;
+    const shortMin = Number(W.shortBreakMinutes) || 5;
+    const longMin = Number(W.longBreakMinutes) || 15;
+    const modes = { focus: workMin * 60, short: shortMin * 60, long: longMin * 60 };
+    if (!window.__verdantTimer) {
+      window.__verdantTimer = { mode: 'focus', remaining: modes.focus, running: false, sessions: state.checkins || 0, interval: null, audioCtx: null };
+      const closeTimerAudio = () => {
+        const tm = window.__verdantTimer;
+        if (tm?.interval) { clearInterval(tm.interval); tm.interval = null; }
+        if (tm?.audioCtx && tm.audioCtx.state !== 'closed') { try { void tm.audioCtx.close(); } catch (_) {} }
+        if (tm) tm.audioCtx = null;
+      };
+      window.addEventListener('pagehide', closeTimerAudio);
+      window.addEventListener('beforeunload', closeTimerAudio);
+    }
+    const tm = window.__verdantTimer;
+    const chime = () => {
+      try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        if (!tm.audioCtx || tm.audioCtx.state === 'closed') tm.audioCtx = new AC();
+        if (tm.audioCtx.state === 'suspended') void tm.audioCtx.resume();
+        const now = tm.audioCtx.currentTime;
+        for (const [off, hz] of [[0, 523.25], [0.16, 659.25], [0.32, 783.99]]) {
+          const osc = tm.audioCtx.createOscillator(), g = tm.audioCtx.createGain();
+          osc.type = 'sine'; osc.frequency.setValueAtTime(hz, now + off);
+          g.gain.setValueAtTime(0.001, now + off); g.gain.exponentialRampToValueAtTime(0.11, now + off + 0.02); g.gain.exponentialRampToValueAtTime(0.0005, now + off + 0.35);
+          osc.connect(g); g.connect(tm.audioCtx.destination); osc.start(now + off); osc.stop(now + off + 0.38);
+        }
+      } catch (_) {}
+    };
+    const fmtClock = (sec) => String(Math.floor(sec / 60)).padStart(2, '0') + ':' + String(sec % 60).padStart(2, '0');
+    const stopTick = () => { if (tm.interval) { clearInterval(tm.interval); tm.interval = null; } tm.running = false; };
+    const startTick = () => {
+      if (tm.interval) return;
+      tm.running = true;
+      tm.interval = setInterval(() => {
+        if (tm.remaining > 0) {
+          tm.remaining -= 1;
+          const clk = document.getElementById('timer-clock');
+          const bar = document.getElementById('timer-bar-fill');
+          if (clk) clk.textContent = fmtClock(tm.remaining);
+          if (bar) bar.style.width = Math.round(((modes[tm.mode] - tm.remaining) / Math.max(1, modes[tm.mode])) * 100) + '%';
+        } else {
+          stopTick(); chime();
+          if (tm.mode === 'focus') { tm.sessions += 1; state.checkins = tm.sessions; persist(); }
+          tm.mode = tm.mode === 'focus' ? (tm.sessions % 4 === 0 ? 'long' : 'short') : 'focus';
+          tm.remaining = modes[tm.mode];
+          render();
+        }
+      }, 1000);
+    };
+
+    const modeRow = document.createElement('div'); modeRow.className = 'organ-seg'; modeRow.style.marginBottom = '18px';
+    for (const [mKey, mLbl] of [['focus', 'Focus (' + workMin + 'm)'], ['short', 'Short Break (' + shortMin + 'm)'], ['long', 'Long Break (' + longMin + 'm)']]) {
+      const b = document.createElement('button'); b.type = 'button';
+      b.className = tm.mode === mKey ? 'active' : '';
+      b.textContent = mLbl;
+      b.onclick = () => { stopTick(); tm.mode = mKey; tm.remaining = modes[mKey]; render(); };
+      modeRow.appendChild(b);
+    }
+    root.appendChild(modeRow);
+
+    const card = document.createElement('div');
+    card.style.cssText = 'text-align:center;padding:28px 20px;border:1px solid var(--v-border);border-radius:16px;background:var(--v-bg);margin-bottom:16px';
+    const clk = document.createElement('div'); clk.id = 'timer-clock';
+    clk.style.cssText = 'font-size:64px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-0.03em;line-height:1;margin-bottom:16px';
+    clk.textContent = fmtClock(tm.remaining);
+    const barWrap = document.createElement('div');
+    barWrap.style.cssText = 'height:8px;border-radius:999px;background:var(--v-surface-alt);overflow:hidden;max-width:340px;margin:0 auto 20px';
+    const barFill = document.createElement('div'); barFill.id = 'timer-bar-fill';
+    const pct = Math.round(((modes[tm.mode] - tm.remaining) / Math.max(1, modes[tm.mode])) * 100);
+    barFill.style.cssText = 'height:100%;background:var(--v-accent);transition:width 0.3s ease;width:' + pct + '%';
+    barWrap.appendChild(barFill);
+
+    const controls = document.createElement('div'); controls.className = 'organ-row'; controls.style.justifyContent = 'center'; controls.style.gap = '10px';
+    const mainBtn = document.createElement('button'); mainBtn.type = 'button'; mainBtn.className = 'organ-btn primary';
+    mainBtn.style.padding = '10px 26px'; mainBtn.textContent = tm.running ? 'Pause' : 'Start';
+    mainBtn.onclick = () => { if (tm.running) stopTick(); else startTick(); render(); };
+    const resetBtn = document.createElement('button'); resetBtn.type = 'button'; resetBtn.className = 'organ-btn';
+    resetBtn.textContent = 'Reset';
+    resetBtn.onclick = () => { stopTick(); tm.remaining = modes[tm.mode]; render(); };
+    const skipBtn = document.createElement('button'); skipBtn.type = 'button'; skipBtn.className = 'organ-btn ghost';
+    skipBtn.textContent = tm.mode === 'focus' ? 'Take Break' : 'Back to Focus';
+    skipBtn.onclick = () => { stopTick(); tm.mode = tm.mode === 'focus' ? 'short' : 'focus'; tm.remaining = modes[tm.mode]; render(); };
+    controls.append(mainBtn, resetBtn, skipBtn);
+    card.append(clk, barWrap, controls);
+    root.appendChild(card);
+
+    const foot = document.createElement('footer'); foot.className = 'doc-footer';
+    const sessEl = document.createElement('span'); sessEl.textContent = 'Completed focus sessions: ' + tm.sessions;
+    const statusEl = document.createElement('span'); statusEl.textContent = tm.running ? 'Running' : 'Ready';
+    foot.append(sessEl, statusEl);
+    root.appendChild(foot);
+    return;
+  }
+
   if (W.role === 'calculator') {
     const grid = document.createElement('div'); grid.style.cssText = 'display:grid;gap:10px;margin-bottom:14px';
     (W.metrics || []).forEach((m, i) => {

@@ -143,7 +143,7 @@ function yieldCooperativeFrame(): Promise<void> {
 function extractCanonicalSubject(prompt: string): string {
   const cleaned = prompt
     .replace(
-      /^\s*(?:please\s+)?(?:create|make|generate|draw|paint|render|compose|build|write|design|start)\s+(?:me\s+)?(?:a|an|the)?\s*/i,
+      /^\s*(?:please\s+)?(?:create|make|generate|draw|paint|render|compose|build|write|design|start)\s+(?:me\s+)?(?:an|a|the)?\s*/i,
       '',
     )
     .replace(
@@ -151,7 +151,7 @@ function extractCanonicalSubject(prompt: string): string {
       '',
     )
     .trim();
-  const words = cleaned.split(/\s+/).filter(Boolean).slice(0, 5);
+  const words = cleaned.split(/\s+/).filter(Boolean).slice(0, 6);
   return words.join(' ') || prompt.trim().slice(0, 48) || 'subject';
 }
 
@@ -220,13 +220,40 @@ export async function contextualizePromptToUnifiedWeights(params: {
   readonly deps: Pick<ReconciliationDeps, 'registry' | 'runLocalLanguagePrompt'>;
 }): Promise<{ readonly revision: SemanticRevisionRecord; readonly inheritedAnchor: boolean }> {
   const { prompt, mediaType, prismId, activePrismId, palette, deps } = params;
-  const associated = deps.registry.semantics.recallAssociatedSemantics(prompt, activePrismId);
+  // When refining an existing Prism (`prismId` already anchored), always advance its own concept
+  // revision; for brand-new Prisms, only inherit an earlier anchor on strong semantic/anaphoric match.
+  const ownConcept = prismId ? deps.registry.semantics.getConceptForPrism(prismId) : null;
+  const associated =
+    ownConcept ?? deps.registry.semantics.recallAssociatedSemantics(prompt, activePrismId);
   const canonicalSubject = associated?.canonicalSubject ?? extractCanonicalSubject(prompt);
   const det = inferDeterministicAttributes(prompt, canonicalSubject);
 
+  const buildMediaBrief = (): string => {
+    const cleanSubj = canonicalSubject.replace(/^[a-z]/, (c) => c.toUpperCase());
+    if (mediaType === 'audio') {
+      return `${cleanSubj} — multi-track stereo arrangement (${det.acousticCues.join(', ')}).`;
+    }
+    if (mediaType === 'video') {
+      return `${cleanSubj} — animated storyboard sequence (${det.motionCues.join(', ')}).`;
+    }
+    if (mediaType === 'interactive-game') {
+      return `${cleanSubj} — playable interactive game with local score tracking and keyboard/touch controls.`;
+    }
+    if (mediaType === 'written-work') {
+      return `${cleanSubj} — multi-chapter editorial document with Write/Read views and Markdown/HTML export.`;
+    }
+    if (mediaType === 'research-program') {
+      return `${cleanSubj} — structured research notebook with hypotheses, evidence log, and milestones.`;
+    }
+    if (mediaType === 'tool-organ') {
+      return `${cleanSubj} — focused private utility running locally in your browser.`;
+    }
+    return `${cleanSubj} — ${det.attributes.slice(1, 4).join(', ')} in ${det.lighting} lighting.`;
+  };
+
   let contextualBrief = associated
     ? `${associated.contextualBrief} Adapted for ${mediaType}: ${prompt.slice(0, 140)}`
-    : `${canonicalSubject} — ${det.attributes.slice(1, 4).join(', ')} in ${det.lighting} lighting.`;
+    : buildMediaBrief();
   let llmAttrs: readonly string[] = [];
 
   if (deps.runLocalLanguagePrompt) {

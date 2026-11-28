@@ -942,7 +942,8 @@ export class VerdantRootPrismRuntime {
       ]);
       const compiled = compilePrismDeclaration(declaration);
       const readiness = evaluateVerdantRouting(declaration);
-      if (!compiled || !readiness.readyToSeal) {
+      const hasProceduralOrgan = Boolean(declaration.view?.proceduralOrgan);
+      if (!compiled || (!readiness.readyToSeal && !hasProceduralOrgan)) {
         const msg = 'Describe your idea in the prompt bar below first so we can finish building it.';
         this.setPartTask(prismId, { status: 'idle', busy: false, label: '', banner: { ok: false, text: msg } });
         return { ok: false, text: msg };
@@ -1261,9 +1262,34 @@ export class VerdantRootPrismRuntime {
       });
     }
 
-    const recentErrors = this.observerBus
-      .getRecentSpans()
-      .filter((s) => s.status === 'error');
+    for (const [mod, q10] of Object.entries(chrono.modalityCoherenceQ10)) {
+      if (typeof q10 === 'number' && q10 < 384) {
+        score -= 128;
+        findings.push({
+          severity: 'warn',
+          subsystem: `chronology:${mod}`,
+          message: `Modality "${mod}" timeliness coherence is low (${q10}/1024).`,
+          recommendedAction: `Inspect recent "${mod}" spans for prompt bloat or stalls.`,
+        });
+      }
+    }
+
+    const recentSpans = this.observerBus.getRecentSpans();
+    const recentCancelled = recentSpans.filter(
+      (s) => s.name === 'thread.turn' && s.attributes['verdant.cancelled'] === true,
+    );
+    if (recentCancelled.length > 0) {
+      const lastCancel = recentCancelled[recentCancelled.length - 1]!;
+      score -= 96;
+      findings.push({
+        severity: 'warn',
+        subsystem: 'inference',
+        message: `${recentCancelled.length} recent cancelled chat turn(s) (latest ran ${Math.round(Number(lastCancel.attributes['verdant.total_ms'] ?? lastCancel.durationMs ?? 0) / 1000)}s).`,
+        recommendedAction: 'Check prompt token count, tool attachment, and thinking token budget.',
+      });
+    }
+
+    const recentErrors = recentSpans.filter((s) => s.status === 'error');
     if (recentErrors.length > 0) {
       score -= Math.min(256, recentErrors.length * 96);
       findings.push({
@@ -1402,6 +1428,9 @@ export class VerdantRootPrismRuntime {
           result = { surfaceMode: action.mode };
           break;
         case 'set_dark_mode':
+          if (typeof action.dark !== 'boolean') {
+            throw new Error('set_dark_mode requires a boolean "dark" field.');
+          }
           this.onSetDarkModeCallback?.(action.dark);
           result = { darkMode: action.dark };
           break;

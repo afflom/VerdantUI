@@ -1276,7 +1276,38 @@ export function createLlamaVTensorAdapter(
       // ---------------------------------------------------------------------
       const allTools =
         context?.tools && Object.keys(context.tools).length > 0 ? context.tools : undefined;
-      const activeTools = certificate.attachTools ? allTools : undefined;
+      // Sparse Top-K Published Prism Tool Projection: when attaching tools, keep built-in tools
+      // and include at most 2 relevant `prism_*` tools (explicitly @mentioned or keyword-matched)
+      // so growing a library of 10..100+ Prisms NEVER bloats `<tools>` into multi-thousand-token prefills!
+      const activeTools = (() => {
+        if (!certificate.attachTools || !allTools) return undefined;
+        const selected: Record<string, Tool<any, any>> = {};
+        const userLower = latestUserText.toLowerCase();
+        const userWords = new Set(
+          userLower.split(/[^a-z0-9]+/).filter((w) => w.length >= 3),
+        );
+        const scoredPrisms: Array<{ name: string; tool: Tool<any, any>; score: number }> = [];
+        for (const [name, tool] of Object.entries(allTools)) {
+          if (!name.startsWith('prism_')) {
+            selected[name] = tool;
+            continue;
+          }
+          const hay = `${name.replace(/^prism_/, '').replace(/_/g, ' ')} ${tool.description ?? ''}`.toLowerCase();
+          let score = 0;
+          if (userLower.includes(`@${name.replace(/^prism_/, '')}`)) score += 100;
+          for (const w of userWords) {
+            if (hay.includes(w)) score += 1;
+          }
+          if (score > 0) {
+            scoredPrisms.push({ name, tool, score });
+          }
+        }
+        scoredPrisms.sort((a, b) => b.score - a.score);
+        for (const item of scoredPrisms.slice(0, 2)) {
+          selected[item.name] = item.tool;
+        }
+        return Object.keys(selected).length > 0 ? selected : undefined;
+      })();
       // Always parse `<tool_call>...</tool_call>` if the model emits one so spontaneous tool calls
       // NEVER leak raw XML to the user and instead resolve cleanly through Prisms (`DEC-013`).
       const parseToolCalls = true;
@@ -1439,6 +1470,12 @@ export function createLlamaVTensorAdapter(
               projectedTtftMs,
               ttftErrorMs: actualTtftMs - projectedTtftMs,
               promptTokens: event.promptTokens,
+              ...(typeof event.prefillTokensEvaluated === 'number'
+                ? { prefillTokens: event.prefillTokensEvaluated }
+                : {}),
+              ...(typeof event.prefillTokensPerSec === 'number' && event.prefillTokensPerSec > 0
+                ? { prefillTokSec: Number(event.prefillTokensPerSec.toFixed(2)) }
+                : {}),
             });
           }
           totalChunks += 1;
@@ -1452,6 +1489,30 @@ export function createLlamaVTensorAdapter(
           }
           lastGeneratedTokens = event.generatedTokens;
           lastTokensPerSecond = event.tokensPerSecond;
+
+          // Runaway repetition / unbounded `<think>` guard: if the model loops verbatim inside
+          // an unclosed reasoning block or spins past 280 reasoning tokens without closing, stop cleanly.
+          const hasUnclosedThink =
+            (startsInReasoning || /<think>/i.test(latestText)) && !/<\/think>/i.test(latestText);
+          let runawayThinkLoop = false;
+          if (hasUnclosedThink && lastGeneratedTokens >= 48) {
+            const tail = latestText.slice(-360);
+            const probe = tail.slice(-36).trim();
+            if (probe.length >= 24) {
+              let hits = 0;
+              let idx = tail.indexOf(probe);
+              while (idx !== -1) {
+                hits += 1;
+                idx = tail.indexOf(probe, idx + probe.length);
+              }
+              if (hits >= 3) {
+                runawayThinkLoop = true;
+              }
+            }
+            if (lastGeneratedTokens >= 280) {
+              runawayThinkLoop = true;
+            }
+          }
 
           const parts = parseAssistantStreamParts(latestText, false, {
             startsInReasoning,
@@ -1478,7 +1539,7 @@ export function createLlamaVTensorAdapter(
             };
           }
 
-          if (completedToolCall) {
+          if (completedToolCall || runawayThinkLoop) {
             runController.abort();
             break;
           }
@@ -1518,7 +1579,13 @@ export function createLlamaVTensorAdapter(
           : [];
         turnSpan?.setAttributes({
           'verdant.cancelled': true,
+          'verdant.prompt_tokens': lastPromptTokens,
+          'verdant.prefill_tokens': lastPrefillTokensEvaluated,
+          ...(lastPrefillTokensPerSec !== undefined
+            ? { 'verdant.prefill_tok_s': Number(lastPrefillTokensPerSec.toFixed(2)) }
+            : {}),
           'verdant.generated_tokens': lastGeneratedTokens,
+          'verdant.tok_per_sec': lastTokensPerSecond,
           'verdant.total_ms': Date.now() - streamStartTime,
         });
         turnSpan?.end('ok');
