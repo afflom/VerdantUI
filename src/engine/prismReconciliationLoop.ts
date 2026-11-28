@@ -251,9 +251,16 @@ export async function contextualizePromptToUnifiedWeights(params: {
     return `${cleanSubj} — ${det.attributes.slice(1, 4).join(', ')} in ${det.lighting} lighting.`;
   };
 
-  let contextualBrief = associated
-    ? `${associated.contextualBrief} Adapted for ${mediaType}: ${prompt.slice(0, 140)}`
-    : buildMediaBrief();
+  const isLegacyStaleBrief =
+    associated !== null &&
+    mediaType !== 'picture' &&
+    (/clear focal silhouette|daylight lighting/i.test(associated.contextualBrief) ||
+      /^n\s+/i.test(associated.contextualBrief));
+
+  let contextualBrief =
+    associated && !isLegacyStaleBrief
+      ? `${associated.contextualBrief} Adapted for ${mediaType}: ${prompt.slice(0, 140)}`
+      : buildMediaBrief();
   let llmAttrs: readonly string[] = [];
 
   if (deps.runLocalLanguagePrompt) {

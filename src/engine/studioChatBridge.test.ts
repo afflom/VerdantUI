@@ -111,5 +111,19 @@ test('StudioChatBridge creates inline PNG Pictures, Stereo WAV Audio, Games, Spa
   const pomoWeights = store.get(pomoRes.prismId)?.declaration?.view?.proceduralOrgan?.weights;
   assert.equal(pomoWeights?.mediaType === 'tool-organ' ? pomoWeights.role : null, 'focus-timer');
 
+  const flashRes = await bridge.createArtifactFromPrompt({
+    prompt: 'Build a flashcards study deck for organic chemistry',
+    forcedMediaType: 'tool-organ',
+  });
+  const flashWeights = store.get(flashRes.prismId)?.declaration?.view?.proceduralOrgan?.weights;
+  assert.equal(flashWeights?.mediaType === 'tool-organ' ? flashWeights.role : null, 'flashcards');
+
+  const budgetRes = await bridge.createArtifactFromPrompt({
+    prompt: 'Build a monthly budget tracker for household expenses',
+    forcedMediaType: 'tool-organ',
+  });
+  const budgetWeights = store.get(budgetRes.prismId)?.declaration?.view?.proceduralOrgan?.weights;
+  assert.equal(budgetWeights?.mediaType === 'tool-organ' ? budgetWeights.role : null, 'budget-tracker');
+
   pool.dispose();
 });

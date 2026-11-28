@@ -1521,14 +1521,10 @@ export class VerdantCognitiveObserver {
         : userCadence === 'rapid'
           ? 1_800
           : this.chronology.slas.turnTtftTargetMs;
-    const uncachedPrefillTokens = Math.min(
-      256,
-      Math.max(8, Math.ceil(ctx.latestUserText.length / 4) + 12),
-    );
 
-  // Derive cognitive execution posture directly from integrated belief + sensed quality budget (zero manual modes!)
-  // Suppress costly hidden <think> chains on explicit brief/minimal queries while boosting analytical
-  // precision on debugging, proofs, edge cases, complexity, and counting puzzles.
+    // Derive cognitive execution posture directly from integrated belief + sensed quality budget (zero manual modes!)
+    // Suppress costly hidden <think> chains on explicit brief/minimal queries while boosting analytical
+    // precision on debugging, proofs, edge cases, complexity, and counting puzzles.
     const analyticalCue =
       /\b(bug|race condition|deadlock|trade[- ]?offs?|prove|proof|theorem|rigorous|verification|derivation|counterexample|complexity|big[- ]?o|how many [a-z]'?s in|step by step|verify|edge cases?)\b/i.test(
         ctx.latestUserText,
@@ -1539,6 +1535,25 @@ export class VerdantCognitiveObserver {
     const epistemicPressure = Math.max(nextBelief[4], escalatedObs[4]);
     const toolCompSignal = Math.max(nextBelief[7], escalatedObs[7]);
     const needsTools = ctx.isToolContinuationStep || toolCompSignal >= 576;
+    const isSelfIntrospection =
+      !ctx.isToolContinuationStep &&
+      /(\byour\s+(?:own\s+)?(?:architecture|runtime|speed|performance|telemetry|memory|model|state|observer|experience|timeliness|limitations|capabilities)\b|\bhow\s+(?:are\s+you\s+(?:doing|running|performing)|do\s+you\s+experience)\b|\bwhat\s+feels\s+(?:fast|slow)\b|\babout\s+yourself\b|\bwhere\s+your\s+features\b)/i.test(
+        ctx.latestUserText,
+      );
+    // Estimate real uncached delta prefill tokens (user text + tail telemetry/recall + optional tools)
+    // so projectedTtftMs & calibrated turn budgets track actual hardware prefill work accurately!
+    const uncachedPrefillTokens = Math.min(
+      1_200,
+      Math.max(
+        16,
+        Math.ceil(ctx.latestUserText.length / 4) +
+          24 +
+          (mem.turnCount === 0 ? 48 : 32) +
+          (isSelfIntrospection ? 95 : 0) +
+          (qualityBudget.shouldConsultContentStreams ? 80 : 0) +
+          (needsTools ? 340 : 0),
+      ),
+    );
     const suppressThinkingForBrevity =
       qualityBudget.featureRichness === 'minimal' &&
       mem.retryEscalationLevel === 0 &&

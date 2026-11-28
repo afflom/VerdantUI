@@ -1358,12 +1358,31 @@ export class VerdantRootPrismRuntime {
 
   /**
    * Self-healing reconciliation (`REQ-SELF-HEALING`): synchronizes Gallery and Expert Basis
-   * indexes from authoritative Prism storage and clears stale errored tasks.
+   * indexes from authoritative Prism storage, clears stale errored tasks, and repairs legacy
+   * non-picture Prism summaries (e.g., stale picture boilerplate or off-by-1 prefix slices).
    */
-  reconcileSelfHeal(): { readonly syncedPrisms: number; readonly clearedErrors: number } {
+  reconcileSelfHeal(): { readonly syncedPrisms: number; readonly clearedErrors: number; readonly healedSummaries: number } {
     const prisms = this.prismStore.list();
-    this.galleryStore.syncFromPrisms(prisms);
-    this.expertRegistry.syncPrismsAsExperts(prisms);
+    let healedSummaries = 0;
+    for (const p of prisms) {
+      const mt = p.declaration?.view?.proceduralOrgan?.mediaType ?? p.declaration?.concept.mediaType;
+      const summary = p.draft.summary ?? '';
+      if (
+        mt &&
+        mt !== 'picture' &&
+        (/clear focal silhouette|daylight lighting/i.test(summary) || /^n\s+/i.test(summary))
+      ) {
+        const cleanSummary = `${p.draft.name} — private on-device ${mt.replace(/-/g, ' ')} creation.`;
+        void this.prismStore.applyStudioOp(
+          p.id,
+          { op: 'set-metadata', description: cleanSummary },
+          { pushRevision: false },
+        );
+        healedSummaries += 1;
+      }
+    }
+    this.galleryStore.syncFromPrisms(this.prismStore.list());
+    this.expertRegistry.syncPrismsAsExperts(this.prismStore.list());
     let clearedErrors = 0;
     for (const [partId, task] of this.partTasks.entries()) {
       if (task.status === 'error' && !task.busy) {
@@ -1371,7 +1390,7 @@ export class VerdantRootPrismRuntime {
         clearedErrors += 1;
       }
     }
-    return { syncedPrisms: prisms.length, clearedErrors };
+    return { syncedPrisms: prisms.length, clearedErrors, healedSummaries };
   }
 
   /**

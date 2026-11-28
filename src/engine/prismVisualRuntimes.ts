@@ -492,7 +492,7 @@ function renderChrome() {
   canvas.style.objectFit = 'contain';
   root.appendChild(canvas);
 
-  const scrub = document.createElement('input'); scrub.id = 'vid-scrub'; scrub.type = 'range';
+  const scrub = document.createElement('input'); scrub.id = 'vid-scrub'; scrub.name = 'vid-scrub'; scrub.type = 'range';
   scrub.min = '0'; scrub.max = String(getTotalDur()); scrub.step = '0.05'; scrub.value = String(tSec);
   scrub.style.width = '100%'; scrub.style.margin = '12px 0 6px';
   scrub.oninput = () => { tSec = Number(scrub.value); drawFrame(tSec); };

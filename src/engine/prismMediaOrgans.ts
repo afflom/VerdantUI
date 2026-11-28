@@ -367,7 +367,14 @@ export interface ToolWorkflowStepWeight {
 
 export interface ToolOrganWeights {
   readonly mediaType: 'tool-organ';
-  readonly role: 'habit-guardian' | 'schedule-guard' | 'calculator' | 'workflow-helper' | 'focus-timer';
+  readonly role:
+    | 'habit-guardian'
+    | 'schedule-guard'
+    | 'calculator'
+    | 'workflow-helper'
+    | 'focus-timer'
+    | 'flashcards'
+    | 'budget-tracker';
   readonly compartmentId: string;
   readonly emitsOpaqueConstraints: boolean;
   readonly rulesSummary: string;
@@ -377,6 +384,7 @@ export interface ToolOrganWeights {
   readonly workMinutes?: number;
   readonly shortBreakMinutes?: number;
   readonly longBreakMinutes?: number;
+  readonly monthlyBudget?: number;
 }
 
 export interface SpaceArtifactEntry {
@@ -894,12 +902,16 @@ export function normalizeOrganWeights(
     };
   }
 
-  // tool-organ (focus timer, habit guardian, schedule guard, calculator, workflow helper)
+  // tool-organ (focus timer, flashcards, budget tracker, habit guardian, schedule guard, calculator, workflow helper)
   const isTimer = /\b(pomodoro|countdown|timer|stopwatch|focus\s+timer)\b/.test(lowerHint);
+  const isFlashcards = /\b(flashcards?|study\s+deck|quiz\s+cards?|spaced\s+repetition|memoriz)\b/.test(lowerHint);
+  const isBudget = /\b(budget|expense|spending|monthly\s+spend|savings\s+tracker)\b/.test(lowerHint);
   const isHabit = /\b(habit|healthy|workout|exercise|meditat|sleep|walk|run|wellness|gym|hydrat)\b/.test(lowerHint);
   const isSchedule = /\b(calendar|schedule|meeting|quiet|block\s*time|protect)\b/.test(lowerHint);
   const role: ToolOrganWeights['role'] =
     p.role === 'focus-timer' ||
+    p.role === 'flashcards' ||
+    p.role === 'budget-tracker' ||
     p.role === 'habit-guardian' ||
     p.role === 'schedule-guard' ||
     p.role === 'calculator' ||
@@ -907,11 +919,15 @@ export function normalizeOrganWeights(
       ? p.role
       : isTimer
         ? 'focus-timer'
-        : isHabit
-          ? 'habit-guardian'
-          : isSchedule
-            ? 'schedule-guard'
-            : 'workflow-helper';
+        : isFlashcards
+          ? 'flashcards'
+          : isBudget
+            ? 'budget-tracker'
+            : isHabit
+              ? 'habit-guardian'
+              : isSchedule
+                ? 'schedule-guard'
+                : 'workflow-helper';
 
   // Extract time window like "5pm to 6pm" or "17:00-18:00" if mentioned in natural language
   const timeMatch = lowerHint.match(

@@ -4,7 +4,7 @@
 
 - **Service Charter:** Free Public Benefit AI Service (Apache-2.0, 100% client-side, zero servers, zero tracking, zero paywalls)
 - **Compute Substrate:** `afflom/verdant-engine@v2.22.4` (`9d22f5ac364d`)
-- **Lifecycle Authority:** `afflom/verdant-studio@b037b426925a`
+- **Lifecycle Authority:** `afflom/verdant-studio@611d75170d80`
 - **Performance Budgets:** Turn OPFS stall `<= 0 ms`, Frame yield KPI `<= 16666 us`, JS bundle `<= 3600 KiB`
 
 ## Locked Architectural & Performance Invariants

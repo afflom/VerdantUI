@@ -151,11 +151,21 @@ function render() {
     bMd.onclick = () => { (window.verdant?.browser?.downloadFile || window.verdant?.downloadFile)?.(W.title.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.md', fullMarkdown(), 'text/markdown'); exportOpen = false; render(); };
     const bHtml = document.createElement('button'); bHtml.type = 'button'; bHtml.textContent = 'Download .html';
     bHtml.onclick = () => {
-      const html = '<!doctype html><html><head><meta charset="utf-8"><title>' + esc(W.title) + '</title><style>body{max-width:680px;margin:56px auto;font-family:Georgia,serif;font-size:17px;line-height:1.85;padding:0 20px;color:#0f172a}</style></head><body>' + renderMarkdownProse(fullMarkdown()) + '</body></html>';
+      const toc = chapters.length > 1
+        ? '<nav style="border-bottom:1px solid #e2e8f0;padding-bottom:12px;margin-bottom:24px"><strong>Contents</strong><ul>' + chapters.map((c, idx) => '<li><a href="#ch-' + idx + '">' + esc(c.title || ('Section ' + (idx + 1))) + '</a></li>').join('') + '</ul></nav>'
+        : '';
+      const bodyHtml = '<h1>' + esc(W.title) + '</h1>' + (W.premise ? '<p><em>' + esc(W.premise) + '</em></p>' : '') + toc +
+        chapters.map((c, idx) => '<section id="ch-' + idx + '"><h2>' + esc(c.title || ('Section ' + (idx + 1))) + '</h2>' + renderMarkdownProse(c.body || c.summary || '') + '</section>').join('');
+      const html = '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>' + esc(W.title) + '</title><style>body{max-width:680px;margin:56px auto;font-family:Georgia,serif;font-size:17px;line-height:1.85;padding:0 20px;color:#0f172a}nav a{color:#0f5132;text-decoration:none}</style></head><body>' + bodyHtml + '</body></html>';
       (window.verdant?.browser?.downloadFile || window.verdant?.downloadFile)?.(W.title.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.html', html, 'text/html');
       exportOpen = false; render();
     };
-    pop.append(bCopy, bMd, bHtml);
+    const bTxt = document.createElement('button'); bTxt.type = 'button'; bTxt.textContent = 'Download .txt';
+    bTxt.onclick = () => {
+      (window.verdant?.browser?.downloadFile || window.verdant?.downloadFile)?.(W.title.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.txt', fullMarkdown().replace(/^#+\s*/gm, ''), 'text/plain');
+      exportOpen = false; render();
+    };
+    pop.append(bCopy, bMd, bHtml, bTxt);
     if (chapters.length > 1) {
       const bDel = document.createElement('button'); bDel.type = 'button'; bDel.style.color = '#dc2626'; bDel.textContent = 'Remove current section';
       bDel.onclick = () => { chapters.splice(activeIdx, 1); activeIdx = Math.max(0, activeIdx - 1); exportOpen = false; persist(); render(); };
@@ -169,6 +179,7 @@ function render() {
 
   if (viewMode === 'write') {
     const titleIn = document.createElement('input');
+    titleIn.id = 'doc-section-title'; titleIn.name = 'doc-section-title';
     titleIn.type = 'text'; titleIn.className = 'doc-title-input';
     titleIn.value = ch.title || ''; titleIn.placeholder = 'Untitled section';
     titleIn.oninput = () => {
@@ -178,11 +189,13 @@ function render() {
       persist();
     };
     const subIn = document.createElement('input');
+    subIn.id = 'doc-section-subtitle'; subIn.name = 'doc-section-subtitle';
     subIn.type = 'text'; subIn.className = 'doc-sub-input';
     subIn.value = ch.summary || ''; subIn.placeholder = 'Optional subtitle or focus note…';
     subIn.oninput = () => { ch.summary = subIn.value; persist(); };
 
     const ta = document.createElement('textarea');
+    ta.id = 'doc-section-body'; ta.name = 'doc-section-body';
     ta.className = 'doc-editor';
     ta.placeholder = 'Write freely… Markdown formatting works when you switch to Read.';
     ta.value = ch.body || '';
@@ -406,6 +419,18 @@ let state = {
       ],
   calcInputs: (W.metrics || []).map((m) => m.target || 10),
   scenarios: [],
+  cards: [
+    { id: 'c1', front: 'Core concept of ' + (W.rulesSummary || 'this study deck').slice(0, 48), back: 'Review the key definition, mechanism, and example.', mastered: false },
+    { id: 'c2', front: 'How does active recall improve retention?', back: 'Retrieving answers from memory strengthens recall pathways far more than passive re-reading.', mastered: false },
+    { id: 'c3', front: 'How can you add a custom card here?', back: 'Type "Add card: Question | Answer" in the prompt bar below.', mastered: false },
+  ],
+  cardIdx: 0,
+  cardFlipped: false,
+  monthlyBudget: Number(W.monthlyBudget) || 2000,
+  expenses: [
+    { id: 'e1', label: 'Groceries', category: 'Essentials', amount: 145, at: 'Today' },
+    { id: 'e2', label: 'Utilities', category: 'Home', amount: 95, at: 'Today' },
+  ],
 };
 
 function persist() { try { window.verdant?.storage?.set('utilityState', state); } catch (_) {} }
@@ -420,6 +445,9 @@ async function hydrate() {
         scenarios: Array.isArray(s.scenarios) ? s.scenarios : state.scenarios,
         windows: Array.isArray(s.windows) && s.windows.length > state.windows.length ? s.windows : state.windows,
         steps: Array.isArray(s.steps) && s.steps.length > state.steps.length ? s.steps : state.steps,
+        cards: Array.isArray(s.cards) && s.cards.length > 0 ? s.cards : state.cards,
+        expenses: Array.isArray(s.expenses) ? s.expenses : state.expenses,
+        monthlyBudget: typeof s.monthlyBudget === 'number' && s.monthlyBudget > 0 ? s.monthlyBudget : state.monthlyBudget,
       };
       render();
     }
@@ -548,13 +576,106 @@ function render() {
     return;
   }
 
+  if (W.role === 'flashcards') {
+    if (!Array.isArray(state.cards) || state.cards.length === 0) {
+      state.cards = [{ id: 'c1', front: 'First card', back: 'Tap Flip to reveal answer.', mastered: false }];
+    }
+    const idx = Math.max(0, Math.min(state.cards.length - 1, state.cardIdx || 0));
+    const card = state.cards[idx];
+    const mastered = state.cards.filter((c) => c.mastered).length;
+
+    const prog = document.createElement('div');
+    prog.style.cssText = 'display:flex;justify-content:space-between;font-size:12px;color:var(--v-muted);margin-bottom:10px';
+    prog.innerHTML = '<span>Card ' + (idx + 1) + ' of ' + state.cards.length + '</span><span>' + mastered + ' mastered</span>';
+    root.appendChild(prog);
+
+    const box = document.createElement('button'); box.type = 'button';
+    box.style.cssText = 'display:flex;flex-direction:column;align-items:center;justify-content:center;width:100%;min-height:190px;padding:28px 24px;border:1px solid var(--v-border);border-radius:16px;background:var(--v-bg);cursor:pointer;text-align:center;margin-bottom:14px';
+    const badge = document.createElement('span'); badge.className = 'organ-pill'; badge.style.marginBottom = '12px';
+    badge.textContent = state.cardFlipped ? 'Answer' : 'Question · Click to Flip';
+    const body = document.createElement('div'); body.style.cssText = 'font-size:19px;font-weight:600;line-height:1.45;color:var(--v-text)';
+    body.textContent = state.cardFlipped ? card.back : card.front;
+    box.append(badge, body);
+    box.onclick = () => { state.cardFlipped = !state.cardFlipped; render(); };
+    root.appendChild(box);
+
+    const row = document.createElement('div'); row.className = 'organ-row'; row.style.justifyContent = 'space-between';
+    const nav = document.createElement('div'); nav.className = 'organ-row';
+    const prevBtn = document.createElement('button'); prevBtn.type = 'button'; prevBtn.className = 'organ-btn ghost'; prevBtn.textContent = 'Prev';
+    prevBtn.onclick = () => { state.cardIdx = (idx - 1 + state.cards.length) % state.cards.length; state.cardFlipped = false; render(); };
+    const flipBtn = document.createElement('button'); flipBtn.type = 'button'; flipBtn.className = 'organ-btn'; flipBtn.textContent = 'Flip';
+    flipBtn.onclick = () => { state.cardFlipped = !state.cardFlipped; render(); };
+    const nextBtn = document.createElement('button'); nextBtn.type = 'button'; nextBtn.className = 'organ-btn ghost'; nextBtn.textContent = 'Next';
+    nextBtn.onclick = () => { state.cardIdx = (idx + 1) % state.cards.length; state.cardFlipped = false; render(); };
+    nav.append(prevBtn, flipBtn, nextBtn);
+
+    const markBtn = document.createElement('button'); markBtn.type = 'button';
+    markBtn.className = 'organ-btn ' + (card.mastered ? 'ghost' : 'primary');
+    markBtn.textContent = card.mastered ? 'Mastered ✓' : 'Mark Mastered';
+    markBtn.onclick = () => { card.mastered = !card.mastered; state.cardIdx = (idx + 1) % state.cards.length; state.cardFlipped = false; persist(); render(); };
+    row.append(nav, markBtn);
+    root.appendChild(row);
+    return;
+  }
+
+  if (W.role === 'budget-tracker') {
+    const limit = Math.max(1, Number(state.monthlyBudget) || 2000);
+    const spent = (state.expenses || []).reduce((acc, e) => acc + (Number(e.amount) || 0), 0);
+    const remaining = limit - spent;
+    const pct = Math.min(100, Math.round((spent / limit) * 100));
+
+    const stats = document.createElement('div');
+    stats.style.cssText = 'display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px';
+    for (const [lbl, val, warn] of [['Monthly Budget', '$' + limit.toLocaleString(), false], ['Spent', '$' + spent.toLocaleString(), false], ['Remaining', (remaining < 0 ? '-$' + Math.abs(remaining).toLocaleString() : '$' + remaining.toLocaleString()), remaining < 0]]) {
+      const c = document.createElement('div');
+      c.style.cssText = 'padding:12px;border:1px solid var(--v-border);border-radius:12px;background:var(--v-bg)';
+      c.innerHTML = '<div style="font-size:11px;color:var(--v-muted)">' + lbl + '</div><div style="font-size:20px;font-weight:700;margin-top:2px;color:' + (warn ? '#dc2626' : 'var(--v-text)') + '">' + val + '</div>';
+      stats.appendChild(c);
+    }
+    root.appendChild(stats);
+
+    const bar = document.createElement('div');
+    bar.style.cssText = 'height:8px;border-radius:999px;background:var(--v-surface-alt);overflow:hidden;margin-bottom:16px';
+    const fill = document.createElement('div');
+    fill.style.cssText = 'height:100%;width:' + pct + '%;background:' + (remaining < 0 ? '#dc2626' : 'var(--v-accent)');
+    bar.appendChild(fill); root.appendChild(bar);
+
+    const form = document.createElement('div');
+    form.style.cssText = 'display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap';
+    const lblIn = document.createElement('input'); lblIn.id = 'budget-item-label'; lblIn.name = 'budget-item-label';
+    lblIn.type = 'text'; lblIn.className = 'organ-input'; lblIn.style.flex = '1'; lblIn.placeholder = 'Expense description…';
+    const amtIn = document.createElement('input'); amtIn.id = 'budget-item-amount'; amtIn.name = 'budget-item-amount';
+    amtIn.type = 'number'; amtIn.className = 'organ-input'; amtIn.style.width = '110px'; amtIn.placeholder = 'Amount';
+    const addBtn = document.createElement('button'); addBtn.type = 'button'; addBtn.className = 'organ-btn primary'; addBtn.textContent = 'Add Expense';
+    addBtn.onclick = () => {
+      const amt = Number(amtIn.value);
+      const label = lblIn.value.trim();
+      if (!label || !Number.isFinite(amt) || amt <= 0) return;
+      state.expenses.unshift({ id: 'e' + Date.now(), label, category: 'General', amount: Math.round(amt * 100) / 100, at: new Date().toLocaleDateString() });
+      persist(); render();
+    };
+    form.append(lblIn, amtIn, addBtn); root.appendChild(form);
+
+    (state.expenses || []).forEach((ex, i) => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 12px;border:1px solid var(--v-border);border-radius:10px;margin-bottom:6px;background:var(--v-bg)';
+      const left = document.createElement('span'); left.textContent = ex.label + ' · ' + ex.at;
+      const right = document.createElement('div'); right.className = 'organ-row';
+      const amt = document.createElement('strong'); amt.textContent = '$' + Number(ex.amount).toLocaleString();
+      const rm = document.createElement('button'); rm.type = 'button'; rm.className = 'organ-btn ghost'; rm.textContent = '×';
+      rm.onclick = () => { state.expenses.splice(i, 1); persist(); render(); };
+      right.append(amt, rm); row.append(left, right); root.appendChild(row);
+    });
+    return;
+  }
+
   if (W.role === 'calculator') {
     const grid = document.createElement('div'); grid.style.cssText = 'display:grid;gap:10px;margin-bottom:14px';
     (W.metrics || []).forEach((m, i) => {
       const row = document.createElement('div');
       row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border:1px solid var(--v-border);border-radius:10px;background:var(--v-bg)';
-      const lbl = document.createElement('label'); lbl.textContent = m.label + ' (' + m.unit + ')';
-      const inp = document.createElement('input'); inp.type = 'number'; inp.className = 'organ-input'; inp.style.width = '110px';
+      const lbl = document.createElement('label'); lbl.htmlFor = 'calc-input-' + i; lbl.textContent = m.label + ' (' + m.unit + ')';
+      const inp = document.createElement('input'); inp.id = 'calc-input-' + i; inp.name = 'calc-input-' + i; inp.type = 'number'; inp.className = 'organ-input'; inp.style.width = '110px';
       inp.value = String(state.calcInputs[i] ?? m.target);
       inp.oninput = () => { state.calcInputs[i] = Number(inp.value) || 0; persist(); updateCalc(); };
       row.append(lbl, inp); grid.appendChild(row);
@@ -654,6 +775,18 @@ if (window.verdant?.onInput) {
     if (sm) {
       state.steps.push({ id: 's' + Date.now(), text: sm[1].trim(), done: false }); persist(); render();
       return { ok: true, steps: state.steps.length };
+    }
+    const cm = text.match(/\\badd\\s+card\\b[:\\s-]*([^|]+)\\|(.+)$/i);
+    if (cm && W.role === 'flashcards') {
+      state.cards.push({ id: 'c' + Date.now(), front: cm[1].trim(), back: cm[2].trim(), mastered: false });
+      state.cardIdx = state.cards.length - 1; state.cardFlipped = false; persist(); render();
+      return { ok: true, cards: state.cards.length };
+    }
+    const em = text.match(/\\badd\\s+expense\\b[:\\s-]*\\$?(\\d+(?:\\.\\d{1,2})?)\\s+(.+)$/i);
+    if (em && W.role === 'budget-tracker') {
+      state.expenses.unshift({ id: 'e' + Date.now(), label: em[2].trim(), category: 'General', amount: Number(em[1]), at: new Date().toLocaleDateString() });
+      persist(); render();
+      return { ok: true, expenses: state.expenses.length };
     }
     return { ok: true };
   });
