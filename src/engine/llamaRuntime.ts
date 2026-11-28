@@ -239,6 +239,10 @@ export interface TokenStreamEvent {
   readonly accumulatedText: string;
   readonly generatedTokens: number;
   readonly promptTokens: number;
+  /** Exact delta prompt tokens evaluated this turn (excluding KV-cache prefix reuse). */
+  readonly prefillTokensEvaluated?: number;
+  /** Exact measured delta prefill throughput (tok/s) for this turn. */
+  readonly prefillTokensPerSec?: number;
   readonly contextWindow?: number;
   readonly promptTruncatedTokens?: number;
   readonly tokensPerSecond: number;
@@ -6192,6 +6196,8 @@ export class LlamaVTensorRuntime {
             accumulatedText: accumulated,
             generatedTokens: step,
             promptTokens: truncatedPrompt.length,
+            prefillTokensEvaluated: tokensToEval,
+            prefillTokensPerSec: observedPrefillTokSec,
             contextWindow: this.maxContextWindow,
             promptTruncatedTokens,
             tokensPerSecond: tokSec,
@@ -6221,6 +6227,8 @@ export class LlamaVTensorRuntime {
           accumulatedText: accumulated,
           generatedTokens: generatedCount,
           promptTokens: truncatedPrompt.length,
+          prefillTokensEvaluated: tokensToEval,
+          prefillTokensPerSec: observedPrefillTokSec,
           contextWindow: this.maxContextWindow,
           promptTruncatedTokens,
           tokensPerSecond: tokSec,

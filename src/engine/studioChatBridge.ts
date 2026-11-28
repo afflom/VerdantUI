@@ -300,21 +300,11 @@ async function materializeInlineArtifact(
 
   if (weights.mediaType === 'picture') {
     const pw = weights as PictureWeights;
-    const residency = deps.observer.getActiveModalityResidency();
-    let neuralLayer: { readonly width: number; readonly height: number; readonly rgba: Uint8ClampedArray } | null = null;
-    if (deps.synthesizeImageLayer && (residency.image || !residency.language)) {
-      try {
-        const res = await deps.synthesizeImageLayer({ prompt: pw.caption || proj.draft.name, seed: pw.seed });
-        if (res.neuralAvailable && res.rgba && res.width > 0 && res.height > 0) {
-          neuralLayer = { width: res.width, height: res.height, rgba: res.rgba };
-        }
-      } catch {
-        neuralLayer = null;
-      }
-    }
+    // Render crisp procedural LOD0 preview immediately (<200 ms, 100% consistent with the
+    // opened Prism canvas) instead of blocking LOD0 on a ~20 s CPU SDXS diffusion pass.
     const rendered = await renderPictureWithCoherenceCheck(pw, {
       maxPreviewDim: 640,
-      neuralLayer,
+      neuralLayer: null,
     });
     return {
       previewImageDataUrl: rendered.pngDataUrl,

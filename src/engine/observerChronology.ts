@@ -363,7 +363,9 @@ export class ObserverChronology {
       Number.isFinite(params.prefillTokSec) &&
       params.prefillTokSec >= 0.5
     ) {
-      const alpha = next.turnSamples === 0 ? 0.75 : 0.3;
+      const ratio = next.prefillTokensPerSec / Math.max(0.5, params.prefillTokSec);
+      const alpha =
+        next.turnSamples === 0 ? 0.85 : ratio > 2.0 || ratio < 0.5 ? 0.6 : 0.35;
       next = {
         ...next,
         prefillTokensPerSec: Number(

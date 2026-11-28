@@ -1352,7 +1352,7 @@ export function createLlamaVTensorAdapter(
           '[Live Observer Self-Report — Grounded Telemetry]',
           `Model: ${state.model.displayName} (${state.model.hparams.primaryQuantization}, ${state.model.backingKind}, ${state.model.maxContextWindow} ctx) on ${state.telemetry.kernelAcceleration} (${workers} browser workers, 100% client-side, zero servers).`,
           `Measured Speeds: prefill ${tp.prefillTokensPerSec} tok/s, decode ${tp.decodeTokensPerSec} tok/s, OPFS read ${opfsReadMBs} MB/s, stream ${netMBs} MB/s.`,
-          `Storage & Chronology: ${opfsMb} MB cached in OPFS, coherence ${Math.round((chronoSnap.coherenceQ10 / 1024) * 100)}%, cadence=${chronoSnap.userCadence}, overdue=${chronoSnap.overdueCount}${recentTurn ? `, last turn=${recentTurn.durationMs} ms` : ''}.`,
+          `Storage & Chronology: ${opfsMb} MB cached in OPFS, timeliness health ${Math.round((chronoSnap.coherenceQ10 / 1024) * 100)}% (100% = all tasks within budget), cadence=${chronoSnap.userCadence}, overdue tasks=${chronoSnap.overdueCount}${recentTurn ? `, last turn=${recentTurn.durationMs} ms` : ''}.`,
           `Built-in Capabilities: <50 ms LOD0 math/conversions, instant Verdant Studio organs (Pictures, Audio, Video, Games, Documents, Research, Spaces), W3C OTEL trace bus.`,
           'Ground your answer honestly in these real measurements — highlight real strengths and genuine bottlenecks without generic chatbot clichés.',
         ].join('\n');
@@ -1404,6 +1404,8 @@ export function createLlamaVTensorAdapter(
       let totalChunks = 0;
       let latestText = '';
       let lastPromptTokens = 0;
+      let lastPrefillTokensEvaluated = 0;
+      let lastPrefillTokensPerSec: number | undefined;
       let lastGeneratedTokens = 0;
       let lastTokensPerSecond = 0;
       const turnTtftObjId = `turn:ttft:${threadId}`;
@@ -1444,6 +1446,12 @@ export function createLlamaVTensorAdapter(
           totalChunks += 1;
           latestText = event.accumulatedText;
           lastPromptTokens = event.promptTokens;
+          if (typeof event.prefillTokensEvaluated === 'number') {
+            lastPrefillTokensEvaluated = event.prefillTokensEvaluated;
+          }
+          if (typeof event.prefillTokensPerSec === 'number' && event.prefillTokensPerSec > 0) {
+            lastPrefillTokensPerSec = event.prefillTokensPerSec;
+          }
           lastGeneratedTokens = event.generatedTokens;
           lastTokensPerSecond = event.tokensPerSecond;
 
@@ -1481,16 +1489,19 @@ export function createLlamaVTensorAdapter(
         if (firstTokenTime === undefined) {
           client.cognitiveObserver.chronology.completeObject(turnTtftObjId);
         }
-        // Close the real-time throughput calibration loop on ObserverChronology
+        // Close the real-time throughput calibration loop on ObserverChronology using TRUE delta
+        // prefill tokens evaluated (never total prompt tokens inflated by KV prefix cache hits!)
         if (lastGeneratedTokens >= 4 && lastTokensPerSecond > 0) {
           const prefillElapsedSec =
             firstTokenTime !== undefined && firstTokenTime > generateStartMs
               ? (firstTokenTime - generateStartMs) / 1000
               : 0;
           const observedPrefillTokSec =
-            lastPromptTokens >= 16 && prefillElapsedSec >= 0.08
-              ? lastPromptTokens / prefillElapsedSec
-              : undefined;
+            lastPrefillTokensPerSec !== undefined && lastPrefillTokensEvaluated >= 8
+              ? lastPrefillTokensPerSec
+              : lastPrefillTokensEvaluated >= 8 && prefillElapsedSec >= 0.08
+                ? lastPrefillTokensEvaluated / prefillElapsedSec
+                : undefined;
           client.cognitiveObserver.chronology.recordInferenceThroughput({
             decodeTokSec: lastTokensPerSecond,
             prefillTokSec: observedPrefillTokSec,

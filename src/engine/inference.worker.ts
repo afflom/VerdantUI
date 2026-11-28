@@ -1022,7 +1022,7 @@ async function executeSingleGenerationJob(job: QueuedGenerationJob): Promise<voi
       });
       const stepUs = (nowMs - lastStepMs) * 1000;
       lastStepMs = nowMs;
-      multimodalCoordinator.frameOracle.recordFrame(stepUs);
+      multimodalCoordinator.recordFrame(stepUs);
 
       if (willCheckpoint) {
         checkpointed = true;

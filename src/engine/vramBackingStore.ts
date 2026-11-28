@@ -2531,12 +2531,29 @@ export async function openOpfsDemandModelBacking(
       signal: options?.signal,
       retryDelaysMs: options?.retryDelaysMs,
     });
+    // Heal legacy demand caches whose `maxSlots` was previously shrunk below `totalBytes`
+    // even though plenty of free browser OPFS quota is available (eliminates OPFS LRU thrashing!)
+    let effectiveMaxCacheBytes = meta.maxSlots * meta.slabBytes;
+    const fullTotalSlabs = Math.max(1, Math.ceil(meta.totalBytes / meta.slabBytes));
+    if (!options?.dirOverride && meta.maxSlots < fullTotalSlabs) {
+      try {
+        const space = await estimateAvailableOpfsSpace();
+        const extraNeeded = (fullTotalSlabs - meta.maxSlots) * meta.slabBytes;
+        const headroom = Math.min(OPFS_SAFETY_HEADROOM_BYTES, Math.floor(space.quota * 0.05));
+        if (space.quota > 0 && space.free > extraNeeded + headroom) {
+          effectiveMaxCacheBytes = meta.totalBytes;
+        }
+      } catch {
+        // Keep existing maxCacheBytes on storage estimate failure
+      }
+    }
+
     const store = new OpfsDemandVramBackingStore({
       modelId,
       url,
       totalBytes: meta.totalBytes,
       handle: syncCache,
-      maxCacheBytes: meta.maxSlots * meta.slabBytes,
+      maxCacheBytes: effectiveMaxCacheBytes,
       slabBytes: meta.slabBytes,
       etag: meta.etag,
       initialIndex: meta,
@@ -3111,13 +3128,16 @@ export async function streamUrlToVramBacking(
                 const headroom = space.quota > 0 ? Math.min(OPFS_SAFETY_HEADROOM_BYTES, Math.floor(space.quota * 0.05)) : 0;
 
                 if (options?.preferDemandStreaming && acceptRanges !== 'none' && knownTotalBytes >= 64 * 1024) {
-                  const targetCachePool =
+                  // Pass true available OPFS space (NOT clamped to `knownTotalBytes`), so
+                  // `switchToDemandSlabCache`'s headroom safety margin never shrinks `maxSlots`
+                  // below `knownTotalBytes` when plenty of browser quota is free!
+                  const availableForDemand =
                     space.quota > 0 && space.free > 0
-                      ? Math.min(knownTotalBytes, space.free)
-                      : knownTotalBytes;
+                      ? space.free
+                      : knownTotalBytes * 2;
                   attemptController.abort();
                   void res.body?.cancel().catch(() => {});
-                  return await switchToDemandSlabCache(knownTotalBytes, targetCachePool, knownEtag);
+                  return await switchToDemandSlabCache(knownTotalBytes, availableForDemand, knownEtag);
                 }
 
                 if (space.quota > 0 && neededBytes + headroom > space.free) {

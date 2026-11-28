@@ -266,9 +266,10 @@ export function extractCleanIdeaTitle(sentence: string): string {
   }
   const cleaned = sentence
     .replace(
-      /\b(this\s+prism\s+(?:will\s+be|is|should\s+be)|make\s+me|build\s+me|create\s+a|i\s+want\s+(?:a|an|to\s+build)|the\s+video\s+game|video\s+game|the\s+game|a\s+game\s+called|called|named)\b/gi,
+      /\b(this\s+prism\s+(?:will\s+be|is|should\s+be)|please|generate|create|draw|paint|render|compose|make\s+me|build\s+me|make|build|i\s+want\s+(?:a|an|to\s+build)|the\s+video\s+game|video\s+game|the\s+game|a\s+game\s+called|a\s+picture\s+of|an\s+image\s+of|a\s+photo\s+of|a\s+video\s+of|a\s+song\s+about|picture\s+of|image\s+of|picture|image|photo|illustration|artwork|called|named)\b/gi,
       ' ',
     )
+    .replace(/\b(a|an|the|of|for|at|in|on|with)\b/gi, ' ')
     .replace(/[^a-zA-Z0-9\s+-]/g, ' ')
     .trim();
   const words = cleaned.split(/\s+/).filter((w) => w.length > 1).slice(0, 4);

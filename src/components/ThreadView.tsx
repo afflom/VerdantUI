@@ -227,9 +227,53 @@ const ComposerPrismMentionPicker: FC<{
   );
 };
 
+function formatCleanMathText(raw: string): string {
+  if (!raw.includes('$')) return raw;
+  const cleanExpr = (expr: string): string =>
+    expr
+      .replace(/\\times\b/g, '×')
+      .replace(/\\cdot\b/g, '·')
+      .replace(/\\approx\b/g, '≈')
+      .replace(/\\leq?\b/g, '≤')
+      .replace(/\\geq?\b/g, '≥')
+      .replace(/\\neq?\b/g, '≠')
+      .replace(/\\pm\b/g, '±')
+      .replace(/\\frac\{([^}]+)\}\{([^}]+)\}/g, '($1)/($2)')
+      .replace(/\s*\\\\\s*/g, '  |  ')
+      .replace(/\s+\\\s+/g, '  |  ')
+      .trim();
+
+  // Display math $$ ... $$ (never matches currency since display equations do not start with $digit alone)
+  let out = raw.replace(/\$\$\s*([^$\n][\s\S]{0,240}?)\s*\$\$/g, (_m, inner: string) => cleanExpr(inner));
+  // Inline math $ x $ / $ 2x + 1 = 1.10 $ — never matches currency like "$1.10" or "$0.05"
+  out = out.replace(
+    /(?<![\w$])\$\s*([a-zA-Z\\][^$\n]{0,80}?|[0-9]+[a-zA-Z][^$\n]{0,80}?)\s*\$(?!\d)/g,
+    (_m, inner: string) => cleanExpr(inner),
+  );
+  return out;
+}
+
+function remarkCleanMath() {
+  const visit = (node: { type?: string; value?: string; children?: unknown[] }) => {
+    if (node.type === 'text' && typeof node.value === 'string' && node.value.includes('$')) {
+      node.value = formatCleanMathText(node.value);
+    }
+    if (Array.isArray(node.children)) {
+      for (const child of node.children) {
+        if (child && typeof child === 'object') {
+          visit(child as { type?: string; value?: string; children?: unknown[] });
+        }
+      }
+    }
+  };
+  return (tree: { type?: string; value?: string; children?: unknown[] }) => {
+    visit(tree);
+  };
+}
+
 const MarkdownText: FC = () => (
   <div className="aui-md">
-    <MarkdownTextPrimitive remarkPlugins={[remarkGfm]} />
+    <MarkdownTextPrimitive remarkPlugins={[remarkGfm, remarkCleanMath]} />
   </div>
 );
 
@@ -1218,6 +1262,8 @@ export const ThreadView: FC<ThreadViewProps> = ({
             </div>
 
             <ComposerPrimitive.Input
+              id="verdant-composer-input"
+              name="prompt"
               aria-label="Message prompt"
               placeholder={
                 publishedPrisms.length > 0

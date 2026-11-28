@@ -1789,12 +1789,14 @@ export class VerdantCognitiveObserver {
       `${winner.routeId}:${winner.freeEnergy}:${thinkingPolicy}:${needsTools ? 1 : 0}:${surpriseQ10}:${obs.inputDigest}`,
     );
 
+    // Only attach heavy `<tools>` JSON schemas (~1,500 tokens) when tools are actually needed
+    // or already latched in this thread — never bloat pure conversational turns or wipe the
+    // warmed boot system-prompt KV prefix simply because the user has saved Prisms!
     const shouldAttachToolsNow =
       winner.kind !== 'lod0-verified' &&
       (mem.toolsLatched ||
         needsTools ||
-        Boolean(ctx.hasConsolidatedHistory) ||
-        Boolean(ctx.publishedPrisms && ctx.publishedPrisms.length > 0));
+        Boolean(ctx.hasConsolidatedHistory));
     if (shouldAttachToolsNow) {
       mem.toolsLatched = true;
     }
