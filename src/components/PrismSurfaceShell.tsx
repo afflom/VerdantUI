@@ -469,6 +469,8 @@ export const PrismSurfaceShell: FC<PrismSurfaceShellProps> = ({
               )}
 
               <input
+                id={`prism-nl-input-${prism.id}`}
+                name="prismPrompt"
                 type="text"
                 aria-label={`Ask ${prism.name}`}
                 value={input}

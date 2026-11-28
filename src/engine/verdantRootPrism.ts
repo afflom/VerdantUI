@@ -712,9 +712,10 @@ export class VerdantRootPrismRuntime {
           galleries: this.galleryStore,
           registry: this.expertRegistry,
           // Keep background LOD1..LOD3 visual/audio reconciliation strictly non-blocking:
-          // never contend with or wipe the active chat thread's KV cache on the single worker!
+          // never contend with or wipe the active chat thread's KV cache on the single worker,
+          // and avoid slow ~20s CPU SDXS passes that overwrite crisp procedural scenes!
           runLocalLanguagePrompt: undefined,
-          synthesizeImageLayer: (p) => this.workerClient.synthesizeImageLayer(p),
+          synthesizeImageLayer: undefined,
           evaluateVisualQa: (p) => this.workerClient.evaluateVisualSemanticQa(p),
           runWithDeterministicPrecision: (fn) =>
             this.workerClient.runWithDeterministicPrecision(fn),

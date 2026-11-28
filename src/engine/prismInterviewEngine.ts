@@ -188,14 +188,16 @@ function derivePrismName(sentence: string): TaggedFact<string> {
     'a', 'an', 'the', 'my', 'our', 'to', 'for', 'of', 'in', 'on', 'by', 'with', 'and', 'or',
     'that', 'which', 'help', 'me', 'us', 'let', 'make', 'build', 'create', 'app', 'prism',
     'tool', 'check', 'if', 'when', 'is', 'are', 'be', 'can', 'should', 'will', 'alert', 'warn',
-    'refuse', 'reject', 'calculate', 'compute', 'track', 'interactive',
+    'refuse', 'reject', 'calculate', 'compute', 'track', 'interactive', 'please', 'generate',
+    'picture', 'image', 'photo', 'draw', 'paint', 'render', 'compose', 'video', 'audio', 'song',
+    'artwork', 'illustration', 'show', 'give', 'write',
   ]);
   const words = sentence
     .replace(/[^a-zA-Z0-9\s]/g, ' ')
     .split(/\s+/)
     .filter((w) => w.length > 2 && !stop.has(w.toLowerCase()));
   if (words.length > 0) {
-    const picked = titleCase(words.slice(0, 3).join(' '));
+    const picked = titleCase(words.slice(0, 4).join(' '));
     return { value: picked, source: 'stated', reason: 'Derived from key terms in your idea.' };
   }
   return { value: 'My Prism', source: 'suggested', reason: 'Default working title (editable anytime).' };

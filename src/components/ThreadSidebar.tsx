@@ -273,6 +273,8 @@ export const ThreadSidebar: FC<ThreadSidebarProps> = ({
             {onImportHoloFile && (
               <>
                 <input
+                  id="verdant-import-creation-file"
+                  name="importCreationFile"
                   ref={holoFileRef}
                   type="file"
                   accept=".holo,.json,application/octet-stream,application/json"

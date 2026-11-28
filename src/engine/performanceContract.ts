@@ -374,7 +374,10 @@ export function derivePerformanceContract(
       : getGgmlTypeTrait(model.dominantWeightType).typeSizeBytes /
         getGgmlTypeTrait(model.dominantWeightType).blockSize;
 
-  // Operational intensity I(B) = (2 * B) / avgBytesPerWeight; solve I(B) >= I_ridge
+  // Operational intensity I(B) = (2 * B) / avgBytesPerWeight; solve I(B) >= I_ridge.
+  // On WASM SIMD (`relaxed-vnni` / `simd128-int8`), 4-column `mul_mat_b4` + 32-token layer-major
+  // chunked prefill unpack each quantized weight block ONCE across 4 activation columns and amortize
+  // OPFS layer loads up to 32x, so ALWAYS use `SPILL_FREE_BATCH_WIDTH` (4) on SIMD hosts!
   const ridgeBatchNeeded = Math.max(
     1,
     Math.ceil((env.ridgeIntensityOpsPerByte * avgBytesPerWeight) / 2),
@@ -382,7 +385,7 @@ export function derivePerformanceContract(
   const optimalPrefillBatchSize =
     env.simdTier === 'scalar-js'
       ? 1
-      : Math.max(1, Math.min(SPILL_FREE_BATCH_WIDTH, ridgeBatchNeeded));
+      : Math.max(SPILL_FREE_BATCH_WIDTH, Math.min(SPILL_FREE_BATCH_WIDTH, ridgeBatchNeeded));
 
   // --- Theorem T3: Amdahl-Synchronization Parallel Partition Threshold ---
   // Parallel speedup S(P) modeled conservatively via Amdahl bandwidth scaling (effective efficiency 0.82)
