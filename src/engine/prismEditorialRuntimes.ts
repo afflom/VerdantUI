@@ -446,7 +446,15 @@ async function hydrate() {
         windows: Array.isArray(s.windows) && s.windows.length > state.windows.length ? s.windows : state.windows,
         steps: Array.isArray(s.steps) && s.steps.length > state.steps.length ? s.steps : state.steps,
         cards: Array.isArray(s.cards) && s.cards.length > 0 ? s.cards : state.cards,
-        expenses: Array.isArray(s.expenses) ? s.expenses : state.expenses,
+        expenses: Array.isArray(s.expenses)
+          ? (() => {
+              const byId = new Map();
+              for (const e of [...(state.expenses || []), ...s.expenses]) {
+                if (e && e.id && !byId.has(e.id)) byId.set(e.id, e);
+              }
+              return Array.from(byId.values());
+            })()
+          : state.expenses,
         monthlyBudget: typeof s.monthlyBudget === 'number' && s.monthlyBudget > 0 ? s.monthlyBudget : state.monthlyBudget,
       };
       render();

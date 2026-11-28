@@ -894,7 +894,7 @@ export function normalizeOrganWeights(
       mediaType: 'research-program',
       topic: safeStr(p.topic, titleHint, 120),
       question: safeStr(p.question, hintText || `Investigate and validate ${titleHint}.`, 260),
-      compartmentId: safeStr(p.compartmentId, 'research', 32),
+      compartmentId: safeStr(p.compartmentId, 'personal', 32),
       tracks,
       hypotheses,
       milestones,
@@ -1007,10 +1007,53 @@ export function normalizeOrganWeights(
     })
     .filter((s) => s.text.length > 0);
 
+  const rawExpenses = Array.isArray(p.expenses) ? p.expenses : [];
+  const expenses = rawExpenses
+    .slice(0, 64)
+    .map((e, i) => {
+      const obj = (e ?? {}) as Record<string, unknown>;
+      const amt = Number(obj.amount);
+      return {
+        id: safeStr(obj.id, `e${i + 1}`, 24),
+        label: safeStr(obj.label, '', 80),
+        category: safeStr(obj.category, 'General', 40),
+        amount: Number.isFinite(amt) && amt > 0 ? Math.round(amt * 100) / 100 : 0,
+        at: safeStr(obj.at, '', 32),
+      };
+    })
+    .filter((e) => e.label.length > 0 && e.amount > 0);
+
+  const rawCards = Array.isArray(p.cards) ? p.cards : [];
+  const cards = rawCards
+    .slice(0, 64)
+    .map((c, i) => {
+      const obj = (c ?? {}) as Record<string, unknown>;
+      return {
+        id: safeStr(obj.id, `c${i + 1}`, 24),
+        front: safeStr(obj.front, '', 140),
+        back: safeStr(obj.back, '', 220),
+        mastered: Boolean(obj.mastered),
+      };
+    })
+    .filter((c) => c.front.length > 0 && c.back.length > 0);
+
+  const monthlyBudget =
+    typeof p.monthlyBudget === 'number' && Number.isFinite(p.monthlyBudget) && p.monthlyBudget > 0
+      ? Math.round(p.monthlyBudget)
+      : undefined;
+  const workMinutes =
+    typeof p.workMinutes === 'number' && Number.isFinite(p.workMinutes) && p.workMinutes > 0
+      ? clampInt(p.workMinutes, 1, 180, 25)
+      : undefined;
+  const breakMinutes =
+    typeof p.breakMinutes === 'number' && Number.isFinite(p.breakMinutes) && p.breakMinutes > 0
+      ? clampInt(p.breakMinutes, 1, 60, 5)
+      : undefined;
+
   return {
     mediaType: 'tool-organ',
     role,
-    compartmentId: safeStr(p.compartmentId, isHabit ? 'personal' : 'work', 32),
+    compartmentId: safeStr(p.compartmentId, 'personal', 32),
     emitsOpaqueConstraints: Boolean(p.emitsOpaqueConstraints ?? (isHabit || isSchedule)),
     rulesSummary: safeStr(
       p.rulesSummary,
@@ -1020,6 +1063,11 @@ export function normalizeOrganWeights(
     scheduleWindows,
     metrics,
     ...(steps.length > 0 ? { steps } : {}),
+    ...(expenses.length > 0 ? { expenses } : {}),
+    ...(monthlyBudget !== undefined ? { monthlyBudget } : {}),
+    ...(cards.length > 0 ? { cards } : {}),
+    ...(workMinutes !== undefined ? { workMinutes } : {}),
+    ...(breakMinutes !== undefined ? { breakMinutes } : {}),
   };
 }
 

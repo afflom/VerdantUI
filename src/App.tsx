@@ -181,7 +181,8 @@ const SubscribedAppInitializingOverlay: FC<{
   }, [summary.streamingConsent, usable, unlockedForConsent]);
 
   const sessionUnlocked =
-    summary.streamingConsent !== 'pending' && unlockedForConsent === summary.streamingConsent;
+    summary.streamingConsent !== 'pending' &&
+    (unlockedForConsent === summary.streamingConsent || (unlockedForConsent !== null && usable));
 
   const view = useMemo(
     () =>

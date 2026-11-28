@@ -1330,9 +1330,13 @@ export function createLlamaVTensorAdapter(
         }
         return Object.keys(selected).length > 0 ? selected : undefined;
       })();
-      // Always parse `<tool_call>...</tool_call>` if the model emits one so spontaneous tool calls
-      // NEVER leak raw XML to the user and instead resolve cleanly through Prisms (`DEC-013`).
-      const parseToolCalls = true;
+      // Parse `<tool_call>...</tool_call>` strictly when tools are attached for this turn; on
+      // non-tool turns (`!activeTools`), strip any stray bare `<tool_call>` control prefix token
+      // emitted by Qwen3 after `</think>` unless a complete JSON `<tool_call>{...}</tool_call>`
+      // was intentionally emitted (`DEC-013`).
+      const parseToolCalls = Boolean(activeTools);
+      const normalizeStreamText = (raw: string): string =>
+        parseToolCalls ? raw : raw.replace(/<tool_call>\s*(?!\{)/gi, '');
 
       const systemMessage = context?.system ?? UNIFIED_VERDANT_SYSTEM_PROMPT;
       const baseSampling = state.samplingCustomized
@@ -1541,7 +1545,7 @@ export function createLlamaVTensorAdapter(
             }
           }
 
-          const parts = parseAssistantStreamParts(latestText, false, {
+          const parts = parseAssistantStreamParts(normalizeStreamText(latestText), false, {
             startsInReasoning,
             parseToolCalls,
             idPrefix: stepIdPrefix,
@@ -1609,7 +1613,7 @@ export function createLlamaVTensorAdapter(
               if (contEvent.tokensPerSecond > 0) {
                 lastTokensPerSecond = contEvent.tokensPerSecond;
               }
-              const parts = parseAssistantStreamParts(latestText, false, {
+              const parts = parseAssistantStreamParts(normalizeStreamText(latestText), false, {
                 startsInReasoning,
                 parseToolCalls,
                 idPrefix: stepIdPrefix,
@@ -1677,7 +1681,7 @@ export function createLlamaVTensorAdapter(
 
       if (abortSignal.aborted) {
         const partialParts = latestText.trim()
-          ? parseAssistantStreamParts(latestText, true, {
+          ? parseAssistantStreamParts(normalizeStreamText(latestText), true, {
               startsInReasoning,
               parseToolCalls,
               idPrefix: stepIdPrefix,
@@ -1716,7 +1720,7 @@ export function createLlamaVTensorAdapter(
         return;
       }
 
-      const rawFinalParts = parseAssistantStreamParts(latestText, true, {
+      const rawFinalParts = parseAssistantStreamParts(normalizeStreamText(latestText), true, {
         startsInReasoning,
         parseToolCalls,
         idPrefix: stepIdPrefix,

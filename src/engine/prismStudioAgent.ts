@@ -696,11 +696,9 @@ export function parseDiscoveryAgentResponse(
   const compartmentId =
     (parsed && typeof parsed.compartmentId === 'string' && parsed.compartmentId.trim()) ||
     currentDecl.concept.compartmentId ||
-    (mediaType === 'research-program'
-      ? 'research'
-      : mediaType === 'tool-organ' && weights.mediaType === 'tool-organ'
-        ? weights.compartmentId
-        : 'personal');
+    (mediaType === 'tool-organ' && weights.mediaType === 'tool-organ'
+      ? weights.compartmentId
+      : 'personal');
 
   const userSaidBuild = BUILD_NOW_RE.test(latestUserMessage);
   const readyToBuild =

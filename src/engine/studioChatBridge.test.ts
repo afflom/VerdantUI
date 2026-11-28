@@ -137,5 +137,40 @@ test('StudioChatBridge creates inline PNG Pictures, Stereo WAV Audio, Games, Spa
   assert.equal(budgetWeights?.mediaType === 'tool-organ' ? budgetWeights.role : null, 'budget-tracker');
   assert.equal(budgetProj.draft.grants.storage, true, 'Stateful tool-organ Prisms must have scoped local storage enabled (FK-07)');
 
+  // 7. Utility compartment visibility, deterministic fast-path refinement (<50ms, 0 neural calls), & procedural status dispatch
+  const visible = observer.getVisiblePublishedPrismsForSpace(store.listPublishedSummaries(), 'personal');
+  assert.ok(
+    visible.some((p) => p.id === budgetRes.prismId),
+    'Budget Guard tool-organ must be visible in default personal Published Prism registry',
+  );
+  let neuralCalls = 0;
+  const guardedBridge = new StudioChatBridge({
+    store,
+    pool,
+    observer,
+    galleries,
+    registry,
+    runLocalStudioPrompt: async () => {
+      neuralCalls += 1;
+      return '';
+    },
+  });
+  await guardedBridge.refinePrismFromPrompt({
+    target: budgetRes.prismId,
+    instruction: 'Add expense $18 lunch',
+  });
+  assert.equal(neuralCalls, 0, 'Deterministic "Add expense $18 lunch" must NOT invoke slow neural rewrite');
+  const updatedBudget = store.get(budgetRes.prismId)!;
+  const bw = updatedBudget.declaration?.view?.proceduralOrgan?.weights as { expenses?: Array<{ label: string; amount: number }> };
+  assert.ok(
+    bw.expenses?.some((e) => e.label.toLowerCase() === 'lunch' && e.amount === 18),
+    'Budget Guard weights must contain the newly added $18 lunch expense',
+  );
+  const statusRes = await pool.dispatchPublishedPrism(budgetRes.prismId, { action: 'input', message: 'status' });
+  const statusObj = statusRes.result as Record<string, unknown>;
+  assert.equal(statusObj.refused, false, 'Procedural status dispatch must NOT refuse or stringify [object Object]');
+  assert.equal(statusObj.request, 'status');
+  assert.equal(statusObj.status, 'ok');
+
   pool.dispose();
 });

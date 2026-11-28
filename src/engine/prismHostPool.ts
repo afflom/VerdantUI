@@ -731,7 +731,7 @@ export class PrismHostPool implements PrismBridgeRuntime {
       if (raw && typeof raw === 'object') {
         const obj = raw as Record<string, unknown>;
         if (typeof obj.request === 'string') return obj.request.trim();
-        if (typeof obj.message === 'string' && (!decl?.encoding || Object.keys(obj).length === 1)) {
+        if (typeof obj.message === 'string' && obj.message.trim().length > 0) {
           return obj.message.trim();
         }
         if (decl?.encoding) {
@@ -754,6 +754,9 @@ export class PrismHostPool implements PrismBridgeRuntime {
             }
           }
           if (matchedField) return formatRequestLine(decl.encoding, numericInputs);
+        }
+        if (typeof obj.action === 'string' && obj.action.trim().length > 0) {
+          return obj.action.trim();
         }
       }
       return String(raw ?? '').trim();
@@ -789,6 +792,37 @@ export class PrismHostPool implements PrismBridgeRuntime {
     if (project.declaration) {
       const decl = project.declaration;
       const line = formatPayloadForModel(payload, decl);
+      const proc = decl.view?.proceduralOrgan;
+      if (proc && (/^(?:status|info|summary|help)$/i.test(line) || line === '')) {
+        const w = proc.weights as unknown as Record<string, unknown>;
+        const { result } = await this.bus.dispatchToEndpoint(prismId, payload, {
+          signal: opts?.signal,
+          parentContext,
+          callChain,
+          fallbackHandler: {
+            endpointId: prismId,
+            endpointKind: 'prism',
+            dispatch: async () => ({
+              status: 'ok',
+              prismName: snapshot.name,
+              mediaType: proc.mediaType,
+              summary: snapshot.summary || decl.concept.purpose,
+              activeOrgans: proc.activeOrgans,
+              ...(Array.isArray(w.items) ? { itemCount: w.items.length } : {}),
+              ...(Array.isArray(w.expenses)
+                ? {
+                    expenseCount: w.expenses.length,
+                    monthlyBudget: w.monthlyBudget ?? 2000,
+                  }
+                : {}),
+              ...(Array.isArray(w.chapters) ? { chapterCount: w.chapters.length } : {}),
+              request: line || 'status',
+              refused: false,
+            }),
+          },
+        });
+        return { result, prismName: snapshot.name, digest: snapshot.digest };
+      }
       const { result } = await this.bus.dispatchToEndpoint(prismId, payload, {
         signal: opts?.signal,
         parentContext,

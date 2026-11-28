@@ -787,6 +787,24 @@ export class StudioChatBridge {
       return createdCompanion;
     }
 
+    // Detect deterministic structured mutations first so utility/space/research commands settle
+    // in <50 ms without triggering a multi-minute neural rewrite!
+    const instr = params.instruction.trim();
+    const isDeterministicUtilityCmd =
+      mediaType === 'tool-organ' &&
+      (/\badd\s+expense\b/i.test(instr) ||
+        /\b(?:set|change|update)\s+(?:monthly\s+)?budget\b/i.test(instr) ||
+        /\badd\s+(?:card|flashcard)\b/i.test(instr) ||
+        /\badd\s+step\b/i.test(instr) ||
+        (/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:to|-|–|until)\s*(\d{1,2})/i.test(instr) &&
+          /\b(protect|block|schedule|focus|quiet|add)\b/i.test(instr)));
+    const isDeterministicStructuredCmd =
+      isDeterministicUtilityCmd ||
+      (mediaType === 'space' && /\b(board|grid|showcase|list|timeline)\b/i.test(instr)) ||
+      (mediaType === 'research-program' &&
+        /\b(add\s+hypothesis|(?:mark|set)\s+h\d+|(?:log|add)\s+(?:evidence|finding|observation)|add\s+milestone)\b/i.test(instr)) ||
+      (mediaType === 'video' && /\badd\s+scene\b/i.test(instr));
+
     // Advance UnifiedSemanticAssociator (vN -> vN+1, parentKappa-chained) so refinements
     // propagate across adjacent modalities and trigger progressive Lod1->Lod3 reconciliation.
     const { revision: refinedSemanticRev } = await contextualizePromptToUnifiedWeights({
@@ -796,14 +814,15 @@ export class StudioChatBridge {
       activePrismId: proj.id,
       deps: {
         registry,
-        runLocalLanguagePrompt: this.deps.runLocalStudioPrompt
-          ? (sys, usr, max) => this.deps.runLocalStudioPrompt!(sys, usr, max, proj.id)
-          : undefined,
+        runLocalLanguagePrompt:
+          !isDeterministicStructuredCmd && this.deps.runLocalStudioPrompt
+            ? (sys, usr, max) => this.deps.runLocalStudioPrompt!(sys, usr, max, proj.id)
+            : undefined,
       },
     });
 
     let rawModelJson = '';
-    if (this.deps.runLocalStudioPrompt) {
+    if (!isDeterministicStructuredCmd && this.deps.runLocalStudioPrompt) {
       try {
         const prompt = buildWeightRefinementPrompt([], decl, params.instruction);
         rawModelJson = await this.deps.runLocalStudioPrompt(prompt, params.instruction, 512, proj.id);
@@ -961,6 +980,63 @@ export class StudioChatBridge {
       if (addStep) {
         steps.push({ id: `s${Date.now()}`, text: addStep[1]!.trim().slice(0, 180), done: false });
         patchWeights.steps = steps;
+      }
+      const addExpA = params.instruction.match(/\badd\s+expense\b[:\s-]*\$?(\d+(?:\.\d{1,2})?)\s+(.+)$/i);
+      const addExpB = !addExpA
+        ? params.instruction.match(/\badd\s+expense\b[:\s-]*(.+?)\s+\$?(\d+(?:\.\d{1,2})?)$/i)
+        : null;
+      if (addExpA || addExpB) {
+        const amount = Math.round(Number(addExpA ? addExpA[1] : addExpB![2]) * 100) / 100;
+        const label = String(addExpA ? addExpA[2] : addExpB![1]).trim().slice(0, 80);
+        if (label && Number.isFinite(amount) && amount > 0) {
+          const existingExp = Array.isArray(patchWeights.expenses)
+            ? (patchWeights.expenses as Array<Record<string, unknown>>).map((e) => ({ ...e }))
+            : [];
+          const newEntry = {
+            id: `e${Date.now()}`,
+            label,
+            category: 'General',
+            amount,
+            at: new Date().toLocaleDateString(),
+          };
+          existingExp.unshift(newEntry);
+          patchWeights.expenses = existingExp;
+          const prevKv = (await store.getKv(proj.id, 'utilityState')) as Record<string, unknown> | null;
+          if (prevKv && typeof prevKv === 'object') {
+            const storedExp = Array.isArray(prevKv.expenses) ? [...(prevKv.expenses as unknown[])] : [];
+            storedExp.unshift(newEntry);
+            await store.setKv(proj.id, 'utilityState', { ...prevKv, expenses: storedExp });
+          }
+        }
+      }
+      const setBudget = params.instruction.match(/\b(?:set|change|update)\s+(?:monthly\s+)?budget\b[^0-9]*\$?(\d+(?:\.\d{1,2})?)/i);
+      if (setBudget) {
+        const limit = Math.max(1, Math.round(Number(setBudget[1])));
+        patchWeights.monthlyBudget = limit;
+        const prevKv = (await store.getKv(proj.id, 'utilityState')) as Record<string, unknown> | null;
+        if (prevKv && typeof prevKv === 'object') {
+          await store.setKv(proj.id, 'utilityState', { ...prevKv, monthlyBudget: limit });
+        }
+      }
+      const addCard = params.instruction.match(/\badd\s+(?:card|flashcard)\b[:\s-]*([^|]+)\|(.+)$/i);
+      if (addCard) {
+        const cards = Array.isArray(patchWeights.cards)
+          ? (patchWeights.cards as Array<Record<string, unknown>>).map((c) => ({ ...c }))
+          : [];
+        const newCard = {
+          id: `c${Date.now()}`,
+          front: addCard[1]!.trim().slice(0, 140),
+          back: addCard[2]!.trim().slice(0, 220),
+          mastered: false,
+        };
+        cards.push(newCard);
+        patchWeights.cards = cards;
+        const prevKv = (await store.getKv(proj.id, 'utilityState')) as Record<string, unknown> | null;
+        if (prevKv && typeof prevKv === 'object') {
+          const storedCards = Array.isArray(prevKv.cards) ? [...(prevKv.cards as unknown[])] : [];
+          storedCards.push(newCard);
+          await store.setKv(proj.id, 'utilityState', { ...prevKv, cards: storedCards });
+        }
       }
     } else if (mediaType === 'space') {
       if (/\bboard\b/i.test(params.instruction)) patchWeights.layout = 'board';

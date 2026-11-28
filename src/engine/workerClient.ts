@@ -767,7 +767,18 @@ export class LlamaVTensorWorkerClient {
         modelStreamEnabled: true,
         errorMessage: null,
         ...(alreadyLoadedRealModel || isAlreadyLoading
-          ? { statusDetail: alreadyLoadedRealModel ? 'Ready' : this.state.statusDetail }
+          ? {
+              statusDetail: alreadyLoadedRealModel ? 'Ready' : this.state.statusDetail,
+              ...(alreadyLoadedRealModel
+                ? {
+                    contextWarmed: true,
+                    backgroundPrewarm:
+                      this.state.backgroundPrewarm.phase === 'idle'
+                        ? { ...this.state.backgroundPrewarm, active: false, phase: 'ready', percent: 100 }
+                        : this.state.backgroundPrewarm,
+                  }
+                : {}),
+            }
           : {
               status: 'downloading',
               progressPercent: 2,
@@ -796,7 +807,10 @@ export class LlamaVTensorWorkerClient {
       this.patchState({
         streamingConsent: consent,
         modelStreamEnabled: false,
-        backgroundPrewarm: INITIAL_BACKGROUND_PREWARM,
+        backgroundPrewarm: {
+          ...this.state.backgroundPrewarm,
+          active: false,
+        },
         status: this.state.model ? 'ready' : 'idle',
         progressPercent: 0,
         statusDetail: consent === 'paused' ? 'Offline only' : 'Ready',

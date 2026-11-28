@@ -1173,6 +1173,7 @@ export class VerdantRootPrismRuntime {
     return {
       ui: {
         ...uiState,
+        streamingConsent: this.workerClient.getState().streamingConsent,
         activePartId: this.activePartId,
         layoutCompliant: this.cachedLayout ? this.cachedLayout.certificate.ok : true,
         layoutSolveCount: this.layoutSolveCount,
@@ -1390,7 +1391,26 @@ export class VerdantRootPrismRuntime {
           { pushRevision: false },
         );
       }
+      const compId = p.declaration?.concept.compartmentId;
+      const legacyWrongCompartment =
+        (mt === 'research-program' && compId === 'research') ||
+        (mt === 'tool-organ' &&
+          compId === 'work' &&
+          !/\bwork\b/i.test(`${p.draft.name} ${p.draft.summary}`));
+      if (legacyWrongCompartment) {
+        void this.prismStore
+          .applyStudioOp(
+            p.id,
+            { op: 'set-concept-profile', compartmentId: 'personal' },
+            { pushRevision: false },
+          )
+          .then(() => {
+            this.workerClient.cognitiveObserver.syncPublishedPrisms(this.prismStore.list());
+          });
+        healedSummaries += 1;
+      }
     }
+    this.workerClient.cognitiveObserver.syncPublishedPrisms(this.prismStore.list());
     this.galleryStore.syncFromPrisms(this.prismStore.list());
     this.expertRegistry.syncPrismsAsExperts(this.prismStore.list());
     let clearedErrors = 0;
